@@ -77,102 +77,102 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       navItem(
         "chat",
-        "New chat",
-        "Start a new conversation",
+        "Sesi Tempur",
+        "Mulai percakapan atau sesi kerja baru",
         PlusSignSquareIcon
       ),
       navItem(
         "profiles",
-        "Agent",
-        "Manage bot configs and tool allowlists",
+        "Zhànyǒu (Agen)",
+        "Kelola agen AI dan izin persenjataan",
         UserSquareIcon
       ),
       navItem(
         "groups",
-        "Groups",
-        "Group chats where agents talk to each other",
+        "Barisan Tim",
+        "Kolaborasi multi-agen bertempur bersama",
         UserGroupIcon
       ),
       navItem(
         "google-meet",
         "Google Meet",
-        "Capture and read meeting transcripts",
+        "Transkripsi dan risalah rapat Meet",
         SharedWifiIcon
       ),
-      navItem("plugin-management", "Plugins", "Manage plugins", PackageIcon),
+      navItem("plugin-management", "Plugins", "Kelola modul plugin", PackageIcon),
       navItem(
         "composio",
-        "Connections",
-        "Connect apps and manage plugins",
+        "Koneksi Eksternal",
+        "Hubungkan aplikasi dan integrasi pihak ketiga",
         PuzzleIcon
       ),
     ],
-    label: "Chat",
+    label: "Sesi",
   },
   {
     id: "agent",
     items: [
       navItem(
         "automations",
-        "Automations",
-        "Manage scheduled automations",
+        "Otomatisasi",
+        "Alur kerja otomatisasi terjadwal",
         SharedWifiIcon
       ),
       navItem(
         "customize",
-        "Control center",
-        "Manage MíngZhàn settings, tools, and integrations",
+        "Pusat Komando",
+        "Pengaturan sistem, senjata, dan integrasi MíngZhàn",
         SlidersHorizontalIcon
       ),
     ],
-    label: "Agent",
+    label: "Zhànyǒu",
   },
   {
     id: "organization",
     items: [
       navItem(
         "organization",
-        "Organization",
-        "Members, memory, and org settings",
+        "Barisan / Organisasi",
+        "Anggota tim, memori kolektif, dan hak akses",
         Building03Icon
       ),
     ],
-    label: "Organization",
+    label: "Organisasi",
   },
   {
     collapsible: true,
     id: "system",
     items: [
-      navItem("usage", "Usage", "View token usage and costs", Coins01Icon),
+      navItem("usage", "Penggunaan Token", "Pantau konsumsi token dan biaya", Coins01Icon),
       navItem(
         "files",
-        "Browse Files",
-        "Manage profile artifacts",
+        "Berkas & Artefak",
+        "Kelola artefak dan dokumen hasil kerja",
         Folder01Icon
       ),
       navItem(
         "workers",
-        "Workers",
-        "Automation and channel workers",
+        "Worker Aktif",
+        "Status background worker dan otomasi",
         DashboardSquare01Icon
       ),
-      navItem("tools", "Tools", "Manage agent tools", LayoutGridIcon),
-      navItem("skills", "Skills", "Browse organization skills", BrainIcon),
-      navItem("mcp", "MCP", "Manage MCP servers", Plug01Icon),
+      navItem("tools", "Senjata (Tools)", "Kelola senjata & perkakas yang digunakan agen", LayoutGridIcon),
+      navItem("skills", "Keterampilan (Skills)", "Jelajahi keterampilan dan SOP organisasi", BrainIcon),
+      navItem("mcp", "Protokol MCP", "Kelola server Model Context Protocol", Plug01Icon),
       navItem(
         "providers",
-        "AI Providers",
-        "Manage provider API keys and models",
+        "Penyedia AI",
+        "Kelola API keys dan model LLM",
         BrainIcon
       ),
       navItem(
         "settings",
-        "Settings",
-        "Appearance and preferences",
+        "Pengaturan",
+        "Preferensi tampilan dan tema",
         Settings01Icon
       ),
     ],
-    label: "System",
+    label: "Sistem",
   },
 ];
 

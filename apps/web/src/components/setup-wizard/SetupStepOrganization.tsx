@@ -98,7 +98,7 @@ export function SetupStepOrganization({
           <Input
             id="setup-org-name"
             onChange={(event) => handleNameChange(event.target.value)}
-            placeholder="Acme Corp"
+            placeholder="MINGPromotion"
             required
             value={name}
           />

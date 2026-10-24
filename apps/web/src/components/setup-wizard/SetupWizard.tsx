@@ -88,21 +88,21 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
 
   const heading =
     currentStep === 1
-      ? "Create your admin account"
+      ? "Buat Akun Komandan (Admin)"
       : currentStep === 2
-        ? "Create your organization"
+        ? "Bentuk Barisan / Organisasi"
         : currentStep === 3
-          ? "Welcome to MíngZhàn"
-          : "Tell us about yourself";
+          ? "Selamat Datang di MíngZhàn (明战)"
+          : "Profil & Preferensi Anda";
 
   const subtitle =
     currentStep === 1
-      ? "Set up your admin account to secure the dashboard, or restore a backup ZIP from a previous install."
+      ? "Amankan pusat komando AI workspace Anda, atau pulihkan data dari instalasi sebelumnya."
       : currentStep === 2
-        ? "Every workspace lives inside an organization. Name yours to finish setup."
+        ? "Seluruh Zhànyǒu, senjata, dan otomatisasi bernaung di bawah Barisan / Organisasi Anda."
         : currentStep === 3
-          ? "Add an AI provider now, or skip it and add one from Settings later."
-          : "Help the agent understand your preferences. Optional.";
+          ? "Hubungkan penyedia AI (OpenAI, Anthropic, Gemini, dll) atau lewati untuk diatur nanti."
+          : "Bantu para Zhànyǒu memahami preferensi dan gaya kerja Anda di garis depan.";
 
   function renderStep(): ReactNode {
     switch (currentStep) {

@@ -11,7 +11,7 @@ import { welcomeAnimationKey } from "@/pages/chat/chat-page.shared";
  * pale indigo glow in light mode, the near-black one in dark mode.
  */
 const COGNITO_SURFACE =
-  "bg-[radial-gradient(125%_125%_at_50%_100%,#ffffff_40%,#dfe3ff_100%)] dark:bg-[radial-gradient(125%_125%_at_50%_100%,#000000_40%,#010133_100%)]";
+  "bg-[radial-gradient(125%_125%_at_50%_100%,#ffffff_40%,#e6f7f9_100%)] dark:bg-[radial-gradient(125%_125%_at_50%_100%,#000000_40%,#002b2f_100%)]";
 
 /** Size of one dither pixel, in CSS pixels. */
 const DITHER_CELL_PX = 4;
@@ -351,14 +351,20 @@ export function ChatWelcome({
         {cognito ? (
           <CognitoWelcome />
         ) : (
-          <h2 className="type-section-title text-xl tracking-tight">
-            {greeting()}
-          </h2>
+          <div className="flex flex-col gap-1">
+            <h2 className="type-section-title text-xl font-bold tracking-tight">
+              {greeting()}
+            </h2>
+            <p className="type-body text-xs text-muted-foreground flex items-center gap-1.5">
+              <span className="inline-block size-1.5 rounded-full bg-[#00b2be] animate-pulse" />
+              <span>MíngZhàn (明战) — Bertarung Bersama, Taklukkan Pasar.</span>
+            </p>
+          </div>
         )}
       </div>
       <div className="flex items-center gap-2 self-start">
         <span className="type-body text-muted-foreground text-sm">
-          Select agent
+          Pilih Zhànyǒu
         </span>
         <ChatProfileSwitcher
           activeProfile={profile}

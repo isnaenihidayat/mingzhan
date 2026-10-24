@@ -1,7 +1,7 @@
 export const sectionClass = "rounded-md border border-border bg-card";
 
 export const profilesTagline =
-  "Separate prompt, tools, and knowledge for each bot.";
+  "Konfigurasi jiwa (soul), senjata (tools), dan keterampilan untuk setiap Zhànyǒu.";
 
 export const profileTextSaveDelayMs = 1000;
 

@@ -164,7 +164,7 @@ function buildProfileSections({
       : []),
     {
       hint: String(detail.tools.filter((tool) => !tool.pluginId).length),
-      label: "Tools",
+      label: "Senjata (Tools)",
       value: "tools",
     },
     {
@@ -174,7 +174,7 @@ function buildProfileSections({
     },
     {
       hint: String(detail.skills.filter((skill) => !skill.pluginId).length),
-      label: "Skills",
+      label: "Keterampilan (Skills)",
       value: "skills",
     },
   ];

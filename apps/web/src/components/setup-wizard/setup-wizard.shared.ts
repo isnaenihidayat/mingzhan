@@ -6,10 +6,10 @@ export interface SetupAccountDraft {
 }
 
 export const SETUP_STEPS = [
-  { id: 1, label: "Account", required: true },
-  { id: 2, label: "Organization", required: true },
-  { id: 3, label: "Provider", required: true },
-  { id: 4, label: "About You", required: false },
+  { id: 1, label: "Akun Komandan", required: true },
+  { id: 2, label: "Barisan / Organisasi", required: true },
+  { id: 3, label: "Penyedia AI", required: true },
+  { id: 4, label: "Profil & Preferensi", required: false },
 ] as const;
 
 export type SetupStepId = (typeof SETUP_STEPS)[number]["id"];
