@@ -1,0 +1,552 @@
+import {
+  lstat,
+  mkdir,
+  readFile,
+  rm,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
+import path from "node:path";
+import { pathExists } from "../fs";
+import {
+  comparablePath,
+  namesAlternateDataStream,
+  resolveWithRealpath,
+} from "../tools/paths";
+import { getUserConfigDir } from "../user-config";
+import { BUNDLED_SKILL_NAMES } from "./bundled-names";
+import { isGlobalSkillSourcePath } from "./dedupe";
+import { parseSkillMarkdown } from "./parse";
+import {
+  getGlobalSkillsDir,
+  getProfileSkillsDir,
+  SKILL_FILE_NAME,
+  SKILL_TOOL_FILES,
+} from "./paths";
+import { getSkillPythonEnvDir } from "./python-env";
+
+const bundledSkillNames = new Set<string>(BUNDLED_SKILL_NAMES);
+
+const SKILL_NAME_PATTERN = /^[a-z0-9-]{1,64}$/;
+
+function isResolvedWithinRoot(
+  resolvedRoot: string,
+  resolvedTarget: string
+): boolean {
+  const root = comparablePath(resolvedRoot);
+  const target = comparablePath(resolvedTarget);
+
+  return target === root || target.startsWith(`${root}${path.sep}`);
+}
+
+export interface CreateSkillFileOptions {
+  body?: string;
+  description: string;
+  disableModelInvocation?: boolean;
+  name: string;
+  orgId?: string;
+  profileId?: string;
+  scripts?: string[];
+}
+
+export function composeSkillMarkdown(options: {
+  name: string;
+  description: string;
+  body?: string;
+  disableModelInvocation?: boolean;
+  scripts?: string[];
+}): string {
+  const lines = [
+    "---",
+    `name: ${options.name}`,
+    `description: ${options.description}`,
+  ];
+
+  if (options.disableModelInvocation) {
+    lines.push("disable-model-invocation: true");
+  }
+
+  // Carried because it decides behaviour: a dropped `scripts:` line leaves the
+  // skill looking installed with none of its scripts loaded as tools, and
+  // nothing says so. Comma separated, matching what parseListField reads.
+  const scripts = (options.scripts ?? [])
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+
+  if (scripts.length > 0) {
+    lines.push(`scripts: ${scripts.join(", ")}`);
+  }
+
+  lines.push("---", "", options.body?.trim() ?? "");
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+export function assertValidSkillName(name: string): string {
+  const normalized = name.trim().toLowerCase();
+
+  if (!SKILL_NAME_PATTERN.test(normalized)) {
+    throw new Error(
+      "Skill name must be lowercase letters, numbers, or hyphens (max 64 chars)."
+    );
+  }
+
+  return normalized;
+}
+
+export function assertNotBundledSkillName(name: string): void {
+  if (bundledSkillNames.has(name)) {
+    throw new Error(
+      `Bundled system skill "${name}" cannot be modified by agents.`
+    );
+  }
+}
+
+export interface ProfileSkillSummary {
+  description: string;
+  name: string;
+}
+
+export interface ProfileSkillSupportingPath {
+  absolutePath: string;
+  relativePath: string;
+}
+
+export function parseRawProfileSkillContent(
+  content: string,
+  orgId: string,
+  profileId: string
+): ProfileSkillSummary {
+  const probePath = path.join(
+    getProfileSkillsDir(orgId, profileId),
+    "_probe",
+    SKILL_FILE_NAME
+  );
+
+  const parsed = parseSkillMarkdown(content, probePath);
+  const name = assertValidSkillName(parsed.frontmatter.name);
+  assertNotBundledSkillName(name);
+
+  if (name !== parsed.frontmatter.name) {
+    throw new Error("Skill frontmatter name must be lowercase kebab-case.");
+  }
+
+  return {
+    description: parsed.frontmatter.description,
+    name,
+  };
+}
+
+export function isPathWithinProfileSkillsDir(
+  orgId: string,
+  profileId: string,
+  targetPath: string
+): boolean {
+  const skillsRoot = resolveWithRealpath(getProfileSkillsDir(orgId, profileId));
+  const resolved = resolveWithRealpath(targetPath);
+
+  return isResolvedWithinRoot(skillsRoot, resolved);
+}
+
+/**
+ * Owning org of a skill directory, read back from its path
+ * (`~/.mingzhan/orgs/{orgId}/profiles/{profileId}/skills/{name}`). Global skills
+ * live outside `orgs/` and belong to no org, so they return null.
+ */
+export function orgIdFromSkillSourcePath(sourcePath: string): string | null {
+  const orgsRoot = resolveWithRealpath(path.join(getUserConfigDir(), "orgs"));
+  const resolved = resolveWithRealpath(sourcePath);
+
+  if (!isResolvedWithinRoot(orgsRoot, resolved)) {
+    return null;
+  }
+
+  const [orgId] = path.relative(orgsRoot, resolved).split(path.sep);
+
+  return orgId || null;
+}
+
+export function resolveProfileSkillDirectory(
+  orgId: string,
+  profileId: string,
+  name: string
+): string {
+  const skillName = assertValidSkillName(name);
+  assertNotBundledSkillName(skillName);
+
+  const skillsRoot = resolveWithRealpath(getProfileSkillsDir(orgId, profileId));
+  const directory = resolveWithRealpath(path.join(skillsRoot, skillName));
+
+  if (!isResolvedWithinRoot(skillsRoot, directory)) {
+    throw new Error("Skill directory escapes the profile skills path.");
+  }
+
+  return directory;
+}
+
+export function assertPathWithinProfileSkillsDir(
+  orgId: string,
+  profileId: string,
+  targetPath: string
+): string {
+  const resolved = resolveWithRealpath(targetPath);
+
+  if (!isPathWithinProfileSkillsDir(orgId, profileId, resolved)) {
+    throw new Error("Path is outside the profile skills directory.");
+  }
+
+  if (isGlobalSkillSourcePath(resolved)) {
+    throw new Error("Global skills cannot be modified by agents.");
+  }
+
+  return resolved;
+}
+
+export function assertSupportingFileAllowed(filePath: string): void {
+  const lower = path.basename(filePath).toLowerCase();
+
+  if (lower === SKILL_FILE_NAME.toLowerCase()) {
+    throw new Error(
+      `Use patch/edit for ${SKILL_FILE_NAME}; write_file/remove_file are for supporting files only.`
+    );
+  }
+
+  if (SKILL_TOOL_FILES.some((name) => name.toLowerCase() === lower)) {
+    throw new Error(
+      `Skill-local tools (${SKILL_TOOL_FILES.join(", ")}) cannot be written by agents.`
+    );
+  }
+}
+
+async function assertSupportingPathIsNotSymlink(
+  absolutePath: string
+): Promise<void> {
+  try {
+    const stats = await lstat(absolutePath);
+
+    if (stats.isSymbolicLink()) {
+      throw new Error("Supporting file path must not be a symbolic link.");
+    }
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return;
+    }
+
+    throw error;
+  }
+}
+
+/**
+ * Resolve a supporting file under `skills/<name>/` with path-escape and
+ * basename guards. Does not require the file to exist yet.
+ */
+export function resolveProfileSkillSupportingFilePath(
+  orgId: string,
+  profileId: string,
+  name: string,
+  relativePath: string,
+  allowSkillTool = false
+): ProfileSkillSupportingPath {
+  const directory = resolveProfileSkillDirectory(orgId, profileId, name);
+  const trimmed = relativePath.trim();
+
+  if (!trimmed) {
+    throw new Error("path is required.");
+  }
+
+  if (path.isAbsolute(trimmed)) {
+    throw new Error("path must be relative to the skill directory.");
+  }
+
+  const segments = trimmed
+    .split(/[/\\]+/)
+    .filter((segment) => segment.length > 0);
+
+  if (segments.length === 0) {
+    throw new Error("path is required.");
+  }
+
+  if (segments.some((segment) => segment === "." || segment === "..")) {
+    throw new Error("path cannot contain '.' or '..' segments.");
+  }
+
+  const target = path.join(directory, ...segments);
+
+  if (namesAlternateDataStream(target)) {
+    throw new Error(
+      "path cannot contain ':' on Windows, where it names an NTFS alternate data stream."
+    );
+  }
+
+  // resolveProfileSkillDirectory already locked `directory` inside the profile
+  // skills root; realpath containment under that skill dir is the remaining check.
+  const skillRoot = resolveWithRealpath(directory);
+  const absolutePath = resolveWithRealpath(target);
+
+  if (!isResolvedWithinRoot(skillRoot, absolutePath)) {
+    throw new Error("Path escapes the skill directory.");
+  }
+
+  if (!allowSkillTool) {
+    assertSupportingFileAllowed(absolutePath);
+  }
+
+  return { absolutePath, relativePath: segments.join("/") };
+}
+
+export async function writeProfileSkillSupportingFile(options: {
+  orgId: string;
+  profileId: string;
+  name: string;
+  relativePath: string;
+  content: string | Uint8Array;
+  overwrite?: boolean;
+}): Promise<ProfileSkillSupportingPath> {
+  const { absolutePath, relativePath } = resolveProfileSkillSupportingFilePath(
+    options.orgId,
+    options.profileId,
+    options.name,
+    options.relativePath
+  );
+
+  await mkdir(path.dirname(absolutePath), { recursive: true });
+  await assertSupportingPathIsNotSymlink(absolutePath);
+  await writeFile(absolutePath, options.content, {
+    flag: options.overwrite === false ? "wx" : "w",
+  });
+
+  return { absolutePath, relativePath };
+}
+
+export async function removeProfileSkillSupportingFile(options: {
+  orgId: string;
+  profileId: string;
+  name: string;
+  relativePath: string;
+}): Promise<{ absolutePath: string; relativePath: string }> {
+  const { absolutePath, relativePath } = resolveProfileSkillSupportingFilePath(
+    options.orgId,
+    options.profileId,
+    options.name,
+    options.relativePath
+  );
+
+  await assertSupportingPathIsNotSymlink(absolutePath);
+
+  if (!(await pathExists(absolutePath))) {
+    throw new Error(`Supporting file "${options.relativePath}" not found.`);
+  }
+
+  await unlink(absolutePath);
+
+  return { absolutePath, relativePath };
+}
+
+export async function createSkillFile(
+  options: CreateSkillFileOptions
+): Promise<string> {
+  const name = assertValidSkillName(options.name);
+  assertNotBundledSkillName(name);
+  const description = options.description.trim();
+  const orgId = options.orgId?.trim();
+  const profileId = options.profileId?.trim();
+
+  if (Boolean(orgId) !== Boolean(profileId)) {
+    throw new Error(
+      "createSkillFile requires both orgId and profileId for profile skills, or neither for global skills."
+    );
+  }
+
+  const skillsRoot =
+    orgId && profileId
+      ? getProfileSkillsDir(orgId, profileId)
+      : getGlobalSkillsDir();
+
+  const directory = path.join(skillsRoot, name);
+  const skillFilePath = path.join(directory, SKILL_FILE_NAME);
+
+  if (await pathExists(skillFilePath)) {
+    throw new Error(`Skill "${name}" already exists.`);
+  }
+
+  const content = composeSkillMarkdown({
+    body: options.body,
+    description,
+    disableModelInvocation: options.disableModelInvocation,
+    name,
+    scripts: options.scripts,
+  });
+
+  parseSkillMarkdown(content, skillFilePath);
+
+  await mkdir(directory, { recursive: true });
+  await writeFile(skillFilePath, content, "utf8");
+
+  return directory;
+}
+
+export async function writeRawProfileSkillMarkdown(options: {
+  orgId: string;
+  profileId: string;
+  content: string;
+  allowExisting?: boolean;
+}): Promise<{
+  directory: string;
+  name: string;
+  description: string;
+  created: boolean;
+}> {
+  const { name, description } = parseRawProfileSkillContent(
+    options.content,
+    options.orgId,
+    options.profileId
+  );
+
+  const directory = resolveProfileSkillDirectory(
+    options.orgId,
+    options.profileId,
+    name
+  );
+
+  const skillFilePath = path.join(directory, SKILL_FILE_NAME);
+  const exists = await pathExists(skillFilePath);
+
+  if (exists && !options.allowExisting) {
+    throw new Error(`Skill "${name}" already exists.`);
+  }
+
+  parseSkillMarkdown(options.content, skillFilePath);
+
+  const nextContent = options.content.endsWith("\n")
+    ? options.content
+    : `${options.content}\n`;
+
+  if (!exists) {
+    await mkdir(directory, { recursive: true });
+    await writeFile(skillFilePath, nextContent, "utf8");
+
+    return {
+      created: true,
+      description,
+      directory,
+      name,
+    };
+  }
+
+  const existing = await readFile(skillFilePath, "utf8");
+  parseSkillMarkdown(existing, skillFilePath);
+
+  if (existing !== nextContent) {
+    await writeFile(skillFilePath, nextContent, "utf8");
+  }
+
+  const finalParsed = parseSkillMarkdown(nextContent, skillFilePath);
+
+  return {
+    created: false,
+    description: finalParsed.frontmatter.description,
+    directory,
+    name: finalParsed.frontmatter.name,
+  };
+}
+
+export async function patchSkillFile(options: {
+  orgId: string;
+  profileId: string;
+  name: string;
+  oldString: string;
+  newString: string;
+}): Promise<{
+  directory: string;
+  name: string;
+  description: string;
+}> {
+  if (!options.oldString) {
+    throw new Error("old_string is required for patch.");
+  }
+
+  const directory = resolveProfileSkillDirectory(
+    options.orgId,
+    options.profileId,
+    options.name
+  );
+
+  // resolveProfileSkillDirectory already assertValidSkillName + assertNotBundledSkillName
+  // and keeps the directory inside the profile skills root; SKILL.md under it cannot escape.
+  const expectedName = options.name.trim().toLowerCase();
+  const skillFilePath = path.join(directory, SKILL_FILE_NAME);
+
+  if (!(await pathExists(skillFilePath))) {
+    throw new Error(`Skill "${options.name}" not found.`);
+  }
+
+  const existing = await readFile(skillFilePath, "utf8");
+  const occurrences = existing.split(options.oldString).length - 1;
+
+  if (occurrences === 0) {
+    throw new Error("old_string not found in SKILL.md.");
+  }
+
+  if (occurrences > 1) {
+    throw new Error(
+      "old_string matched multiple times in SKILL.md; make the match unique."
+    );
+  }
+
+  const next = existing.replace(options.oldString, options.newString);
+  const parsed = parseSkillMarkdown(next, skillFilePath);
+
+  if (parsed.frontmatter.name !== expectedName) {
+    throw new Error(
+      "patch cannot rename a skill via frontmatter; create a new skill instead."
+    );
+  }
+
+  await writeFile(
+    skillFilePath,
+    next.endsWith("\n") ? next : `${next}\n`,
+    "utf8"
+  );
+
+  return {
+    description: parsed.frontmatter.description,
+    directory,
+    name: parsed.frontmatter.name,
+  };
+}
+
+function isManagedSkillDirectory(directory: string): boolean {
+  const configDir = resolveWithRealpath(getUserConfigDir());
+  const resolved = resolveWithRealpath(directory);
+
+  if (!isResolvedWithinRoot(configDir, resolved)) {
+    return false;
+  }
+
+  const relative = path.relative(configDir, resolved);
+  const parts = relative.split(path.sep);
+
+  if (parts[0] === "agent" && parts[1] === "skills" && parts.length >= 3) {
+    return true;
+  }
+
+  return (
+    parts[0] === "orgs" &&
+    parts[2] === "profiles" &&
+    parts[4] === "skills" &&
+    parts.length >= 6
+  );
+}
+
+export async function deleteSkillDirectory(directory: string): Promise<void> {
+  if (!isManagedSkillDirectory(directory)) {
+    throw new Error("Skill directory is outside the allowed skills path.");
+  }
+
+  // The env key hashes the skill's realpath, so resolve it before the
+  // directory is gone.
+  const envDir = getSkillPythonEnvDir(directory);
+
+  await rm(directory, { force: true, recursive: true });
+  await rm(envDir, { force: true, recursive: true });
+}

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+      name="viewport"
+    >
+    <title>MíngZhàn — AI Workspace</title>
+    <meta name="description" content="MíngZhàn (明战) — AI workspace untuk tim berbagi agen, keterampilan, dan otomatisasi. Bertarung Bersama, Taklukkan Pasar.">
+    <link href="/mingzhan-mark-white.svg" rel="icon" type="image/svg+xml">
+    <link href="/manifest.webmanifest" rel="manifest">
+    <link href="/icons/apple-touch-icon-v2.png" rel="apple-touch-icon">
+    <meta
+      content="#ffffff"
+      media="(prefers-color-scheme: light)"
+      name="theme-color"
+    >
+    <meta
+      content="#0C0A09"
+      media="(prefers-color-scheme: dark)"
+      name="theme-color"
+    >
+    <meta content="yes" name="mobile-web-app-capable">
+    <meta content="yes" name="apple-mobile-web-app-capable">
+    <meta content="MíngZhàn" name="apple-mobile-web-app-title">
+    <script>
+    "use strict";
+
+    (() => {
+      var stored = localStorage.getItem("mingzhan-theme");
+
+      var resolved = window.matchMedia("(prefers-color-scheme: dark)").matches
+        ? "dark"
+        : "light";
+
+      if (stored === "light" || stored === "dark") {
+        resolved = stored;
+      } else if (stored === "system") {
+        resolved = window.matchMedia("(prefers-color-scheme: dark)").matches
+          ? "dark"
+          : "light";
+      }
+
+      document.documentElement.classList.toggle("dark", resolved === "dark");
+      document.documentElement.style.colorScheme = resolved;
+
+      var favicon = document.querySelector('link[rel="icon"]');
+
+      if (favicon) {
+        favicon.setAttribute(
+          "href",
+          resolved === "light" ? "/mingzhan-mark.svg" : "/mingzhan-mark-white.svg"
+        );
+      }
+    })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="/src/main.tsx" type="module"></script>
+  </body>
+</html>

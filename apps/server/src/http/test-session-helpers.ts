@@ -1,0 +1,290 @@
+import { expect } from "bun:test";
+import type { OrgRole } from "@mingzhan/core";
+import type { DatabaseAdapter } from "@mingzhan/db";
+import { AuthService } from "../services/auth-service";
+import {
+  buildSetupAuthBody,
+  createPlatformAdminUser,
+  withOrgId,
+} from "./test-org-helpers";
+import type { HonoApp } from "./types";
+
+export type AppFetch = Pick<HonoApp, "fetch">;
+
+export function extractSetCookies(response: Response): string[] {
+  // SAFETY: Bun Headers provides getSetCookie; the fallback supports older runtimes.
+  const headers = response.headers as Headers & {
+    getSetCookie?: () => string[];
+  };
+
+  return (
+    headers.getSetCookie?.() ??
+    (response.headers.get("set-cookie")
+      ? [response.headers.get("set-cookie")!]
+      : [])
+  );
+}
+
+export function cookieValue(setCookies: string[], name: string): string {
+  const cookie = setCookies.find((entry) => entry.startsWith(`${name}=`));
+
+  if (!cookie) {
+    throw new Error(`Missing cookie: ${name}`);
+  }
+
+  return cookie.split(";")[0]!.split("=", 2)[1]!;
+}
+
+export function cookieHeaderFromSetCookies(setCookies: string[]): string {
+  return [
+    `mingzhan_session=${cookieValue(setCookies, "mingzhan_session")}`,
+    `mingzhan_csrf=${cookieValue(setCookies, "mingzhan_csrf")}`,
+  ].join("; ");
+}
+
+export type TestBrowserSession = {
+  response: Response;
+  setCookies: string[];
+  cookieHeader: string;
+  csrfToken: string;
+  orgId?: string;
+  headers(
+    extra?: Record<string, string>,
+    orgIdOverride?: string
+  ): Record<string, string>;
+};
+
+export function browserSessionFromResponse(
+  response: Response,
+  orgId: string
+): TestBrowserSession & { orgId: string };
+export function browserSessionFromResponse(
+  response: Response,
+  orgId?: string
+): TestBrowserSession;
+export function browserSessionFromResponse(
+  response: Response,
+  orgId?: string
+): TestBrowserSession {
+  const setCookies = extractSetCookies(response);
+  const cookieHeader = cookieHeaderFromSetCookies(setCookies);
+  const csrfToken = cookieValue(setCookies, "mingzhan_csrf");
+
+  return {
+    cookieHeader,
+    csrfToken,
+    headers(extra = {}, orgIdOverride?: string) {
+      const base = { Cookie: cookieHeader, ...extra };
+      const resolvedOrgId = orgIdOverride ?? orgId;
+
+      return resolvedOrgId ? withOrgId(base, resolvedOrgId) : base;
+    },
+    orgId,
+    response,
+    setCookies,
+  };
+}
+
+export async function setupFreshInstallSession(
+  app: AppFetch,
+  databaseAdapter: DatabaseAdapter,
+  email = "admin@example.com",
+  role: OrgRole = "admin"
+): Promise<TestBrowserSession & { orgId: string }> {
+  const response = await app.fetch(
+    new Request("http://localhost:4310/v1/auth/setup", {
+      body: JSON.stringify(buildSetupAuthBody(email)),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    })
+  );
+
+  if (response.status !== 201) {
+    throw new Error(`Failed to create browser session: ${response.status}`);
+  }
+
+  // SAFETY: The successful setup response includes the active organization id.
+  const setupBody = (await response.json()) as { activeOrgId: string };
+  const orgId = setupBody.activeOrgId;
+
+  if (role !== "admin") {
+    const user = await databaseAdapter.getUserByEmail(email);
+
+    if (!user) {
+      throw new Error(`User not found: ${email}`);
+    }
+
+    await databaseAdapter.upsertOrgMember({
+      createdAt: new Date().toISOString(),
+      orgId,
+      role,
+      userId: user.id,
+    });
+  }
+
+  return browserSessionFromResponse(response, orgId);
+}
+
+export async function loginPlatformAdminSession(
+  app: AppFetch,
+  authService: AuthService,
+  databaseAdapter: DatabaseAdapter,
+  email = "platform@example.com",
+  password = "password123"
+): Promise<TestBrowserSession> {
+  await createPlatformAdminUser(databaseAdapter, authService, email, password);
+
+  const response = await app.fetch(
+    new Request("http://localhost:4310/v1/auth/login", {
+      body: JSON.stringify({ email, password }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    })
+  );
+
+  expect(response.status).toBe(200);
+
+  return browserSessionFromResponse(response);
+}
+
+export async function loginUserSession(
+  app: AppFetch,
+  email: string,
+  password: string,
+  orgId?: string
+): Promise<TestBrowserSession> {
+  const response = await app.fetch(
+    new Request("http://localhost:4310/v1/auth/login", {
+      body: JSON.stringify({ email, password }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    })
+  );
+
+  expect(response.status).toBe(200);
+
+  return browserSessionFromResponse(response, orgId);
+}
+
+export type SeedOrgAdminOptions = {
+  authService?: AuthService;
+  email?: string;
+  orgId?: string;
+  password?: string;
+  /** When set, also upserts a default profile with this id. */
+  profileId?: string;
+  role?: OrgRole;
+  userId?: string;
+};
+
+export async function seedOrgAdmin(
+  databaseAdapter: DatabaseAdapter,
+  opts: SeedOrgAdminOptions = {}
+) {
+  const email = opts.email ?? "admin@example.com";
+  const password = opts.password ?? "password123";
+  const orgId = opts.orgId ?? "org_test";
+  const userId = opts.userId ?? "user_admin";
+  const role = opts.role ?? "admin";
+  const authService = opts.authService ?? new AuthService();
+  const now = new Date().toISOString();
+
+  await databaseAdapter.createUser({
+    createdAt: now,
+    email,
+    id: userId,
+    passwordHash: await authService.hashPassword(password),
+    updatedAt: now,
+  });
+  await databaseAdapter.upsertOrganization({
+    createdAt: now,
+    id: orgId,
+    name: "Test Org",
+    slug: orgId,
+    updatedAt: now,
+  });
+  await databaseAdapter.upsertOrgMember({
+    createdAt: now,
+    orgId,
+    role,
+    userId,
+  });
+
+  if (opts.profileId) {
+    await databaseAdapter.upsertProfile({
+      createdAt: now,
+      id: opts.profileId,
+      isSuper: false,
+      model: "openrouter/auto",
+      name: "Default",
+      orgId,
+      systemPrompt: "You are helpful.",
+      updatedAt: now,
+    });
+  }
+
+  return {
+    email,
+    orgId,
+    password,
+    profileId: opts.profileId,
+    role,
+    userId,
+  };
+}
+
+export async function createOrgAdminSession(
+  app: AppFetch,
+  authService: AuthService,
+  databaseAdapter: DatabaseAdapter,
+  slug: string,
+  email: string
+): Promise<{
+  adminSession: TestBrowserSession;
+  orgId: string;
+  platformSession: TestBrowserSession;
+}> {
+  const platformSession = await loginPlatformAdminSession(
+    app,
+    authService,
+    databaseAdapter
+  );
+
+  const createResponse = await app.fetch(
+    new Request("http://localhost:4310/v1/platform/orgs", {
+      body: JSON.stringify({
+        admin: {
+          email,
+          name: "Acme Admin",
+          phone: "+628123456789",
+        },
+        name: "Acme",
+        slug,
+      }),
+      headers: platformSession.headers({
+        "Content-Type": "application/json",
+        "X-CSRF-Token": platformSession.csrfToken,
+      }),
+      method: "POST",
+    })
+  );
+
+  expect(createResponse.status).toBe(201);
+
+  // SAFETY: The successful create response includes its organization and admin member.
+  const created = (await createResponse.json()) as {
+    organization: { id: string };
+    adminMember: { temporaryPassword: string };
+  };
+
+  return {
+    adminSession: await loginUserSession(
+      app,
+      email,
+      created.adminMember.temporaryPassword,
+      created.organization.id
+    ),
+    orgId: created.organization.id,
+    platformSession,
+  };
+}

@@ -1,0 +1,134 @@
+---
+title: "Google Meet"
+description: "Capture Google Meet audio in Chrome and read the live transcript in MíngZhàn."
+---
+
+MíngZhàn can listen to a Google Meet call through Chrome and turn the conversation into text you and your agent can use.
+
+## Why use Google Meet capture
+
+The Chrome extension picks up sound from the Meet tab and your microphone on your computer. MíngZhàn sends that sound to OpenAI, which turns it into text and saves it with the meeting.
+
+There is no bot participant joining the call.
+
+## What you need
+
+- An organization admin who can configure Google Meet
+- An OpenAI provider in **AI Providers**. Google Meet uses its key to turn speech into text.
+- Google Chrome with the MíngZhàn extension installed
+- A Google Meet call that you are allowed to record and transcribe
+
+Always tell participants before transcription starts. Follow your organization's recording and privacy rules.
+
+## Set up Google Meet
+
+### 1. Open Google Meet
+
+Open **Control center → Workspace → Google Meet**. It is included in MíngZhàn. An organization admin can enable or disable it in **Google Meet → Settings**.
+
+### 2. Add an OpenAI provider
+
+Open **Control center → Agent tools → AI Providers** and add an OpenAI provider with an API key. Google Meet uses the default provider when it is OpenAI, otherwise the first OpenAI provider. OpenAI bills this usage separately from a ChatGPT subscription.
+
+### 3. Install the Chrome extension
+
+Download the extension from the **Google Meet** page and unzip it. This is a one-time setup in Chrome:
+
+1. Open `chrome://extensions`
+2. Turn on **Developer mode**
+3. Choose **Load unpacked**
+4. Select the extension folder
+
+Keep the extension enabled while you use Google Meet.
+
+## Start a transcription
+
+1. Open **Google Meet** in MíngZhàn and connect the Chrome extension.
+2. Open your Google Meet call in Chrome.
+3. Open the extension panel and start capture.
+
+Keep the MíngZhàn page open. The extension receives a one-time connection link and sends audio to MíngZhàn.
+
+The meeting moves through **Waiting**, **Transcribing**, and **Finished**. Open the meeting in MíngZhàn to see new text while the call is running.
+
+## Read the transcript with your agent
+
+The agent can:
+
+- list meetings
+- check a meeting's status
+- read new transcript text
+- stop an active capture
+
+Ask questions such as:
+
+> What decisions were made in the latest Google Meet?
+
+> Summarize the action items from meeting ABC.
+
+Assign the Google Meet tools and skill to the profile you want to use. The tools are read-only: the agent lists meetings and reads transcripts. It sees meetings owned by that profile, plus your own captures and imports from the Google Meet page. It never sees another member's page meetings.
+
+You can also upload a Markdown transcript (up to 1 MiB) or audio file (up to 7 MiB). Audio uploads use the organization's regular transcription settings; live capture uses the OpenAI provider from **AI Providers**.
+
+## Import a recorded meeting
+
+If a Meet call was recorded, open **Google Meet** and choose **Import recording**. The first time, the dialog lists **Gmail** and **Google Drive**. Choose **Connect** next to each one and sign in with Google. MíngZhàn turns on the integration for your organization and brings you back to Google Meet. Recording import needs Composio: if it is not set up, ask your platform admin. It also needs an OpenAI provider in **AI Providers**.
+
+Select the video from your Meet recording email and choose **Import**. Keep the page open while MíngZhàn downloads the video and sends its audio to OpenAI Whisper. The finished transcript appears in meeting history.
+
+The recording must be no larger than 1 GiB or two hours. If an import fails, choose it again. Imported transcripts do not identify speakers.
+
+## Stop and save
+
+Choose **Leave** in MíngZhàn or stop capture from the Chrome extension. MíngZhàn finishes the current transcript and keeps the saved meeting available under **Saved transcripts**.
+
+If Chrome closes or the connection breaks, MíngZhàn keeps the text collected so far and marks the meeting as incomplete. It does not silently reconnect to the call.
+
+## Remote MíngZhàn servers
+
+The capture service binds to `127.0.0.1` by default. If Chrome runs on another
+computer, your administrator must make the capture WebSocket reachable through
+a secure address and set these variables on the MíngZhàn server before starting
+MíngZhàn:
+
+- `MINGZHAN_MEET_CAPTURE_HOST` sets the capture listener's bind address. Set it to
+  `0.0.0.0` when a container or reverse proxy must connect to the listener.
+- `MINGZHAN_MEET_CAPTURE_ORIGIN` sets the complete WebSocket URL that MíngZhàn gives
+  the Chrome extension. Use `wss://` and include the `/capture` path.
+- `MINGZHAN_MEET_CAPTURE_PORT` sets the capture listener's port. Without it MíngZhàn
+  picks a free port on each start, so set it when a reverse proxy needs a fixed
+  target.
+
+For example, configure a reverse proxy at `meet-capture.example.com` with these
+server environment variables:
+
+```bash
+export MINGZHAN_MEET_CAPTURE_HOST=0.0.0.0
+export MINGZHAN_MEET_CAPTURE_PORT=4320
+export MINGZHAN_MEET_CAPTURE_ORIGIN=wss://meet-capture.example.com/capture
+```
+
+Restart MíngZhàn after changing any of these variables. The reverse
+proxy must forward WebSocket upgrade requests to the capture listener. Do not
+share the connection links; they contain a temporary private passcode for one
+organization and one meeting.
+
+## Troubleshooting
+
+### The capture does not start
+
+- Make sure the Meet tab is open in Chrome.
+- Make sure the extension is enabled.
+- Refresh both the MíngZhàn Google Meet page and the Meet tab.
+- Connect the extension to the active MíngZhàn organization again.
+
+### The meeting is ready but no transcript appears
+
+- Check that an OpenAI provider with an API key exists in **AI Providers**.
+- Check that Google Meet is enabled in **Google Meet → Settings**. Capture starts automatically; there is no separate worker to start.
+- Confirm that Chrome allowed microphone access.
+- Confirm that participants are speaking in the Meet tab being captured.
+
+### The extension cannot reach MíngZhàn
+
+The Chrome extension and MíngZhàn must be able to reach the same connection address. For remote servers, ask your administrator to check the secure connection and firewall.

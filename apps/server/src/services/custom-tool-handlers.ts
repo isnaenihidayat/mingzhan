@@ -1,0 +1,281 @@
+import { constants } from "node:fs";
+import { copyFile, mkdir } from "node:fs/promises";
+import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import type {
+  ToolContext,
+  ToolDefinition,
+  ToolSourceResponse,
+} from "@mingzhan/core";
+import { reportError } from "@mingzhan/core";
+import type { DatabaseAdapter } from "@mingzhan/db";
+import { z } from "zod";
+import {
+  type CustomToolRecord,
+  readHandlerModulePath,
+  resolveCustomToolModulePath,
+} from "./custom-tool-shared";
+import {
+  loadJavascriptTool,
+  validateJavascriptToolModule,
+} from "./javascript-tool-loader";
+import { loadPythonTool, validatePythonToolModule } from "./python-tool-loader";
+
+// Registry of custom tool handler types. Adding a new handler type means
+// adding an entry here plus its loader module — no call-site edits.
+export interface CustomToolHandler {
+  /** File extension required in handlerConfig.modulePath, e.g. ".py". */
+  extension: string;
+  /** Language tag returned by tool-source for this handler type. */
+  language: ToolSourceResponse["language"];
+  load(
+    record: CustomToolRecord,
+    sharedContext?: ToolContext
+  ): Promise<ToolDefinition | null>;
+  resolveModulePath(modulePath: string, orgId?: string | null): string;
+  validateModule(modulePath: string, orgId?: string | null): Promise<void>;
+}
+
+export const CUSTOM_TOOL_HANDLERS = {
+  javascript: {
+    extension: ".js",
+    language: "javascript",
+    load: loadJavascriptTool,
+    resolveModulePath: resolveCustomToolModulePath,
+    validateModule: validateJavascriptToolModule,
+  },
+  python: {
+    extension: ".py",
+    language: "python",
+    load: loadPythonTool,
+    resolveModulePath: resolveCustomToolModulePath,
+    validateModule: validatePythonToolModule,
+  },
+} satisfies Record<string, CustomToolHandler>;
+
+export type CustomToolType = keyof typeof CUSTOM_TOOL_HANDLERS;
+
+/**
+ * How many times a failed custom tool run is retried after the first attempt
+ * (up to 3 attempts total) before the last error is surfaced unchanged.
+ */
+export const TOOL_RETRY_LIMIT = 2;
+
+/**
+ * Subprocess exit code that opts a custom tool into retries (sysexits
+ * `EX_TEMPFAIL`). Any other non-zero exit is treated as permanent — the tool
+ * may already have performed a side effect.
+ */
+export const TOOL_RETRYABLE_EXIT_CODE = 75;
+
+/**
+ * Base backoff between attempts; each retry doubles it: 500ms, then 1s.
+ */
+const TOOL_RETRY_BASE_DELAY_MS = 500;
+
+/** Node errno codes that mean the child never started or the socket never got going. */
+const RETRYABLE_SPAWN_ERRNOS = new Set([
+  "EAGAIN",
+  "EAI_AGAIN",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ETIMEDOUT",
+]);
+
+/**
+ * Explicit opt-in for a transient custom-tool failure. Arbitrary thrown errors
+ * are permanent by default so a write-then-throw path is never replayed.
+ */
+export class RetryableToolError extends Error {
+  readonly retryable = true as const;
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "RetryableToolError";
+  }
+}
+
+/**
+ * Only errors that opt into retries (or known pre-start spawn errno codes)
+ * are replayed. Timeouts, exit codes other than {@link TOOL_RETRYABLE_EXIT_CODE},
+ * validation failures, and plain `Error` throws are permanent.
+ */
+function isRetryableToolError(cause: unknown): boolean {
+  if (!(cause instanceof Object)) {
+    return false;
+  }
+
+  if ("retryable" in cause && cause.retryable === true) {
+    return true;
+  }
+
+  if ("code" in cause && isStringValue(cause.code)) {
+    return RETRYABLE_SPAWN_ERRNOS.has(cause.code);
+  }
+
+  return false;
+}
+
+function isStringValue(value: unknown): value is string {
+  return Object.prototype.toString.call(value) === "[object String]";
+}
+
+/**
+ * Wraps a custom tool run with at-most-two retries and exponential backoff.
+ *
+ * Retries only {@link isRetryableToolError} failures. Arbitrary throws,
+ * timeouts, and ordinary non-zero exits are permanent on the first attempt so
+ * a tool that already wrote data is not replayed. An aborted `context.signal`
+ * stops immediately and is never retried, including mid-backoff. Cancellation
+ * preserves the signal's reason; other final failures are re-thrown unchanged.
+ *
+ * A final failure (exhausted retryable budget, or a permanent error) is also
+ * mirrored to the operator's error tracker, tagged `tool:<name>`.
+ */
+export function withToolRetries<Input, Output>(
+  run: (input: Input, context: ToolContext) => Promise<Output>,
+  toolName: string
+): (input: Input, context: ToolContext) => Promise<Output> {
+  return async (input, context) => {
+    let attempts = 0;
+
+    for (;;) {
+      context.signal?.throwIfAborted();
+
+      try {
+        return await run(input, context);
+      } catch (error) {
+        attempts += 1;
+        context.signal?.throwIfAborted();
+
+        const canRetry =
+          isRetryableToolError(error) && attempts <= TOOL_RETRY_LIMIT;
+
+        if (!canRetry) {
+          // Not awaited: reportError queues synchronously and never throws, and
+          // the model should not wait out the tracker's HTTP timeout on a turn
+          // that has already failed.
+          void reportError(error, { kind: "tool", source: `tool:${toolName}` });
+          throw error;
+        }
+
+        // Rejects immediately if the signal aborts mid-backoff (including an
+        // already-aborted signal), so a cancelled turn never waits out the delay.
+        try {
+          await delay(
+            TOOL_RETRY_BASE_DELAY_MS * 2 ** (attempts - 1),
+            undefined,
+            { signal: context.signal }
+          );
+        } catch (delayError) {
+          context.signal?.throwIfAborted();
+          throw delayError;
+        }
+      }
+    }
+  };
+}
+
+export function getCustomToolHandler(
+  handlerType: string
+): CustomToolHandler | null {
+  const handler = isCustomToolType(handlerType)
+    ? CUSTOM_TOOL_HANDLERS[handlerType]
+    : null;
+
+  if (!handler) {
+    return null;
+  }
+
+  return {
+    ...handler,
+    // Both loader types resolve through this seam, so wrapping load here
+    // applies the retry policy to JavaScript and Python in one place.
+    load: async (record, sharedContext) => {
+      const definition = await handler.load(record, sharedContext);
+
+      if (!definition) {
+        return null;
+      }
+
+      return {
+        ...definition,
+        run: withToolRetries(definition.run, definition.name),
+      };
+    },
+  };
+}
+
+export function isCustomToolType(
+  handlerType: string
+): handlerType is CustomToolType {
+  return handlerType in CUSTOM_TOOL_HANDLERS;
+}
+
+/** Human-readable list of supported handler types, e.g. "javascript or python". */
+export function customToolTypesLabel(): string {
+  return Object.keys(CUSTOM_TOOL_HANDLERS).join(" or ");
+}
+
+/**
+ * Custom tools created before org ownership have no `org_id` and keep their
+ * module in the install-global tools directory. Claim each one for the single
+ * org whose profiles use it and copy its module into that org's directory.
+ * A tool used by several orgs, or by none, stays unowned and is hidden from
+ * every org rather than silently shared.
+ */
+export async function claimLegacyCustomTools(
+  db: DatabaseAdapter
+): Promise<void> {
+  const profiles = await db.listProfiles();
+  const orgsByTool = new Map<string, Set<string>>();
+
+  for (const profile of profiles) {
+    for (const tool of await db.listToolsForProfile(profile.id)) {
+      const orgs = orgsByTool.get(tool.id) ?? new Set<string>();
+
+      if (profile.orgId) {
+        orgs.add(profile.orgId);
+      }
+
+      orgsByTool.set(tool.id, orgs);
+    }
+  }
+
+  for (const tool of await db.listTools()) {
+    const orgs = orgsByTool.get(tool.id);
+    const modulePath = readHandlerModulePath(tool.handlerConfig);
+
+    if (tool.orgId || !modulePath || orgs?.size !== 1) {
+      continue;
+    }
+
+    if (!isCustomToolType(tool.handlerType)) {
+      continue;
+    }
+
+    const [orgId] = orgs;
+
+    if (!orgId) {
+      continue;
+    }
+
+    try {
+      const source = resolveCustomToolModulePath(modulePath);
+      const target = resolveCustomToolModulePath(path.basename(source), orgId);
+      await mkdir(path.dirname(target), { recursive: true });
+      await copyFile(source, target, constants.COPYFILE_EXCL);
+      await db.upsertTool({
+        ...tool,
+        handlerConfig: {
+          ...z.record(z.string(), z.json()).parse(tool.handlerConfig),
+          modulePath: path.basename(source),
+        },
+        orgId,
+        updatedAt: new Date().toISOString(),
+      });
+    } catch {
+      // Leave the tool unowned; it stays hidden until an operator fixes it.
+    }
+  }
+}

@@ -1,0 +1,1596 @@
+import { describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  getDiscordConfigDir,
+  getDiscordConfigPath,
+  getTelegramConfigDir,
+  getTelegramConfigPath,
+  MíngZhànApiError,
+} from "@mingzhan/core";
+import type { createInMemoryDatabaseAdapter } from "@mingzhan/db";
+import type { AgentService } from "./agent-service";
+import { AutomationDeliveryService } from "./automation-delivery-service";
+import { AutomationRunner } from "./automation-runner";
+import { AutomationService } from "./automation-service";
+import {
+  createAutomationTestDb as createTestDb,
+  ORG_ID,
+  PROFILE_ID,
+} from "./automation-test-fixtures";
+import {
+  createMcpAwareEmailOutboundAdapter,
+  hasAutomationEmailDeliveryPath,
+} from "./mcp-email-delivery";
+
+async function assignComposeioGmailSender(
+  db: ReturnType<typeof createInMemoryDatabaseAdapter>,
+  profileId: string,
+  // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- This test fixture stores varied values to exercise service boundary handling.
+  inputSchema?: Record<string, unknown>
+) {
+  const now = new Date().toISOString();
+  const serverId = "mcp_composeio";
+
+  await db.upsertMcpServer({
+    cachedTools: [
+      {
+        description: "Send an email with Gmail",
+        inputSchema: inputSchema ?? {
+          properties: {
+            body: { type: "string" },
+            subject: { type: "string" },
+            to: { type: "string" },
+          },
+          type: "object",
+        },
+        name: "send_email",
+      },
+    ],
+    config: { url: "https://example.com/mcp" },
+    createdAt: now,
+    enabled: true,
+    id: serverId,
+    lastError: null,
+    name: "composeio-gmail",
+    orgId: ORG_ID,
+    status: "connected",
+    transport: "http",
+    updatedAt: now,
+  });
+  await db.assignMcpServerToProfile(profileId, serverId);
+}
+
+describe("AutomationService", () => {
+  test("turns automations on when a disabled profile creates its first automation", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const profile = (await db.getProfile(PROFILE_ID))!;
+    await db.upsertProfile({ ...profile, automationsEnabled: false });
+
+    const automation = await service.create(
+      ORG_ID,
+      {
+        name: "First automation",
+        prompt: "Say hello",
+        trigger: { cron: "0 8 * * *", type: "schedule" },
+      },
+      PROFILE_ID
+    );
+
+    expect((await db.getProfile(PROFILE_ID))?.automationsEnabled).toBe(true);
+    expect((await service.listAll()).map((item) => item.id)).toEqual([
+      automation.id,
+    ]);
+  });
+
+  test("keeps automations off when a disabled profile already has automations", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    await service.create(
+      ORG_ID,
+      {
+        name: "Existing automation",
+        prompt: "Say hello",
+        trigger: { type: "manual" },
+      },
+      PROFILE_ID
+    );
+
+    const profile = (await db.getProfile(PROFILE_ID))!;
+    await db.upsertProfile({ ...profile, automationsEnabled: false });
+
+    await service.create(
+      ORG_ID,
+      {
+        name: "Second automation",
+        prompt: "Say hello again",
+        trigger: { cron: "0 8 * * *", type: "schedule" },
+      },
+      PROFILE_ID
+    );
+
+    expect((await db.getProfile(PROFILE_ID))?.automationsEnabled).toBe(false);
+    expect(await service.listAll()).toEqual([]);
+  });
+
+  test("does not schedule automations for a disabled profile", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const profile = (await db.getProfile(PROFILE_ID))!;
+    await db.upsertProfile({ ...profile, automationsEnabled: false });
+
+    await db.upsertAutomation({
+      createdAt: new Date().toISOString(),
+      definition: {},
+      enabled: true,
+      id: "automation_paused",
+      name: "Existing paused automation",
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+      updatedAt: new Date().toISOString(),
+      version: 1,
+    });
+
+    expect(await service.listAll()).toEqual([]);
+  });
+
+  test("accepts email delivery when composeio MCP email sending is assigned", async () => {
+    const db = await createTestDb();
+    await assignComposeioGmailSender(db, PROFILE_ID);
+
+    const service = new AutomationService(db, {
+      canSendEmail: (profileId) =>
+        hasAutomationEmailDeliveryPath(db, profileId, {
+          loadConfig: async () => null,
+        }),
+      getUserTimezone: async () => "UTC",
+    });
+
+    const automation = await service.create(
+      ORG_ID,
+      {
+        delivery: { channel: "email", to: "hey@ahmadrosid.com" },
+        description: "Daily digest",
+        name: "Digest",
+        prompt: "Summarize news",
+        trigger: { type: "manual" },
+      },
+      PROFILE_ID
+    );
+
+    expect(automation.delivery).toEqual({
+      channel: "email",
+      to: "hey@ahmadrosid.com",
+    });
+  });
+
+  test("falls back to the prompt when description is omitted", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    // The HTTP route casts the body with readJson, so an absent field reaches
+    // create() as undefined however the type is declared.
+    const automation = await service.create(
+      ORG_ID,
+      // SAFETY: This test double supplies only the fields exercised by this test.
+      {
+        name: "Nightly pull",
+        prompt: "run the tool",
+        trigger: { type: "manual" },
+      } as Parameters<typeof service.create>[1],
+      PROFILE_ID
+    );
+
+    expect(automation.description).toBe("run the tool");
+  });
+
+  test("rebinds profileId on update and leaves binding when omitted", async () => {
+    const db = await createTestDb();
+    const now = new Date().toISOString();
+    const otherId = "profile_other";
+    await db.upsertProfile({
+      createdAt: now,
+      id: otherId,
+      isDefault: false,
+      isSuper: false,
+      model: null,
+      name: "Other Bot",
+      orgId: ORG_ID,
+      systemPrompt: "",
+      updatedAt: now,
+    });
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const automation = await service.create(
+      ORG_ID,
+      {
+        description: "Digest",
+        name: "Digest",
+        prompt: "Summarize",
+        trigger: { type: "manual" },
+      },
+      PROFILE_ID,
+      { orgRole: "member" }
+    );
+
+    const rebound = await service.update(
+      automation.id,
+      ORG_ID,
+      { profileId: otherId },
+      { orgRole: "member" }
+    );
+
+    expect(rebound.profileId).toBe(otherId);
+
+    const unchanged = await service.update(
+      automation.id,
+      ORG_ID,
+      { name: "Digest 2" },
+      { orgRole: "member" }
+    );
+
+    expect(unchanged.profileId).toBe(otherId);
+    expect(unchanged.name).toBe("Digest 2");
+  });
+
+  test("rejects blank profileId on update", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const automation = await service.create(
+      ORG_ID,
+      {
+        description: "Digest",
+        name: "Digest",
+        prompt: "Summarize",
+        trigger: { type: "manual" },
+      },
+      PROFILE_ID
+    );
+
+    await expect(
+      service.update(automation.id, ORG_ID, { profileId: "   " })
+    ).rejects.toThrow("Profile id is required.");
+    expect((await service.get(automation.id, ORG_ID))?.profileId).toBe(
+      PROFILE_ID
+    );
+  });
+
+  test("rejects email delivery rebind when the new profile cannot send email", async () => {
+    const db = await createTestDb();
+    const now = new Date().toISOString();
+    const withEmail = "profile_email";
+    const withoutEmail = "profile_plain";
+
+    await db.upsertProfile({
+      createdAt: now,
+      id: withEmail,
+      isDefault: false,
+      isSuper: false,
+      model: null,
+      name: "Mail Bot",
+      orgId: ORG_ID,
+      systemPrompt: "",
+      updatedAt: now,
+    });
+    await db.upsertProfile({
+      createdAt: now,
+      id: withoutEmail,
+      isDefault: false,
+      isSuper: false,
+      model: null,
+      name: "Plain Bot",
+      orgId: ORG_ID,
+      systemPrompt: "",
+      updatedAt: now,
+    });
+    await assignComposeioGmailSender(db, withEmail);
+
+    const service = new AutomationService(db, {
+      canSendEmail: (profileId) =>
+        hasAutomationEmailDeliveryPath(db, profileId, {
+          loadConfig: async () => null,
+        }),
+      getUserTimezone: async () => "UTC",
+    });
+
+    const automation = await service.create(
+      ORG_ID,
+      {
+        delivery: { channel: "email", to: "hey@ahmadrosid.com" },
+        description: "Digest",
+        name: "Digest",
+        prompt: "Summarize",
+        trigger: { type: "manual" },
+      },
+      withEmail
+    );
+
+    await expect(
+      service.update(automation.id, ORG_ID, { profileId: withoutEmail })
+    ).rejects.toThrow("Email is not configured");
+    expect((await service.get(automation.id, ORG_ID))?.profileId).toBe(
+      withEmail
+    );
+  });
+
+  test("defaults schedule timezone from user config", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "Asia/Jakarta",
+    });
+
+    const automation = await service.create(
+      ORG_ID,
+      {
+        description: "Morning news",
+        name: "HN digest",
+        prompt: "Fetch Hacker News headlines",
+        trigger: { cron: "0 8 * * *", type: "schedule" },
+      },
+      PROFILE_ID
+    );
+
+    expect(automation.trigger).toEqual({
+      cron: "0 8 * * *",
+      timezone: "Asia/Jakarta",
+      type: "schedule",
+    });
+    expect(automation.nextRunAt).toBe(
+      service.computeNextRunAt(automation.trigger, "Asia/Jakarta")
+    );
+  });
+
+  test("computes nextRunAt for future runAt triggers", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "Asia/Jakarta",
+    });
+
+    const at = new Date(Date.now() + 60_000).toISOString();
+
+    const automation = await service.create(
+      ORG_ID,
+      {
+        description: "One-time",
+        name: "Reminder",
+        prompt: "Send reminder",
+        trigger: { at, type: "runAt" },
+      },
+      PROFILE_ID
+    );
+
+    expect(automation.trigger.type).toBe("runAt");
+    expect(automation.nextRunAt).toBe(new Date(at).toISOString());
+  });
+
+  test("lists automations only for the active org", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const now = new Date().toISOString();
+    const otherOrgId = "org_other";
+    const otherProfileId = "profile_other";
+
+    await db.upsertOrganization({
+      createdAt: now,
+      id: otherOrgId,
+      name: "Other Org",
+      slug: "other-org",
+      updatedAt: now,
+    });
+
+    await db.upsertProfile({
+      createdAt: now,
+      id: otherProfileId,
+      isDefault: true,
+      isSuper: false,
+      model: null,
+      name: "Other Bot",
+      orgId: otherOrgId,
+      systemPrompt: "",
+      updatedAt: now,
+    });
+
+    const orgAutomation = await service.create(
+      ORG_ID,
+      {
+        description: "Scoped",
+        name: "Org task",
+        prompt: "Run",
+        trigger: { type: "manual" },
+      },
+      PROFILE_ID
+    );
+
+    await service.create(
+      otherOrgId,
+      {
+        description: "Hidden",
+        name: "Other org task",
+        prompt: "Run",
+        trigger: { type: "manual" },
+      },
+      otherProfileId
+    );
+
+    const listed = await service.listForOrg(ORG_ID);
+    expect(listed.automations.map((entry) => entry.id)).toEqual([
+      orgAutomation.id,
+    ]);
+
+    expect(await service.get(orgAutomation.id, ORG_ID)).not.toBeNull();
+    expect(await service.get(orgAutomation.id, otherOrgId)).toBeNull();
+  });
+
+  test("tracks unread runs per user and marks them read", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const userId = "user_test";
+
+    const automation = await service.create(
+      ORG_ID,
+      {
+        description: "Daily digest",
+        name: "Digest",
+        prompt: "Summarize news",
+        trigger: { type: "manual" },
+      },
+      PROFILE_ID
+    );
+
+    await db.insertAutomationRun({
+      automationId: automation.id,
+      completedAt: "2026-06-29T10:01:00.000Z",
+      error: null,
+      id: "run_unread_1",
+      output: "Summary",
+      startedAt: "2026-06-29T10:00:00.000Z",
+      status: "completed",
+    });
+
+    const unread = await service.getUnreadSummary(ORG_ID, userId);
+    expect(unread.totalUnread).toBe(1);
+    expect(unread.byAutomationId[automation.id]).toBe(1);
+
+    const runsBeforeRead = await service.listRuns(
+      automation.id,
+      ORG_ID,
+      20,
+      userId
+    );
+
+    expect(runsBeforeRead[0]?.read).toBe(false);
+
+    await service.markRunsRead(automation.id, ORG_ID, userId);
+
+    const unreadAfter = await service.getUnreadSummary(ORG_ID, userId);
+    expect(unreadAfter.totalUnread).toBe(0);
+
+    const runsAfterRead = await service.listRuns(
+      automation.id,
+      ORG_ID,
+      20,
+      userId
+    );
+
+    expect(runsAfterRead[0]?.read).toBe(true);
+  });
+
+  test("completes the exact claimed automation run", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const automation = await service.create(
+      ORG_ID,
+      {
+        description: "Concurrent task",
+        name: "Concurrent task",
+        prompt: "Say hello",
+        trigger: { type: "manual" },
+      },
+      PROFILE_ID
+    );
+
+    const firstRun = await service.createRun(automation.id);
+    const secondRun = await service.createRun(automation.id);
+
+    await service.completeRun(firstRun.id, automation.id, { output: "First" });
+
+    const runs = await service.listRuns(automation.id);
+    expect(runs.find((run) => run.id === firstRun.id)?.status).toBe(
+      "completed"
+    );
+    expect(runs.find((run) => run.id === secondRun.id)?.status).toBe("running");
+    expect((await service.getActiveRun(automation.id))?.id).toBe(secondRun.id);
+  });
+
+  test("rejects invalid stored delivery status without changing the run", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const automation = await service.create(
+      ORG_ID,
+      {
+        description: "Status check",
+        name: "Status check",
+        prompt: "Say hello",
+        trigger: { type: "manual" },
+      },
+      PROFILE_ID
+    );
+
+    const run = await service.createRun(automation.id);
+    await db.updateAutomationRun({ ...run, deliveryStatus: "invalid" });
+
+    await expect(service.listRuns(automation.id)).rejects.toThrow();
+    expect((await db.listAutomationRuns(automation.id))[0]).toMatchObject({
+      deliveryStatus: "invalid",
+      id: run.id,
+    });
+  });
+
+  test("refuses a member automation that targets a foreign destination", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const owner = { orgId: ORG_ID, profileId: PROFILE_ID };
+    const configDir = await mkdtemp(join(tmpdir(), "mingzhan-automation-dest-"));
+    const previousConfigDir = process.env.MINGZHAN_CONFIG_DIR;
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    try {
+      await mkdir(getTelegramConfigDir(owner), { recursive: true });
+      await writeFile(
+        getTelegramConfigPath(owner),
+        "bot_token=test-token\npaired_user_ids=111\n",
+        "utf8"
+      );
+      await mkdir(getDiscordConfigDir(owner), { recursive: true });
+      await writeFile(
+        getDiscordConfigPath(owner),
+        "bot_token=test-token\npaired_user_ids=123456789012345678\n",
+        "utf8"
+      );
+
+      for (const delivery of [
+        { channel: "telegram", chatId: 999 } as const,
+        { channel: "discord", channelId: "123456789012345679" } as const,
+      ]) {
+        const error = await service
+          .create(
+            ORG_ID,
+            {
+              delivery,
+              description: "Report",
+              name: "Report",
+              prompt: "Summarize the week",
+              trigger: { type: "manual" },
+            },
+            PROFILE_ID,
+            { isPlatformAdmin: false, orgRole: "member" }
+          )
+          .then(
+            () => null,
+            // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The test callback ignores framework inputs that this case does not inspect.
+            (thrown: unknown) => thrown
+          );
+
+        expect(error).toBeInstanceOf(MíngZhànApiError);
+        // SAFETY: This test double supplies only the fields exercised by this test.
+        expect((error as MíngZhànApiError).status).toBe(403);
+      }
+
+      // A member-owned automation that stays on the paired set is unaffected.
+      const paired = await service.create(
+        ORG_ID,
+        {
+          delivery: { channel: "telegram", chatId: 111 },
+          description: "Report",
+          name: "Report",
+          prompt: "Summarize the week",
+          trigger: { type: "manual" },
+        },
+        PROFILE_ID,
+        { isPlatformAdmin: false, orgRole: "member" }
+      );
+
+      expect(paired.delivery).toEqual({ channel: "telegram", chatId: 111 });
+    } finally {
+      if (previousConfigDir === undefined) {
+        delete process.env.MINGZHAN_CONFIG_DIR;
+      } else {
+        process.env.MINGZHAN_CONFIG_DIR = previousConfigDir;
+      }
+
+      await rm(configDir, { force: true, recursive: true });
+    }
+  });
+
+  test("re-locks a member who retargets an admin-approved destination", async () => {
+    const db = await createTestDb();
+    const owner = { orgId: ORG_ID, profileId: PROFILE_ID };
+    const configDir = await mkdtemp(join(tmpdir(), "mingzhan-automation-dest-"));
+    const previousConfigDir = process.env.MINGZHAN_CONFIG_DIR;
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    try {
+      await mkdir(getDiscordConfigDir(owner), { recursive: true });
+      await writeFile(
+        getDiscordConfigPath(owner),
+        "bot_token=test-token\npaired_user_ids=123456789012345678\n",
+        "utf8"
+      );
+
+      const service = new AutomationService(db, {
+        getUserTimezone: async () => "UTC",
+      });
+
+      const now = new Date().toISOString();
+      await db.upsertAutomation({
+        createdAt: now,
+        definition: {
+          delivery: {
+            channel: "discord",
+            channelId: "123456789012345679",
+          },
+          description: "Report",
+          name: "Report",
+          prompt: "Summarize the week",
+          steps: [],
+          trigger: { type: "manual" },
+          version: 1,
+        },
+        enabled: true,
+        id: "automation_admin_owned",
+        name: "Report",
+        orgId: ORG_ID,
+        profileId: PROFILE_ID,
+        updatedAt: now,
+        version: 1,
+      });
+
+      const error = await service
+        .update(
+          "automation_admin_owned",
+          ORG_ID,
+          { delivery: { channel: "discord", channelId: "987654321098765432" } },
+          { isPlatformAdmin: false, orgRole: "member" }
+        )
+        .then(
+          () => null,
+          // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The test callback ignores framework inputs that this case does not inspect.
+          (thrown: unknown) => thrown
+        );
+
+      expect(error).toBeInstanceOf(MíngZhànApiError);
+      // SAFETY: This test double supplies only the fields exercised by this test.
+      expect((error as MíngZhànApiError).status).toBe(403);
+    } finally {
+      if (previousConfigDir === undefined) {
+        delete process.env.MINGZHAN_CONFIG_DIR;
+      } else {
+        process.env.MINGZHAN_CONFIG_DIR = previousConfigDir;
+      }
+
+      await rm(configDir, { force: true, recursive: true });
+    }
+  });
+});
+
+test("automation list reflects a run starting and finishing", async () => {
+  const db = await createTestDb();
+
+  const service = new AutomationService(db, {
+    getUserTimezone: async () => "UTC",
+  });
+
+  const automation = await service.create(
+    ORG_ID,
+    {
+      description: "Digest",
+      name: "Digest",
+      prompt: "Summarize",
+      trigger: { type: "manual" },
+    },
+    PROFILE_ID,
+    { orgRole: "member" }
+  );
+
+  expect(
+    (await service.listForOrg(ORG_ID)).automations[0]?.lastRunStatus
+  ).toBeNull();
+
+  const run = await service.createRun(automation.id);
+  expect((await service.listForOrg(ORG_ID)).automations[0]?.lastRunStatus).toBe(
+    "running"
+  );
+  expect((await service.listForOrg("another_org")).automations).toEqual([]);
+
+  await service.completeRun(run.id, automation.id, { output: "Done" });
+  expect((await service.listForOrg(ORG_ID)).automations[0]?.lastRunStatus).toBe(
+    "completed"
+  );
+});
+
+describe("AutomationRunner", () => {
+  test.each([false, true])(
+    "exposes progress before completion (fails: %s)",
+    async (fails) => {
+      const db = await createTestDb();
+
+      const service = new AutomationService(db, {
+        getUserTimezone: async () => "UTC",
+      });
+
+      const automation = await service.create(
+        ORG_ID,
+        {
+          description: "Live progress",
+          name: "Live task",
+          prompt: "Find news",
+          trigger: { type: "manual" },
+        },
+        PROFILE_ID
+      );
+
+      const started = Promise.withResolvers<void>();
+      const finish = Promise.withResolvers<void>();
+
+      // SAFETY: This test double supplies only the fields exercised by this test.
+      const runner = new AutomationRunner(service, {
+        runAutomationPrompt: async (
+          _orgId: string,
+          _profileId: string,
+          _prompt: string,
+          _automationId?: string,
+          _runId?: string,
+          handlers?: Parameters<AgentService["runAutomationPrompt"]>[5]
+        ) => {
+          handlers?.onChunk("Searching ");
+          handlers?.onChunk("news");
+          handlers?.onToolStart?.({
+            input: { command: "pwd" },
+            tool: "bash",
+            toolCallId: "call-1",
+          });
+          handlers?.onToolStart?.({
+            input: { path: "README.md" },
+            tool: "read_file",
+            toolCallId: "call-2",
+          });
+          handlers?.onToolEnd?.({
+            result: { error: "Not found" },
+            tool: "read_file",
+            toolCallId: "call-2",
+          });
+          started.resolve();
+          await finish.promise;
+
+          if (fails) {
+            throw new Error("Provider disconnected");
+          }
+
+          return "News summary";
+        },
+      } as never);
+
+      const pending = runner.run(automation.id);
+      await started.promise;
+
+      try {
+        const runs = await service.listRuns(automation.id, ORG_ID);
+        expect(runs[0]).toMatchObject({
+          output: "Searching news",
+          status: "running",
+        });
+        expect(runs[0]?.progress).toMatchObject([
+          { content: "Find news", role: "user" },
+          { content: "Searching news", role: "assistant" },
+          {
+            role: "assistant",
+            toolCalls: [
+              { arguments: { command: "pwd" }, id: "call-1", name: "bash" },
+            ],
+          },
+          {
+            content: "",
+            role: "tool",
+            toolCallId: "call-1",
+            toolStartedAt: expect.any(Number),
+          },
+          {
+            role: "assistant",
+            toolCalls: [{ id: "call-2", name: "read_file" }],
+          },
+          {
+            content: JSON.stringify({ error: "Not found" }),
+            role: "tool",
+            toolCallId: "call-2",
+            toolCompletedAt: expect.any(Number),
+          },
+        ]);
+        expect(runs[0]?.progress?.[3]).not.toHaveProperty("toolCompletedAt");
+        await expect(
+          service.listRuns(automation.id, "other-org")
+        ).rejects.toThrow();
+      } finally {
+        finish.resolve();
+        await pending;
+      }
+
+      const runs = await service.listRuns(automation.id, ORG_ID);
+      expect(runs[0]).toMatchObject({
+        output: fails ? "Searching news" : "News summary",
+        status: fails ? "failed" : "completed",
+      });
+      expect(runner.getActiveRunCount()).toBe(0);
+
+      const reloadedService = new AutomationService(db, {
+        getUserTimezone: async () => "UTC",
+      });
+
+      const reloaded = (
+        await reloadedService.listRuns(automation.id, ORG_ID)
+      )[0]!;
+
+      expect(reloaded.progress).toEqual(runs[0]?.progress);
+      expect(reloaded.progress?.[0]).toMatchObject({
+        content: "Find news",
+        role: "user",
+      });
+
+      const unfinished = reloaded.progress?.find(
+        (item) => item.role === "tool" && item.toolCallId === "call-1"
+      );
+
+      expect(unfinished).toMatchObject({ toolCompletedAt: expect.any(Number) });
+
+      if (unfinished?.role === "tool") {
+        expect(JSON.parse(unfinished.content).error).toBeDefined();
+      }
+
+      if (!fails) {
+        expect(reloaded.progress?.at(-1)).toMatchObject({
+          content: "News summary",
+          role: "assistant",
+        });
+      }
+    }
+  );
+
+  test("writes completed run records", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const automation = await service.create(
+      ORG_ID,
+      {
+        description: "Run once",
+        name: "Manual task",
+        prompt: "Say hello",
+        trigger: { type: "manual" },
+      },
+      PROFILE_ID
+    );
+
+    const agentService = {
+      runAutomationPrompt: async () => "Hello from automation",
+    };
+
+    // SAFETY: This test double supplies only the fields exercised by this test.
+    const runner = new AutomationRunner(service, agentService as never);
+    const result = await runner.run(automation.id);
+
+    expect(result.output).toBe("Hello from automation");
+
+    const runs = await service.listRuns(automation.id);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.status).toBe("completed");
+    expect(runs[0]?.output).toBe("Hello from automation");
+  });
+
+  test("resumes an interrupted run instead of failing it", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const automation = await service.create(
+      ORG_ID,
+      {
+        description: "Resume task",
+        name: "Resume task",
+        prompt: "Say hello",
+        trigger: { type: "manual" },
+      },
+      PROFILE_ID
+    );
+
+    const interrupted = await service.createRun(automation.id);
+    const resumeFlags: boolean[] = [];
+
+    // SAFETY: This test double supplies only the fields exercised by this test.
+    const runner = new AutomationRunner(service, {
+      runAutomationPrompt: async (
+        _orgId: string,
+        _profileId: string,
+        _prompt: string,
+        _automationId: string,
+        runId: string,
+        // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The test callback ignores framework inputs that this case does not inspect.
+        _handlers: unknown,
+        resume: boolean
+      ) => {
+        resumeFlags.push(resume);
+        expect(runId).toBe(interrupted.id);
+
+        return "Finished after restart";
+      },
+    } as never);
+
+    const claimed = await db.claimInterruptedAutomationRuns(2);
+    await runner.resumeInterrupted(claimed);
+
+    expect(resumeFlags).toEqual([true]);
+    const runs = await service.listRuns(automation.id);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.status).toBe("completed");
+    expect(runs[0]?.output).toBe("Finished after restart");
+  });
+
+  test("concurrent automation runs execute once", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const automation = await service.create(
+      ORG_ID,
+      {
+        description: "Concurrent task",
+        name: "Concurrent task",
+        prompt: "Say hello",
+        trigger: { type: "manual" },
+      },
+      PROFILE_ID
+    );
+
+    const agentStarted = Promise.withResolvers<void>();
+    const releaseAgent = Promise.withResolvers<void>();
+    let agentCalls = 0;
+    let claimedRunId: string | undefined;
+
+    // SAFETY: This test double supplies only the fields exercised by this test.
+    const runner = new AutomationRunner(service, {
+      runAutomationPrompt: async (
+        _orgId: string,
+        _profileId: string,
+        _prompt: string,
+        _automationId?: string,
+        automationRunId?: string
+      ) => {
+        agentCalls += 1;
+        claimedRunId = automationRunId;
+        agentStarted.resolve();
+        await releaseAgent.promise;
+
+        return "Hello from automation";
+      },
+    } as never);
+
+    const firstRun = runner.run(automation.id);
+    const secondRun = runner.run(automation.id);
+    await agentStarted.promise;
+    releaseAgent.resolve();
+
+    const [firstResult, secondResult] = await Promise.all([
+      firstRun,
+      secondRun,
+    ]);
+
+    expect(firstResult.output).toBe("Hello from automation");
+    expect(secondResult.skipped).toBe(true);
+    expect(agentCalls).toBe(1);
+    const runs = await service.listRuns(automation.id);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({ id: claimedRunId });
+    expect(runs[0]?.status).toBe("completed");
+  });
+
+  test("releases the run guard when run creation fails", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const automation = await service.create(
+      ORG_ID,
+      {
+        description: "Retryable task",
+        name: "Retryable task",
+        prompt: "Say hello",
+        trigger: { type: "manual" },
+      },
+      PROFILE_ID
+    );
+
+    const createRun = service.createRun.bind(service);
+    let createAttempts = 0;
+    service.createRun = async (automationId) => {
+      createAttempts += 1;
+
+      if (createAttempts === 1) {
+        throw new Error("Database unavailable");
+      }
+
+      return createRun(automationId);
+    };
+
+    // SAFETY: This test double supplies only the fields exercised by this test.
+    const runner = new AutomationRunner(service, {
+      runAutomationPrompt: async () => "Hello from automation",
+    } as never);
+
+    await expect(runner.run(automation.id)).rejects.toThrow(
+      "Database unavailable"
+    );
+    expect(runner.isRunning(automation.id)).toBe(false);
+    expect(runner.getActiveRunCount()).toBe(0);
+
+    const result = await runner.run(automation.id);
+    expect(result.output).toBe("Hello from automation");
+    expect(createAttempts).toBe(2);
+    expect(await service.getActiveRun(automation.id)).toBeNull();
+    expect((await service.listRuns(automation.id))[0]?.status).toBe(
+      "completed"
+    );
+  });
+
+  test("passes automation scope to the agent prompt", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const automation = await service.create(
+      ORG_ID,
+      {
+        description: "Run with history scope",
+        name: "Scoped task",
+        prompt: "Say hello",
+        trigger: { type: "manual" },
+      },
+      PROFILE_ID
+    );
+
+    let received:
+      | {
+          orgId: string;
+          profileId: string;
+          prompt: string;
+          automationId?: string;
+          automationRunId?: string;
+        }
+      | undefined;
+
+    const agentService = {
+      runAutomationPrompt: async (
+        orgId: string,
+        profileId: string,
+        prompt: string,
+        automationId?: string,
+        automationRunId?: string
+      ) => {
+        received = { automationId, automationRunId, orgId, profileId, prompt };
+
+        return "Hello from automation";
+      },
+    };
+
+    // SAFETY: This test double supplies only the fields exercised by this test.
+    const runner = new AutomationRunner(service, agentService as never);
+    await runner.run(automation.id);
+
+    const runs = await service.listRuns(automation.id);
+    expect(received).toEqual({
+      automationId: automation.id,
+      automationRunId: runs[0]?.id,
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+      prompt: "Say hello",
+    });
+  });
+
+  test("writes failed run records", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const automation = await service.create(
+      ORG_ID,
+      {
+        description: "Run once",
+        name: "Manual task",
+        prompt: "Say hello",
+        trigger: { type: "manual" },
+      },
+      PROFILE_ID
+    );
+
+    const agentService = {
+      runAutomationPrompt: async () => {
+        throw new Error("Provider offline");
+      },
+    };
+
+    // SAFETY: This test double supplies only the fields exercised by this test.
+    const runner = new AutomationRunner(service, agentService as never);
+    const result = await runner.run(automation.id);
+
+    expect(result.error).toBe("Provider offline");
+
+    const runs = await service.listRuns(automation.id);
+    expect(runs[0]?.status).toBe("failed");
+    expect(runs[0]?.error).toBe("Provider offline");
+  });
+
+  test("maps Bun fetch disconnects to a readable run error", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const automation = await service.create(
+      ORG_ID,
+      {
+        description: "Run once",
+        name: "Manual task",
+        prompt: "Say hello",
+        trigger: { type: "manual" },
+      },
+      PROFILE_ID
+    );
+
+    const agentService = {
+      runAutomationPrompt: async () => {
+        throw new Error(
+          "The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()"
+        );
+      },
+    };
+
+    // SAFETY: This test double supplies only the fields exercised by this test.
+    const runner = new AutomationRunner(service, agentService as never);
+    const result = await runner.run(automation.id);
+
+    expect(result.error).not.toContain(
+      "socket connection was closed unexpectedly"
+    );
+    expect(result.error).not.toContain("Restart the MíngZhàn server");
+    expect(result.error?.length).toBeGreaterThan(0);
+
+    const runs = await service.listRuns(automation.id);
+    expect(runs[0]?.status).toBe("failed");
+    expect(runs[0]).toMatchObject({ error: result.error });
+  });
+
+  test("disables runAt automations before executing", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const at = new Date(Date.now() + 60_000).toISOString();
+
+    const automation = await service.create(
+      ORG_ID,
+      {
+        description: "One-time",
+        name: "Reminder",
+        prompt: "Send reminder",
+        trigger: { at, type: "runAt" },
+      },
+      PROFILE_ID
+    );
+
+    const agentService = {
+      runAutomationPrompt: async () => "Reminder sent",
+    };
+
+    // SAFETY: This test double supplies only the fields exercised by this test.
+    const runner = new AutomationRunner(service, agentService as never);
+    const result = await runner.run(automation.id);
+
+    expect(result.output).toBe("Reminder sent");
+
+    const updated = await service.get(automation.id, ORG_ID);
+    expect(updated?.enabled).toBe(false);
+    expect(updated?.nextRunAt).toBeNull();
+  });
+
+  test("records delivery status after successful runs", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const now = new Date().toISOString();
+    await db.upsertAutomation({
+      createdAt: now,
+      definition: {
+        delivery: { channel: "telegram" },
+        description: "Daily digest",
+        prompt: "Summarize news",
+        steps: [],
+        trigger: { type: "manual" },
+        version: 1,
+      },
+      enabled: true,
+      id: "automation_delivery_test",
+      name: "Digest",
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+      updatedAt: now,
+      version: 1,
+    });
+
+    const agentService = {
+      runAutomationPrompt: async () => "News summary",
+    };
+
+    const deliveryService = new AutomationDeliveryService(service, {
+      telegram: {
+        send: async () => ({ ok: true }),
+      },
+    });
+
+    const runner = new AutomationRunner(
+      service,
+      // SAFETY: This test double supplies only the fields exercised by this test.
+      agentService as never,
+      deliveryService
+    );
+
+    await runner.run("automation_delivery_test");
+
+    const runs = await service.listRuns("automation_delivery_test");
+    expect(runs[0]?.deliveryStatus).toBe("sent");
+  });
+
+  test("records discord delivery status after successful runs", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const now = new Date().toISOString();
+    const sent: Array<{ channelId?: string; text: string }> = [];
+
+    await db.upsertAutomation({
+      createdAt: now,
+      definition: {
+        delivery: { channel: "discord" },
+        description: "Daily digest",
+        prompt: "Summarize news",
+        steps: [],
+        trigger: { type: "manual" },
+        version: 1,
+      },
+      enabled: true,
+      id: "automation_discord_delivery_test",
+      name: "Digest",
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+      updatedAt: now,
+      version: 1,
+    });
+
+    const deliveryService = new AutomationDeliveryService(service, {
+      discord: {
+        send: async (input) => {
+          sent.push(input);
+
+          return { ok: true };
+        },
+      },
+    });
+
+    const runner = new AutomationRunner(
+      service,
+      // SAFETY: This test double supplies only the fields exercised by this test.
+      { runAutomationPrompt: async () => "News summary" } as never,
+      deliveryService
+    );
+
+    await runner.run("automation_discord_delivery_test");
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.text).toContain("News summary");
+
+    const runs = await service.listRuns("automation_discord_delivery_test");
+    expect(runs[0]?.deliveryStatus).toBe("sent");
+  });
+
+  test("skips discord delivery when notifyOn is failure and the run succeeds", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const now = new Date().toISOString();
+    let called = false;
+
+    await db.upsertAutomation({
+      createdAt: now,
+      definition: {
+        delivery: { channel: "discord", notifyOn: "failure" },
+        description: "Daily digest",
+        prompt: "Summarize news",
+        steps: [],
+        trigger: { type: "manual" },
+        version: 1,
+      },
+      enabled: true,
+      id: "automation_discord_skip_test",
+      name: "Digest",
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+      updatedAt: now,
+      version: 1,
+    });
+
+    const deliveryService = new AutomationDeliveryService(service, {
+      discord: {
+        send: async () => {
+          called = true;
+
+          return { ok: true };
+        },
+      },
+    });
+
+    const runner = new AutomationRunner(
+      service,
+      // SAFETY: This test double supplies only the fields exercised by this test.
+      { runAutomationPrompt: async () => "News summary" } as never,
+      deliveryService
+    );
+
+    await runner.run("automation_discord_skip_test");
+
+    expect(called).toBe(false);
+    const runs = await service.listRuns("automation_discord_skip_test");
+    expect(runs[0]?.deliveryStatus).toBe("skipped");
+  });
+
+  test("records discord delivery failure from the adapter", async () => {
+    const db = await createTestDb();
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const now = new Date().toISOString();
+
+    await db.upsertAutomation({
+      createdAt: now,
+      definition: {
+        delivery: { channel: "discord", channelId: "123456789012345678" },
+        description: "Daily digest",
+        prompt: "Summarize news",
+        steps: [],
+        trigger: { type: "manual" },
+        version: 1,
+      },
+      enabled: true,
+      id: "automation_discord_fail_test",
+      name: "Digest",
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+      updatedAt: now,
+      version: 1,
+    });
+
+    const deliveryService = new AutomationDeliveryService(service, {
+      discord: {
+        send: async () => ({
+          error: "Discord API error (403): missing access",
+          ok: false,
+        }),
+      },
+    });
+
+    const runner = new AutomationRunner(
+      service,
+      // SAFETY: This test double supplies only the fields exercised by this test.
+      { runAutomationPrompt: async () => "News summary" } as never,
+      deliveryService
+    );
+
+    await runner.run("automation_discord_fail_test");
+
+    const runs = await service.listRuns("automation_discord_fail_test");
+    expect(runs[0]?.deliveryStatus).toBe("failed");
+    expect(runs[0]?.deliveryError).toContain("403");
+  });
+
+  test("delivers automation email through composeio MCP when SMTP is unavailable", async () => {
+    const db = await createTestDb();
+    await assignComposeioGmailSender(db, PROFILE_ID);
+
+    const service = new AutomationService(db, {
+      getUserTimezone: async () => "UTC",
+    });
+
+    const now = new Date().toISOString();
+    // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- This test fixture stores varied values to exercise service boundary handling.
+    const sent: Record<string, unknown>[] = [];
+
+    await db.upsertAutomation({
+      createdAt: now,
+      definition: {
+        delivery: { channel: "email", to: "hey@ahmadrosid.com" },
+        description: "Daily digest",
+        prompt: "Summarize news",
+        steps: [],
+        trigger: { type: "manual" },
+        version: 1,
+      },
+      enabled: true,
+      id: "automation_email_delivery_test",
+      name: "Digest",
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+      updatedAt: now,
+      version: 1,
+    });
+
+    const mcpService = {
+      // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The test callback ignores framework inputs that this case does not inspect.
+      callTool: async (_server: unknown, _toolName: string, input: unknown) => {
+        // SAFETY: This test double supplies only the fields exercised by this test.
+        // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- This test fixture stores varied values to exercise service boundary handling.
+        sent.push(input as Record<string, unknown>);
+
+        return { ok: true };
+      },
+    };
+
+    const deliveryService = new AutomationDeliveryService(service, {
+      // SAFETY: This test double supplies only the fields exercised by this test.
+      email: createMcpAwareEmailOutboundAdapter(db, mcpService as never, {
+        loadConfig: async () => null,
+      }),
+    });
+
+    const agentService = {
+      runAutomationPrompt: async () => "News summary",
+    };
+
+    const runner = new AutomationRunner(
+      service,
+      // SAFETY: This test double supplies only the fields exercised by this test.
+      agentService as never,
+      deliveryService
+    );
+
+    await runner.run("automation_email_delivery_test");
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({
+      body: expect.stringContaining("News summary"),
+      subject: "[MíngZhàn] Digest — completed",
+      to: "hey@ahmadrosid.com",
+    });
+
+    const runs = await service.listRuns("automation_email_delivery_test");
+    expect(runs[0]?.deliveryStatus).toBe("sent");
+  });
+
+  test("maps composeio-style schema aliases when calling MCP email tools", async () => {
+    const db = await createTestDb();
+    await assignComposeioGmailSender(db, PROFILE_ID, {
+      properties: {
+        message_body: { type: "string" },
+        recipient_email: { type: "string" },
+        title: { type: "string" },
+      },
+      type: "object",
+    });
+
+    // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- This test fixture stores varied values to exercise service boundary handling.
+    const sent: Record<string, unknown>[] = [];
+
+    const adapter = createMcpAwareEmailOutboundAdapter(
+      db,
+      {
+        callTool: async (
+          // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The test callback ignores framework inputs that this case does not inspect.
+          _server: unknown,
+          _toolName: string,
+          // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The test callback ignores framework inputs that this case does not inspect.
+          input: unknown
+        ) => {
+          // SAFETY: This test double supplies only the fields exercised by this test.
+          // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- This test fixture stores varied values to exercise service boundary handling.
+          sent.push(input as Record<string, unknown>);
+
+          return { ok: true };
+        },
+      },
+      { loadConfig: async () => null }
+    );
+
+    await adapter.send({
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+      subject: "Daily digest",
+      text: "Hello world",
+      to: "hey@ahmadrosid.com",
+    });
+
+    expect(sent).toEqual([
+      {
+        message_body: "Hello world",
+        recipient_email: "hey@ahmadrosid.com",
+        title: "Daily digest",
+      },
+    ]);
+  });
+});

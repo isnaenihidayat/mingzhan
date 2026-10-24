@@ -1,0 +1,1795 @@
+import { readdir, readFile, rm } from "node:fs/promises";
+import {
+  basename,
+  extname,
+  isAbsolute,
+  join,
+  normalize,
+  relative,
+  sep,
+} from "node:path";
+import { isDeepStrictEqual } from "node:util";
+import {
+  createId,
+  discoverSkillDirectory,
+  getCustomToolsDir,
+  getProfileAvatarPath,
+  getProfileSkillsDir,
+  getProfileSoulDir,
+  hasProfileAvatar,
+  initSoulDirectory,
+  isGlobalSkillSourcePath,
+  MINGZHAN_API_VERSION,
+  MíngZhànApiError,
+  type ProfilePackCustomTool,
+  type ProfilePackManifest,
+  type ProfilePackMeta,
+  type ProfilePackPreviewResponse,
+  type ProfilePackSkippedItem,
+  parseSkillMarkdown,
+  pathExists,
+  readProfileAvatar,
+  SKILL_ARCHIVE_DIR_NAME,
+  saveProfileAvatar,
+  slugifyProfileName,
+  writePrivateBytesFile,
+} from "@mingzhan/core";
+import type {
+  DatabaseAdapter,
+  StoredMcpServerRecord,
+  StoredProfileComposioToolkitRecord,
+  StoredProfileRecord,
+  StoredSkillRecord,
+  StoredToolRecord,
+} from "@mingzhan/db";
+import { unzipSync, zipSync } from "fflate";
+import { getCustomToolHandler, isCustomToolType } from "./custom-tool-handlers";
+import { readHandlerModulePath } from "./custom-tool-shared";
+import {
+  isDirectExportPath,
+  MAX_IMPORT_ENTRY_BYTES,
+  MAX_IMPORT_UNCOMPRESSED_BYTES,
+} from "./data-portability";
+import { recordProfileChangeEvent } from "./profile-change-history";
+
+interface McpServerResolutionOptions {
+  /**
+   * Platform admins own every install-wide MCP server and may attach one to
+   * any profile, which is what `POST /v1/profiles/:profileId/mcp-servers`
+   * already does. Pack import applies the identical policy.
+   */
+  isPlatformAdmin?: boolean;
+}
+
+/**
+ * MCP servers are install-wide: only a platform admin can create one, and the
+ * only other route that reaches a server is the platform-admin-only profile
+ * assignment endpoint. So "already assigned to a profile in this org" is the
+ * platform admin's explicit grant to that organization.
+ *
+ * Anything running with org-admin rights — profile-pack import above all — must
+ * resolve MCP names through this policy instead of the unscoped name lookup,
+ * otherwise a pack can name any install-wide server and hand the importing org
+ * its headers, OAuth grant, stdio command, and cached tools.
+ */
+async function findMcpServerForOrg(
+  db: DatabaseAdapter,
+  orgId: string,
+  name: string,
+  options: McpServerResolutionOptions = {}
+): Promise<StoredMcpServerRecord | null> {
+  const server = await db.getMcpServerByName(name);
+
+  if (!server || options.isPlatformAdmin) {
+    return server;
+  }
+
+  const profiles = await db.listProfilesForMcpServer(server.id);
+
+  return profiles.some((profile) => profile.orgId === orgId) ? server : null;
+}
+
+export const PROFILE_PACK_KIND = "mingzhan-profile-export" as const;
+
+const PROFILE_PACK_MANIFEST_FILENAME = "mingzhan-profile-export.json";
+
+const PROFILE_PACK_FORMAT_VERSION = 1;
+
+const CUSTOM_TOOLS_ARCHIVE_DIR = "custom-tools";
+
+export const MAX_PROFILE_PACK_ENTRY_COUNT = 10_000;
+
+/** Only these workspace paths ever leave (export) or enter (import) a pack. */
+const ROOT_ALLOWED_FILES = new Set([
+  "SOUL.md",
+  "STYLE.md",
+  "INSTRUCTIONS.md",
+  "MEMORY.md",
+]);
+
+const ALLOWED_ROOT_SUBDIRS = new Set(["examples", "knowledge-base", "skills"]);
+
+const AVATAR_BASENAME_PATTERN = /^avatar\.[a-z0-9]+$/i;
+
+/**
+ * A skill-local `tool.js`/`tool.ts` is `import()`ed straight into the
+ * long-lived server process, so a pack carrying one turns a profile import
+ * into arbitrary code execution holding the deployment's secrets, the
+ * database handle, and the server's network identity. Python skill tools run
+ * in a separate interpreter and are not covered here.
+ */
+const IN_PROCESS_SKILL_SOURCE_EXTENSIONS = new Set([
+  ".cjs",
+  ".cts",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".mts",
+  ".ts",
+  ".tsx",
+]);
+
+const IN_PROCESS_SKILL_SOURCE_REASON =
+  "Executable JavaScript/TypeScript skill sources run inside the MíngZhàn server process and are never installed from a profile pack.";
+
+const AVATAR_EXTENSION_MEDIA_TYPES = new Map([
+  ["gif", "image/gif"],
+  ["jpeg", "image/jpeg"],
+  ["jpg", "image/jpeg"],
+  ["png", "image/png"],
+  ["webp", "image/webp"],
+]);
+
+const NOT_ALLOWLISTED_REASON =
+  "Not part of the profile pack allowlist (secrets and generated data are excluded).";
+
+// A skill's `tool.py` and the `.py` scripts it declares under `scripts:` are
+// executed as subprocesses by the chat runtime, so a pack must not be able to
+// install host-level Python through the ordinary org-admin import. They are
+// written only when a platform admin approves the import, the same gate
+// custom tool source already passes through.
+const PYTHON_SKILL_SCRIPT_REASON =
+  "Python skill script skipped: it runs as a subprocess on the server and requires a platform admin to approve the import.";
+
+const PROFILE_ID_ATTEMPTS = 50;
+
+interface ProfilePackFile {
+  absolutePath: string;
+  relativePath: string;
+}
+
+interface ProfilePackZipEntry {
+  data: Buffer;
+  name: string;
+}
+
+interface CreatedCustomTool {
+  absolutePath: string;
+  id: string;
+}
+
+interface ValidPackedCustomTool {
+  absolutePath: string;
+  definition: ProfilePackCustomTool;
+  handlerConfig: ProfilePackCustomTool["handlerConfig"];
+  sourcePath: string;
+}
+
+type ProfilePackJsonValue =
+  | boolean
+  | null
+  | number
+  | string
+  | ProfilePackJsonValue[]
+  | { [key: string]: ProfilePackJsonValue };
+
+type ToolAssignmentResolution =
+  | { kind: "create"; packed: ValidPackedCustomTool; source: Buffer }
+  | { kind: "existing"; tool: StoredToolRecord };
+
+export interface CreateProfilePackOptions {
+  includeCustomTools?: boolean;
+  now?: Date;
+}
+
+export interface PreviewProfilePackImportOptions {
+  allowPythonSkillTools?: boolean;
+  isPlatformAdmin?: boolean;
+  restoreCustomTools?: boolean;
+}
+
+export interface CreateProfilePackResult {
+  data: Buffer;
+  filename: string;
+  manifest: ProfilePackManifest;
+}
+
+export interface ImportProfilePackOptions {
+  actorUserId?: string | null;
+  allowPythonSkillTools?: boolean;
+  confirm: boolean;
+  isPlatformAdmin?: boolean;
+  name?: string;
+  now?: Date;
+  /** A member importing for themselves: the agent is private and gets no host tools. */
+  ownerUserId?: string | null;
+  restoreCustomTools?: boolean;
+}
+
+export interface ImportProfilePackResult {
+  manifest: ProfilePackManifest;
+  profileId: string;
+  skippedAssignments: ProfilePackSkippedItem[];
+}
+
+export async function createProfilePackExport(
+  db: DatabaseAdapter,
+  orgId: string,
+  profileId: string,
+  options: CreateProfilePackOptions = {}
+): Promise<CreateProfilePackResult> {
+  const profile = await db.getProfileForOrg(profileId, orgId);
+
+  if (!profile) {
+    throw new MíngZhànApiError("Profile not found.", 404);
+  }
+
+  if (profile.isSuper) {
+    throw new MíngZhànApiError("Super MíngZhàn cannot be exported.", 400);
+  }
+
+  const soulDir = getProfileSoulDir(orgId, profileId);
+
+  if ((await pathExists(soulDir)) && !(await isDirectExportPath(soulDir))) {
+    throw new MíngZhànApiError(
+      "Linked profile workspaces cannot be exported.",
+      400
+    );
+  }
+
+  const { files, skipped } = await inventoryProfileSoulDir(soulDir);
+  const meta = await buildProfilePackMeta(db, profileId, profile);
+  const shared = await db.getSharedAgentInstance(orgId, profileId);
+
+  if (shared) {
+    meta.sharedAgent = {
+      publicationId: shared.publicationId,
+      sourceOrgId: shared.sourceOrgId,
+      sourceProfileId: shared.sourceProfileId,
+    };
+  }
+
+  const createdAt = (options.now ?? new Date()).toISOString();
+
+  const entries: Record<string, Uint8Array> = {};
+
+  for (const file of files) {
+    entries[file.relativePath] = await readFile(file.absolutePath);
+  }
+
+  if (options.includeCustomTools ?? true) {
+    const packedTools = await collectPackedCustomTools(db, orgId, profileId);
+    meta.customTools = packedTools.tools;
+    skipped.push(...packedTools.skipped);
+    Object.assign(entries, packedTools.entries);
+  }
+
+  if (await hasProfileAvatar(orgId, profileId)) {
+    const avatar = await readProfileAvatar(orgId, profileId);
+
+    if (
+      avatar &&
+      (await isDirectExportPath(
+        getProfileAvatarPath(orgId, profileId, avatar.mediaType)
+      ))
+    ) {
+      const avatarRelative = basename(
+        getProfileAvatarPath(orgId, profileId, avatar.mediaType)
+      );
+
+      entries[avatarRelative] = avatar.bytes;
+    }
+  }
+
+  const topLevelPaths = Array.from(
+    new Set(Object.keys(entries).map((path) => path.split("/")[0] ?? ""))
+  )
+    .filter(Boolean)
+    .sort();
+
+  const manifest: ProfilePackManifest = {
+    apiVersion: MINGZHAN_API_VERSION,
+    createdAt,
+    kind: PROFILE_PACK_KIND,
+    meta,
+    skipped,
+    sourceProfileId: profileId,
+    topLevelPaths,
+    version: PROFILE_PACK_FORMAT_VERSION,
+  };
+
+  entries[PROFILE_PACK_MANIFEST_FILENAME] = Buffer.from(
+    JSON.stringify(manifest, null, 2),
+    "utf8"
+  );
+
+  return {
+    data: Buffer.from(zipSync(entries)),
+    filename: `mingzhan-profile-export-${slugifyProfileName(profile.name)}-${createdAt.replace(/[:.]/g, "-")}.zip`,
+    manifest,
+  };
+}
+
+export async function previewProfilePackImport(
+  db: DatabaseAdapter,
+  orgId: string,
+  archive: Buffer | Uint8Array | ArrayBuffer,
+  options: PreviewProfilePackImportOptions = {}
+): Promise<ProfilePackPreviewResponse> {
+  const entries = readProfilePackZip(archive);
+  const manifest = readProfilePackManifest(entries);
+
+  const skippedAssignments: ProfilePackSkippedItem[] = [];
+  previewBlockedPythonSkillScripts(
+    entries,
+    options.allowPythonSkillTools === true,
+    skippedAssignments
+  );
+
+  if (!manifest.meta.sharedAgent) {
+    await previewToolAssignments(
+      db,
+      orgId,
+      manifest,
+      entries,
+      options.restoreCustomTools === true,
+      skippedAssignments
+    );
+    await eachNamedOrSkip(
+      manifest.meta.mcpServerNames,
+      (name) =>
+        findMcpServerForOrg(db, orgId, name, {
+          isPlatformAdmin: options.isPlatformAdmin,
+        }),
+      skippedAssignments,
+      (name) => ({
+        path: `MCP server:${name}`,
+        reason: `MCP server "${name}" is not available to this organization and will be skipped.`,
+      })
+    );
+    await eachNamedOrSkip(
+      manifest.meta.composioToolkitSlugs,
+      (slug) => db.getComposioToolkitBySlug(orgId, slug),
+      skippedAssignments,
+      (slug) => ({
+        path: `Composio toolkit:${slug}`,
+        reason: `Composio toolkit "${slug}" was not found in the destination and will be skipped.`,
+      })
+    );
+    await eachNamedOrSkip(
+      manifest.meta.bundledSkillNames,
+      (name) => db.getSkillByName(name, orgId),
+      skippedAssignments,
+      (name) => ({
+        path: `bundled skill:${name}`,
+        reason: `Bundled skill "${name}" was not found in the destination and will be skipped.`,
+      })
+    );
+
+    for (const skill of readSkillNamesFromZip(entries)) {
+      if (await db.getSkillByName(skill.name, orgId)) {
+        skippedAssignments.push({
+          path: `skills/${skill.folder}`,
+          reason: `Skill "${skill.name}" already exists at a different location and will be skipped.`,
+        });
+      }
+    }
+  }
+
+  const restorableEntries = entries.filter(
+    (entry) => entry.name !== PROFILE_PACK_MANIFEST_FILENAME
+  );
+
+  const topLevelPaths = Array.from(
+    new Set(restorableEntries.map((entry) => entry.name.split("/")[0] ?? ""))
+  )
+    .filter(Boolean)
+    .sort();
+
+  return {
+    manifest,
+    plannedName: manifest.meta.name,
+    skippedAssignments,
+    topLevelPaths,
+  };
+}
+
+export async function importProfilePack(
+  db: DatabaseAdapter,
+  orgId: string,
+  archive: Buffer | Uint8Array | ArrayBuffer,
+  options: ImportProfilePackOptions
+): Promise<ImportProfilePackResult> {
+  if (!options.confirm) {
+    throw new Error("Import confirmation is required.");
+  }
+
+  const entries = readProfilePackZip(archive);
+  const manifest = readProfilePackManifest(entries);
+  const name = options.name?.trim() || manifest.meta.name || "Imported profile";
+  const now = (options.now ?? new Date()).toISOString();
+
+  const ownerUserId = options.ownerUserId ?? null;
+
+  if (ownerUserId && manifest.meta.sharedAgent) {
+    throw new MíngZhànApiError("Shared agents cannot be imported here.", 403);
+  }
+
+  // Allocation and insertion are one atomic statement: a concurrent import may
+  // win the id, and we retry the next suffix instead of overwriting its row.
+  const profileId = await createImportedProfile(db, name, {
+    createdAt: now,
+    isDefault: false,
+    isSuper: false,
+    model: manifest.meta.model,
+    name,
+    orgId,
+    ownerUserId,
+    sharedWithTeam: ownerUserId === null,
+    skillsCuratorConsolidateEnabled:
+      manifest.meta.skillsCuratorConsolidateEnabled,
+    skillsPostTurnReview: manifest.meta.skillsPostTurnReview,
+    // The write-approval gate is an admin setting, so a member's pack cannot lower it.
+    skillsWriteApproval: ownerUserId ? null : manifest.meta.skillsWriteApproval,
+    systemPrompt: manifest.meta.systemPrompt,
+    thinkingEffort: manifest.meta.thinkingEffort,
+    thinkingEnabled: manifest.meta.thinkingEnabled,
+    updatedAt: now,
+  });
+
+  let createdSkillIds: string[] = [];
+  const createdCustomTools: CreatedCustomTool[] = [];
+
+  try {
+    const skippedAssignments: ProfilePackSkippedItem[] = [];
+
+    if (manifest.meta.sharedAgent) {
+      await db.importSharedAgentReference({
+        ...manifest.meta.sharedAgent,
+        createdAt: now,
+        profileId,
+        teamOrgId: orgId,
+      });
+    }
+
+    const soulDir = getProfileSoulDir(orgId, profileId);
+    await initSoulDirectory(soulDir);
+    await writePackedWorkspaceFiles(
+      orgId,
+      profileId,
+      entries,
+      options.allowPythonSkillTools === true,
+      skippedAssignments
+    );
+
+    if (!manifest.meta.sharedAgent) {
+      createdSkillIds = await recreatePackedSkills(
+        db,
+        orgId,
+        profileId,
+        skippedAssignments
+      );
+      await restoreToolAssignments(
+        db,
+        profileId,
+        orgId,
+        manifest,
+        entries,
+        options.restoreCustomTools === true,
+        skippedAssignments,
+        createdCustomTools,
+        ownerUserId !== null
+      );
+      await eachNamedOrSkip(
+        manifest.meta.mcpServerNames,
+        (serverName) =>
+          findMcpServerForOrg(db, orgId, serverName, {
+            isPlatformAdmin: options.isPlatformAdmin,
+          }),
+        skippedAssignments,
+        (name) => ({
+          path: `MCP server:${name}`,
+          reason: `MCP server "${name}" is not available to this organization and was skipped.`,
+        }),
+        async (server) => {
+          await db.assignMcpServerToProfile(profileId, server.id);
+        }
+      );
+      await eachNamedOrSkip(
+        manifest.meta.bundledSkillNames,
+        (skillName) => db.getSkillByName(skillName, orgId),
+        skippedAssignments,
+        (name) => ({
+          path: `bundled skill:${name}`,
+          reason: `Bundled skill "${name}" was not found in the destination and was skipped.`,
+        }),
+        async (skill) => {
+          await db.assignSkillToProfile(profileId, skill.id);
+        }
+      );
+      await assignComposioToolkitsBySlug(
+        db,
+        orgId,
+        profileId,
+        manifest.meta.composioToolkitSlugs,
+        skippedAssignments
+      );
+    }
+
+    await recordProfileChangeEvent(db, {
+      actorUserId: options.actorUserId,
+      afterValue: JSON.stringify({ name, profileId }),
+      beforeValue: null,
+      createdAt: now,
+      field: "pack_import",
+      orgId,
+      profileId,
+      source: "pack_import",
+    });
+
+    return { manifest, profileId, skippedAssignments };
+  } catch (error) {
+    await rollbackFailedImport(
+      db,
+      orgId,
+      profileId,
+      createdSkillIds,
+      createdCustomTools
+    );
+    throw error;
+  }
+}
+
+async function inventoryProfileSoulDir(soulDir: string): Promise<{
+  files: ProfilePackFile[];
+  skipped: ProfilePackSkippedItem[];
+}> {
+  const files: ProfilePackFile[] = [];
+  const skipped: ProfilePackSkippedItem[] = [];
+
+  if (!(await pathExists(soulDir))) {
+    return { files, skipped };
+  }
+
+  const rootEntries = await readdir(soulDir, { withFileTypes: true });
+
+  for (const entry of rootEntries) {
+    const relativePath = entry.name;
+    const absolutePath = join(soulDir, entry.name);
+
+    if (AVATAR_BASENAME_PATTERN.test(entry.name)) {
+      // Handled separately via the avatar helpers, which know the real media type.
+      continue;
+    }
+
+    if (entry.isFile()) {
+      if (ROOT_ALLOWED_FILES.has(entry.name)) {
+        files.push({ absolutePath, relativePath });
+      } else {
+        skipped.push({ path: relativePath, reason: NOT_ALLOWLISTED_REASON });
+      }
+
+      continue;
+    }
+
+    if (!entry.isDirectory()) {
+      skipped.push({ path: relativePath, reason: NOT_ALLOWLISTED_REASON });
+      continue;
+    }
+
+    if (entry.name === "examples" || entry.name === "knowledge-base") {
+      await collectFilesRecursively(absolutePath, relativePath, files);
+      continue;
+    }
+
+    if (entry.name === "skills") {
+      await inventorySkillsDir(absolutePath, relativePath, files, skipped);
+      continue;
+    }
+
+    skipped.push({ path: relativePath, reason: NOT_ALLOWLISTED_REASON });
+  }
+
+  files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+
+  return { files, skipped };
+}
+
+async function inventorySkillsDir(
+  skillsDir: string,
+  relativeBase: string,
+  files: ProfilePackFile[],
+  skipped: ProfilePackSkippedItem[]
+): Promise<void> {
+  const entries = await readdir(skillsDir, { withFileTypes: true });
+
+  for (const entry of entries) {
+    const relativePath = `${relativeBase}/${entry.name}`;
+
+    if (entry.name === SKILL_ARCHIVE_DIR_NAME) {
+      skipped.push({
+        path: relativePath,
+        reason: "Archived skills are excluded from profile packs.",
+      });
+      continue;
+    }
+
+    if (!entry.isDirectory()) {
+      skipped.push({ path: relativePath, reason: NOT_ALLOWLISTED_REASON });
+      continue;
+    }
+
+    await collectFilesRecursively(
+      join(skillsDir, entry.name),
+      relativePath,
+      files,
+      skipped
+    );
+  }
+}
+
+async function collectFilesRecursively(
+  dir: string,
+  relativeBase: string,
+  out: ProfilePackFile[],
+  skipped?: ProfilePackSkippedItem[]
+): Promise<void> {
+  const entries = await readdir(dir, { withFileTypes: true });
+
+  for (const entry of entries) {
+    const absolutePath = join(dir, entry.name);
+    const relativePath = `${relativeBase}/${entry.name}`;
+
+    if (entry.isDirectory()) {
+      await collectFilesRecursively(absolutePath, relativePath, out, skipped);
+      continue;
+    }
+
+    if (!entry.isFile()) {
+      continue;
+    }
+
+    // A pack is a transport, not an approval channel: anything a receiver
+    // would have to refuse on import never leaves the exporting server either.
+    if (skipped && isInProcessSkillSource(relativePath)) {
+      skipped.push({
+        path: relativePath,
+        reason: IN_PROCESS_SKILL_SOURCE_REASON,
+      });
+      continue;
+    }
+
+    out.push({ absolutePath, relativePath });
+  }
+}
+
+async function buildProfilePackMeta(
+  db: DatabaseAdapter,
+  profileId: string,
+  profile: StoredProfileRecord
+): Promise<ProfilePackMeta> {
+  const tools = await db.listToolsForProfile(profileId);
+  const mcpServers = await db.listMcpServersForProfile(profileId);
+  const skills = await db.listSkillsForProfile(profileId);
+  const toolkitAssignments = await db.listProfileComposioToolkits(profileId);
+
+  const bundledSkillNames: string[] = [];
+  const profileSkillNames: string[] = [];
+
+  for (const skill of skills) {
+    if (skill.pluginId || (skill.orgId && skill.orgId !== profile.orgId)) {
+      continue;
+    }
+
+    if (isGlobalSkillSourcePath(skill.sourcePath)) {
+      bundledSkillNames.push(skill.name);
+    } else {
+      profileSkillNames.push(skill.name);
+    }
+  }
+
+  const composioToolkitSlugs: string[] = [];
+
+  for (const assignment of toolkitAssignments) {
+    const toolkit = await db.getComposioToolkit(assignment.toolkitId);
+
+    if (toolkit) {
+      composioToolkitSlugs.push(toolkit.toolkitSlug);
+    }
+  }
+
+  return {
+    bundledSkillNames: bundledSkillNames.sort(),
+    composioToolkitSlugs: composioToolkitSlugs.sort(),
+    mcpServerNames: mcpServers.map((server) => server.name).sort(),
+    model: profile.model,
+    name: profile.name,
+    profileSkillNames: profileSkillNames.sort(),
+    skillsCuratorConsolidateEnabled:
+      profile.skillsCuratorConsolidateEnabled ?? null,
+    skillsPostTurnReview: profile.skillsPostTurnReview ?? null,
+    skillsWriteApproval: profile.skillsWriteApproval ?? null,
+    systemPrompt: profile.systemPrompt,
+    thinkingEffort: profile.thinkingEffort ?? null,
+    thinkingEnabled: profile.thinkingEnabled ?? null,
+    toolNames: tools
+      .filter(
+        (tool) =>
+          !tool.pluginId && (!tool.orgId || tool.orgId === profile.orgId)
+      )
+      .map((tool) => tool.name)
+      .sort(),
+  };
+}
+
+async function collectPackedCustomTools(
+  db: DatabaseAdapter,
+  orgId: string,
+  profileId: string
+): Promise<{
+  entries: Record<string, Uint8Array>;
+  skipped: ProfilePackSkippedItem[];
+  tools: ProfilePackCustomTool[];
+}> {
+  const entries: Record<string, Uint8Array> = {};
+  const skipped: ProfilePackSkippedItem[] = [];
+  const packedTools: ProfilePackCustomTool[] = [];
+  const tools = await db.listToolsForProfile(profileId);
+
+  for (const tool of tools) {
+    if (tool.pluginId || !isCustomToolType(tool.handlerType)) {
+      continue;
+    }
+
+    if (tool.orgId && tool.orgId !== orgId) {
+      skipped.push(
+        customToolSkip(tool.name, "Tool belongs to another organization.")
+      );
+      continue;
+    }
+
+    const handler = getCustomToolHandler(tool.handlerType);
+
+    if (!handler) {
+      continue;
+    }
+
+    const storedModulePath = readHandlerModulePath(tool.handlerConfig);
+
+    if (!storedModulePath) {
+      skipped.push(customToolSkip(tool.name, "has no module path"));
+      continue;
+    }
+
+    let absolutePath: string;
+
+    try {
+      absolutePath = handler.resolveModulePath(storedModulePath, orgId);
+    } catch {
+      skipped.push(customToolSkip(tool.name, "has an invalid module path"));
+      continue;
+    }
+
+    const modulePath = portableCustomToolModulePath(absolutePath, orgId);
+
+    if (!(modulePath && modulePath.endsWith(handler.extension))) {
+      skipped.push(customToolSkip(tool.name, "has an invalid module path"));
+      continue;
+    }
+
+    const sourcePath = `${CUSTOM_TOOLS_ARCHIVE_DIR}/${modulePath}`;
+
+    if (entries[sourcePath]) {
+      skipped.push(
+        customToolSkip(tool.name, `shares the module path "${modulePath}"`)
+      );
+      continue;
+    }
+
+    let source: Buffer;
+
+    try {
+      source = await readFile(absolutePath);
+    } catch {
+      skipped.push(customToolSkip(tool.name, "has no readable source file"));
+      continue;
+    }
+
+    const handlerConfig = isPlainRecord(tool.handlerConfig)
+      ? { ...tool.handlerConfig, modulePath }
+      : { modulePath };
+
+    entries[sourcePath] = source;
+    packedTools.push({
+      description: tool.description,
+      handlerConfig,
+      handlerType: tool.handlerType,
+      name: tool.name,
+    });
+  }
+
+  return {
+    entries,
+    skipped,
+    tools: packedTools.sort((left, right) =>
+      left.name.localeCompare(right.name)
+    ),
+  };
+}
+
+async function previewToolAssignments(
+  db: DatabaseAdapter,
+  orgId: string,
+  manifest: ProfilePackManifest,
+  entries: ProfilePackZipEntry[],
+  restoreCustomTools: boolean,
+  skipped: ProfilePackSkippedItem[]
+): Promise<void> {
+  for (const name of manifest.meta.toolNames) {
+    await resolveToolAssignment(
+      db,
+      orgId,
+      manifest,
+      entries,
+      name,
+      restoreCustomTools,
+      skipped
+    );
+  }
+}
+
+async function restoreToolAssignments(
+  db: DatabaseAdapter,
+  profileId: string,
+  orgId: string,
+  manifest: ProfilePackManifest,
+  entries: ProfilePackZipEntry[],
+  restoreCustomTools: boolean,
+  skipped: ProfilePackSkippedItem[],
+  createdTools: CreatedCustomTool[],
+  blockHostTools: boolean
+): Promise<void> {
+  for (const name of manifest.meta.toolNames) {
+    const resolution = await resolveToolAssignment(
+      db,
+      orgId,
+      manifest,
+      entries,
+      name,
+      restoreCustomTools,
+      skipped
+    );
+
+    if (!resolution) {
+      continue;
+    }
+
+    if (resolution.kind === "existing") {
+      if (blockHostTools && resolution.tool.handlerType === "bash") {
+        skipped.push({
+          path: `tool:${name}`,
+          reason: `Tool "${name}" runs commands on the server and was skipped.`,
+        });
+        continue;
+      }
+
+      await db.assignToolToProfile(profileId, resolution.tool.id);
+      continue;
+    }
+
+    const { packed, source } = resolution;
+    const now = new Date().toISOString();
+
+    const record: StoredToolRecord = {
+      createdAt: now,
+      description: packed.definition.description,
+      handlerConfig: packed.handlerConfig,
+      handlerType: packed.definition.handlerType,
+      id: createId("tool"),
+      name,
+      orgId,
+      updatedAt: now,
+    };
+
+    await writePrivateBytesFile(packed.absolutePath, source);
+
+    const handler = getCustomToolHandler(packed.definition.handlerType);
+    const modulePath = readHandlerModulePath(packed.handlerConfig);
+
+    if (!(handler && modulePath)) {
+      await rm(packed.absolutePath, { force: true });
+      skipped.push(customToolSkip(name, "has invalid handler metadata"));
+      continue;
+    }
+
+    try {
+      await handler.validateModule(modulePath, orgId);
+    } catch (error) {
+      await rm(packed.absolutePath, { force: true });
+      skipped.push(
+        customToolSkip(
+          name,
+          `failed validation: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        )
+      );
+      continue;
+    }
+
+    try {
+      await db.upsertTool(record);
+      await db.assignToolToProfile(profileId, record.id);
+      createdTools.push({ absolutePath: packed.absolutePath, id: record.id });
+    } catch (error) {
+      await db.deleteTool(record.id);
+      await rm(packed.absolutePath, { force: true });
+      throw error;
+    }
+  }
+}
+
+async function resolveToolAssignment(
+  db: DatabaseAdapter,
+  orgId: string,
+  manifest: ProfilePackManifest,
+  entries: ProfilePackZipEntry[],
+  name: string,
+  restoreCustomTools: boolean,
+  skipped: ProfilePackSkippedItem[]
+): Promise<ToolAssignmentResolution | null> {
+  // Never resolve tools another organization owns: an unscoped name lookup
+  // would let a pack attach a foreign tenant's tool to this profile.
+  const existing = await db.getToolByNameForOrg(orgId, name);
+  const packed = findPackedCustomTool(manifest, name, orgId);
+
+  if (!packed) {
+    if (hasPackedCustomToolNamed(manifest, name)) {
+      skipped.push(customToolSkip(name, "has invalid metadata"));
+
+      return null;
+    }
+
+    if (existing) {
+      return { kind: "existing", tool: existing };
+    }
+
+    skipped.push(missingToolSkip(name));
+
+    return null;
+  }
+
+  const sourceEntry = entries.find((entry) => entry.name === packed.sourcePath);
+
+  if (!sourceEntry) {
+    skipped.push(customToolSkip(name, "is missing its packed source file"));
+
+    return null;
+  }
+
+  if (existing) {
+    if (await existingToolMatchesPack(existing, packed, sourceEntry.data)) {
+      return { kind: "existing", tool: existing };
+    }
+
+    skipped.push(
+      customToolSkip(name, "conflicts with an existing tool or module")
+    );
+
+    return null;
+  }
+
+  if (!restoreCustomTools) {
+    skipped.push(
+      customToolSkip(name, "requires a platform admin to restore its source")
+    );
+
+    return null;
+  }
+
+  if (await pathExists(packed.absolutePath)) {
+    skipped.push(customToolSkip(name, "cannot replace an existing module"));
+
+    return null;
+  }
+
+  return { kind: "create", packed, source: sourceEntry.data };
+}
+
+async function existingToolMatchesPack(
+  existing: StoredToolRecord,
+  packed: ValidPackedCustomTool,
+  packedSource: Buffer
+): Promise<boolean> {
+  if (
+    existing.handlerType !== packed.definition.handlerType ||
+    !isPlainRecord(existing.handlerConfig)
+  ) {
+    return false;
+  }
+
+  const handler = getCustomToolHandler(existing.handlerType);
+  const modulePath = readHandlerModulePath(existing.handlerConfig);
+
+  if (!(handler && modulePath)) {
+    return false;
+  }
+
+  let absolutePath: string;
+
+  try {
+    absolutePath = handler.resolveModulePath(modulePath, existing.orgId);
+  } catch {
+    return false;
+  }
+
+  const normalizedConfig = {
+    ...existing.handlerConfig,
+    modulePath: portableCustomToolModulePath(absolutePath, existing.orgId),
+  };
+
+  if (
+    absolutePath !== packed.absolutePath ||
+    !isDeepStrictEqual(normalizedConfig, packed.handlerConfig)
+  ) {
+    return false;
+  }
+
+  try {
+    return (await readFile(absolutePath)).equals(packedSource);
+  } catch {
+    return false;
+  }
+}
+
+function hasPackedCustomToolNamed(
+  manifest: ProfilePackManifest,
+  name: string
+): boolean {
+  const definitions: unknown = manifest.meta.customTools;
+
+  return (
+    Array.isArray(definitions) &&
+    definitions.some((entry) => isPlainRecord(entry) && entry.name === name)
+  );
+}
+
+function findPackedCustomTool(
+  manifest: ProfilePackManifest,
+  name: string,
+  orgId: string
+): ValidPackedCustomTool | null {
+  const definitions: unknown = manifest.meta.customTools;
+
+  if (!Array.isArray(definitions)) {
+    return null;
+  }
+
+  const value = definitions.find(
+    (entry) => isPlainRecord(entry) && entry.name === name
+  );
+
+  if (
+    !(
+      isPlainRecord(value) &&
+      isString(value.description) &&
+      isString(value.handlerType) &&
+      isCustomToolType(value.handlerType) &&
+      isPlainRecord(value.handlerConfig)
+    )
+  ) {
+    return null;
+  }
+
+  const modulePath = readHandlerModulePath(value.handlerConfig);
+  const handler = getCustomToolHandler(value.handlerType);
+
+  if (!(modulePath && handler && modulePath.endsWith(handler.extension))) {
+    return null;
+  }
+
+  let absolutePath: string;
+
+  try {
+    absolutePath = handler.resolveModulePath(modulePath, orgId);
+  } catch {
+    return null;
+  }
+
+  const portableModulePath = portableCustomToolModulePath(absolutePath, orgId);
+  const sourcePath = `${CUSTOM_TOOLS_ARCHIVE_DIR}/${portableModulePath}`;
+
+  if (!portableModulePath) {
+    return null;
+  }
+
+  return {
+    absolutePath,
+    definition: {
+      description: value.description,
+      handlerConfig: value.handlerConfig,
+      handlerType: value.handlerType,
+      name,
+    },
+    handlerConfig: { ...value.handlerConfig, modulePath: portableModulePath },
+    sourcePath,
+  };
+}
+
+function portableCustomToolModulePath(
+  absolutePath: string,
+  orgId?: string | null
+): string | null {
+  const modulePath = toZipPath(
+    relative(getCustomToolsDir(orgId ?? undefined), absolutePath)
+  );
+
+  if (
+    !modulePath ||
+    modulePath === ".." ||
+    modulePath.startsWith("../") ||
+    isAbsolute(modulePath)
+  ) {
+    return null;
+  }
+
+  return modulePath;
+}
+
+function customToolSkip(name: string, detail: string): ProfilePackSkippedItem {
+  return {
+    path: `custom tool:${name}`,
+    reason: `Custom tool "${name}" ${detail}.`,
+  };
+}
+
+function missingToolSkip(name: string): ProfilePackSkippedItem {
+  return {
+    path: `tool:${name}`,
+    reason: `Tool "${name}" was not found in the destination and will be skipped.`,
+  };
+}
+
+function isPlainRecord<T>(
+  value: T
+): value is T & Record<string, ProfilePackJsonValue> {
+  if (!(value instanceof Object) || Array.isArray(value)) {
+    return false;
+  }
+
+  return Object.values(value).every(isProfilePackJsonValue);
+}
+
+function isProfilePackManifest<T>(value: T): value is T & ProfilePackManifest {
+  const manifest = readStringKeyedRecord(value);
+  const meta = readStringKeyedRecord(manifest?.get("meta"));
+  const skipped = manifest?.get("skipped");
+  const customTools = meta?.get("customTools");
+  const sharedAgent = meta?.get("sharedAgent");
+  const sharedReference = readStringKeyedRecord(sharedAgent);
+
+  return Boolean(
+    manifest &&
+      meta &&
+      (sharedAgent === undefined ||
+        (sharedReference &&
+          ["publicationId", "sourceOrgId", "sourceProfileId"].every((key) => {
+            const id = sharedReference.get(key);
+
+            return isString(id) && id.trim().length > 0 && id.length <= 256;
+          }))) &&
+      manifest.get("apiVersion") === MINGZHAN_API_VERSION &&
+      isString(manifest.get("createdAt")) &&
+      manifest.get("kind") === PROFILE_PACK_KIND &&
+      isString(manifest.get("sourceProfileId")) &&
+      isStringArray(manifest.get("topLevelPaths")) &&
+      isNumber(manifest.get("version")) &&
+      Array.isArray(skipped) &&
+      skipped.every(isProfilePackSkippedItem) &&
+      isStringArray(meta.get("bundledSkillNames")) &&
+      isStringArray(meta.get("composioToolkitSlugs")) &&
+      isStringArray(meta.get("mcpServerNames")) &&
+      isNullableString(meta.get("model")) &&
+      isString(meta.get("name")) &&
+      isStringArray(meta.get("profileSkillNames")) &&
+      isNullableBoolean(meta.get("skillsCuratorConsolidateEnabled")) &&
+      isNullableBoolean(meta.get("skillsPostTurnReview")) &&
+      isNullableBoolean(meta.get("skillsWriteApproval")) &&
+      isString(meta.get("systemPrompt")) &&
+      isNullableString(meta.get("thinkingEffort")) &&
+      isNullableBoolean(meta.get("thinkingEnabled")) &&
+      isStringArray(meta.get("toolNames")) &&
+      (customTools === undefined ||
+        (Array.isArray(customTools) &&
+          customTools.every(isProfilePackCustomTool)))
+  );
+}
+
+function isProfilePackSkippedItem<T>(value: T): boolean {
+  const item = readStringKeyedRecord(value);
+
+  return Boolean(
+    item && isString(item.get("path")) && isString(item.get("reason"))
+  );
+}
+
+function isProfilePackCustomTool<T>(value: T): boolean {
+  const tool = readStringKeyedRecord(value);
+  const handlerType = tool?.get("handlerType");
+
+  return Boolean(
+    tool &&
+      isString(tool.get("description")) &&
+      isProfilePackJsonValue(tool.get("handlerConfig")) &&
+      isString(handlerType) &&
+      isCustomToolType(handlerType) &&
+      isString(tool.get("name"))
+  );
+}
+
+function readStringKeyedRecord<T>(
+  value: T
+): Map<string, ProfilePackJsonValue> | undefined {
+  if (!isPlainRecord(value)) {
+    return;
+  }
+
+  return new Map(Object.entries(value));
+}
+
+function isNullableString<T>(value: T): boolean {
+  return value === null || isString(value);
+}
+
+function isNullableBoolean<T>(value: T): boolean {
+  return (
+    value === null ||
+    Object.prototype.toString.call(value) === "[object Boolean]"
+  );
+}
+
+function isNumber<T>(value: T): boolean {
+  return (
+    Object.prototype.toString.call(value) === "[object Number]" &&
+    Number.isFinite(value)
+  );
+}
+
+function isStringArray<T>(value: T): boolean {
+  return Array.isArray(value) && value.every(isString);
+}
+
+function isProfilePackJsonValue<T>(
+  value: T
+): value is T & ProfilePackJsonValue {
+  const tag = Object.prototype.toString.call(value);
+
+  if (
+    value === null ||
+    tag === "[object String]" ||
+    tag === "[object Number]" ||
+    tag === "[object Boolean]"
+  ) {
+    return true;
+  }
+
+  if (Array.isArray(value)) {
+    return value.every(isProfilePackJsonValue);
+  }
+
+  return value instanceof Object && isPlainRecord(value);
+}
+
+async function writePackedWorkspaceFiles(
+  orgId: string,
+  profileId: string,
+  entries: ProfilePackZipEntry[],
+  allowPythonSkillTools: boolean,
+  skipped: ProfilePackSkippedItem[]
+): Promise<void> {
+  const soulDir = getProfileSoulDir(orgId, profileId);
+
+  for (const entry of entries) {
+    if (entry.name === PROFILE_PACK_MANIFEST_FILENAME) {
+      continue;
+    }
+
+    if (entry.name.startsWith(`${CUSTOM_TOOLS_ARCHIVE_DIR}/`)) {
+      continue;
+    }
+
+    if (isAvatarEntry(entry.name)) {
+      await writePackedAvatar(orgId, profileId, entry);
+      continue;
+    }
+
+    if (!isAllowlistedProfilePackPath(entry.name)) {
+      skipped.push({ path: entry.name, reason: NOT_ALLOWLISTED_REASON });
+      continue;
+    }
+
+    if (!allowPythonSkillTools && isPackedPythonSkillScript(entry.name)) {
+      skipped.push({ path: entry.name, reason: PYTHON_SKILL_SCRIPT_REASON });
+      continue;
+    }
+
+    const targetPath = join(soulDir, entry.name);
+    await writePrivateBytesFile(targetPath, entry.data);
+  }
+}
+
+/** Every `.py` a skill could run: the skill root tool and declared scripts. */
+function isPackedPythonSkillScript(relativePath: string): boolean {
+  const [first, second] = relativePath.split("/");
+
+  if (first !== "skills" || !second) {
+    return false;
+  }
+
+  return relativePath.toLowerCase().endsWith(".py");
+}
+
+function previewBlockedPythonSkillScripts(
+  entries: ProfilePackZipEntry[],
+  allowPythonSkillTools: boolean,
+  skipped: ProfilePackSkippedItem[]
+): void {
+  if (allowPythonSkillTools) {
+    return;
+  }
+
+  for (const entry of entries) {
+    if (isPackedPythonSkillScript(entry.name)) {
+      skipped.push({ path: entry.name, reason: PYTHON_SKILL_SCRIPT_REASON });
+    }
+  }
+}
+
+async function writePackedAvatar(
+  orgId: string,
+  profileId: string,
+  entry: ProfilePackZipEntry
+): Promise<void> {
+  const extension = entry.name
+    .slice(entry.name.lastIndexOf(".") + 1)
+    .toLowerCase();
+
+  const mediaType = AVATAR_EXTENSION_MEDIA_TYPES.get(extension);
+
+  if (!mediaType) {
+    return;
+  }
+
+  await saveProfileAvatar(orgId, profileId, {
+    data: entry.data.toString("base64"),
+    mediaType,
+  });
+}
+
+async function recreatePackedSkills(
+  db: DatabaseAdapter,
+  orgId: string,
+  profileId: string,
+  skipped: ProfilePackSkippedItem[]
+): Promise<string[]> {
+  const skillsDir = getProfileSkillsDir(orgId, profileId);
+  const createdSkillIds: string[] = [];
+
+  if (!(await pathExists(skillsDir))) {
+    return createdSkillIds;
+  }
+
+  const folders = (await readdir(skillsDir, { withFileTypes: true })).filter(
+    (entry) => entry.isDirectory() && entry.name !== SKILL_ARCHIVE_DIR_NAME
+  );
+
+  for (const folder of folders) {
+    const sourcePath = join(skillsDir, folder.name);
+    const discovered = await discoverSkillDirectory(sourcePath);
+
+    if (!discovered) {
+      skipped.push({
+        path: `skills/${folder.name}`,
+        reason: "Skill directory is missing a valid SKILL.md and was skipped.",
+      });
+      continue;
+    }
+
+    const existing = await db.getSkillByName(discovered.name, orgId);
+
+    if (existing && existing.sourcePath !== sourcePath) {
+      skipped.push({
+        path: `skills/${folder.name}`,
+        reason: `Skill "${discovered.name}" already exists at a different location and was skipped.`,
+      });
+      continue;
+    }
+
+    if (existing) {
+      await db.assignSkillToProfile(profileId, existing.id);
+      continue;
+    }
+
+    const now = new Date().toISOString();
+
+    const record: StoredSkillRecord = {
+      createdAt: now,
+      createdBy: "human",
+      description: discovered.description,
+      disableModelInvocation: discovered.disableModelInvocation,
+      enabled: true,
+      hasTool: discovered.hasTool,
+      id: `skill_${crypto.randomUUID()}`,
+      name: discovered.name,
+      orgId,
+      sourcePath,
+      updatedAt: now,
+    };
+
+    await db.upsertSkill(record);
+    await db.assignSkillToProfile(profileId, record.id);
+    createdSkillIds.push(record.id);
+  }
+
+  return createdSkillIds;
+}
+
+async function eachNamedOrSkip<T extends { id: string }>(
+  names: string[],
+  lookup: (name: string) => Promise<T | null>,
+  skipped: ProfilePackSkippedItem[],
+  notFound: (name: string) => ProfilePackSkippedItem,
+  onHit?: (record: T) => Promise<void>
+): Promise<void> {
+  for (const name of names) {
+    const record = await lookup(name);
+
+    if (!record) {
+      skipped.push(notFound(name));
+      continue;
+    }
+
+    if (onHit) {
+      await onHit(record);
+    }
+  }
+}
+
+async function assignComposioToolkitsBySlug(
+  db: DatabaseAdapter,
+  orgId: string,
+  profileId: string,
+  toolkitSlugs: string[],
+  skipped: ProfilePackSkippedItem[]
+): Promise<void> {
+  const assignments: StoredProfileComposioToolkitRecord[] = [];
+
+  for (const slug of toolkitSlugs) {
+    const toolkit = await db.getComposioToolkitBySlug(orgId, slug);
+
+    if (toolkit) {
+      assignments.push({
+        allowedActions: null,
+        profileId,
+        toolkitId: toolkit.id,
+      });
+    } else {
+      skipped.push({
+        path: `composio:${slug}`,
+        reason: `Composio toolkit "${slug}" was not found in the destination org and was skipped.`,
+      });
+    }
+  }
+
+  if (assignments.length > 0) {
+    await db.replaceProfileComposioToolkits(profileId, assignments);
+  }
+}
+
+function readSkillNamesFromZip(
+  entries: ProfilePackZipEntry[]
+): { folder: string; name: string }[] {
+  const results: { folder: string; name: string }[] = [];
+
+  for (const entry of entries) {
+    const match = /^skills\/([^/]+)\/SKILL\.md$/.exec(entry.name);
+
+    if (!match || match[1] === SKILL_ARCHIVE_DIR_NAME) {
+      continue;
+    }
+
+    try {
+      const parsed = parseSkillMarkdown(
+        entry.data.toString("utf8"),
+        entry.name
+      );
+
+      results.push({
+        // SAFETY: The preceding regular expression requires this folder capture.
+        folder: match[1]!,
+        name: parsed.frontmatter.name,
+      });
+    } catch {
+      // Invalid SKILL.md content is reported again (as a skip) when the
+      // files are actually written to disk during import.
+    }
+  }
+
+  return results;
+}
+
+async function rollbackFailedImport(
+  db: DatabaseAdapter,
+  orgId: string,
+  profileId: string,
+  createdSkillIds: string[],
+  createdCustomTools: CreatedCustomTool[]
+): Promise<void> {
+  for (const tool of createdCustomTools) {
+    try {
+      await db.deleteTool(tool.id);
+      await rm(tool.absolutePath, { force: true });
+    } catch {
+      // Best-effort cleanup only; the original error is what matters.
+    }
+  }
+
+  for (const skillId of createdSkillIds) {
+    try {
+      await db.deleteSkill(skillId);
+    } catch {
+      // Best-effort cleanup only; the original error is what matters.
+    }
+  }
+
+  try {
+    await db.deleteProfileForOrg(profileId, orgId);
+  } catch {
+    // Best-effort cleanup only; the original error is what matters.
+  }
+
+  try {
+    await rm(getProfileSoulDir(orgId, profileId), {
+      force: true,
+      recursive: true,
+    });
+  } catch {
+    // Best-effort cleanup only.
+  }
+}
+
+async function createImportedProfile(
+  db: DatabaseAdapter,
+  name: string,
+  profile: Omit<StoredProfileRecord, "id">
+): Promise<string> {
+  const base = slugifyProfileName(name);
+
+  for (let suffix = 1; suffix <= PROFILE_ID_ATTEMPTS; suffix++) {
+    const id = suffix === 1 ? base : `${base}-${suffix}`;
+    const created = await db.createProfileIfAbsent({ ...profile, id });
+
+    if (created) {
+      return id;
+    }
+  }
+
+  throw new MíngZhànApiError(
+    `Could not find a free profile id for "${name}".`,
+    409
+  );
+}
+
+function isAvatarEntry(relativePath: string): boolean {
+  return (
+    !relativePath.includes("/") && AVATAR_BASENAME_PATTERN.test(relativePath)
+  );
+}
+
+/**
+ * True for pack paths the server would `import()` while building a session's
+ * tools. Only paths under `skills/` qualify: the same extensions elsewhere in
+ * a profile are inert documentation, and the agent write tools already refuse
+ * skill-local executables.
+ */
+function isInProcessSkillSource(relativePath: string): boolean {
+  const [first, ...rest] = relativePath.split("/");
+
+  if (first !== "skills" || rest.length === 0) {
+    return false;
+  }
+
+  return IN_PROCESS_SKILL_SOURCE_EXTENSIONS.has(
+    extname(relativePath).toLowerCase()
+  );
+}
+
+function isAllowlistedProfilePackPath(relativePath: string): boolean {
+  if (ROOT_ALLOWED_FILES.has(relativePath)) {
+    return true;
+  }
+
+  const [first, second] = relativePath.split("/");
+
+  if (!(first && ALLOWED_ROOT_SUBDIRS.has(first))) {
+    return false;
+  }
+
+  if (first === "skills") {
+    return Boolean(second) && second !== SKILL_ARCHIVE_DIR_NAME;
+  }
+
+  return Boolean(second);
+}
+
+function readProfilePackZip(
+  archive: Buffer | Uint8Array | ArrayBuffer
+): ProfilePackZipEntry[] {
+  let entryCount = 0;
+  let uncompressedTotal = 0;
+
+  // fflate invokes the filter after reading ZIP metadata and before allocating
+  // or inflating the entry, so these checks reject bombs from their declarations.
+  const admitEntry = (name: string, size: number): boolean => {
+    entryCount += 1;
+
+    if (entryCount > MAX_PROFILE_PACK_ENTRY_COUNT) {
+      throw new MíngZhànApiError(
+        `Profile pack exceeds the ${MAX_PROFILE_PACK_ENTRY_COUNT} entry limit.`,
+        413
+      );
+    }
+
+    if (size > MAX_IMPORT_ENTRY_BYTES) {
+      throw new MíngZhànApiError(
+        `Profile pack entry ${name} exceeds the ${MAX_IMPORT_ENTRY_BYTES / (1024 * 1024)} MB limit.`,
+        413
+      );
+    }
+
+    uncompressedTotal += size;
+
+    if (uncompressedTotal > MAX_IMPORT_UNCOMPRESSED_BYTES) {
+      throw new MíngZhànApiError(
+        `Profile pack exceeds the ${MAX_IMPORT_UNCOMPRESSED_BYTES / (1024 * 1024)} MB uncompressed limit.`,
+        413
+      );
+    }
+
+    return true;
+  };
+
+  try {
+    return Object.entries(
+      unzipSync(toBuffer(archive), {
+        filter: (file) => admitEntry(file.name, file.originalSize),
+      })
+    )
+      .filter(([name]) => !name.endsWith("/"))
+      .map(([name, data]) => {
+        const entryPath = validateProfilePackEntryPath(name);
+
+        if (isInProcessSkillSource(entryPath)) {
+          throw new MíngZhànApiError(
+            `Profile pack entry ${entryPath} is not importable. ${IN_PROCESS_SKILL_SOURCE_REASON}`,
+            400
+          );
+        }
+
+        return { data: Buffer.from(data), name: entryPath };
+      });
+  } catch (error) {
+    if (error instanceof MíngZhànApiError) {
+      throw error;
+    }
+
+    if (error instanceof Error) {
+      if (error.message === "invalid zip data") {
+        throw new MíngZhànApiError("Invalid ZIP archive.", 400);
+      }
+
+      throw error;
+    }
+
+    throw new MíngZhànApiError("Invalid ZIP archive.", 400);
+  }
+}
+
+function readProfilePackManifest(
+  entries: ProfilePackZipEntry[]
+): ProfilePackManifest {
+  const manifestEntry = entries.find(
+    (entry) => entry.name === PROFILE_PACK_MANIFEST_FILENAME
+  );
+
+  if (!manifestEntry) {
+    throw new Error("Archive is missing the MíngZhàn profile pack manifest.");
+  }
+
+  let manifest: ProfilePackManifest;
+
+  try {
+    const parsed: unknown = JSON.parse(manifestEntry.data.toString("utf8"));
+
+    if (!isProfilePackManifest(parsed)) {
+      throw new Error("Invalid profile pack manifest shape.");
+    }
+
+    manifest = parsed;
+  } catch {
+    throw new Error("MíngZhàn profile pack manifest is not valid JSON.");
+  }
+
+  if (manifest.kind !== PROFILE_PACK_KIND) {
+    throw new Error("Archive is not a MíngZhàn profile pack.");
+  }
+
+  if (manifest.version !== PROFILE_PACK_FORMAT_VERSION) {
+    throw new Error(
+      `Unsupported MíngZhàn profile pack version: ${manifest.version}`
+    );
+  }
+
+  return manifest;
+}
+
+/**
+ * Returns the canonical POSIX form of the entry path, so the guard below and
+ * the write that follows it see the same string: `./skills/x/tool.js` and
+ * `skills/x/tool.js` must not slip past as two different entries.
+ */
+function validateProfilePackEntryPath(entryPath: string): string {
+  if (!entryPath || entryPath.includes("\0")) {
+    throw new Error("Archive entry path is empty or invalid.");
+  }
+
+  if (entryPath !== toZipPath(entryPath)) {
+    throw new Error(`Archive entry must use POSIX separators: ${entryPath}`);
+  }
+
+  if (isAbsolute(entryPath) || /^[a-zA-Z]:/.test(entryPath)) {
+    throw new Error(`Archive entry must be relative: ${entryPath}`);
+  }
+
+  const normalized = normalize(entryPath).split(sep).join("/");
+
+  if (
+    normalized === ".." ||
+    normalized.startsWith("../") ||
+    normalized.includes("/../")
+  ) {
+    throw new Error(`Archive entry escapes profile pack root: ${entryPath}`);
+  }
+
+  return normalized;
+}
+
+function toZipPath(path: string): string {
+  return path.split(sep).join("/");
+}
+
+function toBuffer(value: Buffer | Uint8Array | ArrayBuffer): Buffer {
+  if (Buffer.isBuffer(value)) {
+    return value;
+  }
+
+  if (value instanceof ArrayBuffer) {
+    return Buffer.from(value);
+  }
+
+  return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+}
+
+function isString<T>(value: T): value is T & string {
+  return Object.prototype.toString.call(value) === "[object String]";
+}

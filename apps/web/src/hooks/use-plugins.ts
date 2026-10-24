@@ -1,0 +1,742 @@
+import { MíngZhànApiError } from "@mingzhan/core/api-error";
+import type {
+  DeleteRetainedPluginDataRequest,
+  InstallLocalPluginRequest,
+  InstallPluginPackageRequest,
+  OrgPluginDetail,
+  PluginPackagePreviewResponse,
+  PluginPackageRequest,
+  PluginUsageOrg,
+  ProfileDetail,
+  SkillSummary,
+  ToolSummary,
+  UpdateOrgPluginRequest,
+} from "@mingzhan/core/contract";
+import {
+  queryOptions,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { useAuth } from "@/context/use-auth";
+import { client } from "@/lib/client";
+import { canAccessIntegrationsPage } from "@/lib/navigation";
+import { invalidateQueries } from "@/lib/query-client";
+import { queryKeys } from "@/lib/query-keys";
+
+export type PluginPageViewKind =
+  | "loading"
+  | "unauthorized"
+  | "disabled"
+  | "unavailable"
+  | "failed"
+  | "page";
+
+export function isPluginOwned(resource: { pluginId?: string | null }): boolean {
+  return Boolean(resource.pluginId);
+}
+
+function toolGroupKey(tool: ToolSummary): string {
+  if (tool.pluginId) {
+    return `plugin:${tool.pluginId}`;
+  }
+
+  return tool.handlerType === "browser" ? "browser" : `tool:${tool.id}`;
+}
+
+/**
+ * Group plugin actions and the cloud browser tools for one-click profile
+ * assignment, retaining their IDs. `label` names the group; `unit` counts its
+ * members ("actions", "tools") and is null for a single tool.
+ */
+export function groupAssignableTools(tools: ToolSummary[]) {
+  const groups = new Map<
+    string,
+    {
+      label: string;
+      tool: ToolSummary;
+      tools: ToolSummary[];
+      unit: string | null;
+    }
+  >();
+
+  for (const tool of tools) {
+    const key = toolGroupKey(tool);
+    const group = groups.get(key);
+
+    if (group) {
+      group.tools.push(tool);
+    } else if (key === "browser") {
+      groups.set(key, {
+        label: "Cloud browser",
+        tool,
+        tools: [tool],
+        unit: "tools",
+      });
+    } else {
+      groups.set(key, {
+        label: tool.pluginId ?? tool.name,
+        tool,
+        tools: [tool],
+        unit: tool.pluginId ? "actions" : null,
+      });
+    }
+  }
+
+  return [...groups.values()];
+}
+
+export function pluginAgentAccessState(
+  profile: ProfileDetail,
+  pluginId: string,
+  resources: { tools: ToolSummary[]; skills: SkillSummary[] }
+) {
+  const tools = resources.tools.filter((tool) => tool.pluginId === pluginId);
+
+  const skills = resources.skills.filter(
+    (skill) => skill.pluginId === pluginId
+  );
+
+  const assigned =
+    tools.filter((tool) => profile.tools.some((item) => item.id === tool.id))
+      .length +
+    skills.filter((skill) =>
+      profile.skills.some((item) => item.id === skill.id)
+    ).length;
+
+  const total = tools.length + skills.length;
+
+  return { assigned, full: total > 0 && assigned === total, total };
+}
+
+export function usePluginAgentAccess() {
+  const { activeOrg, user } = useAuth();
+  const orgId = activeOrg?.id ?? "";
+
+  return useQuery({
+    enabled: Boolean(orgId) && user?.isPlatformAdmin === true,
+    queryFn: async () => {
+      const [list, tools, skills] = await Promise.all([
+        client.listProfiles(orgId),
+        client.listTools(orgId),
+        client.listSkills(orgId),
+      ]);
+
+      const profiles = await Promise.all(
+        list.profiles.map(
+          async (profile) =>
+            (await client.getProfile(profile.id, orgId)).profile
+        )
+      );
+
+      const resources = { skills: skills.skills, tools: tools.tools };
+
+      const pluginIds = [
+        ...new Set(
+          [...resources.tools, ...resources.skills].flatMap((item) =>
+            item.pluginId ? [item.pluginId] : []
+          )
+        ),
+      ];
+
+      const counts = Object.fromEntries(
+        pluginIds.map((id) => [
+          id,
+          profiles.filter(
+            (profile) =>
+              pluginAgentAccessState(profile, id, resources).assigned > 0
+          ).length,
+        ])
+      );
+
+      return { profiles, ...resources, counts };
+    },
+    queryKey: [...queryKeys.profiles.all, "plugin-access", orgId],
+  });
+}
+
+async function savePluginAgentAccess(
+  orgId: string,
+  pluginId: string,
+  changes: Record<string, boolean>
+) {
+  const [plugin, tools, skills] = await Promise.all([
+    client.getOrgPlugin(pluginId, orgId),
+    client.listTools(orgId),
+    client.listSkills(orgId),
+  ]);
+
+  if (plugin.lifecycleState !== "enabled") {
+    throw new Error("Enable this plugin before changing agent access.");
+  }
+
+  const pluginTools = tools.tools.filter((item) => item.pluginId === pluginId);
+
+  const pluginSkills = skills.skills.filter(
+    (item) => item.pluginId === pluginId
+  );
+
+  const results = await Promise.allSettled(
+    Object.entries(changes).map(async ([profileId, selected]) => {
+      const { profile } = await client.getProfile(profileId, orgId);
+
+      const operations = [
+        ...pluginTools.flatMap((tool) => {
+          if (selected === profile.tools.some((item) => item.id === tool.id)) {
+            return [];
+          }
+
+          return [
+            selected
+              ? client.assignTool(profileId, { toolId: tool.id }, orgId)
+              : client.unassignTool(profileId, tool.id, orgId),
+          ];
+        }),
+        ...pluginSkills.flatMap((skill) => {
+          if (
+            selected === profile.skills.some((item) => item.id === skill.id)
+          ) {
+            return [];
+          }
+
+          return [
+            selected
+              ? client.assignSkill(profileId, { skillId: skill.id }, orgId)
+              : client.unassignSkill(profileId, skill.id, orgId),
+          ];
+        }),
+      ];
+
+      const outcomes = await Promise.allSettled(operations);
+      const failure = outcomes.find((outcome) => outcome.status === "rejected");
+
+      if (failure?.status === "rejected") {
+        throw failure.reason;
+      }
+    })
+  );
+
+  const failure = results.find((result) => result.status === "rejected");
+
+  if (failure?.status === "rejected") {
+    throw failure.reason;
+  }
+}
+
+export function useSavePluginAgentAccess() {
+  const { activeOrg } = useAuth();
+  const orgId = activeOrg?.id ?? "";
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      pluginId,
+      changes,
+    }: {
+      pluginId: string;
+      changes: Record<string, boolean>;
+    }) => savePluginAgentAccess(orgId, pluginId, changes),
+    onSettled: () => invalidateQueries(queryClient, queryKeys.profiles.all),
+  });
+}
+
+function orgPluginsQueryOptions(orgId: string) {
+  return queryOptions({
+    queryFn: () => client.listOrgPlugins(orgId),
+    queryKey: queryKeys.plugins.all(orgId),
+  });
+}
+
+function orgPluginQueryOptions(orgId: string, pluginId: string) {
+  return queryOptions({
+    queryFn: () => client.getOrgPlugin(pluginId, orgId),
+    queryKey: queryKeys.plugins.detail(orgId, pluginId),
+  });
+}
+
+function pluginReleasesQueryOptions() {
+  return queryOptions({
+    queryFn: () => client.listPluginReleases(),
+    queryKey: queryKeys.plugins.releases,
+  });
+}
+
+export function useOrgPlugins() {
+  const { activeOrg } = useAuth();
+  const orgId = activeOrg?.id ?? "";
+  const allowed = canAccessIntegrationsPage(activeOrg?.role);
+
+  return useQuery({
+    ...orgPluginsQueryOptions(orgId),
+    enabled: Boolean(orgId) && allowed,
+    select: (data) => data.plugins,
+  });
+}
+
+export function useOfficialPlugins() {
+  return useQuery({
+    queryFn: () => client.listOfficialPlugins(),
+    queryKey: ["official-plugins"],
+  });
+}
+
+export function useInstallOfficialPlugin() {
+  return usePluginMutation(
+    (pluginId: string, orgId) => client.installOfficialPlugin(pluginId, orgId),
+    async ({ orgId, queryClient }) => {
+      await invalidateOrgPlugins(queryClient, orgId);
+      await invalidateQueries(queryClient, queryKeys.plugins.releases);
+    }
+  );
+}
+
+export function useInstallLocalPlugin() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (input: InstallLocalPluginRequest) =>
+      client.installLocalPlugin(input),
+    onSettled: async (_data, _error, input) => {
+      await invalidateOrgPlugins(queryClient, input.orgId);
+      await invalidateQueries(queryClient, queryKeys.plugins.releases);
+    },
+  });
+}
+
+export function useReinstallOfficialPlugin() {
+  const queryClient = useQueryClient();
+  const { activeOrg } = useAuth();
+  const orgId = activeOrg?.id ?? "";
+
+  return useMutation({
+    mutationFn: (input: { pluginId: string; expectedRevision: number }) =>
+      client.reinstallOfficialPlugin(
+        input.pluginId,
+        input.expectedRevision,
+        orgId
+      ),
+    onMutate: () => ({ orgId }),
+    onSettled: async (_data, _error, _variables, context) => {
+      await invalidateOrgPlugins(queryClient, context?.orgId ?? orgId);
+      await invalidateQueries(queryClient, queryKeys.plugins.releases);
+    },
+  });
+}
+
+export function useOrgPlugin(pluginId: string | undefined) {
+  const { activeOrg } = useAuth();
+  const orgId = activeOrg?.id ?? "";
+  const allowed = canAccessIntegrationsPage(activeOrg?.role);
+
+  return useQuery({
+    ...orgPluginQueryOptions(orgId, pluginId ?? ""),
+    enabled: Boolean(orgId && pluginId) && allowed,
+  });
+}
+
+export function usePluginUpdates(enabled: boolean) {
+  return useQuery({
+    enabled,
+    queryFn: () => client.listPluginUpdates(),
+    queryKey: queryKeys.plugins.updates,
+    staleTime: 5 * 60_000,
+  });
+}
+
+export function usePluginReleases(enabled: boolean) {
+  return useQuery({
+    ...pluginReleasesQueryOptions(),
+    enabled,
+  });
+}
+
+export function usePluginUsage(pluginId: string | null) {
+  return useQuery({
+    enabled: Boolean(pluginId),
+    queryFn: () => client.getPluginUsage(pluginId ?? ""),
+    queryKey: queryKeys.plugins.usage(pluginId ?? ""),
+  });
+}
+
+/** Turns the plugin off in one organization, removes it, then deletes its saved data. */
+export function useUnplugPlugin() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      org,
+      pluginId,
+    }: {
+      org: PluginUsageOrg;
+      pluginId: string;
+    }) => {
+      let current = {
+        lifecycleState: org.lifecycleState,
+        revision: org.revision,
+      };
+
+      if (current.lifecycleState === "enabled") {
+        current = await client.disableOrgPlugin(
+          pluginId,
+          current.revision,
+          org.orgId
+        );
+      }
+
+      if (current.lifecycleState === "disabled") {
+        current = await client.uninstallOrgPlugin(
+          pluginId,
+          current.revision,
+          org.orgId
+        );
+      }
+
+      await client.deleteRetainedPluginData({
+        confirm: true,
+        expectedRevision: current.revision,
+        orgId: org.orgId,
+        pluginId,
+      });
+    },
+    onSettled: async (_data, _error, { org, pluginId }) => {
+      await invalidateOrgPlugins(queryClient, org.orgId);
+      await invalidateQueries(queryClient, queryKeys.plugins.usage(pluginId));
+    },
+  });
+}
+
+function invalidateOrgPlugins(
+  queryClient: ReturnType<typeof useQueryClient>,
+  orgId: string
+) {
+  return invalidateQueries(
+    queryClient,
+    queryKeys.plugins.all(orgId),
+    queryKeys.tools.all,
+    queryKeys.skills.all,
+    queryKeys.profiles.all,
+    ["organizationOverview"],
+    ["organizationPublicationCatalog"]
+  );
+}
+
+function usePluginMutation<TVariables, TData>(
+  mutationFn: (variables: TVariables, orgId: string) => Promise<TData>,
+  onSuccess?: (input: {
+    data: TData;
+    orgId: string;
+    queryClient: ReturnType<typeof useQueryClient>;
+    variables: TVariables;
+  }) => Promise<void>
+) {
+  const queryClient = useQueryClient();
+  const { activeOrg } = useAuth();
+  const orgId = activeOrg?.id ?? "";
+
+  return useMutation({
+    mutationFn: (variables: TVariables) => mutationFn(variables, orgId),
+    onSuccess: onSuccess
+      ? async (data, variables) => {
+          await onSuccess({ data, orgId, queryClient, variables });
+        }
+      : undefined,
+  });
+}
+
+export function usePreviewPluginPackage() {
+  return usePluginMutation((request: PluginPackageRequest) =>
+    client.previewPluginPackage(request)
+  );
+}
+
+export function useInstallPluginPackage() {
+  return usePluginMutation(
+    (request: InstallPluginPackageRequest) =>
+      client.installPluginPackage(request),
+    async ({ orgId, queryClient }) => {
+      await invalidateQueries(queryClient, queryKeys.plugins.releases);
+
+      if (orgId) {
+        await invalidateOrgPlugins(queryClient, orgId);
+      }
+    }
+  );
+}
+
+export function useRemovePluginRelease() {
+  return usePluginMutation(
+    ({ pluginId, version }: { pluginId: string; version: string }) =>
+      client.removePluginRelease(pluginId, version),
+    async ({ orgId, queryClient }) => {
+      await invalidateQueries(queryClient, queryKeys.plugins.releases);
+
+      if (orgId) {
+        await invalidateOrgPlugins(queryClient, orgId);
+      }
+    }
+  );
+}
+
+export function useInstallOrgPlugin() {
+  return usePluginMutation(
+    ({ pluginId, version }: { pluginId: string; version?: string }, orgId) =>
+      client.installOrgPlugin(pluginId, version ? { version } : {}, orgId),
+    async ({ orgId, queryClient }) => {
+      await invalidateOrgPlugins(queryClient, orgId);
+    }
+  );
+}
+
+export function useEnableOrgPlugin() {
+  return usePluginMutation(
+    (
+      {
+        expectedRevision,
+        pluginId,
+      }: { expectedRevision: number; pluginId: string },
+      orgId
+    ) => client.enableOrgPlugin(pluginId, expectedRevision, orgId),
+    async ({ orgId, queryClient }) => {
+      await invalidateOrgPlugins(queryClient, orgId);
+    }
+  );
+}
+
+export function useDisableOrgPlugin() {
+  return usePluginMutation(
+    (
+      {
+        expectedRevision,
+        pluginId,
+      }: { expectedRevision: number; pluginId: string },
+      orgId
+    ) => client.disableOrgPlugin(pluginId, expectedRevision, orgId),
+    async ({ orgId, queryClient }) => {
+      await invalidateOrgPlugins(queryClient, orgId);
+    }
+  );
+}
+
+export function usePreviewOrgPluginUpdate() {
+  return usePluginMutation(
+    (
+      { pluginId, targetVersion }: { pluginId: string; targetVersion: string },
+      orgId
+    ) => client.previewOrgPluginUpdate(pluginId, targetVersion, orgId)
+  );
+}
+
+export function useUpdateOrgPlugin() {
+  return usePluginMutation(
+    (
+      {
+        pluginId,
+        request,
+      }: { pluginId: string; request: UpdateOrgPluginRequest },
+      orgId
+    ) => client.updateOrgPlugin(pluginId, request, orgId),
+    async ({ orgId, queryClient }) => {
+      await invalidateOrgPlugins(queryClient, orgId);
+    }
+  );
+}
+
+export function useUninstallOrgPlugin() {
+  return usePluginMutation(
+    (
+      {
+        expectedRevision,
+        pluginId,
+      }: { expectedRevision: number; pluginId: string },
+      orgId
+    ) => client.uninstallOrgPlugin(pluginId, expectedRevision, orgId),
+    async ({ orgId, queryClient }) => {
+      await invalidateOrgPlugins(queryClient, orgId);
+    }
+  );
+}
+
+export function useDeleteRetainedPluginData() {
+  return usePluginMutation(
+    (request: DeleteRetainedPluginDataRequest) =>
+      client.deleteRetainedPluginData(request),
+    async ({ queryClient, variables }) => {
+      await invalidateOrgPlugins(queryClient, variables.orgId);
+    }
+  );
+}
+
+export function pluginUiModuleUrl(
+  orgId: string,
+  pluginId: string,
+  revision: number,
+  version: string | null
+): string {
+  return `/v1/plugins/ui/${encodeURIComponent(orgId)}/${encodeURIComponent(pluginId)}/?revision=${revision}&version=${encodeURIComponent(version ?? "")}`;
+}
+
+export function isPluginLifecycleBusy(plugin: OrgPluginDetail): boolean {
+  return (
+    plugin.pendingOperation !== null ||
+    plugin.lifecycleState === "enabling" ||
+    plugin.lifecycleState === "disabling" ||
+    plugin.lifecycleState === "updating"
+  );
+}
+
+// SemVer order: numeric core first, and a prerelease sorts below its release.
+function compareVersions(a: string, b: string): number {
+  const [coreA, ...preA] = a.split("-");
+  const [coreB, ...preB] = b.split("-");
+  const core = coreA.localeCompare(coreB, undefined, { numeric: true });
+
+  if (core !== 0) {
+    return core;
+  }
+
+  if (preA.length === 0 || preB.length === 0) {
+    return preB.length - preA.length;
+  }
+
+  return preA.join("-").localeCompare(preB.join("-"), undefined, {
+    numeric: true,
+  });
+}
+
+/** True when a registry version is newer than the one this org runs. */
+export function isNewerPluginVersion(
+  version: string,
+  plugin: OrgPluginDetail
+): boolean {
+  return (
+    plugin.selectedVersion !== null &&
+    compareVersions(version, plugin.selectedVersion) > 0
+  );
+}
+
+/** Approved releases newer than the selected one, newest first. */
+export function nextPluginVersions(plugin: OrgPluginDetail): string[] {
+  const selected = plugin.selectedVersion;
+
+  if (!selected) {
+    return [];
+  }
+
+  return plugin.availableVersions
+    .filter((version) => compareVersions(version, selected) > 0)
+    .sort((a, b) => compareVersions(b, a));
+}
+
+export function formatPluginTrustLines(
+  preview: PluginPackagePreviewResponse
+): string[] {
+  const { contributions, digest, manifest } = preview;
+
+  return [
+    `${manifest.name} ${manifest.version}`,
+    manifest.id,
+    `Author ${manifest.author}`,
+    `License ${manifest.license}`,
+    `Digest ${digest}`,
+    contributions.hasUi ? "Includes a page" : "No page",
+    contributions.hasDatabase ? "Owns a database" : "No database",
+    ...(contributions.workerKeys?.length
+      ? [`Workers ${contributions.workerKeys.join(", ")}`]
+      : []),
+    contributions.actionKeys.length > 0
+      ? `Actions ${contributions.actionKeys.join(", ")}`
+      : "No actions",
+    contributions.skillKeys.length > 0
+      ? `Skills ${contributions.skillKeys.join(", ")}`
+      : "No skills",
+  ];
+}
+
+export function resolvePluginPageView(input: {
+  errorStatus?: number;
+  orgRole: string | undefined;
+  plugin?: OrgPluginDetail | null;
+  queryStatus: "error" | "pending" | "success";
+}): PluginPageViewKind {
+  if (!canAccessIntegrationsPage(input.orgRole) || input.errorStatus === 403) {
+    return "unauthorized";
+  }
+
+  if (input.queryStatus === "pending" && !input.plugin) {
+    return "loading";
+  }
+
+  if (input.errorStatus === 404) {
+    return "unavailable";
+  }
+
+  const plugin = input.plugin;
+
+  if (!plugin) {
+    return "unavailable";
+  }
+
+  if (
+    plugin.lastLifecycleError === "package_unavailable" ||
+    (plugin.lifecycleState === "enabled" && plugin.ui === null)
+  ) {
+    return "unavailable";
+  }
+
+  if (plugin.lifecycleState !== "enabled") {
+    return "disabled";
+  }
+
+  return "page";
+}
+
+export function pluginPageStateMessage(kind: PluginPageViewKind): string {
+  if (kind === "unauthorized") {
+    return "You can't open this plugin";
+  }
+
+  if (kind === "disabled") {
+    return "This plugin is off";
+  }
+
+  if (kind === "unavailable") {
+    return "This plugin isn't available";
+  }
+
+  if (kind === "failed") {
+    return "This plugin didn't load";
+  }
+
+  return "Loading plugin";
+}
+
+export function pluginRowActions(plugin: OrgPluginDetail): {
+  disable: boolean;
+  enable: boolean;
+  purge: boolean;
+  uninstall: boolean;
+  update: boolean;
+} {
+  // oxlint-disable-next-line anti-slop/no-known-value-widening -- This public result intentionally keeps its documented broad return contract.
+  return {
+    disable: plugin.lifecycleState === "enabled",
+    enable: plugin.installed && plugin.lifecycleState === "disabled",
+    purge: plugin.lifecycleState === "retained",
+    uninstall:
+      plugin.installed &&
+      ["enabled", "disabled"].includes(plugin.lifecycleState),
+    update:
+      plugin.installed &&
+      ["enabled", "disabled"].includes(plugin.lifecycleState) &&
+      nextPluginVersions(plugin).length > 0,
+  };
+}
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Error causes may come from browser or network code and are narrowed by this handler.
+export function apiErrorStatus(error: unknown): number | undefined {
+  if (error instanceof MíngZhànApiError) {
+    return error.status;
+  }
+
+  return undefined;
+}

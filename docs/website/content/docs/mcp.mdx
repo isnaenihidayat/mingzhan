@@ -1,0 +1,258 @@
+---
+title: "MCP Servers"
+description: "Connect external MCP servers to MíngZhàn profiles and expose new tools safely."
+---
+
+An **MCP server** is an external tool provider. MíngZhàn acts as an **MCP client**: it connects to servers you register, caches their tools, and exposes them in chat like [builtin tools](/builtin-tools).
+
+- Register a server once (platform admin)
+- Assign it to profiles that need it
+- Tools appear at chat time, namespaced as `{serverName}__{toolName}`
+
+Use MCP when you need product-specific or internal capabilities — databases, SaaS APIs, local binaries — without writing custom MíngZhàn code. For capabilities every profile should have by default, use a builtin tool or [bundled skill](/skills) instead.
+
+## Transports
+
+| Transport | When to use | Config |
+|-----------|-------------|--------|
+| `http` | Remote endpoint (SaaS MCP, shared service) | `url`, optional `headers` |
+| `stdio` | Local command (`npx` package, binary) | `command`, optional `args`, `env` |
+
+**HTTP** — MíngZhàn opens a streamable HTTP connection and reuses it across turns.
+
+```json
+{
+  "url": "https://mcp.example.com/mcp",
+  "headers": { "Authorization": "Bearer my-token" }
+}
+```
+
+**stdio** — MíngZhàn spawns one process **per profile**, with cwd set to that profile's soul directory (`~/.mingzhan/orgs/{orgId}/profiles/{profileId}/`). HTTP servers share one connection across profiles.
+
+```json
+{
+  "command": "npx",
+  "args": ["-y", "some-mcp-package"],
+  "env": { "API_KEY": "secret-value" }
+}
+```
+
+## Tool naming and lifecycle
+
+MCP tools are namespaced as `{serverName}__{toolName}` to avoid collisions with builtins and other servers (e.g. `github__read_file`). Invalid characters become `_`; duplicates get a numeric suffix.
+
+MíngZhàn **caches** the tool list at connect time — it is not re-fetched on every chat turn.
+
+| State | Meaning |
+|-------|---------|
+| `connected` | Active connection and cached tools |
+| `disconnected` | No connection; tools stale or empty |
+| `needs_auth` | Waiting for a browser sign-in, shown as **Sign-in required** with a **Sign in** button |
+| `error` | Last connect/sync failed — see `lastError` |
+
+- **Connect** — opens the client, fetches and caches tools
+- **Sync** — reconnects and refreshes the cache (after the server adds/removes tools)
+- **Startup** — MíngZhàn auto-reconnects enabled HTTP servers; failures log a warning and set status to `error`. Command servers connect when a profile calls a tool
+
+### Optional tool discovery
+
+Large MCP tool lists can leave less room for chat history. Operators can try
+`MINGZHAN_MCP_TOOL_DISCOVERY=1` in the server environment, then restart MíngZhàn.
+This option is off by default while model accuracy is evaluated.
+
+With this option, the agent searches its assigned MCP servers before calling a
+tool. Only matching definitions are loaded, up to five at a time. Loaded MCP
+tools stay available for the current chat session. Builtin tools stay visible;
+plugin tools keep their existing per-message discovery behavior. Connections
+and **Sync tools** do not change. ACP agents keep their existing tool list.
+
+To compare results, use the same profile and task with the option on and off.
+Check both the answer and the tool calls. Discovery needs an extra model request.
+Remove the environment setting and restart to return to the full tool list.
+
+### Current chat context
+
+An MCP tool can request images and verified WhatsApp sender details from the current message. Add an optional `mingzhanContext` property to its input schema:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": { "type": "string" },
+    "mingzhanContext": {
+      "type": "object",
+      "x-mingzhan-context": "current-chat"
+    }
+  }
+}
+```
+
+MíngZhàn hides this property from the model and adds it to the MCP call. `mingzhanContext.images` contains current-message images as `{ "data": "<base64>", "mediaType": "image/png" }`. `mingzhanContext.whatsapp` contains chat and sender IDs, group status, and `fromMe`. MíngZhàn accepts this sender context only from its authenticated WhatsApp worker. This sends that data to the MCP server.
+
+## Setup
+
+Platform admins manage servers in **Control center → Agent tools → MCP** and assign them by opening **Agent**, selecting a profile, and choosing **MCP**. Registering a server does not assign it to any profile.
+
+### Add a server
+
+1. Open **Control center → Agent tools → MCP**, then select **Add server**
+2. Pick the server type: **HTTP** (a URL, with an API key header if it needs one),
+   **Sign-in** (a URL that authenticates through your browser) or **Command** (a local
+   process), then enter the name and config
+3. **Test connection**, then save — enabled servers connect immediately
+
+### Assign to a profile
+
+1. Open **Agent** and select a profile
+2. In the **MCP** tab, click **Add MCP server**, then pick an existing server or create a new one
+3. Unassigning removes tools from the next chat
+
+### Delete a server
+
+A platform admin can delete a custom MCP server even when profiles use it. MíngZhàn disconnects the server and removes its assignment from every profile. Its tools stop appearing in later chats.
+
+1. Open **Control center → Agent tools → MCP** and select **Delete** on the server
+2. Review the number of assigned profiles in the dialog
+3. Select **Force delete** to delete the server and remove those assignments
+
+Preinstalled servers cannot be deleted.
+
+### Example: Exa web search
+
+MíngZhàn ships a preinstalled **exa** server (`https://mcp.exa.ai/mcp`) with `web_search_exa` and `web_fetch_exa`. The shared free tier can rate-limit; add your own [Exa API key](https://dashboard.exa.ai/api-keys) under **Headers**:
+
+- **Key:** `x-api-key`
+- **Value:** your API key
+
+![Add an HTTP MCP server with an Exa API key header](/screenshots/mcp-exa-api-key.png)
+
+```json
+{
+  "mcpServers": {
+    "exa": {
+      "url": "https://mcp.exa.ai/mcp",
+      "headers": { "x-api-key": "YOUR_EXA_API_KEY" }
+    }
+  }
+}
+```
+
+Tools appear as `exa__web_search_exa` and `exa__web_fetch_exa`.
+
+### Example: Firecrawl
+
+MíngZhàn ships a preinstalled **firecrawl** server (`https://mcp.firecrawl.dev/v2/mcp`) with no API key. Assign it from **Agent** when a profile needs JS-rendered public pages.
+
+Keyless tools appear as `firecrawl__firecrawl_search`, `firecrawl__firecrawl_scrape`, and `firecrawl__firecrawl_parse`. Use scrape for JS-heavy public pages. Search is extra surface next to Exa and builtin [`web_search`](/tool-reference#web_search). Hosted parse is not for files in the profile workspace — use [`extract_document_text`](/tool-reference#extract_document_text).
+
+Firecrawl Cloud fetches the URL. Unlike [`web_fetch`](/tool-reference#web_fetch), the page is processed off the MíngZhàn host. Keyless usage shares a daily cap on the host's public IP across every assigned profile, including automations and Telegram / WhatsApp / Discord.
+
+Keyless MCP does not include interact, crawl, or map. For login walls, forms, and clicks, use the [agent-browser](/agent-browser) skill.
+
+To raise limits or unlock crawl / interact / map, add a [Firecrawl API key](https://www.firecrawl.dev/app/api-keys) under **Headers**, then **Reconnect** or **Sync tools**:
+
+- **Key:** `Authorization`
+- **Value:** `Bearer YOUR_FIRECRAWL_API_KEY`
+
+That header is shared by every profile assigned to this server. After sync, keyed tools are available on all of them until you unassign or rotate the header.
+
+```json
+{
+  "mcpServers": {
+    "firecrawl": {
+      "url": "https://mcp.firecrawl.dev/v2/mcp",
+      "headers": { "Authorization": "Bearer YOUR_FIRECRAWL_API_KEY" }
+    }
+  }
+}
+```
+
+### Servers that sign in with a browser
+
+Hosted MCP servers such as Notion, Linear or Sentry do not take an API key header. They
+use OAuth, the same as any other app you sign in to, so MíngZhàn needs one trip through your
+browser before it can connect.
+
+1. Pick the **Sign-in** type and enter the name and URL. There is no header field: the
+   provider issues the credential. **Test connection** is optional here and reports the
+   sign-in requirement as the expected answer, in green
+2. **Add and sign in** opens a dialog with the provider's sign-in page. Click it, and the
+   page opens in a new tab
+3. Approve the access the provider asks for
+4. The provider sends you back to MíngZhàn, which finishes the connection and caches the
+   tools. The dialog closes itself and the row flips to **connected**
+
+Close the dialog with **Finish later** and nothing is lost: the row stays as **Sign-in
+required** with a **Sign in** button that starts the same flow again.
+
+The provider's tokens are stored with the server, so MíngZhàn can reconnect across
+restarts without asking again. **Connect** starts a fresh sign-in whenever the grant is
+revoked or expires.
+
+Two things this needs:
+
+- **A reachable public URL.** The provider redirects your browser back to
+  `{your MíngZhàn URL}/v1/mcp/oauth/callback/{serverId}`, so set the public URL under
+  **Control center → Workspace → Settings → Public web URL** (or `MINGZHAN_WEB_PUBLIC_URL`) for anything other than a local install
+- **Dynamic client registration**, which MíngZhàn uses to register itself with the provider.
+  Servers that instead hand you a `client_id` and `client_secret` to paste in are not
+  supported yet
+
+Like a header, the grant belongs to the server record, so every profile assigned to that
+server acts as the account that signed in. Editing the URL drops the grant, because it
+belongs to that one endpoint.
+
+### Import from an existing config
+
+Use **Import JSON** or paste a Cursor-style `mcpServers` block onto the form. A bare server object (top-level `command` or `url`) also works — the first entry fills the form for review.
+
+## Secrets
+
+HTTP headers and stdio `env` values are secrets:
+
+- API and dashboard return them as `••••••••`
+- Leave a field blank when editing to keep the stored value
+- **Test connection** merges your input with stored secrets, so you can test without re-entering them
+
+## Config reference
+
+### HTTP
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `url` | string | Yes | Valid URL |
+| `headers` | Record&lt;string, string&gt; | No | Auth or custom headers |
+
+### stdio
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `command` | string | Yes | Executable on PATH or absolute path |
+| `args` | string[] | No | Command arguments |
+| `env` | Record&lt;string, string&gt; | No | Child process environment |
+
+## Permissions
+
+MCP management is platform-admin only (same as profiles, builtins, and skills).
+
+| Actor | Manage MCP | Use MCP tools in chat |
+|-------|------------|----------------------|
+| Platform admin | Yes | Yes |
+| Org admin / member | No | Yes |
+
+## Troubleshooting
+
+- **`error` status** — check `lastError`: wrong URL, missing `command`, unreachable host, or expired credentials
+- **`needs_auth` status / "Sign-in required"** — sign-in is incomplete or needs renewal. Click **Sign in** on the row for a fresh link, and check the public URL matches the origin you open the dashboard on
+- **No tools discovered** — server connected but returned zero tools; fix server-side config, then **Sync tools**
+- **"not connected" on tool call** — connection dropped; reconnect. For stdio, confirm the command is on PATH
+- **Exa rate limit** — add an `x-api-key` header with your [Exa API key](https://dashboard.exa.ai/api-keys), then reconnect
+- **Firecrawl rate limit** — add an `Authorization` header with `Bearer` plus your [Firecrawl API key](https://www.firecrawl.dev/app/api-keys), then reconnect. This also unlocks crawl / interact / map for every assigned profile
+- **Unexpected tool name** — names are sanitized to `a-zA-Z0-9_-`; `tools.list` on server `user.tolaria` becomes `user_tolaria__tools_list`
+
+## Related
+
+- [Builtin tools](/builtin-tools) — tools that ship with MíngZhàn
+- [Agent browser](/agent-browser) — login walls and interactive pages
+- [Profiles](/profiles) — designing bots and tool access
+- [Multi-tenancy](/multi-tenancy) — org roles and admin boundaries

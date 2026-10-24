@@ -1,0 +1,41 @@
+/**
+ * Stdio MCP server that an ACP agent starts for MíngZhàn's tools. ACP agents must
+ * accept stdio MCP servers, so this relays each JSON-RPC line from the agent to
+ * MíngZhàn's HTTP endpoint and writes the reply back on stdout.
+ *
+ * It runs as `node -e` or `bun -e` with the source below, so no file has to be
+ * shipped next to the server. The endpoint URL (which holds the chat's secret
+ * token) comes from the environment, not from the command line.
+ */
+export const ACP_MCP_BRIDGE_SOURCE = `
+const { createInterface } = require("node:readline");
+const url = process.env.MINGZHAN_ACP_MCP_URL;
+
+createInterface({ input: process.stdin }).on("line", async (line) => {
+  if (!line.trim()) return;
+
+  const fail = (message) => {
+    const id = (() => { try { return JSON.parse(line).id ?? null; } catch { return null; } })();
+    process.stdout.write(JSON.stringify({ error: { code: -32603, message }, id, jsonrpc: "2.0" }) + "\\n");
+  };
+
+  try {
+    const response = await fetch(url, {
+      body: line,
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+
+    if (response.status === 202 || response.status === 204) return;
+
+    const text = (await response.text()).trim();
+
+    // A non-JSON-RPC body is dropped by the agent's MCP client, which then
+    // waits out its connect timeout and reports that instead of the cause.
+    if (!response.ok) return fail("MíngZhàn MCP endpoint answered " + response.status + ": " + text);
+    if (text) process.stdout.write(text + "\\n");
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error));
+  }
+});
+`;

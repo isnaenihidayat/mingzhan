@@ -1,0 +1,298 @@
+import type { StoredCodingAgentHarnessKind } from "@mingzhan/db";
+import {
+  formatModelForHarness,
+  mapMíngZhànProviderToPi,
+  redactSpawnEnvForPrompt,
+  resolveCodingAgentSpawnBundle,
+} from "./coding-agent-spawn-env";
+
+export interface CodingAgentCommandHarness {
+  args: string[];
+  command: string;
+  kind: StoredCodingAgentHarnessKind;
+  name: string;
+}
+
+export interface CodingAgentCommandTemplate {
+  backend: StoredCodingAgentHarnessKind;
+  command: string;
+  harnessName: string;
+  notes: string[];
+  spawnEnv: Record<string, string>;
+}
+
+export function buildHarnessNonInteractiveArgs(
+  kind: StoredCodingAgentHarnessKind,
+  options: {
+    prompt: string;
+    cwd: string;
+    baseArgs?: string[];
+    piProvider?: string | null;
+    piModel?: string | null;
+  }
+): string[] {
+  const baseArgs = [...(options.baseArgs ?? [])];
+  const prompt = options.prompt.trim() || "Reply with OK and nothing else.";
+
+  if (kind === "codex") {
+    return [
+      ...baseArgs,
+      "exec",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "--skip-git-repo-check",
+      "--color",
+      "never",
+      prompt,
+    ];
+  }
+
+  if (kind === "claude_code") {
+    return [
+      ...baseArgs,
+      "--print",
+      "--permission-mode",
+      "bypassPermissions",
+      "--output-format",
+      "text",
+      prompt,
+    ];
+  }
+
+  if (kind === "cursor_agent") {
+    return [...baseArgs, "-p", prompt, "--output-format", "text", "--yolo"];
+  }
+
+  if (kind === "pi") {
+    const piArgs = [...baseArgs];
+
+    if (options.piProvider) {
+      piArgs.push("--provider", options.piProvider);
+    }
+
+    if (options.piModel) {
+      piArgs.push("--model", options.piModel);
+    }
+
+    piArgs.push("-p", prompt);
+
+    return piArgs;
+  }
+
+  return [
+    ...baseArgs,
+    "run",
+    "--dir",
+    options.cwd,
+    "--format",
+    "default",
+    "--dangerously-skip-permissions",
+    prompt,
+  ];
+}
+
+export async function buildCodingAgentCommandTemplate(
+  harness: CodingAgentCommandHarness,
+  taskPrompt: string,
+  cwd: string,
+  options: {
+    userConfig?: import("@mingzhan/core").UserConfig | null;
+    profileModel?: string | null;
+  } = {}
+): Promise<CodingAgentCommandTemplate> {
+  const escapedTask = shellEscape(taskPrompt.trim());
+  const baseCommand = [harness.command, ...harness.args].join(" ");
+
+  const { spawn, routing } = await resolveCodingAgentSpawnBundle({
+    harnessKind: harness.kind,
+    profileModel: options.profileModel,
+    userConfig: options.userConfig,
+  });
+
+  const spawnEnv = spawn.env;
+
+  const shared = {
+    backend: harness.kind,
+    harnessName: harness.name,
+    spawnEnv,
+  };
+
+  if (harness.kind === "codex") {
+    return {
+      ...shared,
+      command: [
+        baseCommand,
+        "exec",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--skip-git-repo-check",
+        "--color",
+        "never",
+        escapedTask,
+      ].join(" "),
+      notes: [
+        "Set bash cwd to the target repo when editing one. --skip-git-repo-check also permits scratch work outside a git repo.",
+        "Prefer capturing the final message from stdout; Codex may also write a last-message file when using --output-last-message.",
+      ],
+    };
+  }
+
+  if (harness.kind === "claude_code") {
+    return {
+      ...shared,
+      command: [
+        baseCommand,
+        "--print",
+        "--permission-mode",
+        "bypassPermissions",
+        "--output-format",
+        "text",
+        escapedTask,
+      ].join(" "),
+      notes: [
+        "Print mode is non-interactive and preferred for one-shot coding agent runs.",
+        "Run from the profile workspace cwd unless the user specifies another path inside it.",
+      ],
+    };
+  }
+
+  if (harness.kind === "cursor_agent") {
+    return {
+      ...shared,
+      command: [
+        baseCommand,
+        "-p",
+        escapedTask,
+        "--output-format",
+        "text",
+        "--yolo",
+      ].join(" "),
+      notes: [
+        "Cursor Agent uses host Cursor authentication — MíngZhàn does not inject provider credentials.",
+        "Before coding: ensure the target repo exists in the profile workspace; git clone it there if missing.",
+        "Set bash cwd to the repo directory and keep argv0 as `agent` (do not prefix with cd && — codingAgent requires the harness binary first).",
+        "Prefer --output-format text for a short final answer. If stream-json is used, MíngZhàn summarizes it and saves the full log under artifacts/coding-agent-runs/.",
+        "Use --yolo so unattended background runs do not block on permission prompts.",
+        "After the run: summarize the returned stdout for the user. If unclear, verify with git status / git diff --stat in the repo (full raw log path is included when present).",
+      ],
+    };
+  }
+
+  if (harness.kind === "pi") {
+    const piProvider = routing.providerType
+      ? mapMíngZhànProviderToPi(routing.providerType, routing.baseUrl)
+      : null;
+
+    const piModel = routing.model
+      ? formatModelForHarness(
+          "pi",
+          routing.providerType ?? "openai",
+          routing.model
+        )
+      : null;
+
+    const commandParts = [baseCommand];
+
+    if (piProvider) {
+      commandParts.push("--provider", piProvider);
+    }
+
+    if (piModel) {
+      commandParts.push("--model", shellEscape(piModel));
+    }
+
+    commandParts.push("-p", escapedTask);
+
+    return {
+      ...shared,
+      command: commandParts.join(" "),
+      notes: [
+        "pi runs in non-interactive print mode with -p <prompt>.",
+        "Provider and model are passed via --provider and --model flags from MíngZhàn provider routing.",
+        "Run from the profile workspace cwd unless the user specifies another path inside it.",
+      ],
+    };
+  }
+
+  return {
+    ...shared,
+    command: [
+      baseCommand,
+      "run",
+      "--dir",
+      shellEscape(cwd),
+      "--format",
+      "default",
+      "--dangerously-skip-permissions",
+      escapedTask,
+    ].join(" "),
+    notes: [
+      "OpenCode runs against the workspace directory via --dir.",
+      "Use a longer bash timeout for multi-step coding runs.",
+    ],
+  };
+}
+
+export function formatCodingAgentCommandContext(
+  template: CodingAgentCommandTemplate
+): string {
+  const lines = [
+    "# Coding Agent Harness",
+    `Selected backend: ${template.harnessName} (${template.backend}).`,
+    template.backend === "cursor_agent"
+      ? "Run via the `bash` tool with cwd set to the repo checkout and codingAgent: true (or argv0 `agent`). Cursor uses host auth — MíngZhàn does not merge provider credentials. Do not use `cd … && agent`."
+      : "Run the coding agent via the `bash` tool. Set `codingAgent: true` so MíngZhàn merges spawn env for this harness, or rely on auto-detection when the command starts with the harness binary.",
+    "",
+    "```bash",
+    template.command,
+    "```",
+  ];
+
+  if (Object.keys(template.spawnEnv).length > 0) {
+    lines.push(
+      "",
+      "When MíngZhàn provider passthrough is active, these env vars are merged at spawn time:",
+      "",
+      "```json",
+      JSON.stringify(redactSpawnEnvForPrompt(template.spawnEnv), null, 2),
+      "```"
+    );
+  }
+
+  if (template.notes.length > 0) {
+    lines.push("", "Notes:");
+
+    for (const note of template.notes) {
+      lines.push(`- ${note}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
+function getBackendSkillName(
+  backend: StoredCodingAgentHarnessKind
+):
+  | "coding-backend-codex"
+  | "coding-backend-claude-code"
+  | "coding-backend-opencode"
+  | "coding-backend-pi"
+  | "coding-backend-cursor" {
+  const names = {
+    claude_code: "coding-backend-claude-code",
+    codex: "coding-backend-codex",
+    cursor_agent: "coding-backend-cursor",
+    opencode: "coding-backend-opencode",
+    pi: "coding-backend-pi",
+  } as const;
+
+  return names[backend];
+}
+
+export { getBackendSkillName };
+
+function shellEscape(value: string): string {
+  if (!value.includes("'")) {
+    return `'${value}'`;
+  }
+
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}

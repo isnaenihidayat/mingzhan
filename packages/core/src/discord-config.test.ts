@@ -1,0 +1,233 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { asTestFetch } from "./channel-test-helpers";
+import {
+  buildDiscordInviteUrl,
+  isDiscordUserAuthorized,
+  loadDiscordConfigFile,
+  loadDiscordSettingsPublic,
+  maskBotToken,
+  parseAllowedUserIds,
+  regenerateDiscordHandshake,
+  resolveDiscordApplicationId,
+  resolveDiscordConfigFromSources,
+  saveDiscordConfig,
+  verifyAndPairDiscordUser,
+} from "./discord-config";
+import {
+  describeSharedChannelConfigTests,
+  withTempHomedir,
+  writeChannelIniConfig,
+} from "./testing/channel-config-fixtures";
+
+describe("buildDiscordInviteUrl", () => {
+  test("builds an oauth invite link with bot scopes and permissions", () => {
+    expect(buildDiscordInviteUrl("1525937133096013954")).toBe(
+      "https://discord.com/oauth2/authorize?client_id=1525937133096013954&permissions=101376&scope=bot+applications.commands"
+    );
+  });
+});
+
+describe("resolveDiscordApplicationId", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  test("returns the application id from Discord", async () => {
+    globalThis.fetch = asTestFetch(
+      async () =>
+        new Response(JSON.stringify({ id: "1525937133096013954" }), {
+          headers: { "Content-Type": "application/json" },
+          status: 200,
+        })
+    );
+
+    await expect(resolveDiscordApplicationId("test-token")).resolves.toBe(
+      "1525937133096013954"
+    );
+    await expect(resolveDiscordApplicationId("test-token")).resolves.toBe(
+      "1525937133096013954"
+    );
+  });
+
+  test("returns null when Discord rejects the token", async () => {
+    globalThis.fetch = asTestFetch(
+      async () => new Response(null, { status: 401 })
+    );
+
+    await expect(resolveDiscordApplicationId("bad-token")).resolves.toBeNull();
+  });
+
+  test("returns null for invalid payloads and request failures", async () => {
+    globalThis.fetch = asTestFetch(
+      async () =>
+        new Response(JSON.stringify({ id: "not-a-snowflake" }), {
+          status: 200,
+        })
+    );
+
+    await expect(
+      resolveDiscordApplicationId("invalid-id-token")
+    ).resolves.toBeNull();
+
+    globalThis.fetch = asTestFetch(async () => {
+      throw new Error("network failure");
+    });
+
+    await expect(
+      resolveDiscordApplicationId("network-failure-token")
+    ).resolves.toBeNull();
+  });
+
+  test("force refresh revalidates and evicts a cached application id", async () => {
+    let requestCount = 0;
+    globalThis.fetch = asTestFetch(async () => {
+      requestCount += 1;
+
+      return new Response(JSON.stringify({ id: "1525937133096013954" }), {
+        headers: { "Content-Type": "application/json" },
+        status: 200,
+      });
+    });
+
+    await expect(resolveDiscordApplicationId("cached-token")).resolves.toBe(
+      "1525937133096013954"
+    );
+
+    globalThis.fetch = asTestFetch(async () => {
+      requestCount += 1;
+
+      return new Response(null, { status: 401 });
+    });
+
+    await expect(
+      resolveDiscordApplicationId("cached-token", { forceRefresh: true })
+    ).resolves.toBeNull();
+
+    globalThis.fetch = asTestFetch(async () => {
+      requestCount += 1;
+
+      return new Response(JSON.stringify({ id: "1525937133096013955" }), {
+        headers: { "Content-Type": "application/json" },
+        status: 200,
+      });
+    });
+
+    await expect(resolveDiscordApplicationId("cached-token")).resolves.toBe(
+      "1525937133096013955"
+    );
+    expect(requestCount).toBe(3);
+  });
+});
+
+describe("loadDiscordSettingsPublic", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  test("includes an invite URL when Discord returns the application id", async () => {
+    await withTempHomedir("mingzhan-core-discord-home-", async (tempHome) => {
+      await writeChannelIniConfig(tempHome, "discord", {
+        botToken: "discord-bot-token",
+      });
+
+      globalThis.fetch = asTestFetch(
+        async () =>
+          new Response(JSON.stringify({ id: "1525937133096013954" }), {
+            headers: { "Content-Type": "application/json" },
+            status: 200,
+          })
+      );
+
+      const settings = await loadDiscordSettingsPublic();
+
+      expect(settings.inviteUrl).toBe(
+        "https://discord.com/oauth2/authorize?client_id=1525937133096013954&permissions=101376&scope=bot+applications.commands"
+      );
+    });
+  });
+});
+
+describe("parseAllowedUserIds", () => {
+  test("parses comma-separated snowflake ids", () => {
+    expect(
+      parseAllowedUserIds("123456789012345678, 987654321098765432")
+    ).toEqual(["123456789012345678", "987654321098765432"]);
+  });
+
+  test("rejects invalid ids", () => {
+    expect(() => parseAllowedUserIds("abc")).toThrow("Invalid Discord user ID");
+    expect(() => parseAllowedUserIds("123")).toThrow("Invalid Discord user ID");
+  });
+});
+
+describeSharedChannelConfigTests({
+  allowlistInput: "123456789012345678, 987654321098765432",
+  allowlistParsed: ["123456789012345678", "987654321098765432"],
+  authorize: {
+    allowlisted: "1002",
+    paired: "1001",
+    unauthorized: "1003",
+  },
+  botToken: "discord-bot-token",
+  env: {
+    allowlistKey: "DISCORD_ALLOWED_USER_IDS",
+    allowlistParsed: ["123456789012345678", "987654321098765432"],
+    allowlistValue: "123456789012345678, 987654321098765432",
+    botTokenKey: "DISCORD_BOT_TOKEN",
+  },
+  isUserAuthorized: isDiscordUserAuthorized,
+  loadConfigFile: loadDiscordConfigFile,
+  mask: maskBotToken,
+  name: "discord",
+  regenerate: () => regenerateDiscordHandshake(null),
+  resolveConfigFromSources: resolveDiscordConfigFromSources,
+  resolveFile: {
+    allowedUserIds: ["999999999999999999"],
+    pairedUserIds: ["111111111111111111"],
+  },
+  sampleId: "900100000000000001",
+  saveConfig: saveDiscordConfig,
+  verifyAndPair: verifyAndPairDiscordUser,
+});
+
+describe("per-owner Discord config", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  test("claims one application ID across concurrent owners", async () => {
+    await withTempHomedir("mingzhan-discord-claim-race-", async () => {
+      globalThis.fetch = asTestFetch(
+        async () =>
+          new Response(JSON.stringify({ id: "1525937133096013954" }), {
+            headers: { "Content-Type": "application/json" },
+            status: 200,
+          })
+      );
+
+      const results = await Promise.allSettled([
+        saveDiscordConfig(
+          { botToken: "discord-token-a" },
+          { orgId: "org_a", profileId: "a" }
+        ),
+        saveDiscordConfig(
+          { botToken: "discord-token-b" },
+          { orgId: "org_b", profileId: "b" }
+        ),
+      ]);
+
+      expect(
+        results.filter((result) => result.status === "fulfilled")
+      ).toHaveLength(1);
+      expect(
+        results.filter((result) => result.status === "rejected")
+      ).toHaveLength(1);
+    });
+  });
+});

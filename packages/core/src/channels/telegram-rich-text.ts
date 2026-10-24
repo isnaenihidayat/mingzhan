@@ -1,0 +1,86 @@
+export function renderTelegramRichText(text: string): string {
+  const protectedBlocks = protectFencedCodeBlocks(text.trim());
+  const escapedText = escapeTelegramHtml(protectedBlocks.text);
+  const formattedText = renderInlineTelegramFormatting(escapedText);
+
+  return restoreProtectedBlocks(
+    formattedText,
+    protectedBlocks.blocks,
+    protectedBlocks.prefix
+  ).trim();
+}
+
+interface ProtectedTelegramCodeBlocks {
+  blocks: string[];
+  prefix: string;
+  text: string;
+}
+
+function protectFencedCodeBlocks(text: string): ProtectedTelegramCodeBlocks {
+  const blocks: string[] = [];
+  let prefix = "@@TCTOKEN";
+
+  while (text.includes(prefix)) {
+    prefix += "_";
+  }
+
+  const protectedText = text.replace(
+    /```[\w]*\n?([\s\S]*?)```/g,
+    (_, code: string) => {
+      const token = `${prefix}${blocks.length}@@`;
+      blocks.push(
+        `<pre><code>${escapeTelegramHtml(trimFenceNewlines(code))}</code></pre>`
+      );
+
+      return token;
+    }
+  );
+
+  return { blocks, prefix, text: protectedText };
+}
+
+function renderInlineTelegramFormatting(text: string): string {
+  let result = text;
+
+  result = result.replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>");
+  result = result.replace(/`([^`]+)`/g, "<code>$1</code>");
+  result = result.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+  result = result.replace(/__([^_]+)__/g, "<u>$1</u>");
+  result = result.replace(/\*([^*]+)\*/g, "<i>$1</i>");
+  result = result.replace(/\[([^\]]+)\]\((https?:\/\/[^\s()]+)\)/g, renderLink);
+
+  return result;
+}
+
+function renderLink(_: string, label: string, url: string): string {
+  return `<a href="${escapeTelegramAttribute(url)}">${label}</a>`;
+}
+
+function restoreProtectedBlocks(
+  text: string,
+  blocks: string[],
+  prefix: string
+): string {
+  let result = text;
+
+  for (let index = 0; index < blocks.length; index++) {
+    result = result.replace(`${prefix}${index}@@`, () => blocks[index]!);
+  }
+
+  return result;
+}
+
+function trimFenceNewlines(text: string): string {
+  return text.replace(/^\n/, "").replace(/\n$/, "");
+}
+
+function escapeTelegramHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function escapeTelegramAttribute(text: string): string {
+  return text.replace(/"/g, "&quot;");
+}

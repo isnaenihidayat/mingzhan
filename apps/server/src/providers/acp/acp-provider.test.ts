@@ -1,0 +1,200 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
+import type { GenerateChatInput, StreamChatHandlers } from "@mingzhan/core";
+import { createAcpProvider, stopAcpSession } from "./acp-provider";
+
+const FAKE_AGENT = fileURLToPath(
+  new URL("../../testing/acp-fake-agent.ts", import.meta.url)
+);
+
+const cwd = process.cwd();
+
+let sessionCounter = 0;
+
+function nextSessionKey(): string {
+  sessionCounter += 1;
+
+  return `test-session-${sessionCounter}`;
+}
+
+function createProvider(sessionKey: string) {
+  return createAcpProvider({
+    agent: { args: [FAKE_AGENT], command: "bun" },
+    cwd,
+    sessionKey,
+  });
+}
+
+function collectHandlers() {
+  const chunks: string[] = [];
+  const thoughts: string[] = [];
+
+  const toolStarts: Array<{
+    input: unknown;
+    tool: string;
+    toolCallId: string;
+  }> = [];
+
+  const toolEnds: Array<{
+    result: unknown;
+    tool: string;
+    toolCallId: string;
+  }> = [];
+
+  const handlers: StreamChatHandlers = {
+    onChunk: (delta) => {
+      chunks.push(delta);
+    },
+    onThinking: (delta) => {
+      thoughts.push(delta);
+    },
+    onToolEnd: (event) => {
+      toolEnds.push(event);
+    },
+    onToolStart: (event) => {
+      toolStarts.push(event);
+    },
+  };
+
+  return { chunks, handlers, thoughts, toolEnds, toolStarts };
+}
+
+function chatInput(text: string, system = ""): GenerateChatInput {
+  return {
+    messages: [{ content: text, role: "user" }],
+    system,
+  };
+}
+
+afterEach(() => {
+  for (let index = 1; index <= sessionCounter; index += 1) {
+    stopAcpSession(`test-session-${index}`);
+  }
+});
+
+describe("ACP provider", () => {
+  test("returns the agent reply and streams its text chunks", async () => {
+    const provider = createProvider(nextSessionKey());
+    const { chunks, handlers } = collectHandlers();
+
+    const result = await provider.streamChat(chatInput("hello"), handlers);
+
+    expect(result.content).toBe("fake: hello");
+    expect(chunks.join("")).toBe("fake: hello");
+    expect(result.toolCalls).toEqual([]);
+  });
+
+  test("streams tool calls with their input and result", async () => {
+    const provider = createProvider(nextSessionKey());
+    const { handlers, toolEnds, toolStarts } = collectHandlers();
+
+    await provider.streamChat(chatInput("run a tool"), handlers);
+
+    expect(toolStarts).toEqual([
+      { input: { query: "notes" }, tool: "search_files", toolCallId: "call-1" },
+    ]);
+    expect(toolEnds).toEqual([
+      {
+        result: { matches: 2 },
+        tool: "search_files",
+        toolCallId: "call-1",
+      },
+    ]);
+  });
+
+  test("streams thinking separately from the reply", async () => {
+    const provider = createProvider(nextSessionKey());
+    const { chunks, handlers, thoughts } = collectHandlers();
+
+    const result = await provider.streamChat(
+      chatInput("thought first"),
+      handlers
+    );
+
+    expect(thoughts).toEqual(["thinking about it"]);
+    expect(chunks.join("")).toBe("fake: thought first");
+    expect(result.content).toBe("fake: thought first");
+  });
+
+  test("passes only the MíngZhàn MCP servers to the agent session", async () => {
+    const sessionKey = nextSessionKey();
+
+    const provider = createAcpProvider({
+      agent: { args: [FAKE_AGENT], command: "bun" },
+      cwd,
+      mcpServers: [
+        { args: [], command: "mingzhan-bridge", env: [], name: "mingzhan" },
+      ],
+      sessionKey,
+    });
+
+    const result = await provider.generateChat(chatInput("mcp check"));
+
+    // Strict keeps Claude from adding the MCP servers of the host's own Claude Code config.
+    expect(result.content).toBe(
+      'mcp servers: 1 meta: {"claudeCode":{"options":{"strictMcpConfig":true}}}'
+    );
+  });
+
+  test("sends the system prompt on the first turn only", async () => {
+    const provider = createProvider(nextSessionKey());
+
+    const first = await provider.generateChat(chatInput("first", "Be brief."));
+
+    const second = await provider.generateChat(
+      chatInput("second", "Be brief.")
+    );
+
+    expect(first.content).toBe("fake: Be brief.\n\nfirst");
+    expect(second.content).toBe("fake: second");
+  });
+
+  test("sends a text file to the agent with its name and names other files", async () => {
+    const provider = createProvider(nextSessionKey());
+    const csv = "campaign,spend_usd\nSearch - Brand,7400";
+
+    const result = await provider.generateChat({
+      messages: [
+        {
+          content: [
+            { text: "Sum the spend.", type: "text" },
+            {
+              data: Buffer.from(csv).toString("base64"),
+              filename: "google-ads.csv",
+              mediaType: "text/csv",
+              type: "document",
+            },
+            {
+              data: "JVBERi0=",
+              filename: "brief.pdf",
+              mediaType: "application/pdf",
+              type: "document",
+            },
+          ],
+          role: "user",
+        },
+      ],
+      system: "",
+    });
+
+    expect(result.content).toContain(`[File: google-ads.csv]\n${csv}`);
+    expect(result.content).toContain("brief.pdf");
+    expect(result.content).not.toContain("JVBERi0=");
+  });
+
+  test("rejects a turn with no user message", async () => {
+    const provider = createProvider(nextSessionKey());
+
+    await expect(
+      provider.generateChat({ messages: [], system: "" })
+    ).rejects.toThrow("ACP agent turns need a user message.");
+  });
+
+  test("does not generate text on its own", async () => {
+    const provider = createProvider(nextSessionKey());
+
+    await expect(
+      provider.generateText({ prompt: "title", system: "" })
+    ).rejects.toThrow("ACP agents do not generate text");
+  });
+});

@@ -1,0 +1,390 @@
+import { mkdir, unlink, writeFile } from "node:fs/promises";
+import path from "node:path";
+import {
+  getProfileSoulDir,
+  inferArtifactMimeType,
+  MAX_IMAGE_BYTES,
+  MíngZhànApiError,
+  type ProviderInstance,
+  pathExists,
+  type ToolContext,
+  type ToolDefinition,
+  type UserConfig,
+} from "@mingzhan/core";
+import type { DatabaseAdapter } from "@mingzhan/db";
+import { z } from "zod";
+import { createAttachmentSaver } from "../services/attachment-service";
+import {
+  generateImageWithOpenAI,
+  IMAGE_GENERATION_SIZES,
+  IMAGE_MODEL_REQUIRED_MESSAGE,
+  normalizeImageGenerationSize,
+  resolveImageGenerationSelection,
+} from "../services/image-generation";
+
+export const GENERATE_IMAGE_TOOL_NAME = "generate_image";
+
+const DEFAULT_FILENAME = "generated-image.png";
+
+/** `@image` from the composer's @ menu, at a word start (not `me@image.dev`). */
+const IMAGE_MENTION_PATTERN = /(?:^|\s)@image(?=\s|$)/i;
+
+/**
+ * Turn instruction for a message tagged `@image`: generate now, or say why the
+ * agent cannot. Empty when the message carries no tag.
+ */
+export function formatImageMentionContext(
+  userMessage: string,
+  toolNames: readonly string[]
+): string {
+  if (!IMAGE_MENTION_PATTERN.test(userMessage)) {
+    return "";
+  }
+
+  return toolNames.includes(GENERATE_IMAGE_TOOL_NAME)
+    ? `The user tagged @image, so this turn is an image request. Call ${GENERATE_IMAGE_TOOL_NAME} right away with a detailed prompt built from their message (leave out the @image tag), then reply briefly. Do not answer with text only.`
+    : `The user tagged @image, but the ${GENERATE_IMAGE_TOOL_NAME} tool is not assigned to this agent. Tell them image generation is off here: assign the ${GENERATE_IMAGE_TOOL_NAME} tool to this agent and a platform admin must pick an image generation model in Control center → AI Providers (/customize/providers#image-generation).`;
+}
+
+interface GenerateImageToolSuccess {
+  attachmentId: string | null;
+  mimeType: string;
+  model: string;
+  path: string;
+  sizeBytes: number;
+}
+
+interface GenerateImageToolFailure {
+  error: string;
+}
+
+export type GenerateImageToolOutput =
+  | GenerateImageToolSuccess
+  | GenerateImageToolFailure;
+
+const GenerateImageInputSchema = z.object({
+  filename: z.string().optional().catch(undefined),
+  model: z.unknown().optional(),
+  prompt: z.string().optional().catch(undefined),
+  size: z.string().optional().catch(undefined),
+});
+
+const ErrorInputSchema = z.union([
+  z.instanceof(Error),
+  z.string(),
+  z.number(),
+  z.boolean(),
+  z.null(),
+  z.undefined(),
+]);
+
+export interface GenerateImageToolDeps {
+  db: DatabaseAdapter;
+  ensureSettingsLoaded: () => Promise<void>;
+  /** Test seam — defaults to live OpenAI Images call. */
+  generateImage?: typeof generateImageWithOpenAI;
+  getUserConfig: () => UserConfig | null | undefined;
+  recordUsage?: (
+    modelId: string,
+    inputTokens: number,
+    outputTokens: number,
+    providerInstance: ProviderInstance,
+    attribution: { orgId: string; profileId: string; userId?: string }
+  ) => void;
+}
+
+export function createGenerateImageTool(
+  deps: GenerateImageToolDeps
+): ToolDefinition {
+  return {
+    description:
+      "Generate an image from a text prompt using the workspace image model (OpenAI gpt-image-2). Saves a PNG under artifacts/ with a metadata sidecar and session attachment when available. A platform admin sets the model in Control center → AI Providers (/customize/providers#image-generation) — do not pass a model name.",
+    name: GENERATE_IMAGE_TOOL_NAME,
+    parallelSafe: false,
+    parameters: {
+      additionalProperties: false,
+      properties: {
+        filename: {
+          description:
+            "Optional output filename under artifacts/ (defaults to a generated .png name).",
+          type: "string",
+        },
+        prompt: {
+          description: "Text description of the image to generate.",
+          type: "string",
+        },
+        size: {
+          description: `Optional image size. Allowed: ${IMAGE_GENERATION_SIZES.join(", ")}.`,
+          type: "string",
+        },
+      },
+      required: ["prompt"],
+      type: "object",
+    },
+    async run(input, context) {
+      const parsedInput = GenerateImageInputSchema.safeParse(input);
+
+      if (!parsedInput.success) {
+        return { error: "prompt is required." };
+      }
+
+      return runGenerateImageTool(parsedInput.data, context, deps);
+    },
+  };
+}
+
+export async function runGenerateImageTool(
+  input: z.infer<typeof GenerateImageInputSchema>,
+  context: ToolContext,
+  deps: GenerateImageToolDeps
+): Promise<GenerateImageToolOutput> {
+  const prompt = input.prompt?.trim();
+
+  if (!prompt) {
+    return { error: "prompt is required." };
+  }
+
+  if (Object.hasOwn(input, "model")) {
+    return {
+      error:
+        "model is not a generate_image parameter; a platform admin sets it in Control center → AI Providers (/customize/providers#image-generation).",
+    };
+  }
+
+  const orgId = context.orgId?.trim();
+  const profileId = context.profileId?.trim();
+
+  if (!(orgId && profileId)) {
+    return { error: "orgId and profileId are required." };
+  }
+
+  const sizeRaw = input.size?.trim();
+  let size: string;
+
+  try {
+    size = normalizeImageGenerationSize(sizeRaw);
+  } catch (error) {
+    return {
+      error: errorMessage(
+        ErrorInputSchema.catch(new Error(String(error))).parse(error)
+      ),
+    };
+  }
+
+  const filenameHint = input.filename;
+
+  await deps.ensureSettingsLoaded();
+
+  let selection;
+
+  try {
+    selection = resolveImageGenerationSelection(deps.getUserConfig());
+  } catch (error) {
+    return {
+      error: errorMessage(
+        ErrorInputSchema.catch(new Error(String(error))).parse(error)
+      ),
+    };
+  }
+
+  if (!selection) {
+    return { error: IMAGE_MODEL_REQUIRED_MESSAGE };
+  }
+
+  const generate = deps.generateImage ?? generateImageWithOpenAI;
+  let result;
+
+  try {
+    result = await generate({
+      apiKey: selection.apiKey,
+      baseUrl: selection.baseUrl,
+      model: selection.model,
+      prompt,
+      signal: context.signal,
+      size,
+    });
+  } catch (error) {
+    return {
+      error: errorMessage(
+        ErrorInputSchema.catch(new Error(String(error))).parse(error)
+      ),
+    };
+  }
+
+  if (result.data.byteLength === 0) {
+    return { error: "Image generation returned empty image data." };
+  }
+
+  if (result.data.byteLength > MAX_IMAGE_BYTES) {
+    return {
+      error: `Generated image exceeds the ${MAX_IMAGE_BYTES / (1024 * 1024)} MB size limit.`,
+    };
+  }
+
+  const workspaceRoot =
+    context.workspaceRoot?.trim() || getProfileSoulDir(orgId, profileId);
+
+  if (!path.isAbsolute(workspaceRoot)) {
+    throw new Error(
+      "workspaceRoot must be an absolute path; relative roots resolve against process.cwd() and break profile isolation."
+    );
+  }
+
+  const artifactsDir = path.join(workspaceRoot, "artifacts");
+  const outputName = resolveOutputFilename(filenameHint, result.mediaType);
+
+  const targetPath = await uniqueArtifactPath(
+    path.join(artifactsDir, outputName)
+  );
+
+  const relativePath = normalizeRelativePath(
+    path.relative(workspaceRoot, targetPath)
+  );
+
+  const sizeBytes = result.data.byteLength;
+
+  await mkdir(artifactsDir, { recursive: true });
+
+  try {
+    await writeFile(targetPath, result.data);
+  } catch (error) {
+    await unlink(targetPath).catch(() => undefined);
+
+    return {
+      error: errorMessage(
+        ErrorInputSchema.catch(new Error(String(error))).parse(error)
+      ),
+    };
+  }
+
+  let attachmentId: string | null = null;
+  const sessionId = context.sessionId?.trim();
+  const channel = context.channel;
+
+  if (sessionId && channel) {
+    try {
+      const trackEphemeral = context.trackEphemeralAttachment;
+
+      const save = createAttachmentSaver(deps.db, {
+        channel,
+        ephemeral: Boolean(trackEphemeral),
+        orgId,
+        profileId,
+        sessionId: trackEphemeral ? null : sessionId,
+      });
+
+      const saved = await save({
+        bytes: Buffer.from(result.data),
+        filename: path.basename(targetPath),
+        kind: "image",
+        mediaType: result.mediaType,
+      });
+
+      attachmentId = saved.attachmentId;
+      trackEphemeral?.(attachmentId);
+    } catch (error) {
+      await unlink(targetPath).catch(() => undefined);
+
+      return {
+        error: errorMessage(
+          ErrorInputSchema.catch(new Error(String(error))).parse(error)
+        ),
+      };
+    }
+  }
+
+  await deps.db.upsertArtifactRecord({
+    channel: channel ?? null,
+    createdAt: new Date().toISOString(),
+    filename: path.relative(artifactsDir, targetPath).split(path.sep).join("/"),
+    orgId,
+    profileId,
+    sessionId: sessionId || null,
+    userId: context.userId?.trim() || null,
+  });
+
+  if (result.usage && deps.recordUsage) {
+    deps.recordUsage(
+      result.model,
+      result.usage.inputTokens,
+      result.usage.outputTokens,
+      selection.instance,
+      { orgId, profileId, userId: context.userId }
+    );
+  }
+
+  return {
+    attachmentId,
+    mimeType: result.mediaType,
+    model: result.model,
+    path: relativePath,
+    sizeBytes,
+  };
+}
+
+async function uniqueArtifactPath(filePath: string): Promise<string> {
+  if (!(await pathExists(filePath))) {
+    return filePath;
+  }
+
+  const date = new Date().toISOString().slice(0, 10);
+  const directory = path.dirname(filePath);
+  const extension = path.extname(filePath);
+  const baseName = path.basename(filePath, extension);
+
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const suffix = attempt === 0 ? date : `${date}-${attempt + 1}`;
+    const candidate = path.join(directory, `${baseName}-${suffix}${extension}`);
+
+    if (!(await pathExists(candidate))) {
+      return candidate;
+    }
+  }
+
+  throw new Error(`Unable to find available artifact filename for ${filePath}`);
+}
+
+function resolveOutputFilename(
+  filename: string | null | undefined,
+  mediaType: string
+): string {
+  const extension =
+    mediaType === "image/jpeg"
+      ? ".jpg"
+      : mediaType === "image/webp"
+        ? ".webp"
+        : ".png";
+
+  const raw = filename?.trim() || DEFAULT_FILENAME;
+  let base = path.basename(raw.replace(/\\/g, "/"));
+
+  if (!base || base === "." || base === "..") {
+    base = DEFAULT_FILENAME;
+  }
+
+  if (inferArtifactMimeType(base) !== mediaType) {
+    base = `${path.basename(base, path.extname(base))}${extension}`;
+  }
+
+  return base;
+}
+
+function normalizeRelativePath(relativePath: string): string {
+  return relativePath.replace(/\\/g, "/");
+}
+
+function errorMessage(error: z.infer<typeof ErrorInputSchema>): string {
+  const mingzhanError = z.instanceof(MíngZhànApiError).safeParse(error);
+
+  if (mingzhanError.success) {
+    return mingzhanError.data.message;
+  }
+
+  const regularError = z.instanceof(Error).safeParse(error);
+
+  if (regularError.success && regularError.data.message.trim()) {
+    return regularError.data.message;
+  }
+
+  return String(error);
+}

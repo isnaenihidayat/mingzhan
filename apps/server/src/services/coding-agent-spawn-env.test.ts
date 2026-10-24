@@ -1,0 +1,211 @@
+import { describe, expect, test } from "bun:test";
+import {
+  buildClaudeCodeSpawnEnv,
+  buildCodexSpawnEnv,
+  buildPiSpawnEnv,
+  buildSpawnEnvForHarness,
+  mergeCodingAgentSpawnEnv,
+  normalizeCodingAgentModel,
+  redactSpawnEnvForPrompt,
+} from "./coding-agent-spawn-env";
+import {
+  activeAnthropicRouting,
+  inactiveRouting,
+} from "./coding-agent-test-fixtures";
+
+describe("coding-agent spawn env", () => {
+  test("normalizes profile model ids", () => {
+    expect(normalizeCodingAgentModel("anthropic:claude-sonnet-4-6")).toBe(
+      "claude-sonnet-4-6"
+    );
+    expect(normalizeCodingAgentModel("anthropic/claude-sonnet-4-6")).toBe(
+      "claude-sonnet-4-6"
+    );
+  });
+
+  test("returns empty spawn env for Cursor Agent even when routing is active", async () => {
+    const spawn = await buildSpawnEnvForHarness(
+      "cursor_agent",
+      activeAnthropicRouting({
+        model: "anthropic:claude-opus-4-6",
+      }),
+      "anthropic"
+    );
+
+    expect(spawn.env).toEqual({});
+    expect(spawn.cleanup).toBeUndefined();
+  });
+
+  test("builds Claude Code provider passthrough env", () => {
+    const env = buildClaudeCodeSpawnEnv(
+      activeAnthropicRouting({
+        model: "anthropic:claude-opus-4-6",
+      }),
+      "anthropic"
+    );
+
+    expect(env.ANTHROPIC_BASE_URL).toBe("https://api.anthropic.com");
+    expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-test");
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("claude-opus-4-6");
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+  });
+
+  test("builds pi.dev provider passthrough env for openrouter", async () => {
+    const env = await buildPiSpawnEnv(
+      activeAnthropicRouting({
+        apiKey: "sk-or-test",
+        baseUrl: "https://openrouter.ai/api/v1",
+        providerLabel: "OpenRouter",
+        providerType: "openrouter",
+      }),
+      "openrouter"
+    );
+
+    expect(env.env.PI_CODING_AGENT_DIR).toBeDefined();
+    expect(env.cleanup).toBeDefined();
+  });
+
+  test("builds pi.dev provider passthrough env for openai_compatible", async () => {
+    const env = await buildPiSpawnEnv(
+      activeAnthropicRouting({
+        apiKey: "sk-custom-test",
+        baseUrl: "https://custom.example.com/v1",
+        model: "custom-model",
+        providerLabel: "Custom",
+        providerType: "openai_compatible",
+      }),
+      "openai_compatible"
+    );
+
+    expect(env.env.PI_CODING_AGENT_DIR).toBeDefined();
+    expect(env.cleanup).toBeDefined();
+    // Verify the models.json was written
+    const { readFile } = await import("node:fs/promises");
+
+    const modelsJson = JSON.parse(
+      await readFile(`${env.env.PI_CODING_AGENT_DIR}/models.json`, "utf-8")
+    );
+
+    expect(modelsJson.providers.mingzhan).toBeDefined();
+    expect(modelsJson.providers.mingzhan.baseUrl).toBe(
+      "https://custom.example.com/v1"
+    );
+    expect(modelsJson.providers.mingzhan.apiKey).toBe("sk-custom-test");
+    expect(modelsJson.providers.mingzhan.api).toBe("openai-completions");
+    await env.cleanup?.();
+  });
+
+  test("uses mingzhan provider in models.json for anthropic with custom base URL", async () => {
+    const env = await buildPiSpawnEnv(
+      activeAnthropicRouting({
+        apiKey: "sk-proxy-test",
+        baseUrl: "https://proxy.example.com/v1",
+        model: "claude-sonnet-4-6",
+        providerLabel: "Anthropic Proxy",
+        providerType: "anthropic",
+      }),
+      "anthropic"
+    );
+
+    const { readFile } = await import("node:fs/promises");
+
+    const modelsJson = JSON.parse(
+      await readFile(`${env.env.PI_CODING_AGENT_DIR}/models.json`, "utf-8")
+    );
+
+    // Custom base URL → mingzhan provider with openai-completions, NOT anthropic
+    expect(modelsJson.providers.mingzhan).toBeDefined();
+    expect(modelsJson.providers.anthropic).toBeUndefined();
+    expect(modelsJson.providers.mingzhan.api).toBe("openai-completions");
+    expect(modelsJson.providers.mingzhan.baseUrl).toBe(
+      "https://proxy.example.com/v1"
+    );
+    await env.cleanup?.();
+  });
+
+  test("overrides built-in anthropic provider for default base URL", async () => {
+    const env = await buildPiSpawnEnv(
+      activeAnthropicRouting({
+        apiKey: "sk-ant-test",
+        baseUrl: "https://api.anthropic.com",
+        model: "claude-sonnet-4-6",
+        providerLabel: "Anthropic",
+        providerType: "anthropic",
+      }),
+      "anthropic"
+    );
+
+    const { readFile } = await import("node:fs/promises");
+
+    const modelsJson = JSON.parse(
+      await readFile(`${env.env.PI_CODING_AGENT_DIR}/models.json`, "utf-8")
+    );
+
+    // Default base URL → override built-in anthropic provider
+    expect(modelsJson.providers.anthropic).toBeDefined();
+    expect(modelsJson.providers.mingzhan).toBeUndefined();
+    expect(modelsJson.providers.anthropic.apiKey).toBe("sk-ant-test");
+    await env.cleanup?.();
+  });
+
+  test("returns no env overrides when routing is inactive for pi", async () => {
+    const env = await buildPiSpawnEnv(inactiveRouting(), "openai");
+    expect(env.env).toEqual({});
+    expect(env.cleanup).toBeUndefined();
+  });
+
+  test("builds Codex provider passthrough env", () => {
+    expect(
+      buildCodexSpawnEnv(
+        activeAnthropicRouting({
+          apiKey: "sk-openai-test",
+          baseUrl: "https://api.openai.com/v1",
+          model: "openai:gpt-4.1",
+          providerLabel: "OpenAI",
+          providerType: "openai",
+        }),
+        "openai"
+      )
+    ).toEqual({
+      OPENAI_API_KEY: "sk-openai-test",
+      OPENAI_BASE_URL: "https://api.openai.com/v1",
+      OPENAI_MODEL: "gpt-4.1",
+    });
+  });
+
+  test("protects credential env keys from caller overrides", () => {
+    const env = mergeCodingAgentSpawnEnv(
+      { ANTHROPIC_API_KEY: "base-key", HOME: "/tmp", UNSET_FLAG: undefined },
+      {
+        ANTHROPIC_API_KEY: "sk-from-mingzhan",
+        ANTHROPIC_BASE_URL: "https://api.anthropic.com",
+      },
+      {
+        callerEnv: {
+          ANTHROPIC_API_KEY: "sk-override",
+          CUSTOM_FLAG: "1",
+        },
+        protectCredentialKeys: true,
+      }
+    );
+
+    expect(env.ANTHROPIC_API_KEY).toBe("sk-from-mingzhan");
+    expect(env.CUSTOM_FLAG).toBe("1");
+    expect(env.HOME).toBe("/tmp");
+    expect(env).not.toHaveProperty("UNSET_FLAG");
+  });
+
+  test("redacts secrets for prompt context", () => {
+    expect(
+      redactSpawnEnvForPrompt({
+        ANTHROPIC_API_KEY: "sk-ant-test",
+        ANTHROPIC_BASE_URL: "https://api.anthropic.com",
+        OPENAI_MODEL: "gpt-4.1",
+      })
+    ).toEqual({
+      ANTHROPIC_API_KEY: "***",
+      ANTHROPIC_BASE_URL: "https://api.anthropic.com",
+      OPENAI_MODEL: "gpt-4.1",
+    });
+  });
+});

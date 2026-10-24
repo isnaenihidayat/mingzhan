@@ -1,0 +1,2538 @@
+import type { Database, SQLQueryBindings } from "bun:sqlite";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { orgIdFromSkillSourcePath } from "@mingzhan/core";
+
+const BOOTSTRAP_SCHEMA_VERSION = 1;
+
+export function migrateDatabase(db: Database): void {
+  applyBootstrapSchema(db);
+
+  // Each step runs in its own transaction so a failure cannot leave one half
+  // applied. They deliberately do not share a single outer transaction: the
+  // bootstrap schema has its own versioned transaction, while
+  // migrateLegacyProfileIds toggles `PRAGMA foreign_keys` and opens its own
+  // BEGIN. Stopping between steps is safe because every compatibility step is
+  // idempotent and runs on every open.
+  const atomic = (step: (database: Database) => void): void => {
+    db.transaction(() => step(db))();
+  };
+
+  atomic(migrateProfilesTable);
+  atomic(migrateAutomationsTable);
+  atomic(migrateDropTasksTables);
+  atomic(migrateSessionsTable);
+  atomic(migrateSessionTree);
+  atomic(migrateSessionAppUserId);
+  atomic(migrateMcpTables);
+  atomic(migrateSkillsTables);
+  atomic(migrateUsersTable);
+  atomic(migratePasskeyTables);
+  atomic(migrateOrgTables);
+  atomic((database) => database.exec("DROP TABLE IF EXISTS api_keys"));
+  atomic(migrateLegacyUserContextToOrgMembers);
+  atomic(migrateOrgMemoryProposalsTable);
+  atomic(migrateSkillProposalsTable);
+  atomic(migrateSkillSuggestionsTable);
+  atomic(migrateSkillsWriteApprovalColumns);
+  atomic(migrateOrganizationAllowedInviteDomains);
+  atomic(migrateSkillsPostTurnReviewColumns);
+  atomic(migrateAutomationsEnabledColumn);
+  atomic(migrateGroupsEnabledColumn);
+  atomic(migrateSkillsCuratorColumns);
+  atomic(migrateLlmUsageQuotaColumns);
+  atomic(migrateOrgLlmMonthlyQuotaTable);
+  atomic(migrateSkillsCuratorConsolidateColumns);
+  atomic(migrateOrganizationArchivedAt);
+  atomic(migrateOrganizationParent);
+  atomic(migrateOrgSharedResources);
+  atomic(migrateOrgTeamCreationRequests);
+  atomic(migrateSkillUsageTables);
+  atomic(migrateTenantOrgScope);
+  atomic(migrateSkillOrgIds);
+  atomic(migrateProfileOrgColumns);
+  atomic(migrateSessionOrgIds);
+  atomic(migrateBrowserSessionsTable);
+  atomic(migratePasswordResetTokensTable);
+  migrateLegacyProfileIds(db);
+  atomic(migrateCodingDelegationSkillName);
+  atomic(migrateArtifactDesignSkillName);
+  atomic(migrateSuperMingzhanNaming);
+  atomic(migrateWorkspaceSettingsTable);
+  atomic(migrateLlmUsageOrgScope);
+  atomic((database) =>
+    database.exec("DROP TABLE IF EXISTS tool_output_savings")
+  );
+  atomic(migrateLlmTurnUsageTable);
+  atomic(migrateLlmUsageActorStatsTable);
+  atomic(migrateLlmUsageDailyStatsTable);
+  atomic(migrateAttachmentsTable);
+  atomic(migrateAutomationRunsTable);
+  atomic(migrateAutomationRunReadStateTable);
+  atomic(migrateWorkflowsTables);
+  atomic(migrateComposioTables);
+  atomic(migrateComposioUserConnections);
+  atomic(migrateAuditEventsTable);
+  atomic(migrateProfileChangeEventsTable);
+  atomic(migrateSkillVersionsTable);
+  atomic(migratePluginTables);
+  atomic(migrateRemoveGoogleMeetPlugin);
+  atomic(migrateFilePinsTable);
+  atomic(migrateNotificationWebhookDeliveriesTable);
+  atomic(migrateArtifactsTable);
+  atomic((database) =>
+    addNullableTextColumnIfMissing(database, "profiles", "acp_agent")
+  );
+  atomic((database) =>
+    addNullableTextColumnIfMissing(database, "profiles", "acp_settings")
+  );
+  atomic((database) =>
+    addNullableTextColumnIfMissing(database, "profiles", "owner_user_id")
+  );
+  atomic(migrateProfileSharedWithTeamColumn);
+  atomic(migrateSessionOwners);
+}
+
+/**
+ * Chat history is private to the user who owns the session. Private sessions from
+ * before that rule, or whose owner was deleted, go to the first platform
+ * admin so they stay reachable. Before setup creates that admin there is
+ * nobody to hand them to, and the next open tries again.
+ */
+function migrateSessionOwners(db: Database): void {
+  addNullableTextColumnIfMissing(db, "sessions", "user_id");
+
+  db.exec(`
+    UPDATE sessions
+    SET user_id = (
+      SELECT id FROM users
+      WHERE is_platform_admin = 1
+      ORDER BY disabled_at IS NOT NULL, created_at ASC, id ASC
+      LIMIT 1
+    )
+    WHERE (user_id IS NULL OR user_id NOT IN (SELECT id FROM users))
+      -- Shared chats must not inherit the admin's tool execution permissions.
+      AND channel NOT IN ('discord', 'slack', 'telegram', 'whatsapp')
+      AND EXISTS (SELECT 1 FROM users WHERE is_platform_admin = 1)
+  `);
+
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS sessions_profile_user ON sessions (profile_id, user_id, channel)"
+  );
+}
+
+function migrateProfileSharedWithTeamColumn(db: Database): void {
+  const columns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(profiles)"
+    )
+    .all();
+
+  if (!columns.some((column) => column.name === "shared_with_team")) {
+    db.exec(
+      "ALTER TABLE profiles ADD COLUMN shared_with_team INTEGER NOT NULL DEFAULT 1;"
+    );
+  }
+}
+
+function migrateOrgTeamCreationRequests(db: Database): void {
+  db.exec(`
+CREATE TABLE IF NOT EXISTS org_team_creation_requests (
+  parent_org_id TEXT NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+  request_id TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  creator_user_id TEXT NOT NULL,
+  admin_user_id TEXT NOT NULL,
+  team_org_id TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  completed_at TEXT,
+  PRIMARY KEY (parent_org_id, request_id)
+);
+  `);
+}
+
+function migrateOrgSharedResources(db: Database): void {
+  // Retain source links after revocation; a missing publication blocks use.
+  db.exec(`
+CREATE TABLE IF NOT EXISTS org_shared_resources (
+  id TEXT PRIMARY KEY NOT NULL,
+  org_id TEXT NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+  resource_kind TEXT NOT NULL CHECK (resource_kind IN ('knowledge', 'skill', 'agent', 'tool', 'model')),
+  resource_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (org_id, resource_kind, resource_id)
+);
+
+CREATE TABLE IF NOT EXISTS shared_agent_instances (
+  profile_id TEXT PRIMARY KEY NOT NULL REFERENCES profiles (id) ON DELETE CASCADE,
+  team_org_id TEXT NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+  source_org_id TEXT NOT NULL,
+  source_profile_id TEXT NOT NULL,
+  publication_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (team_org_id, source_profile_id)
+);
+
+CREATE TRIGGER IF NOT EXISTS profiles_unpublish_deleted_source
+AFTER DELETE ON profiles
+BEGIN
+  DELETE FROM org_shared_resources WHERE resource_kind = 'agent' AND resource_id = OLD.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS skills_unpublish_deleted_source
+AFTER DELETE ON skills
+BEGIN
+  DELETE FROM org_shared_resources WHERE resource_kind = 'skill' AND resource_id = OLD.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS tools_unpublish_deleted_source
+AFTER DELETE ON tools
+BEGIN
+  DELETE FROM org_shared_resources WHERE resource_kind = 'tool' AND resource_id = OLD.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS profiles_remove_shared_agent_instance
+AFTER DELETE ON profiles
+BEGIN
+  DELETE FROM shared_agent_instances WHERE profile_id = OLD.id;
+END;
+  `);
+}
+
+function migrateSessionAppUserId(db: Database): void {
+  const columns = db
+    .prepare<
+      {
+        name: string;
+      },
+      SQLQueryBindings[]
+    >("PRAGMA table_info(sessions)")
+    .all();
+
+  if (!columns.some((column) => column.name === "app_user_id")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN app_user_id TEXT;");
+  }
+
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS sessions_app_user_id ON sessions (profile_id, channel, app_user_id)"
+  );
+}
+
+function migrateAuditEventsTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS audit_events (
+      id TEXT PRIMARY KEY NOT NULL,
+      actor_user_id TEXT,
+      org_id TEXT,
+      action TEXT NOT NULL,
+      resource_type TEXT NOT NULL,
+      resource_id TEXT,
+      metadata TEXT NOT NULL DEFAULT '{}',
+      request_id TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS audit_events_created
+      ON audit_events (created_at DESC, id DESC);
+
+    CREATE INDEX IF NOT EXISTS audit_events_org_created
+      ON audit_events (org_id, created_at DESC, id DESC);
+
+    CREATE TRIGGER IF NOT EXISTS audit_events_no_update
+    BEFORE UPDATE ON audit_events
+    BEGIN
+      SELECT RAISE(ABORT, 'audit_events are append-only');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS audit_events_no_delete
+    BEFORE DELETE ON audit_events
+    BEGIN
+      SELECT RAISE(ABORT, 'audit_events are append-only');
+    END;
+  `);
+}
+
+function applyBootstrapSchema(db: Database): void {
+  // Foreign-key enforcement is connection-scoped, so it must run even after
+  // the bootstrap schema has already been applied.
+  db.exec("PRAGMA foreign_keys = ON");
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS schema_version (
+      version INTEGER PRIMARY KEY NOT NULL
+    );
+  `);
+
+  const current = db
+    .prepare<{ version: number | null }, SQLQueryBindings[]>(
+      "SELECT MAX(version) AS version FROM schema_version"
+    )
+    .get();
+
+  if ((current?.version ?? 0) >= BOOTSTRAP_SCHEMA_VERSION) {
+    return;
+  }
+
+  const schemaPath = resolveSchemaPath();
+  const sql = readFileSync(schemaPath, "utf8");
+  db.transaction(() => {
+    db.exec(sql);
+    db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(
+      BOOTSTRAP_SCHEMA_VERSION
+    );
+  })();
+}
+
+export function resolveSchemaPath(
+  options: { moduleDir?: string; cwd?: string } = {}
+): string {
+  const moduleDir =
+    options.moduleDir ?? dirname(fileURLToPath(import.meta.url));
+
+  const cwd = options.cwd ?? process.cwd();
+
+  const candidates = [
+    join(moduleDir, "../sql/schema.sql"),
+    resolve(cwd, "packages/db/sql/schema.sql"),
+    resolve(cwd, "../packages/db/sql/schema.sql"),
+  ];
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return candidates[0];
+}
+
+function migrateProfilesTable(db: Database): void {
+  const columns = db
+    .prepare<
+      {
+        name: string;
+      },
+      SQLQueryBindings[]
+    >("PRAGMA table_info(profiles)")
+    .all();
+
+  const columnNames = new Set(columns.map((column) => column.name));
+
+  if (!columnNames.has("thinking_enabled")) {
+    db.exec(`
+      ALTER TABLE profiles ADD COLUMN thinking_enabled INTEGER;
+    `);
+  }
+
+  if (!columnNames.has("thinking_effort")) {
+    db.exec(`
+      ALTER TABLE profiles ADD COLUMN thinking_effort TEXT;
+    `);
+  }
+
+  if (!columnNames.has("is_default")) {
+    db.exec(`
+      ALTER TABLE profiles ADD COLUMN is_default INTEGER DEFAULT 0 NOT NULL;
+    `);
+  }
+}
+
+function migrateMcpTables(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS mcp_servers (
+      id TEXT PRIMARY KEY NOT NULL,
+      name TEXT NOT NULL,
+      transport TEXT NOT NULL,
+      config TEXT NOT NULL,
+      enabled INTEGER DEFAULT 1 NOT NULL,
+      status TEXT NOT NULL DEFAULT 'disconnected',
+      last_error TEXT,
+      cached_tools TEXT DEFAULT '[]' NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS mcp_servers_name_unique ON mcp_servers (name);
+    CREATE TABLE IF NOT EXISTS profile_mcp_servers (
+      profile_id TEXT NOT NULL,
+      server_id TEXT NOT NULL,
+      PRIMARY KEY (profile_id, server_id),
+      FOREIGN KEY (profile_id) REFERENCES profiles (id) ON DELETE CASCADE,
+      FOREIGN KEY (server_id) REFERENCES mcp_servers (id) ON DELETE CASCADE
+    );
+  `);
+}
+
+function migrateSkillsTables(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS skills (
+      id TEXT PRIMARY KEY NOT NULL,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL,
+      source_path TEXT NOT NULL,
+      has_tool INTEGER DEFAULT 0 NOT NULL,
+      disable_model_invocation INTEGER DEFAULT 0 NOT NULL,
+      enabled INTEGER DEFAULT 1 NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    DROP INDEX IF EXISTS skills_name_unique;
+    CREATE UNIQUE INDEX IF NOT EXISTS skills_source_path_unique ON skills (source_path);
+    CREATE TABLE IF NOT EXISTS profile_skills (
+      profile_id TEXT NOT NULL,
+      skill_id TEXT NOT NULL,
+      PRIMARY KEY (profile_id, skill_id),
+      FOREIGN KEY (profile_id) REFERENCES profiles (id) ON DELETE CASCADE,
+      FOREIGN KEY (skill_id) REFERENCES skills (id) ON DELETE CASCADE
+    );
+  `);
+}
+
+function migrateAutomationsTable(db: Database): void {
+  const columns = db
+    .prepare<
+      {
+        name: string;
+        dflt_value: string | null;
+      },
+      SQLQueryBindings[]
+    >("PRAGMA table_info(automations)")
+    .all();
+
+  const columnNames = new Set(columns.map((column) => column.name));
+
+  if (!columnNames.has("profile_id")) {
+    db.exec(`
+      ALTER TABLE automations ADD COLUMN profile_id TEXT NOT NULL DEFAULT 'default';
+    `);
+  }
+
+  if (!columnNames.has("enabled")) {
+    db.exec(`
+      ALTER TABLE automations ADD COLUMN enabled INTEGER DEFAULT 1 NOT NULL;
+    `);
+  }
+
+  const refreshedColumns = db
+    .prepare<{ name: string; dflt_value: string | null }, SQLQueryBindings[]>(
+      "PRAGMA table_info(automations)"
+    )
+    .all();
+
+  const profileIdColumn = refreshedColumns.find(
+    (column) => column.name === "profile_id"
+  );
+
+  if (
+    normalizeSqlDefaultLiteral(profileIdColumn?.dflt_value) ===
+    "profile_default"
+  ) {
+    recreateAutomationsTableWithDefaultProfile(db);
+  }
+}
+
+function recreateAutomationsTableWithDefaultProfile(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS automations_new (
+      id TEXT PRIMARY KEY NOT NULL,
+      name TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      definition TEXT NOT NULL,
+      profile_id TEXT NOT NULL DEFAULT 'default',
+      enabled INTEGER DEFAULT 1 NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (profile_id) REFERENCES profiles (id) ON DELETE CASCADE
+    );
+
+    INSERT INTO automations_new (
+      id,
+      name,
+      version,
+      definition,
+      profile_id,
+      enabled,
+      created_at,
+      updated_at
+    )
+    SELECT
+      id,
+      name,
+      version,
+      definition,
+      profile_id,
+      enabled,
+      created_at,
+      updated_at
+    FROM automations;
+
+    DROP TABLE automations;
+    ALTER TABLE automations_new RENAME TO automations;
+  `);
+}
+
+function normalizeSqlDefaultLiteral(
+  value: string | null | undefined
+): string | null {
+  if (!value) {
+    return null;
+  }
+
+  return value.replace(/^'+|'+$/g, "");
+}
+
+function migrateDropTasksTables(db: Database): void {
+  db.exec(`
+    DROP TABLE IF EXISTS task_runs;
+    DROP TABLE IF EXISTS tasks;
+  `);
+}
+
+function migrateUsersTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY NOT NULL,
+      email TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      name TEXT,
+      phone TEXT,
+      is_platform_admin INTEGER DEFAULT 0 NOT NULL,
+      disabled_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users (email);
+  `);
+
+  const columns = db
+    .prepare<
+      {
+        name: string;
+      },
+      SQLQueryBindings[]
+    >("PRAGMA table_info(users)")
+    .all();
+
+  const columnNames = new Set(columns.map((column) => column.name));
+
+  if (!columnNames.has("is_platform_admin")) {
+    db.exec(`
+      ALTER TABLE users ADD COLUMN is_platform_admin INTEGER DEFAULT 0 NOT NULL;
+    `);
+  }
+
+  if (!columnNames.has("name")) {
+    db.exec("ALTER TABLE users ADD COLUMN name TEXT;");
+  }
+
+  if (!columnNames.has("phone")) {
+    db.exec("ALTER TABLE users ADD COLUMN phone TEXT;");
+  }
+
+  if (!columnNames.has("user_context")) {
+    db.exec("ALTER TABLE users ADD COLUMN user_context TEXT;");
+  }
+
+  if (!columnNames.has("disabled_at")) {
+    db.exec("ALTER TABLE users ADD COLUMN disabled_at TEXT;");
+  }
+
+  if (!columnNames.has("mfa_enabled")) {
+    db.exec(
+      "ALTER TABLE users ADD COLUMN mfa_enabled INTEGER DEFAULT 0 NOT NULL;"
+    );
+  }
+
+  if (!columnNames.has("mfa_totp_secret_enc")) {
+    db.exec("ALTER TABLE users ADD COLUMN mfa_totp_secret_enc TEXT;");
+  }
+
+  if (!columnNames.has("mfa_totp_pending_secret_enc")) {
+    db.exec("ALTER TABLE users ADD COLUMN mfa_totp_pending_secret_enc TEXT;");
+  }
+
+  if (!columnNames.has("mfa_totp_last_step")) {
+    db.exec("ALTER TABLE users ADD COLUMN mfa_totp_last_step INTEGER;");
+  }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS user_mfa_backup_codes (
+      id TEXT PRIMARY KEY NOT NULL,
+      user_id TEXT NOT NULL,
+      code_hash TEXT NOT NULL,
+      used_at TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS user_mfa_backup_codes_hash_unique
+      ON user_mfa_backup_codes (code_hash);
+    CREATE INDEX IF NOT EXISTS user_mfa_backup_codes_user_idx
+      ON user_mfa_backup_codes (user_id, used_at);
+  `);
+}
+
+function migratePasskeyTables(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS user_passkeys (
+      id TEXT PRIMARY KEY NOT NULL,
+      user_id TEXT NOT NULL,
+      credential_id TEXT NOT NULL,
+      public_key TEXT NOT NULL,
+      counter INTEGER NOT NULL DEFAULT 0,
+      transports TEXT NOT NULL DEFAULT '[]',
+      name TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS user_passkeys_credential_unique
+      ON user_passkeys (credential_id);
+    CREATE INDEX IF NOT EXISTS user_passkeys_user_idx
+      ON user_passkeys (user_id);
+    CREATE TABLE IF NOT EXISTS user_passkey_challenges (
+      challenge TEXT PRIMARY KEY NOT NULL,
+      user_id TEXT,
+      type TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+  `);
+
+  const columns = db
+    .prepare<{ name: string; notnull: number }, SQLQueryBindings[]>(
+      "PRAGMA table_info(user_passkey_challenges)"
+    )
+    .all();
+
+  if (columns.find((column) => column.name === "user_id")?.notnull) {
+    db.exec(`
+      ALTER TABLE user_passkey_challenges
+        RENAME TO user_passkey_challenges_legacy;
+      CREATE TABLE user_passkey_challenges (
+        challenge TEXT PRIMARY KEY NOT NULL,
+        user_id TEXT,
+        type TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+      );
+      INSERT INTO user_passkey_challenges (
+        challenge, user_id, type, expires_at, created_at
+      )
+      SELECT challenge, user_id, type, expires_at, created_at
+      FROM user_passkey_challenges_legacy;
+      DROP TABLE user_passkey_challenges_legacy;
+    `);
+  }
+}
+
+/**
+ * LLM usage is a tenant ledger: the system status page reports it per org, so
+ * one install-wide row answered every organization's request with the whole
+ * install's tokens and cost (#1306).
+ *
+ * Both tables are rebuilt rather than ALTERed because the org has to join the
+ * primary key: one row per org, one row per org and model. The old rows carry
+ * no org. With exactly one organization they can only be that org's, so they
+ * move to it. With several there is no telling whose spend they were, so both
+ * tables start empty and each org accumulates from its next request.
+ *
+ * This runs on every open, so a table that already has org_id in its key is
+ * left alone.
+ */
+function migrateLlmUsageOrgScope(db: Database): void {
+  const unscoped = (
+    [
+      ["llm_usage_stats", "id"],
+      ["llm_usage_model_stats", "model_id"],
+    ] as const
+  ).filter(([table]) => {
+    const columns = db
+      .prepare<
+        {
+          name: string;
+          pk: number;
+        },
+        SQLQueryBindings[]
+      >(`PRAGMA table_info(${table})`)
+      .all();
+
+    return (
+      columns.length > 0 &&
+      !columns.some((column) => column.name === "org_id" && column.pk > 0)
+    );
+  });
+
+  for (const [table] of unscoped) {
+    db.exec(`ALTER TABLE ${table} RENAME TO ${table}_unscoped;`);
+  }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS llm_usage_stats (
+      org_id TEXT NOT NULL,
+      id TEXT NOT NULL,
+      request_count INTEGER NOT NULL DEFAULT 0,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      estimated_cost_usd REAL NOT NULL DEFAULT 0,
+      tracked_since TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (org_id, id)
+    );
+    CREATE TABLE IF NOT EXISTS llm_usage_model_stats (
+      org_id TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      request_count INTEGER NOT NULL DEFAULT 0,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      estimated_cost_usd REAL NOT NULL DEFAULT 0,
+      tracked_since TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (org_id, model_id)
+    );
+  `);
+
+  // Archived organizations count: one of them may be who ran up the old total.
+  const orgs = db
+    .prepare<
+      {
+        id: string;
+      },
+      SQLQueryBindings[]
+    >("SELECT id FROM organizations LIMIT 2")
+    .all();
+
+  for (const [table, key] of unscoped) {
+    if (orgs.length === 1) {
+      db.prepare(`
+        INSERT INTO ${table} (
+          org_id, ${key}, request_count, input_tokens, output_tokens,
+          estimated_cost_usd, tracked_since, updated_at
+        )
+        SELECT ?, ${key}, request_count, input_tokens, output_tokens,
+          estimated_cost_usd, tracked_since, updated_at
+        FROM ${table}_unscoped
+      `).run(orgs[0].id);
+    }
+
+    db.exec(`DROP TABLE ${table}_unscoped;`);
+  }
+}
+
+/**
+ * Provider tokens per turn, per org, per day. The monthly usage quota sums it.
+ * `arm` is left from the removed token optimiser (#1888) and is now always
+ * `none`; older rows may say `omni`, and the quota counts both.
+ */
+function migrateLlmTurnUsageTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS llm_turn_usage (
+      org_id TEXT NOT NULL,
+      bucket TEXT NOT NULL,
+      arm TEXT NOT NULL,
+      turns INTEGER NOT NULL DEFAULT 0,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      estimated_turns INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (org_id, bucket, arm)
+    );
+    CREATE INDEX IF NOT EXISTS llm_turn_usage_org_bucket
+      ON llm_turn_usage (org_id, bucket);
+  `);
+}
+
+/**
+ * LLM usage per org, per agent (profile), per user (#1626). An empty
+ * `profile_id` or `user_id` is the unattributed group.
+ *
+ * Totals recorded before this table existed carry no agent or user, so they
+ * move in as one unattributed row per org. That keeps the groups summing to the
+ * org total without guessing who ran up the old spend. The copy happens only
+ * when the table is created, so it is not repeated on later opens.
+ */
+function migrateLlmUsageActorStatsTable(db: Database): void {
+  const exists = db
+    .prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'llm_usage_actor_stats'"
+    )
+    .get();
+
+  if (exists) {
+    return;
+  }
+
+  db.exec(`
+    CREATE TABLE llm_usage_actor_stats (
+      org_id TEXT NOT NULL,
+      profile_id TEXT NOT NULL DEFAULT '',
+      user_id TEXT NOT NULL DEFAULT '',
+      request_count INTEGER NOT NULL DEFAULT 0,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      estimated_cost_usd REAL NOT NULL DEFAULT 0,
+      tracked_since TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (org_id, profile_id, user_id)
+    );
+    INSERT INTO llm_usage_actor_stats (
+      org_id, profile_id, user_id, request_count, input_tokens, output_tokens,
+      estimated_cost_usd, tracked_since, updated_at
+    )
+    SELECT org_id, '', '', request_count, input_tokens, output_tokens,
+      estimated_cost_usd, tracked_since, updated_at
+    FROM llm_usage_stats
+    WHERE id = 'default';
+  `);
+}
+
+/**
+ * LLM usage per org, per UTC day, per model, per provider, for the usage
+ * charts. Running totals carry no dates, so this table starts empty: it cannot
+ * say on which day old spend happened.
+ */
+function migrateLlmUsageDailyStatsTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS llm_usage_daily_stats (
+      org_id TEXT NOT NULL,
+      day TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT '',
+      request_count INTEGER NOT NULL DEFAULT 0,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      estimated_cost_usd REAL NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (org_id, day, model_id, provider)
+    );
+  `);
+}
+
+function migrateOrgTables(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS organizations (
+      id TEXT PRIMARY KEY NOT NULL,
+      name TEXT NOT NULL,
+      slug TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS organizations_slug_unique ON organizations (slug);
+
+    CREATE TABLE IF NOT EXISTS org_members (
+      org_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      user_context TEXT,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (org_id, user_id),
+      FOREIGN KEY (org_id) REFERENCES organizations (id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS org_invites (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+      email TEXT NOT NULL,
+      role TEXT NOT NULL,
+      token_hash TEXT NOT NULL,
+      invited_by_user_id TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      accepted_at TEXT,
+      revoked_at TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (org_id) REFERENCES organizations (id) ON DELETE CASCADE,
+      FOREIGN KEY (invited_by_user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS org_invites_token_hash_unique ON org_invites (token_hash);
+  `);
+
+  const columns = db
+    .prepare<
+      {
+        name: string;
+      },
+      SQLQueryBindings[]
+    >("PRAGMA table_info(org_members)")
+    .all();
+
+  const columnNames = new Set(columns.map((column) => column.name));
+
+  if (!columnNames.has("user_context")) {
+    db.exec("ALTER TABLE org_members ADD COLUMN user_context TEXT;");
+  }
+}
+
+/**
+ * Pre-org installs stored USER.md on users.user_context. Writes moved to
+ * org_members (#550); copy any remaining legacy values into memberships that
+ * still lack per-org context so getUserContext can stop reading users.
+ */
+function migrateLegacyUserContextToOrgMembers(db: Database): void {
+  const usersColumns = db
+    .prepare<
+      {
+        name: string;
+      },
+      SQLQueryBindings[]
+    >("PRAGMA table_info(users)")
+    .all();
+
+  const membersColumns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(org_members)"
+    )
+    .all();
+
+  const userNames = new Set(usersColumns.map((column) => column.name));
+  const memberNames = new Set(membersColumns.map((column) => column.name));
+
+  if (!(userNames.has("user_context") && memberNames.has("user_context"))) {
+    return;
+  }
+
+  db.exec(`
+    UPDATE org_members
+    SET user_context = (
+      SELECT users.user_context
+      FROM users
+      WHERE users.id = org_members.user_id
+        AND users.user_context IS NOT NULL
+        AND TRIM(users.user_context) != ''
+    )
+    WHERE user_context IS NULL;
+  `);
+}
+
+function migrateOrgMemoryProposalsTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS org_memory_proposals (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+      profile_id TEXT,
+      session_id TEXT,
+      proposed_by_user_id TEXT,
+      bullet TEXT NOT NULL,
+      source_document_ids TEXT,
+      status TEXT NOT NULL,
+      pinned INTEGER NOT NULL DEFAULT 0,
+      reviewer_user_id TEXT,
+      reviewed_at TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (org_id) REFERENCES organizations (id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS org_memory_proposals_org_status ON org_memory_proposals (org_id, status);
+  `);
+
+  const columns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(org_memory_proposals)"
+    )
+    .all();
+
+  const names = new Set(columns.map((column) => column.name));
+
+  if (!names.has("source_document_ids")) {
+    db.exec(
+      "ALTER TABLE org_memory_proposals ADD COLUMN source_document_ids TEXT;"
+    );
+  }
+}
+
+function migrateSkillProposalsTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS skill_proposals (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+      profile_id TEXT NOT NULL,
+      session_id TEXT,
+      proposed_by_user_id TEXT,
+      action TEXT NOT NULL,
+      skill_name TEXT NOT NULL,
+      content TEXT,
+      patch_old_string TEXT,
+      patch_new_string TEXT,
+      relative_path TEXT,
+      status TEXT NOT NULL,
+      reviewer_user_id TEXT,
+      reviewed_at TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (org_id) REFERENCES organizations (id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS skill_proposals_org_status ON skill_proposals (org_id, status);
+    CREATE INDEX IF NOT EXISTS skill_proposals_org_profile_status ON skill_proposals (org_id, profile_id, status);
+  `);
+
+  const columns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(skill_proposals)"
+    )
+    .all();
+
+  const names = new Set(columns.map((column) => column.name));
+
+  if (!names.has("relative_path")) {
+    db.exec("ALTER TABLE skill_proposals ADD COLUMN relative_path TEXT;");
+  }
+
+  if (!names.has("supporting_files")) {
+    db.exec("ALTER TABLE skill_proposals ADD COLUMN supporting_files TEXT;");
+  }
+
+  if (!names.has("consolidate_loser_skill_names")) {
+    db.exec(
+      "ALTER TABLE skill_proposals ADD COLUMN consolidate_loser_skill_names TEXT;"
+    );
+  }
+}
+
+function migrateSkillSuggestionsTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS skill_suggestions (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+      profile_id TEXT NOT NULL,
+      session_id TEXT,
+      proposed_by_user_id TEXT,
+      action TEXT NOT NULL,
+      skill_name TEXT NOT NULL,
+      content TEXT,
+      patch_old_string TEXT,
+      patch_new_string TEXT,
+      status TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'post_turn_review',
+      warnings TEXT,
+      created_at TEXT NOT NULL,
+      applied_at TEXT,
+      FOREIGN KEY (org_id) REFERENCES organizations (id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS skill_suggestions_org_status ON skill_suggestions (org_id, status);
+    CREATE INDEX IF NOT EXISTS skill_suggestions_org_session ON skill_suggestions (org_id, session_id);
+    CREATE INDEX IF NOT EXISTS skill_suggestions_org_profile_status ON skill_suggestions (org_id, profile_id, status);
+  `);
+}
+
+function migrateSkillsWriteApprovalColumns(db: Database): void {
+  const orgColumns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(organizations)"
+    )
+    .all();
+
+  if (
+    !new Set(orgColumns.map((column) => column.name)).has(
+      "skills_write_approval"
+    )
+  ) {
+    db.exec(
+      "ALTER TABLE organizations ADD COLUMN skills_write_approval INTEGER NOT NULL DEFAULT 0;"
+    );
+  }
+
+  const profileColumns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(profiles)"
+    )
+    .all();
+
+  if (
+    !new Set(profileColumns.map((column) => column.name)).has(
+      "skills_write_approval"
+    )
+  ) {
+    db.exec("ALTER TABLE profiles ADD COLUMN skills_write_approval INTEGER;");
+  }
+}
+
+function migrateOrganizationAllowedInviteDomains(db: Database): void {
+  const columns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(organizations)"
+    )
+    .all();
+
+  if (!columns.some((column) => column.name === "allowed_invite_domains")) {
+    db.exec(
+      "ALTER TABLE organizations ADD COLUMN allowed_invite_domains TEXT NOT NULL DEFAULT '[]';"
+    );
+  }
+}
+
+function migrateAutomationsEnabledColumn(db: Database): void {
+  const columns = db
+    .prepare<
+      {
+        name: string;
+      },
+      SQLQueryBindings[]
+    >("PRAGMA table_info(profiles)")
+    .all();
+
+  if (
+    !new Set(columns.map((column) => column.name)).has("automations_enabled")
+  ) {
+    // New profiles start with automations off. Profiles from before the
+    // column always ran automations, so they keep that.
+    db.exec(
+      "ALTER TABLE profiles ADD COLUMN automations_enabled INTEGER NOT NULL DEFAULT 0;"
+    );
+    db.exec("UPDATE profiles SET automations_enabled = 1;");
+  }
+}
+
+function migrateGroupsEnabledColumn(db: Database): void {
+  const columns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(profiles)"
+    )
+    .all();
+
+  if (!columns.some((column) => column.name === "groups_enabled")) {
+    db.exec(
+      "ALTER TABLE profiles ADD COLUMN groups_enabled INTEGER NOT NULL DEFAULT 1;"
+    );
+  }
+}
+
+function migrateSkillsPostTurnReviewColumns(db: Database): void {
+  const orgColumns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(organizations)"
+    )
+    .all();
+
+  if (
+    !new Set(orgColumns.map((column) => column.name)).has(
+      "skills_post_turn_review"
+    )
+  ) {
+    db.exec(
+      "ALTER TABLE organizations ADD COLUMN skills_post_turn_review INTEGER NOT NULL DEFAULT 0;"
+    );
+  }
+
+  const profileColumns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(profiles)"
+    )
+    .all();
+
+  if (
+    !new Set(profileColumns.map((column) => column.name)).has(
+      "skills_post_turn_review"
+    )
+  ) {
+    db.exec("ALTER TABLE profiles ADD COLUMN skills_post_turn_review INTEGER;");
+  }
+}
+
+function migrateSkillsCuratorColumns(db: Database): void {
+  const orgColumns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(organizations)"
+    )
+    .all();
+
+  const names = new Set(orgColumns.map((column) => column.name));
+
+  if (!names.has("skills_curator_enabled")) {
+    db.exec(
+      "ALTER TABLE organizations ADD COLUMN skills_curator_enabled INTEGER NOT NULL DEFAULT 0;"
+    );
+  }
+
+  if (!names.has("skills_curator_stale_after_days")) {
+    db.exec(
+      "ALTER TABLE organizations ADD COLUMN skills_curator_stale_after_days INTEGER NOT NULL DEFAULT 30;"
+    );
+  }
+
+  if (!names.has("skills_curator_archive_after_days")) {
+    db.exec(
+      "ALTER TABLE organizations ADD COLUMN skills_curator_archive_after_days INTEGER NOT NULL DEFAULT 90;"
+    );
+  }
+
+  if (!names.has("skills_curator_last_run_at")) {
+    db.exec(
+      "ALTER TABLE organizations ADD COLUMN skills_curator_last_run_at TEXT;"
+    );
+  }
+}
+
+function migrateSkillsCuratorConsolidateColumns(db: Database): void {
+  const orgColumns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(organizations)"
+    )
+    .all();
+
+  if (
+    !new Set(orgColumns.map((column) => column.name)).has(
+      "skills_curator_consolidate_enabled"
+    )
+  ) {
+    db.exec(
+      "ALTER TABLE organizations ADD COLUMN skills_curator_consolidate_enabled INTEGER NOT NULL DEFAULT 0;"
+    );
+  }
+
+  const profileColumns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(profiles)"
+    )
+    .all();
+
+  if (
+    !new Set(profileColumns.map((column) => column.name)).has(
+      "skills_curator_consolidate_enabled"
+    )
+  ) {
+    db.exec(
+      "ALTER TABLE profiles ADD COLUMN skills_curator_consolidate_enabled INTEGER;"
+    );
+  }
+}
+
+function migrateLlmUsageQuotaColumns(db: Database): void {
+  const columns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(organizations)"
+    )
+    .all();
+
+  const names = new Set(columns.map((column) => column.name));
+
+  if (!names.has("monthly_llm_turn_limit")) {
+    db.exec(
+      "ALTER TABLE organizations ADD COLUMN monthly_llm_turn_limit INTEGER NOT NULL DEFAULT 0;"
+    );
+  }
+
+  if (!names.has("monthly_llm_token_limit")) {
+    db.exec(
+      "ALTER TABLE organizations ADD COLUMN monthly_llm_token_limit INTEGER;"
+    );
+  }
+
+  if (!names.has("monthly_llm_warning_percent")) {
+    db.exec(
+      "ALTER TABLE organizations ADD COLUMN monthly_llm_warning_percent INTEGER NOT NULL DEFAULT 80;"
+    );
+  }
+}
+
+function migrateOrgLlmMonthlyQuotaTable(db: Database): void {
+  db.exec(`
+    -- Its counters only ever grew, so every row in it is a false exhaustion.
+    DROP TABLE IF EXISTS org_llm_monthly_quota;
+    CREATE TABLE IF NOT EXISTS org_llm_quota_reservations (
+      id TEXT PRIMARY KEY,
+      org_id TEXT NOT NULL,
+      reserved_tokens INTEGER NOT NULL CHECK (reserved_tokens >= 0),
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_org_llm_quota_reservations_org
+      ON org_llm_quota_reservations(org_id);
+  `);
+}
+
+function migrateOrganizationParent(db: Database): void {
+  const columns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(organizations)"
+    )
+    .all();
+
+  if (!columns.some((column) => column.name === "parent_org_id")) {
+    db.exec(`
+      ALTER TABLE organizations ADD COLUMN parent_org_id TEXT
+        REFERENCES organizations (id) ON DELETE RESTRICT CHECK (parent_org_id <> id);
+    `);
+  }
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS organizations_parent_org_id ON organizations (parent_org_id);
+  `);
+}
+
+function migrateOrganizationArchivedAt(db: Database): void {
+  const orgColumns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(organizations)"
+    )
+    .all();
+
+  const names = new Set(orgColumns.map((column) => column.name));
+
+  if (!names.has("archived_at")) {
+    db.exec("ALTER TABLE organizations ADD COLUMN archived_at TEXT;");
+  }
+}
+
+function migrateSkillUsageTables(db: Database): void {
+  const skillColumns = db
+    .prepare<
+      {
+        name: string;
+      },
+      SQLQueryBindings[]
+    >("PRAGMA table_info(skills)")
+    .all();
+
+  if (!new Set(skillColumns.map((column) => column.name)).has("created_by")) {
+    db.exec(
+      `ALTER TABLE skills ADD COLUMN created_by TEXT NOT NULL DEFAULT 'bundled';`
+    );
+    db.exec(`
+      UPDATE skills
+      SET created_by = 'human'
+      WHERE source_path LIKE '%/profiles/%/skills/%'
+        AND created_by = 'bundled';
+    `);
+  }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS profile_skill_usage (
+      org_id TEXT NOT NULL,
+      profile_id TEXT NOT NULL,
+      skill_id TEXT NOT NULL,
+      view_count INTEGER NOT NULL DEFAULT 0,
+      use_count INTEGER NOT NULL DEFAULT 0,
+      patch_count INTEGER NOT NULL DEFAULT 0,
+      last_viewed_at TEXT,
+      last_used_at TEXT,
+      last_patched_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (profile_id, skill_id),
+      FOREIGN KEY (profile_id) REFERENCES profiles (id) ON DELETE CASCADE,
+      FOREIGN KEY (skill_id) REFERENCES skills (id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS profile_skill_usage_org_profile ON profile_skill_usage (org_id, profile_id);
+  `);
+}
+
+const TENANT_ORG_ID_TABLES = [
+  "profiles",
+  "sessions",
+  "automations",
+  "tools",
+  "mcp_servers",
+  "skills",
+  "workspace_settings",
+] as const;
+
+type TenantOrgIdTable = (typeof TENANT_ORG_ID_TABLES)[number];
+
+const TENANT_ORG_ID_TABLE_SET = new Set<string>(TENANT_ORG_ID_TABLES);
+
+const PROFILE_JOIN_TABLE_COLUMNS = {
+  profile_mcp_servers: "server_id",
+  profile_skills: "skill_id",
+  profile_tools: "tool_id",
+} as const;
+
+type ProfileJoinTable = keyof typeof PROFILE_JOIN_TABLE_COLUMNS;
+
+function quoteSqliteIdentifier(identifier: string): string {
+  return `"${identifier.replaceAll(`"`, `""`)}"`;
+}
+
+function assertTenantOrgIdTable(
+  tableName: string
+): asserts tableName is TenantOrgIdTable {
+  if (!TENANT_ORG_ID_TABLE_SET.has(tableName)) {
+    throw new Error(`Unsupported tenant org table: ${tableName}`);
+  }
+}
+
+function assertProfileJoinTarget(
+  tableName: string,
+  relatedColumn: string
+): asserts tableName is ProfileJoinTable & string {
+  const expectedColumn = Object.entries(PROFILE_JOIN_TABLE_COLUMNS).find(
+    ([table]) => table === tableName
+  )?.[1];
+
+  if (expectedColumn !== relatedColumn) {
+    throw new Error(
+      `Unsupported profile join target: ${tableName}.${relatedColumn}`
+    );
+  }
+}
+
+function migrateTenantOrgScope(db: Database): void {
+  for (const tableName of TENANT_ORG_ID_TABLES) {
+    addOrgIdColumnIfMissing(db, tableName);
+  }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS channel_org_mappings (
+      channel TEXT NOT NULL,
+      channel_user_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      org_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (channel, channel_user_id),
+      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+      FOREIGN KEY (org_id) REFERENCES organizations (id) ON DELETE CASCADE
+    );
+  `);
+
+  db.exec(`
+    DROP INDEX IF EXISTS tools_name_unique;
+    CREATE UNIQUE INDEX IF NOT EXISTS tools_org_name_unique ON tools (org_id, name);
+
+    DROP INDEX IF EXISTS mcp_servers_name_unique;
+    CREATE UNIQUE INDEX IF NOT EXISTS mcp_servers_org_name_unique ON mcp_servers (org_id, name);
+
+    DROP INDEX IF EXISTS skills_source_path_unique;
+    CREATE UNIQUE INDEX IF NOT EXISTS skills_org_source_path_unique ON skills (org_id, source_path);
+  `);
+
+  restoreGlobalNameUniqueness(db);
+}
+
+/**
+ * Tools and MCP servers are install-wide: both create routes are platform admin
+ * and neither service takes an org. Nothing writes their org_id, so the indexes
+ * above compare NULL to NULL and never fire, which quietly retired the
+ * uniqueness schema.sql still declares. These cover the rows they left behind.
+ */
+function restoreGlobalNameUniqueness(db: Database): void {
+  for (const table of ["tools", "mcp_servers"] as const) {
+    try {
+      db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS ${table}_global_name_unique
+        ON ${table} (name) WHERE org_id IS NULL;
+      `);
+    } catch {
+      // A database that already collected duplicates must still boot. The
+      // create paths guard the name, so it stays consistent from here on.
+    }
+  }
+}
+
+/**
+ * `skills.org_id` shipped empty because no write path ever set it, which left
+ * skills_org_source_path_unique comparing NULL against NULL and skill names
+ * shared across every tenant. The owning org is recoverable from source_path.
+ */
+function migrateSkillOrgIds(db: Database): void {
+  const rows = db
+    .prepare<{ id: string; source_path: string }, SQLQueryBindings[]>(
+      "SELECT id, source_path FROM skills WHERE org_id IS NULL"
+    )
+    .all();
+
+  const update = db.prepare("UPDATE skills SET org_id = ? WHERE id = ?");
+
+  for (const row of rows) {
+    const orgId = orgIdFromSkillSourcePath(row.source_path);
+
+    if (!orgId) {
+      continue;
+    }
+
+    try {
+      update.run(orgId, row.id);
+    } catch {
+      // A pre-fix duplicate would now collide on (org_id, source_path). Leaving
+      // it NULL keeps today's behaviour instead of failing the whole boot.
+    }
+  }
+
+  try {
+    // skills_org_source_path_unique cannot see global skills, because SQLite
+    // treats every (NULL, path) pair as distinct. This restores what
+    // skills_source_path_unique used to guarantee for them.
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS skills_global_source_path_unique
+      ON skills (source_path) WHERE org_id IS NULL;
+    `);
+  } catch {
+    // Same reasoning: legacy duplicates must not stop the server from booting.
+  }
+}
+
+function migrateProfileOrgColumns(db: Database): void {
+  db.transaction(() => {
+    migrateProfilesTable(db);
+
+    const firstOrg = db
+      .prepare<{ id: string }, SQLQueryBindings[]>(
+        "SELECT id FROM organizations ORDER BY id ASC LIMIT 1"
+      )
+      .get();
+
+    if (firstOrg) {
+      db.prepare(`
+      UPDATE profiles
+      SET org_id = ?
+      WHERE org_id IS NULL
+    `).run(firstOrg.id);
+
+      // This step runs on every open. Keep a default the user already chose;
+      // else prefer 'default', then the oldest profile. One default per org.
+      const defaultProfile = db
+        .prepare<{ id: string }, SQLQueryBindings[]>(`
+        SELECT id FROM profiles
+        WHERE org_id = ?
+        ORDER BY is_default DESC, id = 'default' DESC, created_at ASC
+        LIMIT 1
+      `)
+        .get(firstOrg.id);
+
+      if (defaultProfile) {
+        db.prepare(`
+        UPDATE profiles
+        SET is_default = CASE WHEN id = ? THEN 1 ELSE 0 END
+        WHERE org_id = ?
+      `).run(defaultProfile.id, firstOrg.id);
+      }
+    }
+    // With no organization yet, org-less profiles stay as they are. This step
+    // runs on every open, and deleting them cascaded into sessions, messages,
+    // attachments and automations. The branch above adopts them once an
+    // organization exists.
+
+    db.prepare(`
+    UPDATE automations
+    SET org_id = (
+      SELECT org_id FROM profiles WHERE profiles.id = automations.profile_id
+    )
+    WHERE org_id IS NULL
+  `).run();
+  })();
+}
+
+/**
+ * `sessions.org_id` shipped empty because the only insert path never set it,
+ * so every row a pre-fix install holds is NULL. The owning org is recoverable
+ * from the session's profile, which migrateProfileOrgColumns scopes first. A
+ * session whose profile is gone keeps NULL instead of failing the boot.
+ */
+function migrateSessionOrgIds(db: Database): void {
+  db.prepare(`
+    UPDATE sessions
+    SET org_id = (
+      SELECT org_id FROM profiles WHERE profiles.id = sessions.profile_id
+    )
+    WHERE org_id IS NULL
+      AND EXISTS (
+        SELECT 1 FROM profiles WHERE profiles.id = sessions.profile_id
+      )
+  `).run();
+}
+
+export function addOrgIdColumnIfMissing(db: Database, tableName: string): void {
+  assertTenantOrgIdTable(tableName);
+  const quotedTableName = quoteSqliteIdentifier(tableName);
+
+  const columns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      `PRAGMA table_info(${quotedTableName})`
+    )
+    .all();
+
+  if (columns.length === 0) {
+    return;
+  }
+
+  const columnNames = new Set(columns.map((column) => column.name));
+
+  if (!columnNames.has("org_id")) {
+    // ponytail: nullable for legacy rows — no default-org backfill (see plan R13); NOT NULL enforced at adapter layer in T3+
+    db.exec(`ALTER TABLE ${quotedTableName} ADD COLUMN org_id TEXT;`);
+  }
+}
+
+function migrateBrowserSessionsTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS browser_sessions (
+      id TEXT PRIMARY KEY NOT NULL,
+      user_id TEXT NOT NULL,
+      session_token_hash TEXT NOT NULL,
+      csrf_token_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      revoked_at TEXT,
+      last_used_at TEXT,
+      active_org_id TEXT,
+      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS browser_sessions_token_hash_unique
+      ON browser_sessions (session_token_hash);
+  `);
+
+  const columns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(browser_sessions)"
+    )
+    .all();
+
+  const columnNames = new Set(columns.map((column) => column.name));
+
+  if (!columnNames.has("active_org_id")) {
+    db.exec("ALTER TABLE browser_sessions ADD COLUMN active_org_id TEXT;");
+  }
+}
+
+function migratePasswordResetTokensTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      id TEXT PRIMARY KEY NOT NULL,
+      user_id TEXT NOT NULL,
+      token_hash TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      consumed_at TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS password_reset_tokens_token_hash_unique
+      ON password_reset_tokens (token_hash);
+  `);
+}
+
+const LEGACY_PROFILE_ID_MAP = [
+  ["profile_default", "default"],
+  ["profile_super_bot", "super_bot"],
+] as const;
+
+function migrateLegacyProfileIds(db: Database): void {
+  const rows = db
+    .prepare<
+      {
+        id: string;
+      },
+      SQLQueryBindings[]
+    >("SELECT id FROM profiles")
+    .all();
+
+  const existingIds = new Set(rows.map((row) => row.id));
+
+  const pending = LEGACY_PROFILE_ID_MAP.filter(([legacyId]) =>
+    existingIds.has(legacyId)
+  );
+
+  if (pending.length === 0) {
+    return;
+  }
+
+  db.exec("PRAGMA foreign_keys = OFF");
+  db.exec("BEGIN");
+
+  try {
+    for (const [legacyId, canonicalId] of pending) {
+      if (!canonicalIdIsFree(db, legacyId, canonicalId)) {
+        continue;
+      }
+
+      copyProfileRow(db, legacyId, canonicalId);
+      moveProfileReferences(db, legacyId, canonicalId);
+      db.prepare("DELETE FROM profiles WHERE id = ?").run(legacyId);
+    }
+
+    const violations = db
+      .prepare<unknown, SQLQueryBindings[]>("PRAGMA foreign_key_check")
+      .all();
+
+    if (violations.length > 0) {
+      throw new Error(
+        "Legacy profile ID migration left foreign key violations."
+      );
+    }
+
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON");
+  }
+}
+
+export function migrateCodingDelegationSkillName(db: Database): void {
+  renameSkillRecords(db, "coding-delegation", "coding-agent");
+}
+
+export function migrateArtifactDesignSkillName(db: Database): void {
+  renameSkillRecords(db, "save-artifact", "artifact-design");
+}
+
+// Only the stock name moves; a renamed super profile keeps its name.
+export function migrateSuperMingzhanNaming(db: Database): void {
+  db.exec(`
+    UPDATE profiles SET name = 'Super MíngZhàn' WHERE is_super = 1 AND name = 'Super Bot';
+    UPDATE profile_change_events SET source = 'super_mingzhan' WHERE source = 'super_bot';
+  `);
+}
+
+// Points profile_skills at the new name without duplicates, then drops the
+// old rows. With no new row yet, the old rows take the new name and path.
+function renameSkillRecords(
+  db: Database,
+  oldName: string,
+  newName: string
+): void {
+  const legacyRows = db
+    .prepare<{ id: string; source_path: string }, SQLQueryBindings[]>(
+      "SELECT id, source_path FROM skills WHERE name = ?"
+    )
+    .all(oldName);
+
+  if (legacyRows.length === 0) {
+    return;
+  }
+
+  const canonical = db
+    .prepare<{ id: string }, SQLQueryBindings[]>(
+      "SELECT id FROM skills WHERE name = ?"
+    )
+    .get(newName);
+
+  if (canonical) {
+    const reassignProfileSkill = db.prepare(`
+      UPDATE profile_skills
+      SET skill_id = ?
+      WHERE skill_id = ?
+        AND NOT EXISTS (
+          SELECT 1
+          FROM profile_skills existing
+          WHERE existing.profile_id = profile_skills.profile_id
+            AND existing.skill_id = ?
+        )
+    `);
+
+    const deleteProfileSkill = db.prepare(
+      "DELETE FROM profile_skills WHERE skill_id = ?"
+    );
+
+    const deleteSkill = db.prepare("DELETE FROM skills WHERE id = ?");
+
+    for (const row of legacyRows) {
+      reassignProfileSkill.run(canonical.id, row.id, canonical.id);
+      deleteProfileSkill.run(row.id);
+      deleteSkill.run(row.id);
+    }
+
+    return;
+  }
+
+  const now = new Date().toISOString();
+
+  const update = db.prepare(`
+    UPDATE skills
+    SET name = ?, source_path = ?, updated_at = ?
+    WHERE id = ?
+  `);
+
+  for (const row of legacyRows) {
+    update.run(
+      newName,
+      row.source_path.replaceAll(oldName, newName),
+      now,
+      row.id
+    );
+  }
+}
+
+// A canonical id owned by another org must not absorb this org's data. Keep
+// the legacy row in that case.
+function canonicalIdIsFree(
+  db: Database,
+  legacyId: string,
+  canonicalId: string
+): boolean {
+  const owners = db
+    .prepare<{ id: string; org_id: string | null }, SQLQueryBindings[]>(
+      "SELECT id, org_id FROM profiles WHERE id IN (?, ?)"
+    )
+    .all(legacyId, canonicalId);
+
+  const legacy = owners.find((row) => row.id === legacyId);
+  const canonical = owners.find((row) => row.id === canonicalId);
+
+  return !canonical || canonical.org_id === legacy?.org_id;
+}
+
+function copyProfileRow(
+  db: Database,
+  legacyId: string,
+  canonicalId: string
+): void {
+  const columns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(profiles)"
+    )
+    .all()
+    .map((column) => quoteSqliteIdentifier(column.name))
+    .filter((column) => column !== '"id"')
+    .join(", ");
+
+  db.prepare(`
+    INSERT INTO profiles (id, ${columns})
+    SELECT ?, ${columns}
+    FROM profiles
+    WHERE id = ?
+    ON CONFLICT(id) DO NOTHING
+  `).run(canonicalId, legacyId);
+}
+
+function moveProfileReferences(
+  db: Database,
+  legacyId: string,
+  canonicalId: string
+): void {
+  const tables = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+    )
+    .all();
+
+  for (const { name } of tables) {
+    if (name === "profiles" || name in PROFILE_JOIN_TABLE_COLUMNS) {
+      continue;
+    }
+
+    const quotedTableName = quoteSqliteIdentifier(name);
+
+    const hasProfileId = db
+      .prepare<{ name: string }, SQLQueryBindings[]>(
+        `PRAGMA table_info(${quotedTableName})`
+      )
+      .all()
+      .some((column) => column.name === "profile_id");
+
+    if (!hasProfileId) {
+      continue;
+    }
+
+    // Rows that collide with a canonical row are duplicates; drop them.
+    db.prepare(
+      `UPDATE OR IGNORE ${quotedTableName} SET profile_id = ? WHERE profile_id = ?`
+    ).run(canonicalId, legacyId);
+    db.prepare(`DELETE FROM ${quotedTableName} WHERE profile_id = ?`).run(
+      legacyId
+    );
+  }
+
+  // These hold profile ids without a profile_id column. Move them before the
+  // legacy row is deleted, or the delete triggers remove them.
+  db.prepare(`
+    UPDATE OR IGNORE org_shared_resources
+    SET resource_id = ?
+    WHERE resource_kind = 'agent' AND resource_id = ?
+  `).run(canonicalId, legacyId);
+  db.prepare(`
+    UPDATE OR IGNORE shared_agent_instances
+    SET source_profile_id = ?
+    WHERE source_profile_id = ?
+  `).run(canonicalId, legacyId);
+
+  for (const [tableName, relatedColumn] of Object.entries(
+    PROFILE_JOIN_TABLE_COLUMNS
+  )) {
+    moveProfileJoinReferences(
+      db,
+      tableName,
+      relatedColumn,
+      legacyId,
+      canonicalId
+    );
+  }
+}
+
+export function moveProfileJoinReferences(
+  db: Database,
+  tableName: string,
+  relatedColumn: string,
+  legacyId: string,
+  canonicalId: string
+): void {
+  assertProfileJoinTarget(tableName, relatedColumn);
+  const quotedTableName = quoteSqliteIdentifier(tableName);
+  const quotedRelatedColumn = quoteSqliteIdentifier(relatedColumn);
+  db.prepare(`
+    INSERT OR IGNORE INTO ${quotedTableName} (profile_id, ${quotedRelatedColumn})
+    SELECT ?, ${quotedRelatedColumn}
+    FROM ${quotedTableName}
+    WHERE profile_id = ?
+  `).run(canonicalId, legacyId);
+
+  db.prepare(`DELETE FROM ${quotedTableName} WHERE profile_id = ?`).run(
+    legacyId
+  );
+}
+
+function migrateSessionsTable(db: Database): void {
+  const columns = db
+    .prepare<
+      {
+        name: string;
+      },
+      SQLQueryBindings[]
+    >("PRAGMA table_info(sessions)")
+    .all();
+
+  const columnNames = new Set(columns.map((column) => column.name));
+
+  if (!columnNames.has("title")) {
+    db.exec(`
+      ALTER TABLE sessions ADD COLUMN title TEXT;
+    `);
+  }
+
+  if (!columnNames.has("model")) {
+    db.exec(`
+      ALTER TABLE sessions ADD COLUMN model TEXT;
+    `);
+  }
+
+  if (!columnNames.has("agent_todos")) {
+    db.exec(`
+      ALTER TABLE sessions ADD COLUMN agent_todos TEXT DEFAULT '[]' NOT NULL;
+    `);
+  }
+
+  if (!columnNames.has("agent_questionnaire")) {
+    db.exec(`
+      ALTER TABLE sessions ADD COLUMN agent_questionnaire TEXT;
+    `);
+  }
+
+  if (!columnNames.has("user_id")) {
+    db.exec(`
+      ALTER TABLE sessions ADD COLUMN user_id TEXT REFERENCES users (id) ON DELETE SET NULL;
+    `);
+  }
+
+  if (!columnNames.has("updated_at")) {
+    db.exec(`
+      ALTER TABLE sessions ADD COLUMN updated_at TEXT;
+    `);
+    db.exec(`
+      UPDATE sessions
+      SET updated_at = COALESCE(
+        (
+          SELECT MAX(created_at)
+          FROM session_messages
+          WHERE session_id = sessions.id
+        ),
+        created_at
+      )
+      WHERE updated_at IS NULL;
+    `);
+  }
+
+  if (!columnNames.has("pinned")) {
+    db.exec(`
+      ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+    `);
+  }
+
+  addNullableTextColumnIfMissing(db, "sessions", "thinking_effort");
+}
+
+function migrateSessionTree(db: Database): void {
+  addNullableTextColumnIfMissing(db, "sessions", "parent_session_id");
+
+  if (
+    !db
+      .prepare<{ name: string }, SQLQueryBindings[]>(
+        "PRAGMA table_info(sessions)"
+      )
+      .all()
+      .some((column) => column.name === "branch_message_index")
+  ) {
+    db.exec("ALTER TABLE sessions ADD COLUMN branch_message_index INTEGER");
+  }
+
+  db.exec(`CREATE TABLE IF NOT EXISTS session_user_order (
+    session_id TEXT NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    sort_position INTEGER NOT NULL,
+    PRIMARY KEY (session_id, user_id)
+  )`);
+}
+
+function migrateWorkspaceSettingsTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS workspace_settings (
+      id TEXT PRIMARY KEY NOT NULL,
+      vision_model TEXT,
+      transcription_model TEXT,
+      image_model TEXT,
+      coding_agent_harnesses TEXT NOT NULL DEFAULT '[]',
+      selected_coding_agent_harness TEXT,
+      updated_at TEXT NOT NULL
+    );
+  `);
+
+  const columns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(workspace_settings)"
+    )
+    .all();
+
+  const columnNames = new Set(columns.map((column) => column.name));
+
+  if (!columnNames.has("transcription_model")) {
+    db.exec(`
+      ALTER TABLE workspace_settings ADD COLUMN transcription_model TEXT;
+    `);
+  }
+
+  if (!columnNames.has("image_model")) {
+    db.exec(`
+      ALTER TABLE workspace_settings ADD COLUMN image_model TEXT;
+    `);
+  }
+
+  if (!columnNames.has("coding_agent_harnesses")) {
+    db.exec(`
+      ALTER TABLE workspace_settings ADD COLUMN coding_agent_harnesses TEXT NOT NULL DEFAULT '[]';
+    `);
+  }
+
+  if (!columnNames.has("selected_coding_agent_harness")) {
+    db.exec(`
+      ALTER TABLE workspace_settings ADD COLUMN selected_coding_agent_harness TEXT;
+    `);
+  }
+
+  // Left by the token optimiser removed in #1888.
+  if (columnNames.has("token_optimizer_enabled")) {
+    db.exec(
+      "ALTER TABLE workspace_settings DROP COLUMN token_optimizer_enabled;"
+    );
+  }
+
+  if (!columnNames.has("coding_agent_provider_passthrough")) {
+    db.exec(`
+      ALTER TABLE workspace_settings ADD COLUMN coding_agent_provider_passthrough INTEGER NOT NULL DEFAULT 1;
+    `);
+  }
+
+  if (!columnNames.has("automation_worker_poll_interval_ms")) {
+    db.exec(`
+      ALTER TABLE workspace_settings ADD COLUMN automation_worker_poll_interval_ms INTEGER NOT NULL DEFAULT 300000;
+    `);
+  }
+}
+
+function migrateAutomationRunsTable(db: Database): void {
+  const columns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(automation_runs)"
+    )
+    .all();
+
+  const columnNames = new Set(columns.map((column) => column.name));
+
+  if (!columnNames.has("progress")) {
+    db.exec("ALTER TABLE automation_runs ADD COLUMN progress TEXT;");
+  }
+
+  if (!columnNames.has("delivery_status")) {
+    db.exec(`
+      ALTER TABLE automation_runs ADD COLUMN delivery_status TEXT;
+    `);
+  }
+
+  if (!columnNames.has("delivery_error")) {
+    db.exec(`
+      ALTER TABLE automation_runs ADD COLUMN delivery_error TEXT;
+    `);
+  }
+
+  if (!columnNames.has("resume_count")) {
+    db.exec(`
+      ALTER TABLE automation_runs ADD COLUMN resume_count INTEGER NOT NULL DEFAULT 0;
+    `);
+  }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS automation_run_steps (
+      run_id TEXT NOT NULL,
+      tool_call_id TEXT NOT NULL,
+      tool_group_id TEXT,
+      tool_name TEXT NOT NULL,
+      args TEXT NOT NULL,
+      result TEXT,
+      status TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      position INTEGER NOT NULL,
+      PRIMARY KEY (run_id, tool_call_id),
+      FOREIGN KEY (run_id) REFERENCES automation_runs (id) ON DELETE CASCADE
+    );
+  `);
+}
+
+function migrateAutomationRunReadStateTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS automation_run_read_state (
+      user_id TEXT NOT NULL,
+      org_id TEXT NOT NULL,
+      automation_id TEXT NOT NULL,
+      read_through_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, org_id, automation_id),
+      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+      FOREIGN KEY (org_id) REFERENCES organizations (id) ON DELETE CASCADE,
+      FOREIGN KEY (automation_id) REFERENCES automations (id) ON DELETE CASCADE
+    );
+  `);
+}
+
+function migrateWorkflowsTables(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS workflows (
+      id TEXT PRIMARY KEY NOT NULL,
+      name TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      definition TEXT NOT NULL,
+      profile_id TEXT NOT NULL,
+      org_id TEXT,
+      enabled INTEGER DEFAULT 1 NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (profile_id) REFERENCES profiles (id) ON DELETE CASCADE,
+      FOREIGN KEY (org_id) REFERENCES organizations (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS workflow_runs (
+      id TEXT PRIMARY KEY NOT NULL,
+      workflow_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      input TEXT,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      output TEXT,
+      error TEXT,
+      FOREIGN KEY (workflow_id) REFERENCES workflows (id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS workflow_runs_workflow_started
+      ON workflow_runs (workflow_id, started_at DESC);
+
+    CREATE TABLE IF NOT EXISTS workflow_run_steps (
+      id TEXT PRIMARY KEY NOT NULL,
+      run_id TEXT NOT NULL,
+      step_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      status TEXT NOT NULL,
+      input TEXT,
+      output TEXT,
+      error TEXT,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      position INTEGER NOT NULL,
+      FOREIGN KEY (run_id) REFERENCES workflow_runs (id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS workflow_run_steps_run_position
+      ON workflow_run_steps (run_id, position);
+  `);
+}
+
+function migrateAttachmentsTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS attachments (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT,
+      profile_id TEXT NOT NULL,
+      session_id TEXT,
+      channel TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      filename TEXT,
+      media_type TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL,
+      storage_path TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      ephemeral INTEGER DEFAULT 0 NOT NULL,
+      FOREIGN KEY (org_id) REFERENCES organizations (id) ON DELETE CASCADE,
+      FOREIGN KEY (profile_id) REFERENCES profiles (id) ON DELETE CASCADE,
+      FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE SET NULL
+    );
+  `);
+
+  const columns = db
+    .prepare<
+      {
+        name: string;
+      },
+      SQLQueryBindings[]
+    >("PRAGMA table_info(attachments)")
+    .all();
+
+  // A cognito session has no `sessions` row to hang the foreign key on, so its
+  // attachments carry a null session_id. This column is what a restart sweep
+  // has left to tell them apart from ordinary orphans.
+  if (!columns.some((column) => column.name === "ephemeral")) {
+    db.exec(`
+      ALTER TABLE attachments ADD COLUMN ephemeral INTEGER DEFAULT 0 NOT NULL;
+    `);
+  }
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS attachments_session_id ON attachments (session_id);
+  `);
+}
+
+function migrateComposioUserConnections(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS composio_user_connections (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      toolkit_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      connected_account_id TEXT,
+      session_id_enc TEXT,
+      oauth_state_hash TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (org_id) REFERENCES organizations (id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+      FOREIGN KEY (toolkit_id) REFERENCES composio_toolkits (id) ON DELETE CASCADE
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS composio_user_connections_user_toolkit_unique
+      ON composio_user_connections (user_id, toolkit_id);
+
+    CREATE INDEX IF NOT EXISTS composio_user_connections_org_user
+      ON composio_user_connections (org_id, user_id);
+  `);
+
+  const legacyToolkits = db
+    .prepare<
+      {
+        id: string;
+        org_id: string;
+        status: string;
+        connected_account_id: string | null;
+        session_id_enc: string | null;
+        oauth_state_hash: string | null;
+        last_error: string | null;
+        created_at: string;
+        updated_at: string;
+      },
+      SQLQueryBindings[]
+    >(
+      `
+      SELECT
+        id,
+        org_id,
+        status,
+        connected_account_id,
+        session_id_enc,
+        oauth_state_hash,
+        last_error,
+        created_at,
+        updated_at
+      FROM composio_toolkits
+      WHERE status IN ('connected', 'oauth_in_progress', 'error')
+         OR connected_account_id IS NOT NULL
+         OR oauth_state_hash IS NOT NULL
+         OR session_id_enc IS NOT NULL
+    `
+    )
+    .all();
+
+  const findAdminStmt = db.prepare<
+    {
+      user_id: string;
+    },
+    SQLQueryBindings[]
+  >(`
+    SELECT user_id
+    FROM org_members
+    WHERE org_id = ? AND role = 'admin'
+    ORDER BY created_at ASC
+    LIMIT 1
+  `);
+
+  const existingConnectionStmt = db.prepare(`
+    SELECT id FROM composio_user_connections WHERE toolkit_id = ? LIMIT 1
+  `);
+
+  const insertConnectionStmt = db.prepare(`
+    INSERT INTO composio_user_connections (
+      id,
+      org_id,
+      user_id,
+      toolkit_id,
+      status,
+      connected_account_id,
+      session_id_enc,
+      oauth_state_hash,
+      last_error,
+      created_at,
+      updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const normalizeToolkitStmt = db.prepare(`
+    UPDATE composio_toolkits
+    SET
+      status = CASE WHEN status = 'disabled' THEN 'disabled' ELSE 'enabled' END,
+      connected_account_id = NULL,
+      session_id_enc = NULL,
+      oauth_state_hash = NULL,
+      updated_at = ?
+    WHERE id = ?
+  `);
+
+  const now = new Date().toISOString();
+
+  for (const toolkit of legacyToolkits) {
+    if (existingConnectionStmt.get(toolkit.id)) {
+      normalizeToolkitStmt.run(now, toolkit.id);
+      continue;
+    }
+
+    const adminRow = findAdminStmt.get(toolkit.org_id);
+
+    if (!adminRow?.user_id) {
+      normalizeToolkitStmt.run(now, toolkit.id);
+      continue;
+    }
+
+    const connectionStatus =
+      toolkit.status === "oauth_in_progress"
+        ? "oauth_in_progress"
+        : toolkit.status === "error"
+          ? "error"
+          : "connected";
+
+    insertConnectionStmt.run(
+      `cuc_${toolkit.id}`,
+      toolkit.org_id,
+      adminRow.user_id,
+      toolkit.id,
+      connectionStatus,
+      toolkit.connected_account_id,
+      toolkit.session_id_enc,
+      toolkit.oauth_state_hash,
+      toolkit.last_error,
+      toolkit.created_at,
+      toolkit.updated_at
+    );
+
+    normalizeToolkitStmt.run(now, toolkit.id);
+  }
+}
+
+function migrateProfileChangeEventsTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS profile_change_events (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+      profile_id TEXT NOT NULL,
+      actor_user_id TEXT,
+      source TEXT NOT NULL,
+      field TEXT NOT NULL,
+      before_value TEXT,
+      after_value TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (org_id) REFERENCES organizations (id) ON DELETE CASCADE,
+      FOREIGN KEY (profile_id) REFERENCES profiles (id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS profile_change_events_profile_created
+      ON profile_change_events (profile_id, created_at DESC);
+  `);
+}
+
+function migrateSkillVersionsTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS skill_versions (
+      id TEXT PRIMARY KEY NOT NULL,
+      skill_id TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      content TEXT NOT NULL,
+      note TEXT,
+      actor_user_id TEXT,
+      source TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (skill_id) REFERENCES skills (id) ON DELETE CASCADE
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS skill_versions_skill_version
+      ON skill_versions (skill_id, version);
+  `);
+}
+
+function migrateRemoveGoogleMeetPlugin(db: Database): void {
+  // Meet is built in. Remove obsolete plugin contributions and their cascading
+  // profile assignments; meeting databases and transcripts live outside this DB.
+  db.prepare("DELETE FROM tools WHERE plugin_id = ?").run("google-meet");
+  db.prepare("DELETE FROM skills WHERE plugin_id = ?").run("google-meet");
+  db.prepare("DELETE FROM org_plugins WHERE plugin_id = ?").run("google-meet");
+  db.prepare("DELETE FROM plugin_releases WHERE plugin_id = ?").run(
+    "google-meet"
+  );
+}
+
+function migratePluginTables(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plugin_releases (
+      plugin_id TEXT NOT NULL,
+      version TEXT NOT NULL,
+      manifest TEXT NOT NULL,
+      digest TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (plugin_id, version)
+    );
+
+    CREATE TABLE IF NOT EXISTS org_plugins (
+      org_id TEXT NOT NULL,
+      plugin_id TEXT NOT NULL,
+      selected_version TEXT,
+      database_generation TEXT,
+      lifecycle_state TEXT NOT NULL,
+      revision INTEGER NOT NULL,
+      pending_operation TEXT,
+      last_lifecycle_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (org_id, plugin_id),
+      FOREIGN KEY (org_id) REFERENCES organizations (id) ON DELETE CASCADE
+    );
+  `);
+
+  addNullableTextColumnIfMissing(db, "tools", "plugin_id");
+
+  const releaseColumns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      "PRAGMA table_info(plugin_releases)"
+    )
+    .all();
+
+  if (!releaseColumns.some((column) => column.name === "source")) {
+    db.exec(
+      "ALTER TABLE plugin_releases ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy'"
+    );
+  }
+
+  addNullableTextColumnIfMissing(db, "tools", "plugin_key");
+  addNullableTextColumnIfMissing(db, "skills", "plugin_id");
+  addNullableTextColumnIfMissing(db, "skills", "plugin_key");
+
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS skills_org_plugin_key_unique
+      ON skills (org_id, plugin_id, plugin_key)
+      WHERE plugin_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS tools_org_plugin_key_unique
+      ON tools (org_id, plugin_id, plugin_key)
+      WHERE plugin_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS org_plugins_org_id
+      ON org_plugins (org_id);
+  `);
+}
+
+function addNullableTextColumnIfMissing(
+  db: Database,
+  tableName: string,
+  columnName: string
+): void {
+  const columns = db
+    .prepare<{ name: string }, SQLQueryBindings[]>(
+      `PRAGMA table_info(${quoteSqliteIdentifier(tableName)})`
+    )
+    .all();
+
+  if (columns.length === 0) {
+    return;
+  }
+
+  if (!columns.some((column) => column.name === columnName)) {
+    db.exec(
+      `ALTER TABLE ${quoteSqliteIdentifier(tableName)} ADD COLUMN ${quoteSqliteIdentifier(columnName)} TEXT;`
+    );
+  }
+}
+
+function migrateComposioTables(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS composio_toolkits (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+      toolkit_slug TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      status TEXT NOT NULL,
+      connected_account_id TEXT,
+      session_id_enc TEXT,
+      oauth_state_hash TEXT,
+      cached_tools TEXT NOT NULL DEFAULT '[]',
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (org_id) REFERENCES organizations (id) ON DELETE CASCADE
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS composio_toolkits_org_slug_unique
+      ON composio_toolkits (org_id, toolkit_slug);
+
+    CREATE INDEX IF NOT EXISTS composio_toolkits_org_id
+      ON composio_toolkits (org_id);
+
+    CREATE TABLE IF NOT EXISTS profile_composio_toolkits (
+      profile_id TEXT NOT NULL,
+      toolkit_id TEXT NOT NULL,
+      allowed_actions TEXT,
+      PRIMARY KEY (profile_id, toolkit_id),
+      FOREIGN KEY (profile_id) REFERENCES profiles (id) ON DELETE CASCADE,
+      FOREIGN KEY (toolkit_id) REFERENCES composio_toolkits (id) ON DELETE CASCADE
+    );
+  `);
+}
+
+function migrateFilePinsTable(db: Database): void {
+  db.exec(`
+CREATE TABLE IF NOT EXISTS file_pins (
+  org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  PRIMARY KEY (org_id, user_id, profile_id, path)
+);
+  `);
+}
+
+function migrateArtifactsTable(db: Database): void {
+  db.exec(`
+CREATE TABLE IF NOT EXISTS artifacts (
+  org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  filename TEXT NOT NULL,
+  session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+  user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  channel TEXT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (org_id, profile_id, filename)
+);
+
+CREATE INDEX IF NOT EXISTS artifacts_org_user ON artifacts (org_id, user_id);
+  `);
+}
+
+function migrateNotificationWebhookDeliveriesTable(db: Database): void {
+  db.exec(`
+CREATE TABLE IF NOT EXISTS notification_webhook_deliveries (
+  destination_id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (destination_id, event_id),
+  FOREIGN KEY (destination_id) REFERENCES notification_destinations (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS notification_webhook_deliveries_created_at
+  ON notification_webhook_deliveries (created_at);
+  `);
+}

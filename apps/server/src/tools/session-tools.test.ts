@@ -1,0 +1,422 @@
+import { describe, expect, test } from "bun:test";
+import type { ToolContext } from "@mingzhan/core";
+import type { DatabaseAdapter, StoredProfileRecord } from "@mingzhan/db";
+import {
+  createInMemoryDatabaseAdapter,
+  createSqliteDatabase,
+} from "@mingzhan/db";
+import { AgentService } from "../services/agent-service";
+import { createSessionTools } from "./session-tools";
+
+const ORG_A = "org_a";
+
+const ORG_B = "org_b";
+
+const USER_ID = "user_reader";
+
+function profile(id: string, orgId: string): StoredProfileRecord {
+  const now = new Date().toISOString();
+
+  return {
+    createdAt: now,
+    id,
+    isDefault: false,
+    isSuper: false,
+    model: null,
+    name: id,
+    orgId,
+    systemPrompt: "You are helpful.",
+    updatedAt: now,
+  };
+}
+
+function context(orgId?: string, userId = USER_ID): ToolContext {
+  return { orgId, userId };
+}
+
+async function captureError(promise: Promise<unknown>): Promise<Error | null> {
+  try {
+    await promise;
+
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+}
+
+async function seedSession(
+  db: DatabaseAdapter,
+  service: AgentService,
+  options: { channel: "web" | "cli"; orgId: string; profileId: string }
+): Promise<string> {
+  const sessionId = await service.createSession(
+    options.orgId,
+    options.channel,
+    options.profileId,
+    USER_ID
+  );
+
+  await db.replaceMessagesForSession(
+    sessionId,
+    ["first", "second", "third"].map((text, index) => ({
+      createdAt: `2026-08-21T10:00:0${index}.000Z`,
+      id: `${sessionId}_msg_${index}`,
+      payload: { content: text, role: index % 2 === 0 ? "user" : "assistant" },
+      seq: index,
+      sessionId,
+    }))
+  );
+
+  return sessionId;
+}
+
+async function setUp(db: DatabaseAdapter) {
+  // Real SQLite enforces the profiles -> organizations foreign key, so the org
+  // rows have to exist first. The in-memory adapter does not care either way.
+  const now = new Date().toISOString();
+
+  for (const orgId of [ORG_A, ORG_B]) {
+    await db.upsertOrganization({
+      createdAt: now,
+      id: orgId,
+      name: orgId,
+      slug: orgId.replace("_", "-"),
+      updatedAt: now,
+    });
+  }
+
+  await db.createUser({
+    createdAt: now,
+    email: "reader@example.com",
+    id: USER_ID,
+    passwordHash: "unused",
+    updatedAt: now,
+  });
+  await db.upsertProfile(profile("profile_reader", ORG_A));
+  await db.upsertProfile(profile("profile_target", ORG_A));
+  await db.upsertProfile(profile("profile_other_org", ORG_B));
+
+  const service = new AgentService(null, null, db);
+  const [listTool, readTool] = createSessionTools(service);
+
+  const webSessionId = await seedSession(db, service, {
+    channel: "web",
+    orgId: ORG_A,
+    profileId: "profile_target",
+  });
+
+  const cliSessionId = await seedSession(db, service, {
+    channel: "cli",
+    orgId: ORG_A,
+    profileId: "profile_target",
+  });
+
+  const foreignSessionId = await seedSession(db, service, {
+    channel: "web",
+    orgId: ORG_B,
+    profileId: "profile_other_org",
+  });
+
+  return { cliSessionId, foreignSessionId, listTool, readTool, webSessionId };
+}
+
+describe("session reader tools", () => {
+  test("hides another user's sessions unless the caller is a platform admin", async () => {
+    const { listTool, readTool, webSessionId } = await setUp(
+      createInMemoryDatabaseAdapter()
+    );
+
+    // SAFETY: The tool result is the documented session-list shape asserted below.
+    const list = (await listTool.run(
+      { profileId: "profile_target" },
+      context(ORG_A, "user_someone_else")
+    )) as { sessions: unknown[] };
+
+    expect(list.sessions).toEqual([]);
+    expect(
+      await captureError(
+        readTool.run(
+          { sessionId: webSessionId },
+          context(ORG_A, "user_someone_else")
+        )
+      )
+    ).not.toBeNull();
+
+    // SAFETY: The tool result is the documented transcript shape asserted below.
+    const transcript = (await readTool.run(
+      { sessionId: webSessionId },
+      { isPlatformAdmin: true, orgId: ORG_A, userId: "user_someone_else" }
+    )) as { totalMessages: number };
+
+    expect(transcript.totalMessages).toBe(3);
+  });
+
+  test("lists another profile's sessions in the same org", async () => {
+    const { listTool, webSessionId } = await setUp(
+      createInMemoryDatabaseAdapter()
+    );
+
+    // SAFETY: The tool result is the documented session-list or transcript shape asserted below.
+    const result = (await listTool.run(
+      { profileId: "profile_target" },
+      context(ORG_A)
+    )) as { sessions: Array<{ id: string; profileId: string }> };
+
+    expect(result.sessions.map((session) => session.id)).toEqual([
+      webSessionId,
+    ]);
+    expect(result.sessions[0]?.profileId).toBe("profile_target");
+  });
+
+  test("defaults to the web channel and returns cli sessions on request", async () => {
+    const { cliSessionId, listTool } = await setUp(
+      createInMemoryDatabaseAdapter()
+    );
+
+    // SAFETY: The tool result is the documented session-list or transcript shape asserted below.
+    const cli = (await listTool.run(
+      { channel: "cli", profileId: "profile_target" },
+      context(ORG_A)
+    )) as { sessions: Array<{ id: string }> };
+
+    expect(cli.sessions.map((session) => session.id)).toEqual([cliSessionId]);
+  });
+
+  test("rejects an unknown channel rather than silently listing web", async () => {
+    const { listTool, webSessionId } = await setUp(
+      createInMemoryDatabaseAdapter()
+    );
+
+    await expect(
+      listTool.run(
+        { channel: "carrier-pigeon", profileId: "profile_target" },
+        context(ORG_A)
+      )
+    ).rejects.toThrow();
+
+    // Positive control: a known channel still lists, so the refusal above is
+    // the channel check and not a tool that fails on everything.
+    // SAFETY: The tool result is the documented session-list or transcript shape asserted below.
+    const allowed = (await listTool.run(
+      { channel: "web", profileId: "profile_target" },
+      context(ORG_A)
+    )) as { sessions: Array<{ id: string }> };
+
+    expect(allowed.sessions.map((session) => session.id)).toEqual([
+      webSessionId,
+    ]);
+  });
+
+  test("reads the persisted transcript of another profile's session", async () => {
+    const { readTool, webSessionId } = await setUp(
+      createInMemoryDatabaseAdapter()
+    );
+
+    // SAFETY: The tool result is the documented session-list or transcript shape asserted below.
+    // SAFETY: The tool result is the documented session-list or transcript shape asserted below.
+    const result = (await readTool.run(
+      { sessionId: webSessionId },
+      context(ORG_A)
+    )) as {
+      channel: string;
+      messages: Array<{ content: string }>;
+      profileId: string;
+      returnedMessages: number;
+      totalMessages: number;
+    };
+
+    expect(result.channel).toBe("web");
+    expect(result.profileId).toBe("profile_target");
+    expect(result.totalMessages).toBe(3);
+    expect(result.returnedMessages).toBe(3);
+    expect(result.messages.map((message) => message.content)).toEqual([
+      "first",
+      "second",
+      "third",
+    ]);
+  });
+
+  test("qualifies artifact paths from another profile, not from its own", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const { readTool, webSessionId } = await setUp(db);
+    await db.replaceMessagesForSession(webSessionId, [
+      {
+        createdAt: "2026-08-21T10:00:00.000Z",
+        id: `${webSessionId}_msg_0`,
+        payload: {
+          content:
+            "Saved artifacts/shots/frame.png and /srv/orgs/org_a/profiles/profile_target/artifacts/raw.mp4",
+          role: "assistant",
+          toolCalls: [
+            {
+              arguments: { path: "artifacts/shots/frame.png" },
+              id: "call_1",
+              name: "write_file",
+            },
+          ],
+        },
+        seq: 0,
+        sessionId: webSessionId,
+      },
+    ]);
+
+    // SAFETY: The tool result is the documented session-list or transcript shape asserted below.
+    const read = async (profileId: string) =>
+      (
+        (await readTool.run(
+          { sessionId: webSessionId },
+          { orgId: ORG_A, profileId, userId: USER_ID }
+        )) as {
+          messages: Array<{
+            content: string;
+            toolCalls?: Array<{ arguments: { path: string } }>;
+          }>;
+        }
+      ).messages[0];
+
+    const fromReader = await read("profile_reader");
+    expect(fromReader?.content).toBe(
+      "Saved profiles/profile_target/artifacts/shots/frame.png and /srv/orgs/org_a/profiles/profile_target/artifacts/raw.mp4"
+    );
+    expect(fromReader?.toolCalls?.[0]?.arguments.path).toBe(
+      "profiles/profile_target/artifacts/shots/frame.png"
+    );
+
+    const fromOwner = await read("profile_target");
+    expect(fromOwner?.content).toBe(
+      "Saved artifacts/shots/frame.png and /srv/orgs/org_a/profiles/profile_target/artifacts/raw.mp4"
+    );
+  });
+
+  test("pages the transcript with limit and offset", async () => {
+    const { readTool, webSessionId } = await setUp(
+      createInMemoryDatabaseAdapter()
+    );
+
+    // SAFETY: The tool result is the documented session-list or transcript shape asserted below.
+    // SAFETY: The tool result is the documented session-list or transcript shape asserted below.
+    const result = (await readTool.run(
+      { limit: 1, offset: 1, sessionId: webSessionId },
+      context(ORG_A)
+    )) as {
+      messages: Array<{ content: string }>;
+      returnedMessages: number;
+      totalMessages: number;
+    };
+
+    expect(result.totalMessages).toBe(3);
+    expect(result.returnedMessages).toBe(1);
+    expect(result.messages.map((message) => message.content)).toEqual([
+      "second",
+    ]);
+  });
+
+  test("refuses a profile in another org with the same error as an unknown one", async () => {
+    const { listTool, webSessionId } = await setUp(
+      createInMemoryDatabaseAdapter()
+    );
+
+    const foreign = await captureError(
+      listTool.run({ profileId: "profile_other_org" }, context(ORG_A))
+    );
+
+    const unknown = await captureError(
+      listTool.run({ profileId: "profile_does_not_exist" }, context(ORG_A))
+    );
+
+    expect(foreign).not.toBeNull();
+    expect(unknown).not.toBeNull();
+    expect(foreign?.message).toBe(unknown?.message);
+
+    // Positive control: the same call still works inside the org, so the two
+    // refusals above are the org boundary and not a broken tool.
+    // SAFETY: The tool result is the documented session-list or transcript shape asserted below.
+    const allowed = (await listTool.run(
+      { profileId: "profile_target" },
+      context(ORG_A)
+    )) as { sessions: Array<{ id: string }> };
+
+    expect(allowed.sessions.map((session) => session.id)).toEqual([
+      webSessionId,
+    ]);
+  });
+
+  test("refuses a session in another org with the same error as an unknown one", async () => {
+    const { foreignSessionId, readTool, webSessionId } = await setUp(
+      createInMemoryDatabaseAdapter()
+    );
+
+    const foreign = await captureError(
+      readTool.run({ sessionId: foreignSessionId }, context(ORG_A))
+    );
+
+    const unknown = await captureError(
+      readTool.run({ sessionId: "session_does_not_exist" }, context(ORG_A))
+    );
+
+    expect(foreign).not.toBeNull();
+    expect(unknown).not.toBeNull();
+    expect(foreign?.message).toBe(unknown?.message);
+
+    // Positive control, as above.
+    // SAFETY: The tool result is the documented session-list or transcript shape asserted below.
+    const allowed = (await readTool.run(
+      { sessionId: webSessionId },
+      context(ORG_A)
+    )) as { totalMessages: number };
+
+    expect(allowed.totalMessages).toBe(3);
+  });
+
+  test("refuses a session in another org on real SQLite too", async () => {
+    // sessions has no org_id column, so the in-memory adapter can keep an orgId
+    // the SQL adapter drops. This runs the same case against the real schema.
+    const database = await createSqliteDatabase(":memory:");
+
+    try {
+      const { foreignSessionId, readTool, webSessionId } = await setUp(
+        database.adapter
+      );
+
+      const foreign = await captureError(
+        readTool.run({ sessionId: foreignSessionId }, context(ORG_A))
+      );
+
+      const unknown = await captureError(
+        readTool.run({ sessionId: "session_does_not_exist" }, context(ORG_A))
+      );
+
+      expect(foreign).not.toBeNull();
+      expect(unknown).not.toBeNull();
+      expect(foreign?.message).toBe(unknown?.message);
+
+      // SAFETY: The tool result is the documented session-list or transcript shape asserted below.
+      const allowed = (await readTool.run(
+        { sessionId: webSessionId },
+        context(ORG_A)
+      )) as { totalMessages: number };
+
+      expect(allowed.totalMessages).toBe(3);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("requires an organization context", async () => {
+    const { listTool, readTool, webSessionId } = await setUp(
+      createInMemoryDatabaseAdapter()
+    );
+
+    await expect(
+      listTool.run({ profileId: "profile_target" }, context(undefined))
+    ).rejects.toThrow();
+    await expect(
+      readTool.run({ sessionId: webSessionId }, context(undefined))
+    ).rejects.toThrow();
+
+    // Positive control: the same read succeeds once the org context is there.
+    await expect(
+      readTool.run({ sessionId: webSessionId }, context(ORG_A))
+    ).resolves.toMatchObject({ totalMessages: 3 });
+  });
+});

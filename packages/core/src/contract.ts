@@ -1,0 +1,3511 @@
+import type { LoadAttachmentBytes } from "./attachments/content";
+import type {
+  OrgPluginLifecycleState,
+  PluginActionAccess,
+  PluginActionEffect,
+  PluginManifest,
+} from "./plugins";
+import type { SkillScriptIssue } from "./skills/script-tools";
+
+export type JsonValue =
+  | boolean
+  | null
+  | number
+  | string
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
+export type AutomationTrigger =
+  | { type: "manual" }
+  | { type: "schedule"; cron: string; timezone?: string }
+  | { type: "runAt"; at: string; timezone?: string };
+
+export interface AutomationStep {
+  id: string;
+  input: Record<string, JsonValue>;
+  tool: string;
+}
+
+export type AutomationDeliveryChannel =
+  | "telegram"
+  | "whatsapp"
+  | "email"
+  | "discord";
+
+export type AutomationDeliveryNotifyOn = "success" | "failure" | "both";
+
+export interface AutomationDelivery {
+  channel: AutomationDeliveryChannel;
+  /** Optional Discord channel snowflake; defaults to DMs for all paired users. */
+  channelId?: string;
+  /** Optional Telegram chat override; defaults to all paired users. */
+  chatId?: number;
+  notifyOn?: AutomationDeliveryNotifyOn;
+  /** Required when channel is email. */
+  to?: string;
+}
+
+export interface AutomationDefinition {
+  delivery?: AutomationDelivery;
+  description: string;
+  id: string;
+  name: string;
+  prompt: string;
+  steps: AutomationStep[];
+  trigger: AutomationTrigger;
+  version: number;
+}
+
+export interface StoredAutomation extends AutomationDefinition {
+  createdAt: string;
+  enabled: boolean;
+  lastRunAt?: string | null;
+  lastRunStatus?: AutomationRunStatus | null;
+  nextRunAt?: string | null;
+  orgId?: string | null;
+  profileId: string;
+  updatedAt: string;
+}
+
+export type AutomationRunStatus = "running" | "completed" | "failed";
+
+export type AutomationDeliveryStatus = "sent" | "failed" | "skipped";
+
+export interface AutomationRunRecord {
+  automationId: string;
+  completedAt: string | null;
+  deliveryError?: string | null;
+  deliveryStatus?: AutomationDeliveryStatus | null;
+  error: string | null;
+  id: string;
+  output: string | null;
+  /** Chat transcript, updated live and retained when the run completes. */
+  progress?: ChatMessage[];
+  /** Present when the API resolves read state for the current user. */
+  read?: boolean;
+  startedAt: string;
+  status: AutomationRunStatus;
+}
+
+export interface AutomationUnreadSummary {
+  byAutomationId: Record<string, number>;
+  totalUnread: number;
+}
+
+export const AGENT_CHANNELS = [
+  "web",
+  "cli",
+  "telegram",
+  "whatsapp",
+  "discord",
+  "slack",
+  "automation",
+  "task",
+  "subagent",
+] as const;
+
+export type AgentChannel = (typeof AGENT_CHANNELS)[number];
+
+/**
+ * Narrow a stored channel string to `AgentChannel`. Session rows keep the
+ * column as `string`, so this is the one place that decides what an unknown
+ * value means: `null`, never a silent pass.
+ */
+export function parseAgentChannel(value: string): AgentChannel | null {
+  return AGENT_CHANNELS.find((channel) => channel === value) ?? null;
+}
+
+export const MINGZHAN_API_VERSION = 1;
+
+export interface HealthResponse {
+  apiVersion: typeof MINGZHAN_API_VERSION;
+  /**
+   * Whether MíngZhàn can reach the Composio API with the saved key.
+   * Probed only on `GET /v1/system/status` (`server.composioAvailable`).
+   * `GET /health` always returns `false` so liveness stays local and fast.
+   */
+  composioAvailable: boolean;
+  /** A Composio project API key is saved on this server. */
+  composioConfigured: boolean;
+  ok: true;
+  providerConfigured: boolean;
+  userConfigured: boolean;
+  /** App version (`MINGZHAN_VERSION` or package.json). Not `apiVersion`. */
+  version: string;
+}
+
+export interface AutomationSchedule {
+  /** Recurring cron trigger — mutually exclusive with runAt. */
+  cron?: string;
+  id: string;
+  orgId: string;
+  profileId: string;
+  /** One-shot ISO-8601 datetime — mutually exclusive with cron. */
+  runAt?: string;
+  timezone: string | null;
+}
+
+export interface AutomationWorkerStatus {
+  activeRuns: number;
+  ok: boolean;
+  process?: WorkerProcessInfo;
+  providerConfigured: boolean;
+  running: boolean;
+  scheduledJobs: number;
+}
+
+export interface WorkerProcessInfo {
+  cpuPercent: number | null;
+  error?: string;
+  managed: boolean;
+  memoryMb: number | null;
+  status: "online" | "stopped" | "errored" | null;
+  uptimeSeconds: number | null;
+}
+
+export interface TelegramWorkerStatus {
+  configured: boolean;
+  ok: boolean;
+  paired: boolean;
+  process?: WorkerProcessInfo;
+  running: boolean;
+}
+
+export interface DiscordWorkerStatus {
+  configured: boolean;
+  connected: boolean;
+  ok: boolean;
+  paired: boolean;
+  process?: WorkerProcessInfo;
+  running: boolean;
+}
+
+export interface SlackWorkerStatus {
+  configured: boolean;
+  connected: boolean;
+  ok: boolean;
+  paired: boolean;
+  process?: WorkerProcessInfo;
+  running: boolean;
+}
+
+export interface WhatsAppWorkerStatus {
+  configured: boolean;
+  connected: boolean;
+  /** Set when WhatsApp linked an account this agent may not use. */
+  linkError?: string;
+  /** The agent that holds that account, when the viewer may see its org. */
+  linkOwner?: { agentName: string; orgName: string };
+  ok: boolean;
+  paired: boolean;
+  process?: WorkerProcessInfo;
+  qrCode: string | null;
+  running: boolean;
+}
+
+export interface PluginWorkerStatus {
+  label: string;
+  name: string;
+  pluginId: string;
+  process: WorkerProcessInfo;
+}
+
+export interface WorkerLogsResponse {
+  stderr: string;
+  stdout: string;
+}
+
+export interface LlmUsageStats {
+  estimatedCostUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  requestCount: number;
+  totalTokens: number;
+  trackedSince: string;
+}
+
+export interface LlmUsageModelStats extends LlmUsageStats {
+  modelId: string;
+}
+
+/** One agent's or one user's share of the org ledger. A null `id` is the unattributed group. */
+export interface LlmUsageGroupStats extends LlmUsageStats {
+  id: string | null;
+  name: string | null;
+}
+
+/** One provider's share of one day. A null provider means the call had no provider context. */
+export interface LlmUsageDayProviderStats {
+  estimatedCostUsd: number;
+  provider: string | null;
+  totalTokens: number;
+}
+
+/** One UTC day of the org ledger. Days without calls are present with zeros. */
+export interface LlmUsageDayStats {
+  /** `YYYY-MM-DD`, UTC. */
+  day: string;
+  estimatedCostUsd: number;
+  providers: LlmUsageDayProviderStats[];
+  requestCount: number;
+  totalTokens: number;
+}
+
+export interface LlmUsageStatus extends LlmUsageStats {
+  /** Org admins and platform admins only. */
+  agents?: LlmUsageGroupStats[];
+  costEstimated: boolean;
+  currentModel: string | null;
+  /** The last 30 UTC days, oldest first. */
+  daily: LlmUsageDayStats[];
+  displayName: string | null;
+  models: LlmUsageModelStats[];
+  provider: ProviderName | null;
+  providerConfigured: boolean;
+  /** Org admins and platform admins only. */
+  users?: LlmUsageGroupStats[];
+}
+
+export interface McpStatus {
+  assignedProfileCount: number;
+  connectedCount: number;
+  serverCount: number;
+}
+
+export interface CodingHarnessLoginCommand {
+  command: string;
+  name: string;
+}
+
+export interface AutomationWorkerSettingsResponse {
+  pollIntervalMinutes: number;
+}
+
+export interface UpdateAutomationWorkerSettingsRequest {
+  pollIntervalMinutes: number;
+}
+
+export interface CodingHarnessSettingsResponse {
+  loginCommands: CodingHarnessLoginCommand[];
+  providerPassthroughEnabled: boolean;
+}
+
+export interface SystemStatusResponse {
+  automationWorker: AutomationWorkerStatus;
+  checkedAt: string;
+  discordWorker: DiscordWorkerStatus;
+  llmUsage: LlmUsageStatus;
+  mcp: McpStatus;
+  server: HealthResponse;
+  slackWorker: SlackWorkerStatus;
+  telegramWorker: TelegramWorkerStatus;
+  whatsappWorker: WhatsAppWorkerStatus;
+}
+
+export interface DataExportSkippedItem {
+  path: string;
+  reason: string;
+}
+
+export interface DataExportManifest {
+  apiVersion: typeof MINGZHAN_API_VERSION;
+  createdAt: string;
+  fileCount: number;
+  kind: "mingzhan-export";
+  skipped: DataExportSkippedItem[];
+  sourceRootName: string;
+  topLevelPaths: string[];
+  totalBytes: number;
+  version: number;
+}
+
+export interface DataImportPreviewResponse {
+  archiveFileCount: number;
+  archiveTotalBytes: number;
+  manifest: DataExportManifest;
+  topLevelPaths: string[];
+  willReplaceRoot: boolean;
+}
+
+export interface RestoreDataImportRequest {
+  confirm: boolean;
+  data: string;
+}
+
+export interface PreviewDataImportRequest {
+  data: string;
+}
+
+export interface RestoreDataImportResponse {
+  manifest: DataExportManifest;
+  restoredFileCount: number;
+  restoredRoot: string;
+}
+
+export interface SetupRestoreDataImportResponse
+  extends RestoreDataImportResponse {
+  requiresRestart: boolean;
+}
+
+/**
+ * Single-profile "pack" portability, distinct from full-root `mingzhan-export`.
+ * Contains only one profile's portable workspace + name-based assignment
+ * references — never provider keys, MCP config, or Composio connections.
+ */
+export interface ProfilePackSkippedItem {
+  path: string;
+  reason: string;
+}
+
+export interface ProfilePackCustomTool {
+  description: string;
+  handlerConfig: unknown;
+  handlerType: "javascript" | "python";
+  name: string;
+}
+
+export interface ProfilePackMeta {
+  bundledSkillNames: string[];
+  composioToolkitSlugs: string[];
+  customTools?: ProfilePackCustomTool[];
+  mcpServerNames: string[];
+  model: string | null;
+  name: string;
+  profileSkillNames: string[];
+  sharedAgent?: {
+    publicationId: string;
+    sourceOrgId: string;
+    sourceProfileId: string;
+  };
+  skillsCuratorConsolidateEnabled: boolean | null;
+  skillsPostTurnReview: boolean | null;
+  skillsWriteApproval: boolean | null;
+  systemPrompt: string;
+  thinkingEffort: ThinkingEffort | null;
+  thinkingEnabled: boolean | null;
+  toolNames: string[];
+}
+
+export interface ProfilePackManifest {
+  apiVersion: typeof MINGZHAN_API_VERSION;
+  createdAt: string;
+  kind: "mingzhan-profile-export";
+  meta: ProfilePackMeta;
+  skipped: ProfilePackSkippedItem[];
+  sourceProfileId: string;
+  topLevelPaths: string[];
+  version: number;
+}
+
+export interface ProfilePackPreviewResponse {
+  manifest: ProfilePackManifest;
+  plannedName: string;
+  skippedAssignments: ProfilePackSkippedItem[];
+  topLevelPaths: string[];
+}
+
+export interface ProfilePackImportRequest {
+  confirm: boolean;
+  data: string;
+  name?: string;
+}
+
+export interface ProfilePackImportResponse {
+  manifest: ProfilePackManifest;
+  profileId: string;
+  skippedAssignments: ProfilePackSkippedItem[];
+}
+
+export interface AuthCredentialsRequest {
+  email: string;
+  password: string;
+}
+
+export interface SetupAuthRequest {
+  admin: {
+    name: string;
+    email: string;
+    phone?: string;
+    password: string;
+  };
+  organization: {
+    name: string;
+    slug: string;
+  };
+  /** Public web app origin (e.g. window.location.origin) for OAuth callbacks. */
+  webPublicUrl?: string;
+}
+
+export interface UpdateWebPublicUrlRequest {
+  webPublicUrl: string;
+}
+
+export interface WebPublicUrlSettingsResponse {
+  /** Set when MINGZHAN_WEB_PUBLIC_URL / MINGZHAN_PUBLIC_URL overrides the saved value. */
+  envOverride: string | null;
+  webPublicUrl: string | null;
+}
+
+export interface AuthUserResponse {
+  activeOrgId?: string | null;
+  backupCodesEnabled?: boolean;
+  email: string;
+  id: string;
+  isPlatformAdmin?: boolean;
+  mfaEnabled?: boolean;
+  mfaEnrolled?: boolean;
+  mfaRequired?: boolean;
+  /** Credential used for this request. */
+  mode?: "browser-session" | "local-token";
+  name?: string | null;
+  orgId?: string | null;
+  passkeyEnabled?: boolean;
+  phone?: string | null;
+}
+
+export interface MfaPolicyResponse {
+  enabled: boolean;
+  enforcedRoles: OrgRole[];
+  keyConfigured: boolean;
+  required: boolean;
+}
+
+export interface MfaTotpStartResponse {
+  secret: string;
+  uri: string;
+}
+
+export interface MfaTotpVerifyResponse {
+  backupCodes: string[];
+  enabled: boolean;
+}
+
+export interface MfaBackupCodesResponse {
+  backupCodes: string[];
+}
+
+export interface PasskeyVerificationResponse {
+  backupCodes: string[];
+  enabled: boolean;
+}
+
+export interface PasskeyRegistrationOptionsResponse {
+  challenge: string;
+  options: Record<string, JsonValue>;
+}
+
+export interface PasskeyAuthenticationOptionsResponse {
+  challenge: string;
+  options: Record<string, JsonValue>;
+}
+
+export interface PasskeyCredentialResponse {
+  authenticatorAttachment?: string;
+  clientExtensionResults: Record<string, JsonValue>;
+  id: string;
+  rawId: string;
+  response: {
+    attestationObject?: string;
+    authenticatorData?: string;
+    clientDataJSON: string;
+    signature?: string;
+    transports?: string[];
+    userHandle?: string;
+  };
+  type: string;
+}
+
+export interface UpdateAuthProfileRequest {
+  currentPassword?: string;
+  email?: string;
+  name?: string | null;
+  phone?: string | null;
+}
+
+export type OrgRole = "admin" | "member";
+
+export type ChannelType = "telegram" | "whatsapp" | "discord";
+
+export interface OrganizationSummary {
+  allowedInviteDomains?: string[];
+  archivedAt?: string | null;
+  createdAt: string;
+  id: string;
+  monthlyLlmTokenLimit?: number;
+  monthlyLlmTurnLimit?: number;
+  monthlyLlmWarningPercent?: number;
+  name: string;
+  parentOrgId?: string | null;
+  skillsCuratorArchiveAfterDays?: number;
+  skillsCuratorConsolidateEnabled?: boolean;
+  skillsCuratorEnabled?: boolean;
+  skillsCuratorLastRunAt?: string | null;
+  skillsCuratorStaleAfterDays?: number;
+  skillsPostTurnReview?: boolean;
+  skillsWriteApproval?: boolean;
+  slug: string;
+  updatedAt: string;
+}
+
+export interface CreateOrganizationRequest {
+  admin?: {
+    name: string;
+    email: string;
+    phone: string;
+  };
+  name: string;
+  slug: string;
+}
+
+export interface CreateTeamRequest
+  extends Pick<CreateOrganizationRequest, "name" | "slug"> {
+  adminUserId?: string;
+  requestId: string;
+}
+
+export type OrgSharedResourceKind =
+  | "knowledge"
+  | "skill"
+  | "agent"
+  | "tool"
+  | "model";
+
+export interface PublishOrgSharedResourceRequest {
+  resourceId: string;
+  resourceKind: OrgSharedResourceKind;
+}
+
+export interface OrgSharedResourcePublication
+  extends PublishOrgSharedResourceRequest {
+  createdAt: string;
+  id: string;
+  orgId: string;
+  updatedAt: string;
+}
+
+export interface OrgSharedResourceResponse {
+  publication: OrgSharedResourcePublication;
+}
+
+export interface OrgSharedResourceSummary extends OrgSharedResourcePublication {
+  label: string;
+  readiness: "ready" | "requires_setup" | "unavailable";
+  sourceOrganization: { id: string; name: string };
+}
+
+export interface ListOrgSharedResourcesResponse {
+  resources: OrgSharedResourceSummary[];
+}
+
+export interface OrganizationOverviewResponse {
+  activeOrgId: string;
+  canManageOrganization: boolean;
+  organization: { id: string; name: string };
+  sharedResources: OrgSharedResourceSummary[];
+  teams: Array<{
+    canSwitch: boolean;
+    id: string;
+    isCurrent: boolean;
+    localResourceCounts: {
+      agents: number;
+      knowledge: number;
+      skills: number;
+      tools: number;
+    };
+    memberCount: number;
+    name: string;
+    slug: string;
+  }>;
+}
+
+export interface UpdateOrganizationRequest {
+  allowedInviteDomains?: string[];
+  monthlyLlmTokenLimit?: number;
+  monthlyLlmTurnLimit?: number;
+  monthlyLlmWarningPercent?: number;
+  name?: string;
+  skillsCuratorArchiveAfterDays?: number;
+  skillsCuratorConsolidateEnabled?: boolean;
+  skillsCuratorEnabled?: boolean;
+  skillsCuratorStaleAfterDays?: number;
+  skillsPostTurnReview?: boolean;
+  skillsWriteApproval?: boolean;
+}
+
+export type SkillCuratorTrigger = "schedule" | "manual" | "seed";
+
+export interface SkillCuratorRestoreMiss {
+  archivedDirectory: string;
+  skillId: string;
+}
+
+export interface SkillCuratorRunResult {
+  archived: number;
+  consolidateApplied?: number;
+  consolidateBudgetExhausted?: boolean;
+  consolidateDeslopified?: number;
+  consolidateMerged?: number;
+  consolidateSkipped?: number;
+  consolidateStaged?: number;
+  dryRun: boolean;
+  finishedAt: string;
+  orgId: string;
+  restoreMisses: SkillCuratorRestoreMiss[];
+  scanned: number;
+  skippedAutomation: number;
+  skippedBundled: number;
+  skippedError: number;
+  skippedTooNew: number;
+  stale: number;
+  startedAt: string;
+  status: "completed" | "in_flight";
+  trigger: SkillCuratorTrigger;
+}
+
+export interface RunSkillCuratorRequest {
+  dryRun?: boolean;
+}
+
+export interface SkillCuratorRunResponse {
+  result: SkillCuratorRunResult;
+}
+
+export interface SkillCuratorLatestResponse {
+  lastRunAt: string | null;
+  result: SkillCuratorRunResult | null;
+}
+
+export interface SkillCuratorOrgSchedule {
+  id: string;
+  skillsCuratorEnabled: boolean;
+  skillsCuratorLastRunAt: string | null;
+}
+
+export interface ListSkillCuratorOrgsResponse {
+  orgs: SkillCuratorOrgSchedule[];
+}
+
+export interface RunSkillCuratorInternalRequest {
+  trigger: "seed" | "schedule";
+}
+
+export interface ListOrganizationsResponse {
+  organizations: OrganizationSummary[];
+}
+
+export interface OrgLlmQuotaStatusResponse {
+  month: string;
+  status: "blocked" | "ok" | "warning";
+  tokenLimit: number;
+  tokens: number;
+  turnLimit: number;
+  turns: number;
+  warningPercent: number;
+}
+
+export interface OrgUsageLeader {
+  name: string;
+  requestCount: number;
+}
+
+export interface OrgUsageSummaryResponse {
+  /** Every agent by requests, Super MíngZhàn excluded. */
+  agents: OrgUsageLeader[];
+  /** Estimated spend over the last 30 UTC days. */
+  costUsd30d: number;
+  /** Last 30 UTC days, oldest first. */
+  daily: LlmUsageDayStats[];
+  /** Every member by requests. */
+  people: OrgUsageLeader[];
+  requests7d: number;
+  /** The 7 days before `requests7d`. */
+  requestsPrev7d: number;
+  /** Agent with the most requests, all time. */
+  topAgent: OrgUsageLeader | null;
+}
+
+export interface OrganizationResponse {
+  organization: OrganizationSummary;
+}
+
+export interface OrgInviteCreatedResponse {
+  delivered: boolean;
+  invite: OrgInviteSummary;
+  token: string | null;
+}
+
+export interface AddOrgMemberResponse {
+  member: OrgMemberSummary;
+  temporaryPassword: string | null;
+}
+
+export interface CreateOrganizationResponse {
+  adminMember?: AddOrgMemberResponse;
+  organization: OrganizationSummary;
+}
+
+export interface UserOrgSummary extends OrganizationSummary {
+  role: OrgRole;
+}
+
+export interface ListUserOrgsResponse {
+  orgs: UserOrgSummary[];
+}
+
+export interface SetActiveOrgRequest {
+  orgId: string;
+}
+
+export interface OrgMemberSummary {
+  createdAt: string;
+  /** Set while the account is disabled; disabling is install-wide, not per org. */
+  disabledAt?: string | null;
+  email: string;
+  name: string | null;
+  phone: string | null;
+  role: OrgRole;
+  userId: string;
+}
+
+export interface ListOrgMembersResponse {
+  members: OrgMemberSummary[];
+}
+
+export interface AddOrgMemberRequest {
+  email: string;
+  name: string;
+  phone?: string;
+  role: OrgRole;
+}
+
+export interface OrgMemberResponse {
+  member: OrgMemberSummary;
+}
+
+export interface UpdateOrgMemberRequest {
+  name?: string | null;
+  phone?: string | null;
+  role?: OrgRole;
+}
+
+/**
+ * One login session, as its owner sees it. The token hashes never leave the
+ * database: a caller revokes a session by id, and the id alone is useless
+ * without the row.
+ */
+export interface BrowserSessionSummary {
+  createdAt: string;
+  /** True for the session making the request, so the UI does not offer to log you out of the page you are on. */
+  current: boolean;
+  expiresAt: string;
+  id: string;
+  lastUsedAt: string | null;
+}
+
+export interface ListBrowserSessionsResponse {
+  sessions: BrowserSessionSummary[];
+}
+
+export interface RevokeBrowserSessionsResponse {
+  revoked: number;
+}
+
+export interface OrgMemoryResponse {
+  content: string;
+}
+
+export interface UpdateOrgMemoryRequest {
+  content: string;
+}
+
+export interface AddOrgMemoryFactRequest {
+  bullet: string;
+  pin?: boolean;
+}
+
+export interface OrgMemorySearchRequest {
+  query: string;
+}
+
+export interface OrgMemorySearchMatchEntry {
+  bullet: string;
+  date?: string;
+  source: string;
+  tier?: "pinned" | "recent-log" | "archive";
+}
+
+export interface OrgMemorySearchResponse {
+  matches: OrgMemorySearchMatchEntry[];
+  query: string;
+}
+
+export interface ArchiveOrgMemoryRequest {
+  entries: string[];
+  reason?: string;
+}
+
+export interface ArchiveOrgMemoryResponse {
+  activeBytes: number;
+  archived: number;
+  archivePath: string;
+}
+
+export interface PinOrgMemoryRequest {
+  bullet: string;
+}
+
+export interface UnpinOrgMemoryRequest {
+  bullet: string;
+}
+
+export type OrgMemoryChangeAction =
+  | "edit"
+  | "approve"
+  | "add_fact"
+  | "pin"
+  | "unpin"
+  | "archive"
+  | "restore";
+
+export interface OrgMemoryChangeLogEntry {
+  action: OrgMemoryChangeAction;
+  actorUserId: string | null;
+  createdAt: string;
+  id: string;
+  label: string;
+  orgId: string;
+  restoredFromId?: string | null;
+}
+
+export interface ListOrgMemoryHistoryResponse {
+  changes: OrgMemoryChangeLogEntry[];
+  /** Soft cap kept on disk; older revisions are pruned. */
+  maxEntries: number;
+  /** True once pruning has discarded at least one older revision. */
+  truncated: boolean;
+}
+
+export interface RestoreOrgMemoryHistoryResponse {
+  content: string;
+}
+
+export interface OrgMemoryHistoryRevisionResponse {
+  change: OrgMemoryChangeLogEntry;
+  content: string;
+}
+
+export type OrgMemoryProposalStatus = "pending" | "approved" | "rejected";
+
+export interface OrgMemoryProposal {
+  bullet: string;
+  createdAt: string;
+  id: string;
+  orgId: string;
+  pinned: boolean;
+  profileId: string | null;
+  proposedByUserId: string | null;
+  reviewedAt: string | null;
+  reviewerUserId: string | null;
+  sessionId: string | null;
+  /** Knowledge-base document ids cited when the bullet was proposed. */
+  sourceDocumentIds: string[];
+  status: OrgMemoryProposalStatus;
+}
+
+export interface ListOrgMemoryProposalsResponse {
+  pendingCount: number;
+  proposals: OrgMemoryProposal[];
+}
+
+export interface ApproveOrgMemoryProposalRequest {
+  pin?: boolean;
+}
+
+export interface OrgMemoryProposalResponse {
+  content?: string;
+  proposal: OrgMemoryProposal;
+}
+
+export type SkillProposalStatus = "pending" | "approved" | "rejected";
+
+export type SkillProposalAction =
+  | "create"
+  | "patch"
+  | "delete"
+  | "edit"
+  | "write_file"
+  | "remove_file"
+  | "approve_code";
+
+export interface SkillProposal {
+  action: SkillProposalAction;
+  consolidateLoserSkillNames?: string[] | null;
+  content: string | null;
+  createdAt: string;
+  id: string;
+  orgId: string;
+  patchNewString: string | null;
+  patchOldString: string | null;
+  profileId: string;
+  proposedByUserId: string | null;
+  relativePath: string | null;
+  reviewedAt: string | null;
+  reviewerUserId: string | null;
+  sessionId: string | null;
+  skillName: string;
+  status: SkillProposalStatus;
+  supportingFiles?: { path: string; contentBase64: string }[] | null;
+  warnings?: string[];
+}
+
+export interface ListSkillProposalsResponse {
+  pendingCount: number;
+  proposals: SkillProposal[];
+}
+
+export interface SkillProposalResponse {
+  proposal: SkillProposal;
+}
+
+export type SkillSuggestionStatus = "pending" | "applied";
+
+export type SkillSuggestionAction = "create" | "patch";
+
+export interface SkillSuggestion {
+  action: SkillSuggestionAction;
+  appliedAt: string | null;
+  content: string | null;
+  createdAt: string;
+  id: string;
+  orgId: string;
+  patchNewString: string | null;
+  patchOldString: string | null;
+  profileId: string;
+  proposedByUserId: string | null;
+  sessionId: string | null;
+  skillName: string;
+  source: "post_turn_review";
+  status: SkillSuggestionStatus;
+  warnings?: string[];
+}
+
+export interface ListSkillSuggestionsResponse {
+  suggestions: SkillSuggestion[];
+}
+
+export type ApplySkillSuggestionOutcome =
+  | "applied"
+  | "already_applied"
+  | "staged_as_proposal";
+
+export interface ApplySkillSuggestionResponse {
+  outcome: ApplySkillSuggestionOutcome;
+  proposalId?: string;
+  suggestion: SkillSuggestion;
+}
+
+export interface InviteOrgMemberRequest {
+  email: string;
+  role: OrgRole;
+}
+
+export interface OrgInviteSummary {
+  createdAt: string;
+  email: string;
+  expiresAt: string;
+  id: string;
+  orgId: string;
+  role: OrgRole;
+}
+
+export interface AcceptOrgInviteRequest {
+  password?: string;
+  token: string;
+}
+
+export interface AcceptOrgInviteResponse {
+  email: string;
+  orgId: string;
+  role: OrgRole;
+}
+
+export interface ChangePasswordRequest {
+  currentPassword: string;
+  newPassword: string;
+}
+
+export interface RequestPasswordResetRequest {
+  email: string;
+}
+
+export interface RequestPasswordResetResponse {
+  delivered: boolean;
+  token: string | null;
+}
+
+export interface ResetPasswordRequest {
+  newPassword: string;
+  token: string;
+}
+
+export interface CreateSessionRequest {
+  channel: AgentChannel;
+  codingWorkspaceRoot?: string;
+  /**
+   * A cognito session lives only in server memory: no `sessions` row, no
+   * `session_messages`, no generated title, and no write-back into profile or
+   * org memory. It still loads soul, skills, plugins and memory, it just
+   * leaves nothing behind. Absent or false means an ordinary session.
+   */
+  cognito?: boolean;
+  model?: string;
+  profileId?: string;
+  /** Overrides the install thinking effort for this session. */
+  thinkingEffort?: ThinkingEffort;
+}
+
+export interface CreateSessionResponse {
+  sessionId: string;
+}
+
+export interface UpdateSessionRequest {
+  model?: string | null;
+  parentSessionId?: null;
+  pinned?: boolean;
+  /** Null goes back to the install thinking effort. */
+  thinkingEffort?: ThinkingEffort | null;
+  title?: string;
+}
+
+export interface BranchSessionRequest {
+  messageIndex: number;
+}
+
+export interface BranchSessionResponse {
+  sessionId: string;
+}
+
+export type AgentTodoStatus =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "cancelled";
+
+export interface AgentTodo {
+  content: string;
+  id: string;
+  status: AgentTodoStatus;
+}
+
+export interface AgentQuestionChoice {
+  id: string;
+  label: string;
+}
+
+export interface AgentQuestionItem {
+  allowCustomAnswer: boolean;
+  choices: AgentQuestionChoice[];
+  id: string;
+  placeholder?: string;
+  prompt: string;
+}
+
+export interface AgentQuestionnaire {
+  id: string;
+  questions: AgentQuestionItem[];
+  title: string;
+}
+
+export interface AgentQuestionAnswer {
+  answer: string;
+  prompt: string;
+  questionId: string;
+}
+
+export interface SessionMessageMeta {
+  createdAt: string;
+  id: string;
+  seq: number;
+}
+
+/** How full the model context window is for the current chat session. */
+export type ChatContextUsageSource = "provider" | "estimate";
+
+export interface ChatContextUsageBreakdown {
+  conversation: number;
+  systemPrompt: number;
+  toolDefinitions: number;
+}
+
+export interface ChatContextUsage {
+  /**
+   * Estimated composition of the prompt (system + tools + history). Token
+   * total may differ from `usedTokens` when the provider reports input size.
+   */
+  breakdown?: ChatContextUsageBreakdown;
+  contextWindow: number;
+  source: ChatContextUsageSource;
+  /** Denominator matching compaction usable context (window minus reserved output). */
+  usableContextTokens: number;
+  usedTokens: number;
+}
+
+export interface SessionMessagesResponse {
+  channel: AgentChannel;
+  contextUsage?: ChatContextUsage | null;
+  messageMeta: SessionMessageMeta[];
+  messages: ChatMessage[];
+  model: string | null;
+  questionnaire: AgentQuestionnaire | null;
+  /** Null or absent follows the install thinking effort. */
+  thinkingEffort?: ThinkingEffort | null;
+  todos: AgentTodo[];
+}
+
+export interface SessionStatusResponse {
+  active: boolean;
+  startedAt?: string;
+}
+
+export interface SessionSummary {
+  /** True while a turn is streaming for this session on the serving process. */
+  active: boolean;
+  branchMessageIndex: number | null;
+  channel: AgentChannel;
+  createdAt: string;
+  id: string;
+  messageCount: number;
+  parentSessionId: string | null;
+  pinned: boolean;
+  preview: string | null;
+  profileId: string;
+  sortPosition: number | null;
+  title: string | null;
+  updatedAt: string;
+}
+
+/**
+ * Longest `q` that `GET /v1/sessions` accepts, after trimming. The web search
+ * field stops at the same length, so typing on cannot turn into a 400.
+ */
+export const MAX_SESSION_SEARCH_LENGTH = 200;
+
+export interface ListSessionsResponse {
+  /** Set only when a `limit` was asked for; `null` on the last page. */
+  nextCursor?: string | null;
+  sessions: SessionSummary[];
+  /**
+   * Set only when a `limit` was asked for. `true` when chats moved across
+   * `cursor` since it was issued, so the pages loaded before no longer join
+   * this one and paging has to start again from the first page.
+   */
+  stale?: boolean;
+}
+
+export interface CompactSessionRequest {
+  force?: boolean;
+}
+
+export interface CompactionResponse {
+  action: "none" | "pruned" | "summarized";
+  messagesAfter: number;
+  messagesBefore: number;
+  prunedTokens?: number;
+}
+
+export type MessageContentPart =
+  | { type: "text"; text: string }
+  | { type: "image"; mediaType: string; data: string; description?: string }
+  | { type: "document"; filename: string; mediaType: string; data: string }
+  | { type: "image_ref"; attachmentId: string; mediaType: string; size: number }
+  | {
+      type: "document_ref";
+      attachmentId: string;
+      filename: string;
+      mediaType: string;
+      size: number;
+    };
+
+export interface ImageAttachment {
+  data: string;
+  mediaType: string;
+}
+
+export interface DocumentAttachment {
+  data: string;
+  filename: string;
+  mediaType: string;
+}
+
+export interface SendMessageInput {
+  /** Browser origin for OAuth callbacks (e.g. window.location.origin). */
+  clientOrigin?: string;
+  documents?: DocumentAttachment[];
+  images?: ImageAttachment[];
+  message: string;
+}
+
+export interface SendMessageRequest {
+  clientOrigin?: string;
+  documents?: DocumentAttachment[];
+  images?: ImageAttachment[];
+  message: string;
+  stream?: boolean;
+  whatsappMessage?: ToolContext["whatsappMessage"];
+}
+
+export interface SendMessageResponse {
+  contextUsage?: ChatContextUsage;
+  reply: string;
+  /** Billable tokens for this turn. `contextUsage` is not a substitute. */
+  usage?: ChatTurnUsage;
+}
+
+export type StreamEvent =
+  | { type: "chunk"; delta: string }
+  | { type: "thinking"; delta: string }
+  | {
+      type: "tool_input_delta";
+      toolGroupId?: string;
+      toolCallId: string;
+      tool: string;
+      delta: string;
+      accumulatedArguments?: string;
+    }
+  | {
+      type: "tool_start";
+      toolGroupId?: string;
+      toolCallId: string;
+      tool: string;
+      input: Record<string, JsonValue>;
+    }
+  | {
+      type: "tool_end";
+      toolGroupId?: string;
+      toolCallId: string;
+      tool: string;
+      result: unknown;
+      images?: ImageAttachment[];
+    }
+  | { type: "todos_updated"; todos: AgentTodo[] }
+  | { type: "questionnaire_updated"; questionnaire: AgentQuestionnaire | null }
+  | {
+      type: "sub_agent_activity";
+      parentToolCallId: string;
+      label: string;
+    }
+  | { type: "usage"; usage: ChatUsage }
+  | {
+      type: "done";
+      reply: string;
+      contextUsage?: ChatContextUsage;
+      usage?: ChatTurnUsage;
+    }
+  | { type: "error"; error: string; usage?: ChatTurnUsage };
+
+export interface DraftAutomationRequest {
+  channel: AgentChannel;
+  prompt: string;
+}
+
+export interface DraftAutomationResponse {
+  automation: AutomationDefinition;
+}
+
+export interface ListAutomationsResponse {
+  automations: StoredAutomation[];
+  unread?: AutomationUnreadSummary;
+}
+
+export interface AutomationResponse {
+  automation: StoredAutomation;
+}
+
+export interface CreateAutomationRequest {
+  delivery?: AutomationDelivery;
+  description: string;
+  enabled?: boolean;
+  name: string;
+  profileId?: string;
+  prompt: string;
+  trigger: AutomationTrigger;
+}
+
+export interface UpdateAutomationRequest {
+  delivery?: AutomationDelivery | null;
+  description?: string;
+  enabled?: boolean;
+  name?: string;
+  profileId?: string;
+  prompt?: string;
+  trigger?: AutomationTrigger;
+}
+
+export interface RunAutomationResponse {
+  run: AutomationRunRecord;
+}
+
+export interface ListAutomationRunsResponse {
+  runs: AutomationRunRecord[];
+}
+
+export interface MarkAutomationRunsReadResponse {
+  readThroughAt: string;
+}
+
+export type WorkflowStepKind =
+  | "tool"
+  | "compare"
+  | "assert"
+  | "template"
+  | "summarize";
+
+export type WorkflowCompareOp = "eq" | "near" | "contains";
+
+export interface WorkflowToolStep {
+  id: string;
+  input: Record<string, JsonValue>;
+  kind: "tool";
+  tool: string;
+}
+
+export interface WorkflowCompareStep {
+  id: string;
+  kind: "compare";
+  left: unknown;
+  op: WorkflowCompareOp;
+  right: unknown;
+  tolerance?: number;
+}
+
+export interface WorkflowAssertStep {
+  expected: unknown;
+  id: string;
+  kind: "assert";
+  path: string;
+}
+
+export interface WorkflowTemplateStep {
+  id: string;
+  kind: "template";
+  template: string;
+}
+
+export interface WorkflowSummarizeStep {
+  id: string;
+  kind: "summarize";
+  prompt: string;
+}
+
+export type WorkflowStep =
+  | WorkflowToolStep
+  | WorkflowCompareStep
+  | WorkflowAssertStep
+  | WorkflowTemplateStep
+  | WorkflowSummarizeStep;
+
+export interface WorkflowDefinition {
+  description: string;
+  id: string;
+  name: string;
+  steps: WorkflowStep[];
+  version: number;
+}
+
+export interface StoredWorkflow extends WorkflowDefinition {
+  createdAt: string;
+  enabled: boolean;
+  lastRunAt?: string | null;
+  orgId?: string | null;
+  profileId: string;
+  updatedAt: string;
+}
+
+export type WorkflowRunStatus = "running" | "completed" | "failed";
+
+export type WorkflowRunStepStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "skipped";
+
+export interface WorkflowReceiptBag {
+  input: Record<string, JsonValue>;
+  steps: Record<string, JsonValue>;
+}
+
+export interface WorkflowRunStepRecord {
+  completedAt: string | null;
+  error: string | null;
+  id: string;
+  input: unknown;
+  kind: WorkflowStepKind;
+  output: unknown;
+  runId: string;
+  startedAt: string;
+  status: WorkflowRunStepStatus;
+  stepId: string;
+}
+
+export interface WorkflowRunRecord {
+  completedAt: string | null;
+  error: string | null;
+  id: string;
+  input: Record<string, JsonValue> | null;
+  output: string | null;
+  startedAt: string;
+  status: WorkflowRunStatus;
+  steps?: WorkflowRunStepRecord[];
+  workflowId: string;
+}
+
+export interface ListWorkflowsResponse {
+  workflows: StoredWorkflow[];
+}
+
+export interface CreateWorkflowRequest {
+  description: string;
+  enabled?: boolean;
+  name: string;
+  profileId?: string;
+  steps: WorkflowStep[];
+}
+
+export interface UpdateWorkflowRequest {
+  description?: string;
+  enabled?: boolean;
+  name?: string;
+  profileId?: string;
+  steps?: WorkflowStep[];
+}
+
+export interface RunWorkflowRequest {
+  input?: Record<string, JsonValue>;
+}
+
+export interface RunWorkflowResponse {
+  run: WorkflowRunRecord;
+}
+
+export interface ListWorkflowRunsResponse {
+  runs: WorkflowRunRecord[];
+}
+
+export interface GetWorkflowRunResponse {
+  run: WorkflowRunRecord;
+}
+
+export interface WorkflowSqliteTableInfo {
+  name: string;
+  rowCount: number;
+}
+
+export interface WorkflowSqlitePreview {
+  columns: string[];
+  rows: Record<string, JsonValue>[];
+  table: string;
+  total: number;
+}
+
+export interface WorkflowSqliteInspectResponse {
+  preview: WorkflowSqlitePreview | null;
+  tables: WorkflowSqliteTableInfo[];
+}
+
+export interface TimezoneSettingsResponse {
+  timezone: string;
+}
+
+export interface UpdateTimezoneRequest {
+  timezone: string;
+}
+
+export type ThinkingEffort = "low" | "medium" | "high";
+
+export interface ThinkingSettings {
+  effort: ThinkingEffort;
+  enabled: boolean;
+}
+
+export interface ThinkingSettingsResponse {
+  thinking: ThinkingSettings;
+}
+
+export interface UpdateThinkingRequest {
+  effort?: ThinkingEffort;
+  enabled: boolean;
+}
+
+export interface VisionSettings {
+  model: string | null;
+}
+
+export interface VisionSettingsResponse {
+  vision: VisionSettings;
+}
+
+export interface UpdateVisionRequest {
+  model: string | null;
+}
+
+export interface TranscriptionSettings {
+  model: string | null;
+}
+
+export interface TranscriptionSettingsResponse {
+  transcription: TranscriptionSettings;
+}
+
+export interface UpdateTranscriptionRequest {
+  model: string | null;
+}
+
+export interface TranscribeAudioRequest {
+  data: string;
+  filename?: string;
+  mediaType: string;
+}
+
+export interface TranscribeAudioResponse {
+  text: string;
+}
+
+export interface ImageGenerationSettings {
+  model: string | null;
+}
+
+export interface ImageGenerationSettingsResponse {
+  imageGeneration: ImageGenerationSettings;
+}
+
+export interface UpdateImageGenerationRequest {
+  model: string | null;
+}
+
+/** Search back-end that replaces the provider-hosted `web_search` tool. */
+export type WebSearchProvider = "exa" | "firecrawl" | "serply";
+
+export interface WebSearchSettingsResponse {
+  apiKeyMasked: string | null;
+  /** false means the active LLM provider's own hosted web search is used. */
+  configured: boolean;
+  endpoint: string | null;
+  provider: WebSearchProvider | null;
+}
+
+export interface UpdateWebSearchSettingsRequest {
+  apiKey?: string;
+  endpoint?: string;
+  /** null clears the override and restores the built-in hosted search. */
+  provider?: WebSearchProvider | null;
+}
+
+export interface GenerateImageRequest {
+  prompt: string;
+  size?: string;
+}
+
+export interface GenerateImageResponse {
+  data: string;
+  mediaType: string;
+  model: string;
+  revisedPrompt?: string;
+  size: string;
+  sizeBytes: number;
+}
+
+export interface RotateLocalAuthTokenResponse {
+  token: string;
+}
+
+export interface TelegramSettingsResponse {
+  allowedUserIds: number[];
+  botTokenMasked: string | null;
+  configured: boolean;
+  handshakeCode: string | null;
+  pairedUserIds: number[];
+  profileId: string;
+}
+
+export interface TelegramAccessRequestsResponse {
+  allowedUsernames: Record<string, string>;
+  botUsername: string | null;
+  requests: Array<{
+    requestedAt: string;
+    userId: number;
+    username: string | null;
+  }>;
+}
+
+export interface UpdateTelegramSettingsRequest {
+  allowedUserIds?: string;
+  botToken?: string;
+  pairedUserIds?: string;
+  profileId?: string;
+}
+
+export interface StartTelegramPairingRequest {
+  profileId: string;
+}
+
+export interface TelegramPairingStartResponse {
+  deepLink: string;
+  expiresAt: string;
+  pairingId: string;
+  qrPayload: string;
+  suggestedUsername: string;
+}
+
+export interface TelegramPairingStatusResponse {
+  botUsername: string | null;
+  expiresAt: string;
+  ownerUserId: number | null;
+  pairingId: string;
+  profileId: string;
+  status: "waiting" | "ready" | "expired" | "cancelled" | "applied";
+}
+
+export interface ApplyTelegramPairingRequest {
+  profileId: string;
+}
+
+export interface DiscordSettingsResponse {
+  allowedUserIds: string[];
+  botTokenMasked: string | null;
+  configured: boolean;
+  handshakeCode: string | null;
+  inviteUrl: string | null;
+  pairedUserIds: string[];
+  profileId: string;
+}
+
+export interface UpdateDiscordSettingsRequest {
+  allowedUserIds?: string;
+  botToken?: string;
+  profileId?: string;
+}
+
+export interface SlackSettingsResponse {
+  allowedUserIds: string[];
+  allowWorkspace: boolean;
+  appTokenMasked: string | null;
+  botTokenMasked: string | null;
+  configured: boolean;
+  handshakeCode: string | null;
+  pairedUserIds: string[];
+  profileId: string;
+}
+
+/**
+ * Splits typed or pasted Slack member IDs (commas, spaces or new lines) into
+ * valid IDs and the pieces that are not IDs. Shared by the dashboard input
+ * and the server so both accept exactly the same values.
+ */
+export interface SlackMemberIdInput {
+  ids: string[];
+  invalid: string[];
+}
+
+export function parseSlackMemberIdInput(raw: string): SlackMemberIdInput {
+  const ids = new Set<string>();
+  const invalid: string[] = [];
+
+  for (const part of raw.split(/[\s,]+/)) {
+    const id = part.trim().toUpperCase();
+
+    if (!id) {
+      continue;
+    }
+
+    if (/^[UW][A-Z0-9]{6,}$/.test(id)) {
+      ids.add(id);
+    } else {
+      invalid.push(part.trim());
+    }
+  }
+
+  return { ids: [...ids], invalid };
+}
+
+export interface UpdateSlackSettingsRequest {
+  allowedUserIds?: string;
+  allowWorkspace?: boolean;
+  appToken?: string;
+  botToken?: string;
+}
+
+export interface ComposioSettingsResponse {
+  apiKeyMasked: string | null;
+  composioReachable: boolean;
+  configured: boolean;
+}
+
+export interface UpdateComposioSettingsRequest {
+  apiKey?: string;
+}
+
+export interface ErrorTrackingSettingsResponse {
+  configured: boolean;
+  dashboardUrl?: string | null;
+  dsnMasked: string | null;
+  /** Cleared when the DSN changes. */
+  lastTest: { at: string; delivered: boolean } | null;
+  savedAt: string | null;
+}
+
+export interface UpdateErrorTrackingSettingsRequest {
+  /** Empty string clears the DSN and turns error tracking off. */
+  dsn?: string;
+}
+
+export interface SendErrorTrackingTestResponse {
+  delivered: boolean;
+}
+
+export type NotificationDestinationChannel =
+  | "telegram"
+  | "discord"
+  | "whatsapp";
+
+export type NotificationWebhookLevel = "info" | "success" | "warning" | "error";
+
+export interface TelegramNotificationDestinationConfig {
+  chatId: number;
+  profileId?: string;
+  topicId?: number | null;
+}
+
+export interface DiscordNotificationDestinationConfig {
+  channelId: string;
+  profileId: string;
+}
+
+export interface WhatsAppNotificationDestinationConfig {
+  profileId: string;
+}
+
+export type NotificationDestinationSummary = {
+  createdAt: string;
+  id: string;
+  name: string;
+  updatedAt: string;
+  webhookPath: string;
+} & (
+  | { channel: "telegram"; telegram: TelegramNotificationDestinationConfig }
+  | { channel: "discord"; discord: DiscordNotificationDestinationConfig }
+  | { channel: "whatsapp"; whatsapp: WhatsAppNotificationDestinationConfig }
+);
+
+export interface NotificationDestinationWithSecret {
+  apiKey: string;
+  destination: NotificationDestinationSummary;
+}
+
+export interface ListNotificationDestinationsResponse {
+  destinations: NotificationDestinationSummary[];
+}
+
+export type CreateNotificationDestinationRequest = {
+  name: string;
+} & (
+  | { channel: "telegram"; telegram: TelegramNotificationDestinationConfig }
+  | { channel: "discord"; discord: DiscordNotificationDestinationConfig }
+  | { channel: "whatsapp"; whatsapp: WhatsAppNotificationDestinationConfig }
+);
+
+export type UpdateNotificationDestinationRequest = {
+  name: string;
+} & (
+  | { channel?: "telegram"; telegram: TelegramNotificationDestinationConfig }
+  | { channel: "discord"; discord: DiscordNotificationDestinationConfig }
+  | { channel: "whatsapp"; whatsapp: WhatsAppNotificationDestinationConfig }
+);
+
+export interface RegenerateNotificationDestinationKeyResponse {
+  apiKey: string;
+  destination: NotificationDestinationSummary;
+}
+
+export interface NotificationWebhookRequest {
+  body: string;
+  level?: NotificationWebhookLevel;
+  title?: string;
+}
+
+export interface EmailSettingsResponse {
+  configured: boolean;
+  from: string | null;
+  fromName: string | null;
+  imapHost: string | null;
+  imapPort: number | null;
+  imapSecure: boolean | null;
+  passwordMasked: string | null;
+  smtpHost: string | null;
+  smtpPort: number | null;
+  smtpSecure: boolean | null;
+  username: string | null;
+}
+
+export interface UpdateEmailSettingsRequest {
+  from?: string;
+  fromName?: string;
+  imapHost?: string;
+  imapPort?: number;
+  imapSecure?: boolean;
+  password?: string;
+  smtpHost?: string;
+  smtpPort?: number;
+  smtpSecure?: boolean;
+  username?: string;
+}
+
+export interface SendEmailTestRequest {
+  to?: string;
+}
+
+export interface SendEmailTestResponse {
+  messageId: string;
+  ok: true;
+  to: string;
+}
+
+/** Cloud browser that agent-browser connects to instead of local Chrome. */
+export type AgentBrowserProvider = "kernel";
+
+export interface AgentBrowserStatusResponse {
+  apiKeyMasked: string | null;
+  installCommand: string;
+  installed: boolean;
+  nextStep: "install" | null;
+  /** null means agent-browser launches Chrome on the MíngZhàn host. */
+  provider: AgentBrowserProvider | null;
+  ready: boolean;
+  statusMessage: string | null;
+  version: string | null;
+}
+
+/** Live view of the caller's cloud browser; null when none is running. */
+export interface SessionBrowserResponse {
+  liveViewUrl: string | null;
+}
+
+export interface UpdateAgentBrowserSettingsRequest {
+  apiKey?: string;
+  /** null restores local Chrome. */
+  provider?: AgentBrowserProvider | null;
+}
+
+export type AgentBrowserInstallEvent =
+  | {
+      type: "progress";
+      message: string;
+    }
+  | {
+      type: "done";
+      status: AgentBrowserStatusResponse;
+    }
+  | {
+      type: "error";
+      error: string;
+    };
+
+export interface WhatsAppAllowedPhoneDetail {
+  addedAt: string | null;
+  name: string;
+}
+
+export interface WhatsAppSettingsResponse {
+  allowedPhoneDetails: Record<string, WhatsAppAllowedPhoneDetail>;
+  allowedPhones: string[];
+  allowUnpairedGroupMembers: boolean;
+  configured: boolean;
+  pairedJid: string | null;
+  pairingCode: string | null;
+  phoneNumberMasked: string | null;
+  profileId: string;
+  requireGroupMention: boolean;
+}
+
+export interface UpdateWhatsAppSettingsRequest {
+  /** Display names keyed by phone; an empty name clears it. */
+  allowedPhoneNames?: Record<string, string>;
+  allowedPhones?: string;
+  allowUnpairedGroupMembers?: boolean;
+  phoneNumber?: string;
+  profileId?: string;
+  requireGroupMention?: boolean;
+}
+
+export interface TimezoneCatalogEntry {
+  abbreviation: string;
+  /** Extra searchable city names (e.g. San Francisco → America/Los_Angeles). */
+  aliases?: string[];
+  city: string;
+  countryCode: string;
+  countryName: string;
+  id: string;
+  label: string;
+  offset: string;
+  tzName: string;
+}
+
+export interface TimezoneCatalogGroup {
+  countryCode: string;
+  countryName: string;
+  timezones: TimezoneCatalogEntry[];
+}
+
+export interface ListTimezonesResponse {
+  groups: TimezoneCatalogGroup[];
+}
+
+export interface ProfileRef {
+  id: string;
+  name: string;
+}
+
+export interface ApiErrorResponse {
+  error: string;
+  profiles?: ProfileRef[];
+  totpEnabled?: boolean;
+  /** Tokens a failed turn had already spent. They are billable regardless. */
+  usage?: ChatTurnUsage;
+}
+
+export interface CustomModelEntry {
+  /** USD per 1M input tokens served from the provider's prompt cache. */
+  cachedInputPerMillionUsd?: number;
+  /** Total context the model accepts. Blank falls back to the catalog entry,
+   * then to a conservative default, so existing entries keep their behaviour. */
+  contextWindow?: number;
+  default?: boolean;
+  id: string;
+  inputPerMillionUsd?: number;
+  maxOutputTokens?: number;
+  name?: string;
+  outputPerMillionUsd?: number;
+  supportsThinking?: boolean;
+  supportsVision?: boolean;
+}
+
+export interface ProviderModelOption {
+  contextWindow?: number;
+  default?: boolean;
+  id: string;
+  inputPerMillionUsd?: number;
+  maxOutputTokens?: number;
+  name: string;
+  outputPerMillionUsd?: number;
+  /** "acp" for models an ACP agent reports for its chat. */
+  provider: ProviderName | "acp";
+  providerId?: string;
+  providerLabel?: string;
+  supportsThinking?: boolean;
+  supportsVision?: boolean;
+}
+
+export interface OpenRouterRoutingSettings {
+  dataCollection?: "allow" | "deny";
+  requireParameters?: boolean;
+  zdr?: boolean;
+}
+
+export interface ProviderInstanceSummary {
+  baseUrl?: string | null;
+  createdAt: string;
+  customModels?: CustomModelEntry[];
+  hasApiKey: boolean;
+  hostMode?: OllamaHostMode | null;
+  id: string;
+  label: string;
+  modelCount: number;
+  openRouterRouting?: OpenRouterRoutingSettings;
+  type: ProviderName;
+  wireApi?: WireApi | null;
+}
+
+export interface ListProvidersResponse {
+  defaultProviderId: string | null;
+  providers: ProviderInstanceSummary[];
+}
+
+export interface CreateProviderRequest {
+  apiKey: string;
+  baseUrl?: string;
+  chatgptOAuth?: ChatgptOAuthCredentials;
+  customModels?: CustomModelEntry[];
+  hostMode?: OllamaHostMode;
+  label?: string;
+  model?: string;
+  openRouterRouting?: OpenRouterRoutingSettings;
+  type: ProviderName;
+  wireApi?: WireApi;
+  xaiOAuth?: XaiOAuthCredentials;
+}
+
+export interface CreateProviderResponse {
+  defaultProviderId: string;
+  initialModel: string;
+  provider: ProviderInstanceSummary;
+}
+
+export interface UpdateProviderRequest {
+  apiKey?: string;
+  baseUrl?: string;
+  chatgptOAuth?: ChatgptOAuthCredentials;
+  customModels?: CustomModelEntry[];
+  hostMode?: OllamaHostMode;
+  label?: string;
+  /** Replaces the routing settings; {} clears request-level overrides. */
+  openRouterRouting?: OpenRouterRoutingSettings;
+  wireApi?: WireApi;
+  xaiOAuth?: XaiOAuthCredentials;
+}
+
+export interface UpdateProviderResponse {
+  provider: ProviderInstanceSummary;
+}
+
+export interface DeleteProviderResponse {
+  defaultProviderId: string | null;
+}
+
+export interface ModelsResponse {
+  baseUrl?: string | null;
+  /** Full static model catalog for provider setup and management UIs. */
+  catalog?: ProviderModelOption[];
+  currentProviderId: string | null;
+  customModels?: CustomModelEntry[];
+  displayName: string | null;
+  models: ProviderModelOption[];
+  provider: ProviderName | null;
+  providers: ProviderInstanceSummary[];
+}
+
+export interface DiscoverModelsRequest {
+  apiKey?: string;
+  baseUrl?: string;
+  hostMode?: OllamaHostMode;
+  /** When set, discovery uses the matching remote fetch path (Ollama includes `/api/tags` fallback). */
+  provider?: "ollama" | "openai_compatible" | "fireworks" | "netra";
+  providerId?: string;
+}
+
+export interface ConfigureProviderRequest {
+  apiKey: string;
+  baseUrl?: string;
+  customModels?: CustomModelEntry[];
+  displayName?: string;
+  hostMode?: OllamaHostMode;
+  model?: string;
+  provider: ProviderName;
+}
+
+export interface ConfigureProviderResponse {
+  currentModel: string;
+  displayName: string | null;
+  provider: ProviderName;
+}
+
+/** A coding agent that runs a profile's chat turns over ACP (stdio). */
+export interface AcpAgentConfig {
+  args: string[];
+  command: string;
+}
+
+/** One setting the ACP agent offers for a chat, such as its model or reasoning effort. */
+export interface AcpSessionSetting {
+  category: string | null;
+  currentValue: string;
+  id: string;
+  name: string;
+  options: Array<{ name: string; value: string }>;
+}
+
+export interface AcpSessionSettingsResponse {
+  settings: AcpSessionSetting[];
+}
+
+/** An agent MíngZhàn ships with, ready to save on a profile. */
+export interface AcpAgentPresetSummary {
+  agent: AcpAgentConfig;
+  id: string;
+  label: string;
+}
+
+export interface AcpAgentPresetsResponse {
+  presets: AcpAgentPresetSummary[];
+}
+
+export interface ProfileSummary {
+  /** Set when chat turns run through an ACP agent. The composer shows the agent's settings. */
+  acpAgent?: AcpAgentConfig | null;
+  /** Whether this profile may create and execute automations. */
+  automationsEnabled?: boolean;
+  createdAt: string;
+  /** Whether a super agent may create agent groups. */
+  groupsEnabled?: boolean;
+  hasAvatar: boolean;
+  id: string;
+  isDefault?: boolean;
+  isSuper: boolean;
+  mcpServerCount: number;
+  model: string | null;
+  name: string;
+  /** Member who created the agent. null for agents created by platform admins. */
+  ownerUserId?: string | null;
+  sharedAgent?: {
+    available: boolean;
+    publicationId: string;
+    sourceOrgId: string;
+    sourceProfileId: string;
+  };
+  /** false = private to the owner and admins. */
+  sharedWithTeam?: boolean;
+  /** null = inherit org default; true/false = force consolidate on/off for this profile */
+  skillsCuratorConsolidateEnabled?: boolean | null;
+  /** null = inherit org default; true/false = force post-turn review on/off for this profile */
+  skillsPostTurnReview?: boolean | null;
+  /** null = inherit org default; true/false = force gate on/off for this profile */
+  skillsWriteApproval?: boolean | null;
+  soulActive: boolean;
+  toolCount: number;
+  updatedAt: string;
+}
+
+export interface ProfileDetail extends ProfileSummary {
+  mcpServers: McpServerSummary[];
+  publishedSkills?: PublishedSkillSummary[];
+  skills: SkillSummary[];
+  systemPrompt: string;
+  tools: ToolSummary[];
+}
+
+export interface SkillUsageSummary {
+  lastPatchedAt: string | null;
+  lastUsedAt: string | null;
+  lastViewedAt: string | null;
+  patchCount: number;
+  useCount: number;
+  viewCount: number;
+}
+
+export type SkillCreatedBy = "agent" | "human" | "bundled";
+
+export interface SkillSummary {
+  createdAt: string;
+  createdBy: SkillCreatedBy;
+  description: string;
+  disableModelInvocation: boolean;
+  enabled: boolean;
+  hasTool: boolean;
+  id: string;
+  name: string;
+  /** null means shared across organizations. */
+  orgId?: string | null;
+  pluginId?: string | null;
+  pluginKey?: string | null;
+  sourcePath: string;
+  updatedAt: string;
+  usage?: SkillUsageSummary;
+}
+
+export interface SkillDetail extends SkillSummary {
+  body: string;
+  scriptIssues: SkillScriptIssue[];
+}
+
+export interface ListSkillsResponse {
+  publishedSkills?: PublishedSkillSummary[];
+  skills: SkillSummary[];
+}
+
+export interface PublishedSkillSummary
+  extends Pick<
+    SkillSummary,
+    | "createdAt"
+    | "createdBy"
+    | "description"
+    | "disableModelInvocation"
+    | "enabled"
+    | "hasTool"
+    | "id"
+    | "name"
+    | "updatedAt"
+  > {
+  publicationId: string;
+  scope: "parent";
+  sourceOrganization: { id: string; name: string };
+}
+
+export interface SkillResponse {
+  skill: SkillDetail;
+}
+
+export interface PublishedSkillResponse {
+  skill: PublishedSkillSummary & { body: string };
+}
+
+export interface SkillFilesResponse {
+  files: { path: string; type: "file" | "directory" }[];
+  truncated: boolean;
+}
+
+export interface SkillFileResponse {
+  content: string | null;
+  image?: { mediaType: string; dataBase64: string };
+  path: string;
+  unavailableReason?: string;
+}
+
+export interface AssignSkillRequest {
+  skillId: string;
+}
+
+export interface MoveProfileRequest {
+  organizationId: string;
+}
+
+export interface CloneProfileRequest {
+  /** Optional explicit id; otherwise a unique slug of the name. */
+  id?: string;
+  /** Defaults to `{source name} (copy)`. */
+  name?: string;
+}
+
+export interface CreateSkillRequest {
+  body?: string;
+  description: string;
+  disableModelInvocation?: boolean;
+  name: string;
+  profileId?: string;
+  /** Scripts the skill ships that should load as tools, relative to its directory. */
+  scripts?: string[];
+}
+
+export interface InstallSkillRequest {
+  command?: string;
+  profileId: string;
+  url?: string;
+  zipBase64?: string;
+}
+
+export interface PatchSkillRequest {
+  body?: string;
+  description?: string;
+  disableModelInvocation?: boolean;
+  /** Optional change note, shown as the version title. */
+  note?: string;
+}
+
+export interface SyncSkillsResponse {
+  created: number;
+  discovered: number;
+  updated: number;
+}
+
+export type McpServerStatus =
+  | "connected"
+  | "disconnected"
+  | "error"
+  /** Waiting for someone to approve the server's OAuth sign-in in a browser. */
+  | "needs_auth";
+
+export type McpTransport = "http" | "stdio";
+
+export interface McpHttpConfig {
+  headers?: Record<string, string>;
+  url: string;
+}
+
+export interface McpStdioConfig {
+  args?: string[];
+  command: string;
+  env?: Record<string, string>;
+}
+
+export type McpServerConfig = McpHttpConfig | McpStdioConfig;
+
+export interface CachedMcpToolSummary {
+  description: string;
+  inputSchema?: unknown;
+  name: string;
+}
+
+export interface McpServerSummary {
+  assignedProfileCount?: number;
+  createdAt: string;
+  enabled: boolean;
+  id: string;
+  lastError: string | null;
+  name: string;
+  status: McpServerStatus;
+  toolCount: number;
+  transport: McpTransport;
+  updatedAt: string;
+}
+
+export interface McpServerDetail extends McpServerSummary {
+  cachedTools: CachedMcpToolSummary[];
+  config: McpServerConfig;
+  /** Authenticated by a browser sign-in rather than by headers. */
+  usesOAuth: boolean;
+}
+
+export interface ListMcpServersResponse {
+  servers: McpServerSummary[];
+}
+
+export interface McpServerResponse {
+  /**
+   * Present when the server needs a browser sign-in before it can connect.
+   * Open it, approve, and the OAuth callback finishes the connection.
+   */
+  authorizationUrl?: string;
+  server: McpServerDetail;
+}
+
+export interface CreateMcpServerRequest {
+  config: McpServerConfig;
+  connect?: boolean;
+  enabled?: boolean;
+  name: string;
+  /** When testing an existing server, merges blank header/env values with stored secrets. */
+  serverId?: string;
+  transport: McpTransport;
+}
+
+export interface UpdateMcpServerRequest {
+  config?: McpServerConfig;
+  enabled?: boolean;
+  name?: string;
+  transport?: McpTransport;
+}
+
+export interface AssignMcpServerRequest {
+  serverId: string;
+}
+
+export interface TestMcpServerResponse {
+  error?: string;
+  ok: boolean;
+  /** The server answers 401 and advertises OAuth: sign-in, not a broken config. */
+  requiresAuthorization?: boolean;
+  toolCount: number;
+  tools: CachedMcpToolSummary[];
+}
+
+export interface ToolSummary {
+  description: string;
+  handlerType: string;
+  id: string;
+  name: string;
+  pluginId?: string | null;
+  pluginKey?: string | null;
+}
+
+export interface ToolDetail extends ToolSummary {
+  createdAt: string;
+  handlerConfig: unknown;
+  /** Resolved JSON Schema for javascript tools (module export or handlerConfig). */
+  parameters?: JsonSchema;
+  publicationId?: string;
+  scope?: "parent";
+  sourceOrganization?: { id: string; name: string };
+  updatedAt: string;
+}
+
+export interface ToolResponse {
+  tool: ToolDetail;
+}
+
+export interface ToolSourceResponse {
+  content: string;
+  language: "javascript" | "python" | "typescript";
+  path: string;
+}
+
+export interface ListProfilesResponse {
+  profiles: ProfileSummary[];
+}
+
+export interface ProfileResponse {
+  profile: ProfileDetail;
+}
+
+export interface CreateProfileWithSuperMingzhanRequest {
+  name?: string;
+  prompt: string;
+}
+
+export interface CreateProfileRequest {
+  id?: string;
+  isSuper?: boolean;
+  model?: string | null;
+  name: string;
+  soulFiles?: {
+    "SOUL.md"?: string;
+    "STYLE.md"?: string;
+    "INSTRUCTIONS.md"?: string;
+    "MEMORY.md"?: string;
+  };
+  systemPrompt?: string;
+}
+
+export interface UpdateProfileRequest {
+  /** Platform admins only: the agent runs as a process on the server host. */
+  acpAgent?: AcpAgentConfig | null;
+  automationsEnabled?: boolean;
+  groupsEnabled?: boolean;
+  model?: string | null;
+  name?: string;
+  /** Owner or admin: false keeps the agent private to its owner. */
+  sharedWithTeam?: boolean;
+  skillsCuratorConsolidateEnabled?: boolean | null;
+  skillsPostTurnReview?: boolean | null;
+  skillsWriteApproval?: boolean | null;
+  soulFiles?: {
+    "SOUL.md"?: string;
+    "STYLE.md"?: string;
+    "INSTRUCTIONS.md"?: string;
+    "MEMORY.md"?: string;
+  };
+  systemPrompt?: string;
+}
+
+export type ProfileChangeSource =
+  | "dashboard"
+  | "super_mingzhan"
+  | "skill_manage"
+  | "pack_import";
+
+export type ProfileChangeField =
+  | "system_prompt"
+  | "soul.soul"
+  | "soul.style"
+  | "soul.instructions"
+  | "soul.memory"
+  | "tools"
+  | "skills"
+  | "mcp"
+  | "pack_import";
+
+export interface ProfileChangeEvent {
+  actorName?: string | null;
+  actorUserId: string | null;
+  afterValue: string | null;
+  assignmentChanges?: {
+    added: Array<{ id: string; name: string | null }>;
+    removed: Array<{ id: string; name: string | null }>;
+  };
+  assignmentNames?: Record<string, string | null>;
+  beforeValue: string | null;
+  createdAt: string;
+  field: ProfileChangeField;
+  id: string;
+  orgId: string;
+  profileId: string;
+  source: ProfileChangeSource;
+}
+
+export interface SkillVersion {
+  actorName: string | null;
+  content: string;
+  createdAt: string;
+  id: string;
+  /** "original" is the content saved before the first tracked change. */
+  kind: "created" | "original" | "restored" | "updated";
+  note: string | null;
+  source: ProfileChangeSource | null;
+  version: number;
+}
+
+/** A pending skill proposal, shown as the SKILL.md it would produce. */
+export interface PendingSkillVersion {
+  content: string;
+  createdAt: string;
+  id: string;
+  proposedByName: string | null;
+}
+
+export interface ListSkillVersionsResponse {
+  /** SKILL.md on disk; the base for pending diffs. */
+  currentContent: string;
+  /** Newest first. */
+  pending: PendingSkillVersion[];
+  /** Newest first. */
+  versions: SkillVersion[];
+}
+
+export interface ListProfileChangeHistoryResponse {
+  events: ProfileChangeEvent[];
+}
+
+export interface CreateToolRequest {
+  description: string;
+  handlerConfig?: unknown;
+  handlerType?: string;
+  name: string;
+}
+
+export interface ToolCredentialStatus {
+  configured: boolean;
+  /** Present when the tool declares handlerConfig.env. */
+  env?: {
+    configured: boolean;
+    name: string;
+    secret: boolean;
+    /** Only for non-secret variables. */
+    value?: string;
+  }[];
+}
+
+export interface ToolSetupPlan {
+  description: string;
+  id: string;
+  name: string;
+  plan: string;
+  profileId?: string;
+  requiresApiKey: boolean;
+  sessionId: string;
+  status: "pending" | "approved" | "ready";
+  toolId?: string;
+}
+
+export interface ListToolsResponse {
+  tools: ToolDetail[];
+}
+
+export interface AssignToolRequest {
+  toolId: string;
+}
+
+export interface RunToolRequest {
+  parameters: Record<string, JsonValue>;
+}
+
+export interface RunToolResponse {
+  error?: string;
+  ok: boolean;
+  result?: unknown;
+}
+
+export interface SuggestToolParamsRequest {
+  prompt: string;
+}
+
+export interface SuggestToolParamsResponse {
+  parameters: Record<string, JsonValue>;
+}
+
+import type { SoulFileStatus, SoulStackFiles } from "./soul/types";
+
+export type { SoulFileStatus, SoulStackFiles } from "./soul/types";
+
+export interface SoulStatusResponse {
+  active: boolean;
+  contents?: SoulStackFiles;
+  directory: string;
+  files: SoulFileStatus;
+  profileId?: string;
+}
+
+export interface InitSoulResponse {
+  created: string[];
+  directory: string;
+  profileId?: string;
+}
+
+export interface SoulStackResponse {
+  directory: string;
+  files: SoulStackFiles;
+  loaded: string[];
+  profileId?: string;
+}
+
+export interface UpdateSoulFileRequest {
+  content: string;
+}
+
+/** Who saved an artifact. Absent when no owner was recorded (older files, shell writes). */
+export interface ArtifactCreator {
+  channel: string | null;
+  createdAt: string;
+  userId: string | null;
+  userName: string | null;
+}
+
+export interface ArtifactFile {
+  createdBy?: ArtifactCreator;
+  filename: string;
+  mimeType: string;
+  path: string;
+  sizeBytes: number;
+  updatedAt: string;
+}
+
+export interface WorkspaceEntry extends ArtifactFile {
+  kind: "file" | "directory";
+}
+
+export interface SetFilePinnedRequest {
+  path: string;
+  pinned: boolean;
+}
+
+export interface RenameWorkspaceEntryRequest {
+  newName: string;
+  path: string;
+}
+
+export interface ListWorkspaceFilesResponse {
+  entries: WorkspaceEntry[];
+}
+
+export interface ListArtifactsOptions {
+  folder?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface ListArtifactsResponse {
+  artifacts: ArtifactFile[];
+  directory: string;
+  limit?: number;
+  offset?: number;
+  profileId: string;
+  total: number;
+}
+
+export interface UpdateArtifactRequest {
+  content: string;
+}
+
+export interface UpdateArtifactResponse {
+  filename: string;
+  profileId: string;
+  sizeBytes: number;
+  updatedAt: string;
+}
+
+export interface DeleteArtifactResponse {
+  deleted: boolean;
+  filename: string;
+  profileId: string;
+}
+
+export interface PublishArtifactShareRequest {
+  /** Public web origin for minting share URLs (workers; browsers send Origin). */
+  clientOrigin?: string;
+  path: string;
+}
+
+export interface PublishArtifactShareResponse {
+  id: string;
+  refreshed: boolean;
+  sharePath: string;
+  shareUrl: string | null;
+  token: string;
+  webPublicUrlConfigured: boolean;
+}
+
+export interface ArtifactShareStatusResponse {
+  active: boolean;
+  createdAt: string;
+  id: string;
+  sharePath: string;
+  shareUrl: string | null;
+  webPublicUrlConfigured: boolean;
+}
+
+export interface RevokeArtifactShareResponse {
+  id: string;
+  revoked: boolean;
+}
+
+export interface PublicArtifactShareResponse {
+  filename: string;
+  inlineAllowed: boolean;
+  mimeType: string;
+  sizeBytes: number;
+}
+
+export type KnowledgeBaseDocumentStatus = "ready" | "failed";
+
+export type KnowledgeBaseDuplicateAction = "error" | "skip" | "replace";
+
+export type KnowledgeBaseUploadOutcome = "created" | "skipped" | "replaced";
+
+export interface KnowledgeBaseDocument {
+  /** SHA-256 hex of the stored file bytes. Optional on legacy manifests. */
+  contentHash?: string;
+  error?: string;
+  filename: string;
+  id: string;
+  mediaType: string;
+  /** Absent in legacy profile responses; new responses may identify ownership. */
+  scope?: "organization" | "profile";
+  sizeBytes: number;
+  status: KnowledgeBaseDocumentStatus;
+  uploadedAt: string;
+}
+
+export interface KnowledgeBaseSource {
+  description: string;
+  enabled: boolean;
+  id: string;
+  inherited: boolean;
+  kind: "url";
+  title: string;
+  url: string;
+}
+
+export interface PublishedKnowledgeBaseDocument
+  extends Pick<
+    KnowledgeBaseDocument,
+    "id" | "filename" | "mediaType" | "sizeBytes" | "status" | "uploadedAt"
+  > {
+  publicationId: string;
+  scope: "parent";
+  sourceOrganization: { id: string; name: string };
+}
+
+export interface ListKnowledgeBaseResponse {
+  documents: KnowledgeBaseDocument[];
+  profileId: string;
+  publishedDocuments?: PublishedKnowledgeBaseDocument[];
+  sources: KnowledgeBaseSource[];
+}
+
+export interface UploadKnowledgeBaseRequest {
+  document: DocumentAttachment;
+  /** Default `error` — reject duplicates so clients can warn / choose skip or replace. */
+  onDuplicate?: KnowledgeBaseDuplicateAction;
+}
+
+export interface UploadKnowledgeBaseResponse {
+  document: KnowledgeBaseDocument;
+  outcome: KnowledgeBaseUploadOutcome;
+  profileId: string;
+}
+
+export interface ImportKnowledgeBaseZipRequest {
+  zipBase64: string;
+}
+
+export interface ImportKnowledgeBaseZipEntry {
+  documentId?: string;
+  filename: string;
+  match?: "content_hash" | "name_size";
+  outcome: "created" | "duplicate" | "unsupported" | "error";
+  reason?: string;
+  status?: KnowledgeBaseDocumentStatus;
+}
+
+export interface ImportKnowledgeBaseZipResponse {
+  entries: ImportKnowledgeBaseZipEntry[];
+  profileId: string;
+  totals: {
+    created: number;
+    duplicate: number;
+    unsupported: number;
+    error: number;
+    failedExtraction: number;
+  };
+}
+
+export interface DeleteKnowledgeBaseResponse {
+  deleted: boolean;
+  documentId: string;
+  profileId: string;
+}
+
+/** Organization documents are shared, so their responses carry no profile id. */
+export interface UploadOrganizationKnowledgeBaseResponse {
+  document: KnowledgeBaseDocument;
+  outcome: KnowledgeBaseUploadOutcome;
+}
+
+export interface DeleteOrganizationKnowledgeBaseResponse {
+  deleted: boolean;
+  documentId: string;
+}
+
+export interface UserContextStatusResponse {
+  active: boolean;
+  content?: string;
+}
+
+export interface UpdateUserContextRequest {
+  content: string;
+}
+
+export interface InitUserContextResponse {
+  created: boolean;
+}
+
+export type ProviderName =
+  | "openai"
+  | "anthropic"
+  | "openrouter"
+  | "gemini"
+  | "deepseek"
+  | "netra"
+  | "doubao"
+  | "mistral"
+  | "perplexity"
+  | "cerebras"
+  | "fireworks"
+  | "ollama"
+  | "openai_compatible"
+  | "opencode_go"
+  | "cloudflare"
+  | "chatgpt"
+  | "xai_oauth"
+  | "minimax"
+  | "minimax_cn"
+  | "moonshot"
+  | "moonshot_cn"
+  | "zhipu"
+  | "zhipu_cn"
+  | "xai"
+  | "groq"
+  | "together"
+  | "xiaomi"
+  | "meta"
+  | "qwen"
+  | "qwen_cn"
+  | "vercel_ai_gateway";
+
+export interface ChatgptOAuthCredentials {
+  accessToken: string;
+  accountId: string;
+  expiresAt: string;
+  refreshToken: string;
+}
+
+export interface ChatgptOAuthDeviceStartResponse {
+  intervalSeconds: number;
+  sessionId: string;
+  userCode: string;
+  verificationUri: string;
+}
+
+export interface ChatgptOAuthDeviceCompleteRequest {
+  sessionId: string;
+}
+
+export interface ChatgptOAuthDeviceCompleteResponse {
+  chatgptOAuth: ChatgptOAuthCredentials;
+  models?: CustomModelEntry[];
+}
+
+export type OllamaHostMode = "local" | "cloud";
+
+/**
+ * Which OpenAI API an endpoint speaks. Some hosts serve `/responses` only, so
+ * this is a property of the endpoint and cannot be inferred from the model id.
+ */
+export type WireApi = "chat" | "responses";
+
+export type GenerateTextFormat = "json" | "text";
+
+export interface GenerateTextInput {
+  /** Defaults to `json` for structured automation drafts. Use `text` for plain prose. */
+  format?: GenerateTextFormat;
+  prompt: string;
+  system: string;
+}
+
+export type JsonSchema = {
+  $schema?: string;
+  additionalProperties?: boolean | JsonSchema;
+  description?: string;
+  enum?: Array<string | number | boolean>;
+  exclusiveMaximum?: number | boolean;
+  exclusiveMinimum?: number | boolean;
+  items?: JsonSchema;
+  maximum?: number;
+  minimum?: number;
+  properties?: Record<string, JsonSchema>;
+  required?: string[];
+  type?: string | string[];
+};
+
+export interface LlmToolDefinition {
+  description: string;
+  name: string;
+  parameters: JsonSchema;
+}
+
+export interface ToolCall {
+  arguments: Record<string, JsonValue>;
+  id: string;
+  name: string;
+}
+
+export type ChatMessage =
+  | { role: "user"; content: string | MessageContentPart[] }
+  | {
+      role: "assistant";
+      content: string;
+      /** Model reasoning trace for display; not sent as plain assistant text to providers. */
+      thinking?: string;
+      /** Observed reasoning stream time, excluding answer generation. */
+      thinkingDurationMs?: number;
+      summary?: boolean;
+      toolCalls?: ToolCall[];
+      /** Provider-specific assistant payload for multi-turn replay (Anthropic blocks, OpenAI response items). */
+      providerContent?: unknown[];
+      /** Tokens and estimated cost of the LLM call that produced this message. */
+      usage?: ChatUsage;
+    }
+  | {
+      role: "tool";
+      toolGroupId?: string;
+      toolCallId: string;
+      name: string;
+      content: string;
+      /** Visual tool output, kept separate from the JSON/text result. */
+      attachments?: MessageContentPart[];
+      toolStartedAt?: number;
+      toolCompletedAt?: number;
+    };
+
+export interface ChatUsage {
+  /**
+   * Input tokens the provider served from its prompt cache. A subset of
+   * `inputTokens`, so never add the two together.
+   */
+  cachedInputTokens?: number;
+  /** Absent when the model has no known pricing. */
+  costUsd?: number;
+  /** True when input/output tokens were estimated rather than reported by the provider. */
+  estimated?: boolean;
+  inputTokens: number;
+  /** The model that served this call, so a turn spanning two can be split. */
+  modelId?: string;
+  outputTokens: number;
+  totalTokens: number;
+}
+
+/**
+ * What one turn actually cost, as the provider counted it. Separate from
+ * `ChatContextUsage`, which is context window occupancy: that re-counts the
+ * system prompt and the tool definitions on every message and folds input and
+ * output into one number, so it is the wrong basis for billing.
+ */
+export interface ChatTurnUsage {
+  cachedInputTokens: number;
+  /** One entry per provider call, in the order they ran. */
+  calls: ChatUsage[];
+  /** Absent when any call in the turn has no known pricing. */
+  costUsd?: number;
+  /** True when any call's tokens were estimated rather than reported. */
+  estimated: boolean;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+
+export interface ChatCompletionResult {
+  assistantMessage: Extract<ChatMessage, { role: "assistant" }>;
+  /**
+   * Tool steps the provider already ran and finished. They are saved to history
+   * as tool results and are not run again.
+   */
+  completedToolCalls?: Array<{
+    call: ToolCall;
+    result: unknown;
+    /** Text the agent wrote just before this step. */
+    textBefore?: string;
+  }>;
+  content: string;
+  toolCalls: ToolCall[];
+  usage?: ChatUsage;
+}
+
+export interface GenerateTextResult {
+  content: string;
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  };
+}
+
+export interface ProviderChatOptions {
+  thinking?: {
+    enabled: boolean;
+    effort?: ThinkingEffort;
+  };
+  /** Use the active provider's hosted web search instead of executing web_search locally. */
+  webSearch?: boolean;
+}
+
+export interface GenerateChatInput {
+  messages: ChatMessage[];
+  providerOptions?: ProviderChatOptions;
+  /**
+   * Aborts the upstream request when the caller cancels the turn. Providers must
+   * pass it to their HTTP client, otherwise a cancelled chat keeps streaming and
+   * billing until the model finishes.
+   */
+  signal?: AbortSignal;
+  system: string;
+  tools?: LlmToolDefinition[];
+}
+
+export interface StreamChatHandlers {
+  onChunk: (delta: string) => void;
+  onThinking?: (delta: string) => void;
+  onToolEnd?: (event: {
+    toolCallId: string;
+    tool: string;
+    result: unknown;
+    images?: ImageAttachment[];
+  }) => void;
+  onToolInputDelta?: (event: {
+    toolCallId: string;
+    tool: string;
+    delta: string;
+    accumulatedArguments?: string;
+  }) => void;
+  onToolStart?: (event: {
+    toolCallId: string;
+    tool: string;
+    input: Record<string, JsonValue>;
+  }) => void;
+}
+
+export interface ProviderClient {
+  generateChat(input: GenerateChatInput): Promise<ChatCompletionResult>;
+  generateText(input: GenerateTextInput): Promise<GenerateTextResult>;
+  /** "acp" for chat turns run by an ACP agent (see providers/acp). */
+  name: ProviderName | "acp";
+  streamChat(
+    input: GenerateChatInput,
+    handlers: StreamChatHandlers
+  ): Promise<ChatCompletionResult>;
+}
+
+export interface ToolContext {
+  /** Nesting depth for sub-agent execution (0 = parent, 1 = child). */
+  agentDepth?: number;
+  /**
+   * Atomically reserves quota before a new LLM invocation. The reservation is
+   * a hold, not a charge: call the returned function once the call settles.
+   */
+  assertCanStartLlmTurn?: (
+    reservedTokens: number
+  ) => Promise<() => Promise<void>>;
+  automationId?: string;
+  automationRunId?: string;
+  /** Session channel when known (used for interactive-only tool gates). */
+  channel?: AgentChannel;
+  /** Browser origin for OAuth callbacks during this tool run. */
+  clientOrigin?: string;
+  /** Local CLI launch directory for shell commands, including coding agents. */
+  codingWorkspaceRoot?: string;
+  /** Images attached to the current user message, as scoped stored references. */
+  currentChatImages?: Array<
+    Pick<
+      Extract<MessageContentPart, { type: "image_ref" }>,
+      "attachmentId" | "mediaType"
+    >
+  >;
+  /** Emits concise live status lines while a sub-agent child loop runs (parent web UI). */
+  emitSubAgentActivity?: (label: string) => void;
+  /**
+   * When true (save_artifact is in the session tool list), write_file refuses paths
+   * under artifacts/ so every saved artifact goes through save_artifact and gets an
+   * owner row.
+   */
+  forbidArtifactFileWrites?: boolean;
+  /**
+   * When true (a cognito session), write_file / write_docx / edit_file / delete_file
+   * refuse MEMORY.md and memory-archive/YYYY-MM.md under the profile workspace, so a
+   * chat that leaves no trace cannot leave one through the file tools either.
+   */
+  forbidMemoryWrites?: boolean;
+  /**
+   * When true (skill_manage is in the session tool list), write_file / edit_file / delete_file
+   * refuse paths matching skills/<name>/SKILL.md under the profile workspace.
+   */
+  forbidProfileSkillMarkdownWrites?: boolean;
+  /** Platform admin flag for Super MíngZhàn bind checks (same as HTTP ProfileAccess). */
+  isPlatformAdmin?: boolean;
+  listPublishedKnowledgeDocuments?: () => Promise<
+    PublishedKnowledgeBaseDocument[]
+  >;
+  /** Loads a provider-neutral document/image reference scoped to this execution. */
+  loadAttachment?: LoadAttachmentBytes;
+  /** Host-owned memory storage; file guards run before these callbacks. */
+  memoryFiles?: {
+    read(path: string, content: string): Promise<string>;
+    write(path: string, content: string): Promise<void>;
+    remove(path: string): Promise<void>;
+  };
+  /** Invalidates the cached skills catalog after a live skill mutation. */
+  onSkillCatalogChange?: () => void;
+  /**
+   * Returns a reminder when the session still has open todos, else null. The
+   * chat loop uses it to keep the model working instead of ending the turn.
+   */
+  openTodosReminder?: () => Promise<string | null>;
+  orgId?: string;
+  /** Org role of the invoking user. Org-memory tools gate on this; undefined means deny-by-default. */
+  orgRole?: OrgRole;
+  profileId?: string;
+  /** Reads assigned parent skill files after live server publication checks. */
+  readPublishedSkillFile?: (
+    publicationId: string,
+    filePath: string,
+    maxBytes: number
+  ) => Promise<Uint8Array>;
+  /** Records what the provider actually charged for one request. */
+  recordTurnUsage?: (turn: {
+    estimated: boolean;
+    inputTokens: number;
+    outputTokens: number;
+  }) => void;
+  searchKnowledge?: (input: {
+    query: string;
+    filename?: string;
+    maxResults: number;
+    regex: boolean;
+  }) => Promise<{
+    matches: { file: string; line: number; text: string }[];
+    truncated: boolean;
+  } | null>;
+  sessionId?: string;
+  /** Agent group folder the file tools may also read and write (absolute path). */
+  sharedDir?: string;
+  /** Aborts when the caller cancels the turn. Long-running tools should stop their work on it. */
+  signal?: AbortSignal;
+  /**
+   * Present only in a cognito session. Attachments there have no `sessions`
+   * row to reference, so they are written with a null session_id and their
+   * ids reported here, which is the only handle on them for cleanup.
+   */
+  trackEphemeralAttachment?: (attachmentId: string) => void;
+  userId?: string;
+  /** Verified WhatsApp identity for the current inbound message. */
+  whatsappMessage?: {
+    chatJid: string;
+    fromMe: boolean;
+    isGroup: boolean;
+    senderJid: string;
+    senderJids: string[];
+  };
+  workflowId?: string;
+  workflowRunId?: string;
+  /** Profile workspace root (~/.mingzhan/orgs/{orgId}/profiles/{profileId}/). */
+  workspaceRoot?: string;
+}
+
+export interface ToolDefinition<Input = unknown, Output = unknown> {
+  /** Rechecked before a deferred tool is returned by discovery. */
+  canDiscover?: (context: ToolContext) => Promise<boolean>;
+  description: string;
+  /** Assigned tools in this group are loaded through discovery. */
+  discoveryGroup?: string;
+  /** What the group is for, shown beside it in the discovery catalog. */
+  discoveryHint?: string;
+  /** Plugins default to one turn; MCP discoveries can last for the session. */
+  discoveryScope?: "session";
+  /**
+   * When true, the LLM provider runs this tool itself and `run` is never
+   * called. Only `web_search` uses it today: the built-in stub is hosted, a
+   * custom search back-end is not. Undefined is treated as local.
+   */
+  hosted?: boolean;
+  name: string;
+  /** When true, this tool may run concurrently with other parallelSafe tools in the same turn. */
+  parallelSafe?: boolean;
+  parameters?: JsonSchema;
+  run(input: Input, context: ToolContext): Promise<Output>;
+}
+
+export const COMPOSIO_TOOLKIT_SLUG_PATTERN = /^[a-z0-9_-]+$/;
+
+export type ComposioOrgToolkitStatus = "disabled" | "enabled";
+
+export type ComposioUserConnectionStatus =
+  | "oauth_in_progress"
+  | "connected"
+  | "error";
+
+export type ComposioToolErrorCode =
+  | "COMPOSIO_NOT_CONNECTED"
+  | "COMPOSIO_TRANSIENT"
+  | "COMPOSIO_POLICY";
+
+export interface ComposioCachedToolSummary {
+  description: string;
+  inputSchema: Record<string, JsonValue>;
+  name: string;
+  slug: string;
+}
+
+export interface ComposioToolkitSummary {
+  cachedTools: ComposioCachedToolSummary[];
+  displayName: string;
+  id: string;
+  lastError: string | null;
+  status: ComposioOrgToolkitStatus;
+  toolkitSlug: string;
+  updatedAt: string;
+}
+
+export interface ComposioUserConnectionSummary {
+  id: string;
+  lastError: string | null;
+  status: ComposioUserConnectionStatus;
+  toolkitId: string;
+  toolkitSlug: string;
+  updatedAt: string;
+}
+
+export interface ComposioCatalogToolkitSummary {
+  description: string | null;
+  logoUrl: string | null;
+  name: string;
+  slug: string;
+}
+
+export interface ListComposioToolkitsResponse {
+  catalog: ComposioCatalogToolkitSummary[];
+  catalogError: string | null;
+  /** @deprecated Use composioReachable. */
+  composioAvailable: boolean;
+  /** MíngZhàn can reach the Composio API with the saved key. */
+  composioReachable: boolean;
+  /** A Composio project API key is saved on this server. */
+  configured: boolean;
+  orgToolkits: ComposioToolkitSummary[];
+  userConnections: ComposioUserConnectionSummary[];
+}
+
+export interface EnableComposioToolkitRequest {
+  toolkitSlug: string;
+}
+
+export interface ComposioConnectRequest {
+  /** Browser origin for OAuth callback (e.g. http://localhost:3003). */
+  callbackOrigin?: string;
+}
+
+export interface ComposioConnectResponse {
+  redirectUrl: string;
+}
+
+export interface ProfileComposioToolkitAssignment {
+  allowedActions: string[] | null;
+  toolkitId: string;
+  toolkitSlug: string;
+}
+
+export interface ListProfileComposioToolkitsResponse {
+  assignments: ProfileComposioToolkitAssignment[];
+}
+
+export interface UpdateProfileComposioToolkitsRequest {
+  assignments: Array<{
+    toolkitId: string;
+    allowedActions?: string[] | null;
+  }>;
+}
+
+export interface ComposioToolErrorResult {
+  code: ComposioToolErrorCode;
+  error: string;
+  toolkitSlug?: string;
+}
+
+export interface PluginReleaseSummary {
+  createdAt: string;
+  digest: string;
+  manifest: PluginManifest;
+  pluginId: string;
+  /** Missing in older exports; treat as legacy provenance. */
+  source?: "legacy" | "npm" | "official" | "local" | "agent";
+  version: string;
+}
+
+export interface LocalPluginDraftRequest {
+  draftId: string;
+  orgId: string;
+  profileId: string;
+}
+
+export interface LocalPluginPreviewResponse
+  extends PluginPackagePreviewResponse {
+  draft: LocalPluginDraftRequest;
+  expectedRevision: number | null;
+  files: Array<{ path: string; size: number }>;
+}
+
+export interface InstallLocalPluginRequest extends LocalPluginDraftRequest {
+  expectedDigest: string;
+  expectedRevision: number | null;
+}
+
+export interface ReadLocalPluginFileRequest extends LocalPluginDraftRequest {
+  expectedDigest: string;
+  offset?: number;
+  path: string;
+}
+
+export interface OrgPluginSummary {
+  databaseGeneration: string | null;
+  lastLifecycleError: string | null;
+  lifecycleState: OrgPluginLifecycleState;
+  pendingOperation: string | null;
+  pluginId: string;
+  revision: number;
+  selectedVersion: string | null;
+  updatedAt: string;
+}
+
+export interface PluginActionDescription {
+  access: PluginActionAccess;
+  description: string;
+  effect: PluginActionEffect;
+  key: string;
+}
+
+export interface PluginUiSummary {
+  assetsDir: string;
+  entryModule: string;
+  pageLabel: string;
+}
+
+export interface OrgPluginDetail extends OrgPluginSummary {
+  actions: PluginActionDescription[];
+  availableVersions: string[];
+  description: string;
+  icon?: string;
+  installed: boolean;
+  name: string;
+  ui: PluginUiSummary | null;
+}
+
+export interface ListOrgPluginsResponse {
+  plugins: OrgPluginDetail[];
+}
+
+export interface ListPluginReleasesResponse {
+  releases: PluginReleaseSummary[];
+}
+
+/** An organization that still holds a plugin, so its releases cannot be removed. */
+export interface PluginUsageOrg {
+  /** Agents in this organization with one of the plugin's tools or skills. */
+  agents: Array<{ id: string; name: string }>;
+  lifecycleState: OrgPluginLifecycleState;
+  name: string;
+  orgId: string;
+  revision: number;
+  selectedVersion: string | null;
+}
+
+export interface PluginUsageResponse {
+  orgs: PluginUsageOrg[];
+}
+
+/** A registry version newer than anything approved for this plugin. */
+export interface PluginUpdateSummary {
+  packageName: string;
+  pluginId: string;
+  version: string;
+}
+
+export interface ListPluginUpdatesResponse {
+  updates: PluginUpdateSummary[];
+}
+
+export interface PluginPackageRequest {
+  packageName: string;
+  version: string;
+}
+
+export interface PluginPackagePreviewResponse {
+  contributions: {
+    actionKeys: string[];
+    workerKeys?: string[];
+    hasDatabase: boolean;
+    hasUi: boolean;
+    skillKeys: string[];
+  };
+  digest: string;
+  integrity: string;
+  manifest: PluginManifest;
+}
+
+export interface InstallPluginPackageRequest extends PluginPackageRequest {
+  expectedDigest: string;
+  expectedIntegrity: string;
+}
+
+export interface InstallPluginPackageResponse {
+  createdAt: string;
+  digest: string;
+  manifest: PluginManifest;
+  pluginId: string;
+  reused: boolean;
+  version: string;
+}
+
+export interface InstallOrgPluginRequest {
+  version?: string;
+}
+
+export interface PluginRevisionRequest {
+  expectedRevision: number;
+}
+
+export interface UpdateOrgPluginRequest {
+  expectedRevision: number;
+  targetVersion: string;
+}
+
+export interface PluginContributionChangePreview {
+  lastLifecycleError: string | null;
+  removedActionKeys: string[];
+  removedSkillKeys: string[];
+  retainedSkillIds: string[];
+  retainedToolIds: string[];
+}
+
+export interface DeleteRetainedPluginDataRequest {
+  confirm: true;
+  expectedRevision: number;
+  orgId: string;
+  pluginId: string;
+}
+
+export interface InvokePluginActionRequest {
+  input?: unknown;
+}
+
+export interface InvokePluginActionResponse {
+  invocationId: string;
+  result: unknown;
+}
+
+export interface XaiOAuthCredentials {
+  accessToken: string;
+  expiresAt: string;
+  refreshToken: string;
+}
+
+export type XaiOAuthDeviceStartResponse = ChatgptOAuthDeviceStartResponse;
+
+export type XaiOAuthDeviceCompleteRequest = ChatgptOAuthDeviceCompleteRequest;
+
+export interface XaiOAuthDeviceCompleteResponse {
+  models?: CustomModelEntry[];
+  xaiOAuth: XaiOAuthCredentials;
+}

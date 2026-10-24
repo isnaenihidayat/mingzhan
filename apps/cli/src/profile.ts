@@ -1,0 +1,199 @@
+import * as readline from "node:readline/promises";
+import type { MíngZhànClient } from "@mingzhan/client";
+import type { ProfileSummary } from "@mingzhan/core";
+import { pickProfileForOrg } from "@mingzhan/core";
+import { loadSavedCliProfileId, saveCliProfileId } from "./cli-config";
+import { printLine } from "./terminal-safe";
+
+export interface CliProfileOptions {
+  profileId?: string;
+}
+
+export function parseCliProfileArgs(
+  argv = process.argv.slice(2)
+): CliProfileOptions {
+  let profileId: string | undefined;
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+
+    if (arg === "--profile" || arg === "-p") {
+      profileId = argv[index + 1]?.trim();
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--profile=")) {
+      profileId = arg.slice("--profile=".length).trim();
+    }
+  }
+
+  return { profileId: profileId || undefined };
+}
+
+export function sortProfilesForPicker(
+  profiles: ProfileSummary[]
+): ProfileSummary[] {
+  return [...profiles].sort((left, right) => {
+    if (left.isDefault && !right.isDefault) {
+      return -1;
+    }
+
+    if (right.isDefault && !left.isDefault) {
+      return 1;
+    }
+
+    return left.name.localeCompare(right.name);
+  });
+}
+
+export function resolveProfileInput(
+  profiles: ProfileSummary[],
+  input: string
+): ProfileSummary | undefined {
+  const trimmed = input.trim();
+
+  if (!trimmed) {
+    return;
+  }
+
+  const exactId = profiles.find((profile) => profile.id === trimmed);
+
+  if (exactId) {
+    return exactId;
+  }
+
+  const lower = trimmed.toLowerCase();
+
+  const exactName = profiles.filter(
+    (profile) => profile.name.toLowerCase() === lower
+  );
+
+  if (exactName.length === 1) {
+    return exactName[0];
+  }
+
+  const sorted = sortProfilesForPicker(profiles);
+  const numeric = Number(trimmed);
+
+  if (Number.isInteger(numeric) && numeric >= 1 && numeric <= sorted.length) {
+    return sorted[numeric - 1];
+  }
+
+  const partialMatches = profiles.filter(
+    (profile) =>
+      profile.id.toLowerCase().includes(lower) ||
+      profile.name.toLowerCase().includes(lower)
+  );
+
+  if (partialMatches.length === 1) {
+    return partialMatches[0];
+  }
+}
+
+export function formatProfileLine(
+  profile: ProfileSummary,
+  index: number
+): string {
+  const markers = [
+    profile.isDefault ? "default" : null,
+    profile.isSuper ? "orchestrator" : null,
+  ]
+    .filter(Boolean)
+    .join(", ");
+
+  return `  ${index + 1}) ${profile.name}${markers ? ` (${markers})` : ""}`;
+}
+
+function findProfile(
+  profiles: ProfileSummary[],
+  profileId: string
+): ProfileSummary | undefined {
+  return (
+    resolveProfileInput(profiles, profileId) ??
+    profiles.find((profile) => profile.id === profileId)
+  );
+}
+
+export async function resolveStartupProfile(
+  client: MíngZhànClient,
+  options: CliProfileOptions
+): Promise<{ profileId: string; profile: ProfileSummary }> {
+  const { profiles } = await client.listProfiles();
+
+  if (profiles.length === 0) {
+    throw new Error("No bot profiles found.");
+  }
+
+  const explicitProfileId = options.profileId?.trim();
+
+  const savedProfileId = explicitProfileId
+    ? null
+    : await loadSavedCliProfileId();
+
+  const candidateProfileId = explicitProfileId ?? savedProfileId ?? undefined;
+
+  if (candidateProfileId) {
+    const match = findProfile(profiles, candidateProfileId);
+
+    if (match) {
+      await saveCliProfileId(match.id);
+
+      return { profile: match, profileId: match.id };
+    }
+
+    if (explicitProfileId) {
+      throw new Error(`Unknown profile: ${explicitProfileId}`);
+    }
+  }
+
+  const superMingzhan = profiles.find((profile) => profile.isSuper);
+
+  if (superMingzhan) {
+    await saveCliProfileId(superMingzhan.id);
+
+    return { profile: superMingzhan, profileId: superMingzhan.id };
+  }
+
+  if (!(process.stdin.isTTY && process.stdout.isTTY)) {
+    const fallback = pickProfileForOrg(profiles);
+
+    await saveCliProfileId(fallback.id);
+
+    return { profile: fallback, profileId: fallback.id };
+  }
+
+  const selected = await promptForProfile(profiles);
+  await saveCliProfileId(selected.profileId);
+
+  return selected;
+}
+
+async function promptForProfile(
+  profiles: ProfileSummary[]
+): Promise<{ profileId: string; profile: ProfileSummary }> {
+  const sorted = sortProfilesForPicker(profiles);
+  const defaultProfile = pickProfileForOrg(sorted);
+
+  console.log("Select a bot profile:\n");
+
+  for (const [index, profile] of sorted.entries()) {
+    printLine(formatProfileLine(profile, index));
+  }
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  try {
+    const input = (await rl.question("\nProfile (optional): ")).trim();
+    const selected = resolveProfileInput(sorted, input) ?? defaultProfile;
+
+    printLine(`Using ${selected.name}.\n`);
+
+    return { profile: selected, profileId: selected.id };
+  } finally {
+    rl.close();
+  }
+}

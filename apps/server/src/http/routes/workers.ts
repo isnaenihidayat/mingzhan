@@ -1,0 +1,327 @@
+import { createRoute, z } from "@hono/zod-openapi";
+import {
+  MíngZhànApiError,
+  reportError,
+  type WorkerLogsResponse,
+} from "@mingzhan/core";
+import type { Context } from "hono";
+import type { ServerOptions } from "../context";
+import {
+  requireActiveOrgIdFromContext,
+  requireOrgAdminOrPlatformAdminFromContext,
+  requireOrgMemberFromContext,
+  requirePlatformAdminFromContext,
+} from "../org-guards";
+import { errorResponse, json } from "../shared";
+import type { AppEnv, HonoApp } from "../types";
+
+function requireWorkerAuthorization(
+  c: Context<AppEnv>,
+  name: string,
+  manager: ServerOptions["workerManager"]
+): void {
+  if (["telegram", "discord", "whatsapp", "slack"].includes(name)) {
+    requireOrgAdminOrPlatformAdminFromContext(c);
+
+    return;
+  }
+
+  if (name.startsWith("plugin-")) {
+    requireOrgAdminOrPlatformAdminFromContext(c);
+
+    if (!manager.isPluginWorkerForOrg(name, requireActiveOrgIdFromContext(c))) {
+      throw new MíngZhànApiError("Worker not found", 404);
+    }
+
+    return;
+  }
+
+  // Everything left is install-wide. `automation` is the only one today, and it
+  // schedules every organization's automations plus the per-org skill curator,
+  // so stopping it reaches tenants the caller is not a member of. The workers
+  // page already gates these controls on `isPlatformAdmin`, and so does the
+  // same worker's settings write.
+  requirePlatformAdminFromContext(c);
+}
+
+export function registerWorkerRoutes(
+  app: HonoApp,
+  options: ServerOptions
+): void {
+  const { workerManager } = options;
+
+  async function workerScope(c: Context<AppEnv>, name: string) {
+    if (!["telegram", "discord", "whatsapp", "slack"].includes(name)) {
+      return null;
+    }
+
+    const orgId = requireActiveOrgIdFromContext(c);
+    const profileId = c.req.query("profileId")?.trim();
+
+    if (!profileId) {
+      throw new MíngZhànApiError("Choose an agent to manage this worker.", 400);
+    }
+
+    await options.agent.getProfile(orgId, profileId);
+
+    return { orgId, profileId };
+  }
+
+  const errorSchema = z
+    .object({ error: z.string() })
+    .openapi("ApiErrorResponse");
+
+  const workerLogsSchema = z
+    .object({
+      lines: z.array(z.string()),
+      worker: z.string(),
+    })
+    .passthrough()
+    .openapi("WorkerLogsResponse");
+
+  const okSchema = z.object({ ok: z.boolean() });
+
+  const workerParam = z.object({
+    name: z.string().openapi({ param: { in: "path", name: "name" } }),
+  });
+
+  const workerActionParam = z.object({
+    action: z
+      .enum(["start", "stop", "restart", "disconnect"])
+      .openapi({ param: { in: "path", name: "action" } }),
+    name: z.string().openapi({ param: { in: "path", name: "name" } }),
+  });
+
+  const workerScopeQuery = z.object({
+    profileId: z.string().optional().openapi({
+      description: "Required for Telegram, Discord, and WhatsApp workers",
+    }),
+  });
+
+  const workerLogsQuery = workerScopeQuery.extend({
+    lines: z.string().optional(),
+  });
+
+  app.openAPIRegistry.registerPath(
+    createRoute({
+      method: "post",
+      operationId: "workerAction",
+      path: "/v1/workers/{name}/{action}",
+      request: { params: workerActionParam, query: workerScopeQuery },
+      responses: {
+        200: {
+          content: { "application/json": { schema: okSchema } },
+          description: "Worker action succeeded",
+        },
+        400: {
+          content: { "application/json": { schema: errorSchema } },
+          description: "Error",
+        },
+        500: {
+          content: { "application/json": { schema: errorSchema } },
+          description: "Error",
+        },
+      },
+      summary: "Control a worker",
+      tags: ["Workers"],
+    })
+  );
+  app.openAPIRegistry.registerPath(
+    createRoute({
+      method: "get",
+      operationId: "getWorkerLogs",
+      path: "/v1/workers/{name}/logs",
+      request: { params: workerParam, query: workerLogsQuery },
+      responses: {
+        200: {
+          content: { "application/json": { schema: workerLogsSchema } },
+          description: "Worker logs",
+        },
+        400: {
+          content: { "application/json": { schema: errorSchema } },
+          description: "Error",
+        },
+        500: {
+          content: { "application/json": { schema: errorSchema } },
+          description: "Error",
+        },
+      },
+      summary: "Get worker logs",
+      tags: ["Workers"],
+    })
+  );
+  app.openAPIRegistry.registerPath(
+    createRoute({
+      method: "post",
+      operationId: "clearWorkerLogs",
+      path: "/v1/workers/{name}/clear-logs",
+      request: { params: workerParam, query: workerScopeQuery },
+      responses: {
+        200: {
+          content: { "application/json": { schema: okSchema } },
+          description: "Worker logs cleared",
+        },
+        400: {
+          content: { "application/json": { schema: errorSchema } },
+          description: "Error",
+        },
+        500: {
+          content: { "application/json": { schema: errorSchema } },
+          description: "Error",
+        },
+      },
+      summary: "Clear worker logs",
+      tags: ["Workers"],
+    })
+  );
+
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/v1/workers/plugins",
+      operationId: "listPluginWorkers",
+      tags: ["Workers"],
+      summary: "List the active organization's plugin workers",
+      responses: {
+        200: {
+          description: "Plugin workers",
+          content: {
+            "application/json": {
+              schema: z.array(
+                z.object({
+                  name: z.string(),
+                  label: z.string(),
+                  pluginId: z.string(),
+                  process: z.object({
+                    managed: z.boolean(),
+                    status: z.enum(["online", "stopped", "errored"]).nullable(),
+                    cpuPercent: z.number().nullable(),
+                    memoryMb: z.number().nullable(),
+                    uptimeSeconds: z.number().nullable(),
+                  }),
+                })
+              ),
+            },
+          },
+        },
+      },
+    }),
+    async (c) => {
+      requireOrgMemberFromContext(c);
+
+      return c.json(
+        await workerManager.listPluginWorkers(requireActiveOrgIdFromContext(c)),
+        200
+      );
+    }
+  );
+
+  app.post(
+    "/v1/workers/:name/:action{start|stop|restart|disconnect}",
+    async (c) => {
+      const name = decodeURIComponent(c.req.param("name"));
+      const action = c.req.param("action");
+      requireWorkerAuthorization(c, name, workerManager);
+
+      if (!workerManager.isValidWorker(name)) {
+        return errorResponse(`Unknown worker: ${name}`, 400);
+      }
+
+      try {
+        if (action === "disconnect") {
+          const owner = await workerScope(c, name);
+
+          if (!owner) {
+            throw new MíngZhànApiError(
+              "Only agent channels can be disconnected",
+              400
+            );
+          }
+
+          await workerManager.disconnectChannel(
+            // SAFETY: The validated value satisfies the contract checked by this assertion.
+            name as "telegram" | "discord" | "whatsapp" | "slack",
+            owner
+          );
+        } else if (action === "start") {
+          await workerManager.startWorker(name, await workerScope(c, name));
+        } else if (action === "stop") {
+          await workerManager.stopWorker(name, await workerScope(c, name));
+        } else {
+          await workerManager.restartWorker(name, await workerScope(c, name));
+        }
+
+        return json({ ok: true });
+      } catch (err) {
+        if (err instanceof MíngZhànApiError) {
+          return errorResponse(err.message, err.status);
+        }
+
+        void reportError(err, { kind: "http", source: "server" });
+        const message = err instanceof Error ? err.message : String(err);
+
+        return errorResponse(message, 500);
+      }
+    }
+  );
+
+  app.get("/v1/workers/:name/logs", async (c) => {
+    const name = decodeURIComponent(c.req.param("name"));
+    requireWorkerAuthorization(c, name, workerManager);
+
+    if (!workerManager.isValidWorker(name)) {
+      return errorResponse(`Unknown worker: ${name}`, 400);
+    }
+
+    const linesParam = c.req.query("lines");
+    const parsed = linesParam ? Number.parseInt(linesParam, 10) : 200;
+
+    const lines = Math.min(
+      Math.max(1, Number.isFinite(parsed) ? parsed : 200),
+      2000
+    );
+
+    try {
+      const logs = await workerManager.getWorkerLogs(
+        name,
+        lines,
+        await workerScope(c, name)
+      );
+
+      return json<WorkerLogsResponse>(logs);
+    } catch (err) {
+      if (err instanceof MíngZhànApiError) {
+        return errorResponse(err.message, err.status);
+      }
+
+      void reportError(err, { kind: "http", source: "server" });
+      const message = err instanceof Error ? err.message : String(err);
+
+      return errorResponse(message, 500);
+    }
+  });
+
+  app.post("/v1/workers/:name/clear-logs", async (c) => {
+    const name = decodeURIComponent(c.req.param("name"));
+    requireWorkerAuthorization(c, name, workerManager);
+
+    if (!workerManager.isValidWorker(name)) {
+      return errorResponse(`Unknown worker: ${name}`, 400);
+    }
+
+    try {
+      await workerManager.clearWorkerLogs(name, await workerScope(c, name));
+
+      return json({ ok: true });
+    } catch (err) {
+      if (err instanceof MíngZhànApiError) {
+        return errorResponse(err.message, err.status);
+      }
+
+      void reportError(err, { kind: "http", source: "server" });
+      const message = err instanceof Error ? err.message : String(err);
+
+      return errorResponse(message, 500);
+    }
+  });
+}

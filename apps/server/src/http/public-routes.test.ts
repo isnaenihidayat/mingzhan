@@ -1,0 +1,59 @@
+import { describe, expect, test } from "bun:test";
+import { isPublicRouteRequest } from "./public-routes";
+
+describe("isPublicRouteRequest", () => {
+  test("allows Composio OAuth callback without auth", () => {
+    expect(isPublicRouteRequest("GET", "/v1/composio/oauth/callback")).toBe(
+      true
+    );
+  });
+
+  test("still requires auth for other Composio routes", () => {
+    expect(isPublicRouteRequest("GET", "/v1/composio/toolkits")).toBe(false);
+    expect(
+      isPublicRouteRequest("POST", "/v1/composio/toolkits/gmail/connect")
+    ).toBe(false);
+  });
+
+  test("allows the MCP OAuth callback without auth, GET only", () => {
+    expect(isPublicRouteRequest("GET", "/v1/mcp/oauth/callback/mcp_123")).toBe(
+      true
+    );
+    expect(isPublicRouteRequest("POST", "/v1/mcp/oauth/callback/mcp_123")).toBe(
+      false
+    );
+  });
+
+  test("keeps the rest of the MCP API behind auth", () => {
+    expect(isPublicRouteRequest("GET", "/v1/mcp/servers")).toBe(false);
+    expect(isPublicRouteRequest("GET", "/v1/mcp/oauth/callback")).toBe(false);
+    expect(
+      isPublicRouteRequest("GET", "/v1/mcp/oauth/callback/mcp_123/tools")
+    ).toBe(false);
+  });
+
+  test("allows public artifact share reads", () => {
+    expect(
+      isPublicRouteRequest("GET", "/v1/public/artifact-shares/tok123")
+    ).toBe(true);
+  });
+
+  test("keeps the tool catalog behind auth", () => {
+    expect(isPublicRouteRequest("GET", "/v1/tools")).toBe(false);
+    expect(isPublicRouteRequest("POST", "/v1/tools")).toBe(false);
+    expect(isPublicRouteRequest("POST", "/v1/tools/tool_x/run")).toBe(false);
+  });
+
+  test("allows GET /v1/auth/me without middleware auth but not PATCH", () => {
+    expect(isPublicRouteRequest("GET", "/v1/auth/me")).toBe(true);
+    expect(isPublicRouteRequest("PATCH", "/v1/auth/me")).toBe(false);
+  });
+
+  test("allows the ACP MCP bridge POST without a login, but not other ACP routes", () => {
+    expect(isPublicRouteRequest("POST", "/v1/acp-mcp/abc123token")).toBe(true);
+    expect(isPublicRouteRequest("GET", "/v1/acp-mcp/abc123token")).toBe(false);
+    expect(isPublicRouteRequest("POST", "/v1/profiles/p1/acp-settings")).toBe(
+      false
+    );
+  });
+});

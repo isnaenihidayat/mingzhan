@@ -1,0 +1,206 @@
+import { existsSync } from "node:fs";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { buildLlmsTxt, type PageMetadata } from "../lib/site-meta";
+import { type ContentPage, readContentPages } from "./content-inventory";
+
+const ROOT = path.dirname(new URL(import.meta.url).pathname);
+
+const CONTENT_DIR = path.join(ROOT, "..", "content", "docs");
+
+const PUBLIC_DIR = path.join(ROOT, "..", "public");
+
+const WEBSITE_DIR = path.join(ROOT, "..");
+
+const MIRRORS_DIR = path.join(WEBSITE_DIR, "generated", "mirrors");
+
+const MIRROR_ROUTES_DIR = path.join(WEBSITE_DIR, "app", "(mirrors)");
+
+const EXTRA_MIRRORS = ["getting-started.md"];
+
+// next build resolves pages, not the links inside them, so a renamed page
+// leaves dead internal links that only a reader finds.
+function checkInternalLinks(contentPages: ContentPage[]): void {
+  const routes = new Set([
+    ...contentPages.map((page) =>
+      page.relativePath.replace(/\.md$/, "").replace(/(^|\/)index$/, "")
+    ),
+    ...EXTRA_MIRRORS.map((extra) => extra.replace(/\.md$/, "")),
+  ]);
+
+  const missing: string[] = [];
+
+  for (const page of contentPages) {
+    for (const match of page.markdown.matchAll(/\[[^\]]*\]\(([^)\s]+)/g)) {
+      const href = match[1];
+
+      if (!href.startsWith("/") || href.startsWith("//")) {
+        continue;
+      }
+
+      const route = href.replace(/[?#].*$/, "").replace(/^\/+|\/+$/g, "");
+
+      if (
+        route === "" ||
+        route === "llms.txt" ||
+        routes.has(route.replace(/\.md$/, "")) ||
+        existsSync(path.join(PUBLIC_DIR, route))
+      ) {
+        continue;
+      }
+
+      missing.push(`${page.mdxPath}: ${href}`);
+    }
+  }
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing internal documentation paths:\n${missing.join("\n")}`
+    );
+  }
+}
+
+function mirrorContentType(relativePath: string): string {
+  return relativePath.endsWith(".md")
+    ? "text/markdown; charset=utf-8"
+    : "text/plain; charset=utf-8";
+}
+
+async function writeMirrorRoute(relativePath: string) {
+  const routePath = path.join(MIRROR_ROUTES_DIR, relativePath, "route.ts");
+  const contentType = mirrorContentType(relativePath);
+
+  const routeSource = `import { readFile } from 'node:fs/promises'
+import path from 'node:path'
+
+export const dynamic = 'force-static'
+export const runtime = 'nodejs'
+
+const RELATIVE_PATH = ${JSON.stringify(relativePath)}
+
+export async function GET() {
+  const content = await readFile(
+    path.join(process.cwd(), 'generated', 'mirrors', RELATIVE_PATH),
+    'utf8',
+  )
+  return new Response(content, {
+    headers: {
+      'Content-Type': ${JSON.stringify(contentType)},
+    },
+  })
+}
+`;
+
+  await mkdir(path.dirname(routePath), { recursive: true });
+  await writeFile(routePath, routeSource);
+}
+
+async function writeMirrorRoutes(relativePaths: string[]) {
+  for (const relativePath of relativePaths) {
+    await writeMirrorRoute(relativePath);
+  }
+}
+
+async function cleanGeneratedMirrors() {
+  await rm(MIRROR_ROUTES_DIR, { force: true, recursive: true });
+  await rm(MIRRORS_DIR, { force: true, recursive: true });
+
+  const entries = await readdir(PUBLIC_DIR, { withFileTypes: true }).catch(
+    () => []
+  );
+
+  for (const entry of entries) {
+    const full = path.join(PUBLIC_DIR, entry.name);
+
+    if (entry.isDirectory() && entry.name === "docs") {
+      await rm(full, { force: true, recursive: true });
+      continue;
+    }
+
+    if (
+      entry.isFile() &&
+      (entry.name.endsWith(".md") || entry.name === "llms.txt")
+    ) {
+      await rm(full, { force: true });
+    }
+  }
+}
+
+async function main() {
+  await cleanGeneratedMirrors();
+
+  const contentPages: ContentPage[] = await readContentPages(CONTENT_DIR);
+  checkInternalLinks(contentPages);
+
+  const pages: PageMetadata[] = contentPages.map((page) => ({
+    description: page.description,
+    relativePath: page.relativePath,
+    title: page.title,
+  }));
+
+  for (const page of contentPages) {
+    const outputPath = path.join(MIRRORS_DIR, page.relativePath);
+    await mkdir(path.dirname(outputPath), { recursive: true });
+    await writeFile(outputPath, page.markdown);
+  }
+
+  for (const extra of EXTRA_MIRRORS) {
+    const sourcePath = path.join(WEBSITE_DIR, extra);
+    const outputPath = path.join(MIRRORS_DIR, extra);
+    const raw = await readFile(sourcePath, "utf8");
+    await writeFile(outputPath, raw);
+
+    if (!pages.some((page) => page.relativePath === extra)) {
+      const title = raw.match(/^# (.+)$/m)?.[1] ?? "Getting Started";
+
+      const description =
+        raw
+          .split("\n")
+          .map((line) => line.trim())
+          .find((line) => line && !line.startsWith("#")) ?? "";
+
+      pages.push({ description, relativePath: extra, title });
+    }
+  }
+
+  await writeFile(path.join(MIRRORS_DIR, "llms.txt"), buildLlmsTxt(pages));
+
+  const pagePaths = pages.map((page) => page.relativePath);
+
+  const sitemapUrls = [
+    "",
+    ...pagePaths.map((pagePath) => {
+      const clean = pagePath.replace(/index\.md$/, "").replace(/\.md$/, "");
+
+      return clean ? `/${clean}` : "/";
+    }),
+  ];
+
+  const siteUrl =
+    process.env.MINGZHAN_DOCS_SITE_URL ?? "https://ahmadrosid.github.io/mingzhan";
+
+  const sitemap = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${sitemapUrls
+  .map(
+    (url) => `  <url>
+    <loc>${siteUrl}${url === "/" ? "/" : url}</loc>
+  </url>`
+  )
+  .join("\n")}
+</urlset>
+`;
+
+  await writeFile(path.join(PUBLIC_DIR, "sitemap.xml"), sitemap);
+
+  await writeMirrorRoutes([...pagePaths, "llms.txt"]);
+
+  console.log(
+    `Generated ${pages.length} markdown mirrors, llms.txt, sitemap.xml, and mirror routes`
+  );
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

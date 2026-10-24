@@ -1,0 +1,113 @@
+import type {
+  ChatCompletionResult,
+  GenerateChatInput,
+  GenerateTextInput,
+  GenerateTextResult,
+  ProviderClient,
+  StreamChatHandlers,
+} from "@mingzhan/core";
+import {
+  type ChatgptOAuthCredentials,
+  chatgptOAuthNeedsRefresh,
+} from "@mingzhan/core";
+import { generateOpenAIResponsesChat } from "../openai/responses";
+import { CHATGPT_CODEX_BASE_URL, refreshChatgptOAuthToken } from "./oauth";
+
+export interface ChatgptProviderOptions {
+  getOAuth: () => ChatgptOAuthCredentials | null;
+  model: string;
+  onTokenRefresh?: (oauth: ChatgptOAuthCredentials) => Promise<void>;
+}
+
+async function resolveAccessToken(
+  options: ChatgptProviderOptions
+): Promise<ChatgptOAuthCredentials> {
+  const current = options.getOAuth();
+
+  if (!current) {
+    throw new Error(
+      "ChatGPT provider is not connected. Reconnect in Control center → AI Providers (/customize/providers)."
+    );
+  }
+
+  if (!chatgptOAuthNeedsRefresh(current)) {
+    return current;
+  }
+
+  const refreshed = await refreshChatgptOAuthToken(current.refreshToken);
+  await options.onTokenRefresh?.(refreshed);
+
+  return refreshed;
+}
+
+export function createChatgptProvider(
+  options: ChatgptProviderOptions
+): ProviderClient {
+  const model = options.model;
+
+  async function runChat(
+    input: GenerateChatInput,
+    handlers?: StreamChatHandlers
+  ): Promise<ChatCompletionResult> {
+    const oauth = await resolveAccessToken(options);
+
+    const request: Parameters<typeof generateOpenAIResponsesChat>[0] = {
+      apiKey: oauth.accessToken,
+      baseUrl: CHATGPT_CODEX_BASE_URL,
+      extraHeaders: {
+        "ChatGPT-Account-ID": oauth.accountId,
+        "OpenAI-Beta": "responses=v1",
+        originator: "mingzhan",
+        version: "1.0.0",
+      },
+      input,
+      label: "ChatGPT",
+      model,
+      // Codex rejects non-streaming /responses calls.
+      stream: true,
+      supportsThinking: true,
+    };
+
+    if (handlers) {
+      request.handlers = handlers;
+    }
+
+    return generateOpenAIResponsesChat(request);
+  }
+
+  return {
+    generateChat(input) {
+      return runChat(input);
+    },
+    async generateText(input: GenerateTextInput): Promise<GenerateTextResult> {
+      const useJson = (input.format ?? "json") === "json";
+
+      const system = useJson
+        ? `${input.system}\n\nRespond with valid JSON only.`
+        : `${input.system}\n\nReturn only the requested text. No JSON, labels, or markdown fences.`;
+
+      const result = await runChat({
+        messages: [{ content: input.prompt, role: "user" }],
+        system,
+      });
+
+      const content = result.content.trim();
+
+      if (!content) {
+        throw new Error("ChatGPT returned an empty response.");
+      }
+
+      const textResult: GenerateTextResult = { content };
+
+      if (result.usage) {
+        textResult.usage = result.usage;
+      }
+
+      return textResult;
+    },
+    name: "chatgpt",
+    streamChat(input, handlers) {
+      return runChat(input, handlers);
+    },
+  };
+}

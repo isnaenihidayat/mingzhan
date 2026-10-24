@@ -1,0 +1,63 @@
+/* Composer streaming rim — under the face, never over content. */
+
+@property --ai-from {
+  syntax: "<angle>";
+  inherits: true;
+  initial-value: 0deg;
+}
+
+/* The --ai-* palette lives on :root in index.css, so the sidebar can sweep the
+ * same colours across a running chat's title. rollPalette still overrides it
+ * inline per rim, which wins over both. */
+.composer-rim {
+  --ai-from: 0deg;
+}
+
+.composer-rim-layer {
+  position: absolute;
+  z-index: 0;
+  display: block;
+  pointer-events: none;
+  background: conic-gradient(
+    from var(--ai-from),
+    var(--ai-c1) 0deg,
+    var(--ai-c2) 16deg,
+    var(--ai-c3) 30deg,
+    var(--ai-c4) 43deg,
+    var(--ai-c5) 59deg,
+    var(--ai-c6) 72deg,
+    transparent 84deg,
+    transparent 324deg,
+    var(--ai-tail) 349deg,
+    var(--ai-c1) 360deg
+  );
+  border-radius: inherit;
+  opacity: 0;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-size: 100% 100%;
+  mask-size: 100% 100%;
+}
+
+.composer-rim[data-playing="true"] .composer-rim-layer {
+  opacity: 0.55;
+  animation: composer-rim-orbit 2.4s linear infinite;
+}
+
+@keyframes composer-rim-orbit {
+  from {
+    --ai-from: 0deg;
+  }
+  to {
+    --ai-from: 360deg;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .composer-rim[data-playing="true"] .composer-rim-layer {
+    opacity: 0;
+    animation: none;
+  }
+}

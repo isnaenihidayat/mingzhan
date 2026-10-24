@@ -1,0 +1,425 @@
+import { expect, mock, spyOn, test } from "bun:test";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { MeetImportProgress } from "@mingzhan/core/google-meet";
+import * as recordingImport from "../meet-recording-import";
+import type { MeetExecutionContext } from "./actions";
+import { openaiProviderKey, run } from "./actions";
+import { MeetingStore } from "./store";
+
+test("settings are admin-only, credentials never returned, meetings are scoped to actor and profile", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "meet-actions-"));
+
+  const context: MeetExecutionContext = {
+    actionKey: "configure",
+    actor: { id: "a", role: "admin" },
+    captureUrl: async () => "ws://localhost/capture",
+    createCapture: () => ({ token: "test", url: "ws://localhost/capture" }),
+    dataDir: dir,
+    openaiKey: () => "secret-api-key",
+    orgId: "org",
+    profileId: "p",
+  };
+
+  const input = { enabled: true };
+
+  try {
+    await expect(
+      run(input, { ...context, actor: { id: "a", role: "member" } })
+    ).rejects.toThrow();
+    const result = await run(input, context);
+    expect(result).toEqual({ configured: true, enabled: true });
+    expect(JSON.stringify(result)).not.toContain("secret");
+    await expect(
+      run(
+        { url: "https://meet.google.com/abc-defg-hij" },
+        { ...context, actionKey: "start-capture", openaiKey: () => null }
+      )
+    ).rejects.toThrow();
+
+    // SAFETY: The start-capture action returns a meeting record.
+    const meeting = (await run(
+      { url: "https://meet.google.com/abc-defg-hij" },
+      { ...context, actionKey: "start-capture" }
+    )) as { id: string };
+
+    const store = new MeetingStore(dir, "org");
+    store.addSegment(meeting.id, {
+      id: "turn",
+      receivedAt: 1,
+      text: "Saved speech",
+    });
+    store.close();
+
+    // SAFETY: The meetings action returns the overview contract.
+    const overview = (await run({}, { ...context, actionKey: "meetings" })) as {
+      meetings: { transcriptFile?: string }[];
+    };
+
+    expect(overview.meetings[0]?.transcriptFile).toBe(
+      `meeting-${meeting.id}.txt`
+    );
+
+    // SAFETY: The meetings action returns an array of meetings.
+    const other = (await run(
+      {},
+      { ...context, actionKey: "meetings", actor: { id: "b", role: "member" } }
+    )) as { meetings: unknown[] };
+
+    expect(other.meetings).toEqual([]);
+
+    for (const actionKey of ["status", "transcript", "leave"]) {
+      await expect(
+        run(
+          { meetingId: meeting.id },
+          { ...context, actionKey, actor: { id: "b", role: "member" } }
+        )
+      ).rejects.toThrow();
+      await expect(
+        run(
+          { meetingId: meeting.id },
+          { ...context, actionKey, profileId: "other" }
+        )
+      ).rejects.toThrow();
+      await expect(
+        run(
+          { meetingId: meeting.id },
+          { ...context, actionKey, actor: { id: "", role: "member" } }
+        )
+      ).rejects.toThrow();
+    }
+
+    // SAFETY: The status action returns one meeting.
+    const status = (await run(
+      { meetingId: meeting.id },
+      { ...context, actionKey: "status" }
+    )) as { meeting: { state: string } };
+
+    expect(status.meeting.state).toBe("queued");
+    const deletion = { ...context, actionKey: "delete" };
+    await expect(run({ meetingId: meeting.id }, deletion)).rejects.toThrow();
+    const finished = new MeetingStore(dir, "org");
+    finished.update(meeting.id, "finished");
+    finished.close();
+
+    for (const denied of [
+      { ...deletion, actor: { id: "b", role: "member" as const } },
+      { ...deletion, actor: { id: "", role: "member" as const } },
+      { ...deletion, profileId: "other" },
+    ]) {
+      await expect(run({ meetingId: meeting.id }, denied)).rejects.toThrow();
+    }
+
+    expect(await run({ meetingId: meeting.id }, deletion)).toEqual({
+      deleted: true,
+    });
+    const reopened = new MeetingStore(dir, "org");
+    expect(reopened.get(meeting.id)).toBeNull();
+    expect(reopened.transcript(meeting.id)).toEqual([]);
+    expect(reopened.list()).toEqual([]);
+    reopened.close();
+    expect(
+      existsSync(join(dir, "transcripts", `meeting-${meeting.id}.txt`))
+    ).toBe(false);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("uploads preserve Markdown and use MíngZhàn's host for audio without plugin credentials", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "meet-upload-"));
+  const host = mock(async () => ({ text: "Audio transcript" }));
+
+  const context = {
+    actionKey: "upload",
+    actor: { id: "a", role: "member" as const },
+    apiVersion: 1 as const,
+    dataDir: dir,
+    orgId: "org",
+    profileId: "p",
+    transcribeAudio: host,
+  };
+
+  try {
+    const content = "# Planning\n\n**Keep** this Markdown.\n";
+
+    // SAFETY: The upload action returns the imported meeting record.
+    const meeting = (await run(
+      {
+        content: Buffer.from(content).toString("base64"),
+        filename: "notes.md",
+      },
+      context
+    )) as { id: string; state: string };
+
+    expect(meeting.state).toBe("finished");
+    expect(host).not.toHaveBeenCalled();
+    const audio = Buffer.from("audio").toString("base64");
+
+    // SAFETY: The upload action returns the imported meeting record.
+    const imported = (await run(
+      { content: audio, filename: "meeting.wav" },
+      context
+    )) as { id: string };
+
+    expect(host).toHaveBeenCalledWith(
+      {
+        data: audio,
+        filename: "meeting.wav",
+        mediaType: "application/octet-stream",
+      },
+      undefined
+    );
+    const store = new MeetingStore(dir, "org");
+
+    try {
+      expect(
+        store
+          .transcript(meeting.id)
+          .map((segment) => segment.text)
+          .join("")
+      ).toBe(content);
+      expect(store.transcript(imported.id)[0]?.text).toBe("Audio transcript");
+      expect(store.list("a", "p")).toHaveLength(2);
+      expect(store.list("b", "p")).toEqual([]);
+      expect(store.list("a", "other")).toEqual([]);
+    } finally {
+      store.close();
+    }
+
+    for (const filename of ["../notes.md", "notes.html", "bad\0.md"]) {
+      await expect(
+        run({ content: audio, filename }, context)
+      ).rejects.toThrow();
+    }
+
+    await expect(
+      run({ content: "%%%", filename: "notes.md" }, context)
+    ).rejects.toThrow();
+    await expect(
+      run(
+        {
+          content: Buffer.alloc(1024 * 1024 + 1, "x").toString("base64"),
+          filename: "notes.md",
+        },
+        context
+      )
+    ).rejects.toThrow();
+    await expect(
+      run(
+        { content: audio, filename: "notes.md" },
+        { ...context, actor: { id: "", role: "member" } }
+      )
+    ).rejects.toThrow();
+    host.mockRejectedValueOnce(new Error("Provider unavailable"));
+    await expect(
+      run({ content: audio, filename: "meeting.wav" }, context)
+    ).rejects.toThrow();
+    const afterFailure = new MeetingStore(dir, "org");
+    expect(afterFailure.list()).toHaveLength(2);
+    afterFailure.close();
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("recording import saves only a complete Whisper result in the member's history", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "meet-recording-import-"));
+
+  const importer = spyOn(
+    recordingImport,
+    "importMeetRecording"
+  ).mockResolvedValue({
+    filename: "Sprint.mp4",
+    text: "Decision one.\n\nDecision two.",
+  });
+
+  const composio = {
+    downloadMeetRecording: mock(async () => {
+      throw new Error("Unexpected download");
+    }),
+    listMeetRecordings: mock(async () => ({
+      driveConnected: true,
+      gmailConnected: true,
+      recordings: [
+        {
+          date: "",
+          fileId: "drive_file_123",
+          messageId: "msg_1",
+          name: "Sprint.mp4",
+          size: 100,
+        },
+      ],
+    })),
+  };
+
+  const context: MeetExecutionContext = {
+    actionKey: "recordings",
+    actor: { id: "member", role: "member" },
+    composio,
+    dataDir: dir,
+    openaiKey: () => "test-key",
+    orgId: "org",
+    profileId: "profile",
+  };
+
+  try {
+    // SAFETY: The surrounding code checked this value before the assertion.
+    const listed = (await run({}, context)) as { recordings: unknown[] };
+    expect(listed.recordings).toHaveLength(1);
+    expect(composio.listMeetRecordings).toHaveBeenCalledWith("org", "member");
+
+    // SAFETY: The surrounding code checked this value before the assertion.
+    const meeting = (await run(
+      { fileId: "drive_file_123", messageId: "msg_1" },
+      {
+        ...context,
+        actionKey: "import-recording",
+      }
+    )) as { id: string; state: string };
+
+    expect(meeting.state).toBe("finished");
+    const store = new MeetingStore(dir, "org");
+    expect(
+      store
+        .transcript(meeting.id)
+        .map((segment) => segment.text)
+        .join("")
+    ).toBe("Decision one.\n\nDecision two.");
+    expect(store.list("member", "profile")).toHaveLength(1);
+    expect(store.list("other", "profile")).toEqual([]);
+    store.close();
+    importer.mockRejectedValueOnce(new Error("Whisper unavailable"));
+    await expect(
+      run(
+        { fileId: "drive_file_123", messageId: "msg_1" },
+        {
+          ...context,
+          actionKey: "import-recording",
+        }
+      )
+    ).rejects.toThrow();
+    const after = new MeetingStore(dir, "org");
+    expect(after.list("member", "profile")).toHaveLength(1);
+    after.close();
+    await expect(
+      run(
+        {},
+        // SAFETY: The surrounding code checked this value before the assertion.
+        { ...context, actor: { id: "viewer", role: "viewer" as "member" } }
+      )
+    ).rejects.toThrow();
+  } finally {
+    importer.mockRestore();
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("recording import progress is readable while it runs and cleared after", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "meet-import-progress-"));
+  let release!: () => void;
+  let started!: () => void;
+
+  const running = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+
+  const importer = spyOn(
+    recordingImport,
+    "importMeetRecording"
+  ).mockImplementation(async (_composio, _input, _signal, onProgress) => {
+    onProgress?.({ part: 1, parts: 2, step: "transcribe" });
+    started();
+    await new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    return { filename: "Sprint.mp4", text: "Decision." };
+  });
+
+  let saved: MeetImportProgress | null = null;
+
+  const context: MeetExecutionContext = {
+    actionKey: "import-progress",
+    actor: { id: "member", role: "member" },
+    composio: {
+      downloadMeetRecording: mock(async () => {
+        throw new Error("Unexpected download");
+      }),
+      listMeetRecordings: mock(async () => {
+        throw new Error("Unexpected list");
+      }),
+    },
+    dataDir: dir,
+    importProgress: {
+      get: () => saved,
+      set: (progress) => {
+        saved = progress;
+      },
+    },
+    openaiKey: () => "test-key",
+    orgId: "org",
+  };
+
+  try {
+    expect(await run({}, context)).toEqual({ progress: null });
+
+    const imported = run(
+      { fileId: "drive_file_123", messageId: "msg_1" },
+      { ...context, actionKey: "import-recording" }
+    );
+
+    await running;
+    expect(await run({}, context)).toEqual({
+      progress: { part: 1, parts: 2, step: "transcribe" },
+    });
+    release();
+    await imported;
+    expect(await run({}, context)).toEqual({ progress: null });
+  } finally {
+    importer.mockRestore();
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("Meet takes the OpenAI key from AI provider settings", () => {
+  const provider = (
+    id: string,
+    type: "openai" | "anthropic",
+    apiKey: string
+  ) => ({
+    apiKey,
+    createdAt: "",
+    id,
+    label: id,
+    type,
+  });
+
+  expect(openaiProviderKey(null)).toBeNull();
+  expect(
+    openaiProviderKey({
+      defaultProviderId: "claude",
+      providers: [provider("claude", "anthropic", "anthropic-key")],
+    })
+  ).toBeNull();
+  expect(
+    openaiProviderKey({
+      defaultProviderId: "claude",
+      providers: [
+        provider("claude", "anthropic", "anthropic-key"),
+        provider("empty", "openai", " "),
+        provider("first", "openai", "first-key"),
+      ],
+    })
+  ).toBe("first-key");
+  expect(
+    openaiProviderKey({
+      defaultProviderId: "second",
+      providers: [
+        provider("first", "openai", "first-key"),
+        provider("second", "openai", "second-key"),
+      ],
+    })
+  ).toBe("second-key");
+});

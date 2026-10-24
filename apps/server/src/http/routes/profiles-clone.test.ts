@@ -1,0 +1,351 @@
+import { describe, expect, test } from "bun:test";
+import type { MoveProfileRequest } from "@mingzhan/core";
+import { createInMemoryDatabaseAdapter } from "@mingzhan/db";
+import { ProfileService } from "../../services/profile-service";
+import { setupTestConfigDir } from "../../test-config-dir";
+import { createMinimalHonoApp } from "../test-app-helpers";
+import {
+  loginUserSession,
+  setupFreshInstallSession,
+} from "../test-session-helpers";
+
+setupTestConfigDir("mingzhan-profiles-clone-routes-");
+
+const BASE = "http://localhost:4310";
+
+function createApp() {
+  const databaseAdapter = createInMemoryDatabaseAdapter();
+  const profileService = new ProfileService(databaseAdapter);
+
+  return {
+    ...createMinimalHonoApp({
+      agent: {
+        cloneProfile: (
+          orgId: string,
+          sourceId: string,
+          request: Parameters<ProfileService["cloneProfile"]>[2]
+        ) => profileService.cloneProfile(orgId, sourceId, request),
+        getProfile: (orgId: string, profileId: string) =>
+          profileService.getProfile(orgId, profileId),
+        moveProfile: (
+          orgId: string,
+          profileId: string,
+          request: MoveProfileRequest
+        ) => profileService.moveProfile(orgId, profileId, request),
+        listProfiles: async () => ({ profiles: [] }),
+      },
+      databaseAdapter,
+    }),
+    databaseAdapter,
+  };
+}
+
+describe("POST /v1/profiles/:profileId/clone", () => {
+  test("an org admin who is not a platform admin gets 403", async () => {
+    const { app, authService, databaseAdapter } = createApp();
+
+    const platformSession = await setupFreshInstallSession(
+      app,
+      databaseAdapter,
+      "platform@example.com"
+    );
+
+    const orgId = platformSession.orgId!;
+    const [source] = await databaseAdapter.listProfilesForOrg(orgId);
+    const now = new Date().toISOString();
+
+    await databaseAdapter.createUser({
+      createdAt: now,
+      email: "org-admin-clone@example.com",
+      id: "user_org_admin_clone",
+      passwordHash: await authService.hashPassword("password123"),
+      updatedAt: now,
+    });
+    await databaseAdapter.upsertOrgMember({
+      createdAt: now,
+      orgId,
+      role: "admin",
+      userId: "user_org_admin_clone",
+    });
+
+    const countBefore = (await databaseAdapter.listProfilesForOrg(orgId))
+      .length;
+
+    const orgAdmin = await loginUserSession(
+      app,
+      "org-admin-clone@example.com",
+      "password123",
+      orgId
+    );
+
+    const denied = await app.fetch(
+      new Request(`${BASE}/v1/profiles/${source!.id}/clone`, {
+        body: "{}",
+        headers: orgAdmin.headers(
+          {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": orgAdmin.csrfToken,
+          },
+          orgId
+        ),
+        method: "POST",
+      })
+    );
+
+    expect(denied.status).toBe(403);
+    // The refusal must happen before anything is written.
+    expect(await databaseAdapter.listProfilesForOrg(orgId)).toHaveLength(
+      countBefore
+    );
+  }, 20_000);
+
+  test("a platform admin gets 201 and a new profile", async () => {
+    const { app, databaseAdapter } = createApp();
+
+    const session = await setupFreshInstallSession(
+      app,
+      databaseAdapter,
+      "platform2@example.com"
+    );
+
+    const orgId = session.orgId!;
+    const before = await databaseAdapter.listProfilesForOrg(orgId);
+    const source = before.find((profile) => !profile.isSuper);
+
+    const response = await app.fetch(
+      new Request(`${BASE}/v1/profiles/${source!.id}/clone`, {
+        body: "{}",
+        headers: session.headers(
+          {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": session.csrfToken,
+          },
+          orgId
+        ),
+        method: "POST",
+      })
+    );
+
+    expect(response.status).toBe(201);
+    expect(await databaseAdapter.listProfilesForOrg(orgId)).toHaveLength(
+      before.length + 1
+    );
+  }, 20_000);
+
+  test("malformed JSON returns 400 without cloning a profile", async () => {
+    const { app, databaseAdapter } = createApp();
+
+    const session = await setupFreshInstallSession(
+      app,
+      databaseAdapter,
+      "platform3@example.com"
+    );
+
+    const orgId = session.orgId!;
+    const before = await databaseAdapter.listProfilesForOrg(orgId);
+    const source = before.find((profile) => !profile.isSuper);
+
+    const response = await app.fetch(
+      new Request(`${BASE}/v1/profiles/${source!.id}/clone`, {
+        body: "{",
+        headers: session.headers(
+          {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": session.csrfToken,
+          },
+          orgId
+        ),
+        method: "POST",
+      })
+    );
+
+    expect(response.status).toBe(400);
+    expect(await databaseAdapter.listProfilesForOrg(orgId)).toHaveLength(
+      before.length
+    );
+  }, 20_000);
+
+  test("an empty body keeps the optional clone defaults", async () => {
+    const { app, databaseAdapter } = createApp();
+
+    const session = await setupFreshInstallSession(
+      app,
+      databaseAdapter,
+      "platform4@example.com"
+    );
+
+    const orgId = session.orgId!;
+    const before = await databaseAdapter.listProfilesForOrg(orgId);
+    const source = before.find((profile) => !profile.isSuper);
+
+    const response = await app.fetch(
+      new Request(`${BASE}/v1/profiles/${source!.id}/clone`, {
+        headers: session.headers({ "X-CSRF-Token": session.csrfToken }, orgId),
+        method: "POST",
+      })
+    );
+
+    expect(response.status).toBe(201);
+    expect(await databaseAdapter.listProfilesForOrg(orgId)).toHaveLength(
+      before.length + 1
+    );
+  }, 20_000);
+});
+
+describe("POST /v1/profiles/:profileId/move", () => {
+  test("platform admin moves a profile and the source org loses access", async () => {
+    const { app, databaseAdapter } = createApp();
+
+    const session = await setupFreshInstallSession(
+      app,
+      databaseAdapter,
+      "move-platform@example.com"
+    );
+
+    const orgId = session.orgId!;
+    const now = new Date().toISOString();
+    await databaseAdapter.upsertOrganization({
+      id: "move-destination",
+      name: "Destination",
+      slug: "move-destination",
+      createdAt: now,
+      updatedAt: now,
+    });
+    const service = new ProfileService(databaseAdapter);
+
+    const { profile } = await service.createProfile(orgId, {
+      name: "Transfer me",
+    });
+
+    const response = await app.fetch(
+      new Request(`${BASE}/v1/profiles/${profile.id}/move`, {
+        method: "POST",
+        body: JSON.stringify({ organizationId: "move-destination" }),
+        headers: session.headers(
+          {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": session.csrfToken,
+          },
+          orgId
+        ),
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect((await response.json()).profile.id).toBe(profile.id);
+    expect(
+      await databaseAdapter.getProfileForOrg(profile.id, orgId)
+    ).toBeNull();
+    expect(
+      await databaseAdapter.getProfileForOrg(profile.id, "move-destination")
+    ).not.toBeNull();
+  });
+
+  test("org admin cannot transfer a profile", async () => {
+    const { app, authService, databaseAdapter } = createApp();
+
+    const platform = await setupFreshInstallSession(
+      app,
+      databaseAdapter,
+      "move-owner@example.com"
+    );
+
+    const orgId = platform.orgId!;
+    const now = new Date().toISOString();
+    await databaseAdapter.createUser({
+      id: "move-org-admin",
+      email: "move-admin@example.com",
+      passwordHash: await authService.hashPassword("password123"),
+      createdAt: now,
+      updatedAt: now,
+    });
+    await databaseAdapter.upsertOrgMember({
+      userId: "move-org-admin",
+      orgId,
+      role: "admin",
+      createdAt: now,
+    });
+
+    const session = await loginUserSession(
+      app,
+      "move-admin@example.com",
+      "password123",
+      orgId
+    );
+
+    const [profile] = await databaseAdapter.listProfilesForOrg(orgId);
+
+    const response = await app.fetch(
+      new Request(`${BASE}/v1/profiles/${profile!.id}/move`, {
+        method: "POST",
+        body: JSON.stringify({ organizationId: "elsewhere" }),
+        headers: session.headers(
+          {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": session.csrfToken,
+          },
+          orgId
+        ),
+      })
+    );
+
+    expect(response.status).toBe(403);
+    expect(
+      await databaseAdapter.getProfileForOrg(profile!.id, orgId)
+    ).not.toBeNull();
+  });
+
+  test("invalid request bodies and wrong source organizations cannot move a profile", async () => {
+    const { app, databaseAdapter } = createApp();
+
+    const session = await setupFreshInstallSession(
+      app,
+      databaseAdapter,
+      "move-invalid@example.com"
+    );
+
+    const orgId = session.orgId!;
+    const service = new ProfileService(databaseAdapter);
+
+    const { profile } = await service.createProfile(orgId, {
+      name: "Stay here",
+    });
+
+    for (const body of ["{", "null", "{}", '{"organizationId":123}']) {
+      const response = await app.fetch(
+        new Request(`${BASE}/v1/profiles/${profile.id}/move`, {
+          method: "POST",
+          body,
+          headers: session.headers(
+            {
+              "Content-Type": "application/json",
+              "X-CSRF-Token": session.csrfToken,
+            },
+            orgId
+          ),
+        })
+      );
+
+      expect(response.status).toBe(400);
+    }
+
+    const response = await app.fetch(
+      new Request(`${BASE}/v1/profiles/missing/move`, {
+        method: "POST",
+        body: JSON.stringify({ organizationId: orgId }),
+        headers: session.headers(
+          {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": session.csrfToken,
+          },
+          orgId
+        ),
+      })
+    );
+
+    expect(response.status).toBe(404);
+    expect(
+      await databaseAdapter.getProfileForOrg(profile.id, orgId)
+    ).not.toBeNull();
+  });
+});

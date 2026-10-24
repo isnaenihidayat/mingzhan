@@ -1,0 +1,44 @@
+import type { DatabaseAdapter } from "@mingzhan/db";
+import type { AgentService } from "../services/agent-service";
+import type { AuthService } from "../services/auth-service";
+import type { AutomationService } from "../services/automation-service";
+import type { ComposioService } from "../services/composio-service";
+import type { GoogleMeetService } from "../services/google-meet/service";
+import type { McpService } from "../services/mcp-service";
+import type { OrgMemoryService } from "../services/org-memory-service";
+import type { OrgService } from "../services/org-service";
+import type { PluginService } from "../services/plugin-service";
+import type { SkillCuratorService } from "../services/skill-curator-service";
+import type { SkillProposalService } from "../services/skill-proposal-service";
+import type { SkillSuggestionService } from "../services/skill-suggestion-service";
+import type { SystemStatusService } from "../services/system-status-service";
+import type { WorkerManagerService } from "../services/worker-manager-service";
+
+export interface ServerOptions {
+  agent: AgentService;
+  authService?: AuthService | null;
+  automationService: AutomationService;
+  composioService?: ComposioService | null;
+  databaseAdapter?: DatabaseAdapter | null;
+  googleMeetService?: GoogleMeetService | null;
+  mcpService: McpService;
+  /**
+   * Release the SQLite file before a restore moves the data root. Set only on
+   * Windows, which cannot move an open database.
+   */
+  onBeforeDataRestore?: () => void | Promise<void>;
+  /**
+   * Close/reopen SQLite and reload config after a data-root restore. Also runs
+   * when a restore fails after `onBeforeDataRestore`, to reopen what is on disk.
+   */
+  onDataRestored?: () => Promise<void>;
+  orgMemoryService?: OrgMemoryService | null;
+  orgService?: OrgService | null;
+  pluginService?: PluginService | null;
+  skillCuratorService?: SkillCuratorService | null;
+  skillProposalService?: SkillProposalService | null;
+  skillSuggestionService?: SkillSuggestionService | null;
+  systemStatus: SystemStatusService;
+  webDistDir?: string | null;
+  workerManager: WorkerManagerService;
+}

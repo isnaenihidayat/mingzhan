@@ -1,0 +1,514 @@
+import { Key, matchesKey } from "@earendil-works/pi-tui";
+import { type ImageAttachment, validateImageAttachments } from "@mingzhan/core";
+import { pastedImagePath, readClipboardImage } from "./clipboard-image";
+import type { PromptSuggestion } from "./commands";
+import type { PromptLineResult } from "./prompt";
+import { normalizePastedText } from "./prompt-display";
+import type { TerminalInput } from "./terminal-input";
+import type { TerminalRenderer } from "./terminal-renderer";
+
+const BRACKETED_PASTE_START = "\x1b[200~";
+
+const BRACKETED_PASTE_END = "\x1b[201~";
+
+const BLINK_INTERVAL_MS = 530;
+
+const MAX_VISIBLE_SUGGESTIONS = 8;
+
+/** Cap bracketed-paste accumulation so a missing end sequence cannot grow forever. */
+export const MAX_BRACKETED_PASTE_BYTES = 256 * 1024;
+
+export interface PersistentPromptOptions {
+  getSuggestions?: (input: string) => PromptSuggestion[];
+  onAbortStream?: () => void;
+  onCancel: () => void;
+  onScrollHistory?: (
+    event: "line_up" | "line_down" | "page_up" | "page_down" | "home" | "end"
+  ) => void;
+  onSubmit: (result: PromptLineResult) => void | Promise<void>;
+  prefix?: string;
+  renderer: Pick<TerminalRenderer, "setComposerState">;
+  terminalInput: Pick<TerminalInput, "onInput">;
+}
+
+export class PersistentPrompt {
+  private readonly prefix: string;
+  private readonly renderer: Pick<TerminalRenderer, "setComposerState">;
+  private readonly terminalInput: Pick<TerminalInput, "onInput">;
+  private readonly getSuggestions: (input: string) => PromptSuggestion[];
+  private readonly onSubmit: (result: PromptLineResult) => void | Promise<void>;
+  private readonly onCancel: () => void;
+  private readonly onAbortStream?: () => void;
+  private readonly onScrollHistory?: (
+    event: "line_up" | "line_down" | "page_up" | "page_down" | "home" | "end"
+  ) => void;
+
+  private value = "";
+  private textPastes: { start: number; end: number }[] = [];
+  private attachedImages: ImageAttachment[] = [];
+  private cursorVisible = true;
+  private active = false;
+  private selectedIndex = 0;
+  private hasNavigated = false;
+  private pasteBuffer = "";
+  private inBracketedPaste = false;
+  private blinkTimer: ReturnType<typeof setInterval> | null = null;
+  private clipboardAttachTask: Promise<void> = Promise.resolve();
+  private unsubscribeInput: (() => void) | null = null;
+
+  constructor(options: PersistentPromptOptions) {
+    this.prefix = options.prefix ?? "> ";
+    this.renderer = options.renderer;
+    this.terminalInput = options.terminalInput;
+    this.getSuggestions = options.getSuggestions ?? (() => []);
+    this.onSubmit = options.onSubmit;
+    this.onCancel = options.onCancel;
+    this.onAbortStream = options.onAbortStream;
+    this.onScrollHistory = options.onScrollHistory;
+  }
+
+  start(): void {
+    if (this.active) {
+      return;
+    }
+
+    this.active = true;
+    this.unsubscribeInput = this.terminalInput.onInput(this.onData);
+    this.startBlink();
+    this.render();
+  }
+
+  stop(): void {
+    if (!this.active) {
+      return;
+    }
+
+    this.active = false;
+    this.stopBlink();
+    this.unsubscribeInput?.();
+    this.unsubscribeInput = null;
+    process.stdout.write("\x1b[?25h");
+  }
+
+  prefill(value: string): void {
+    this.value = value;
+    this.textPastes = [];
+    this.attachedImages = [];
+    this.resetSelection();
+    this.cursorVisible = true;
+    this.render();
+  }
+
+  private startBlink(): void {
+    if (this.blinkTimer) {
+      return;
+    }
+
+    this.blinkTimer = setInterval(() => {
+      this.cursorVisible = !this.cursorVisible;
+      this.render();
+    }, BLINK_INTERVAL_MS);
+  }
+
+  private stopBlink(): void {
+    if (!this.blinkTimer) {
+      return;
+    }
+
+    clearInterval(this.blinkTimer);
+    this.blinkTimer = null;
+  }
+
+  private currentSuggestions(): PromptSuggestion[] {
+    return this.getSuggestions(this.value).slice(0, MAX_VISIBLE_SUGGESTIONS);
+  }
+
+  private render(): void {
+    if (!this.active) {
+      return;
+    }
+
+    const suggestions = this.currentSuggestions().map((suggestion) => ({
+      description: suggestion.description,
+      label: suggestion.label,
+    }));
+
+    let display = "";
+    let offset = 0;
+
+    for (const [index, paste] of this.textPastes.entries()) {
+      display += `${this.value.slice(offset, paste.start)}[Text #${index + 1}]`;
+      offset = paste.end;
+    }
+
+    display += this.value.slice(offset);
+
+    this.renderer.setComposerState({
+      cursorVisible: this.cursorVisible,
+      imageCount: this.attachedImages.length || undefined,
+      prefix: this.prefix,
+      selectedIndex: this.selectedIndex,
+      suggestions,
+      value: display,
+    });
+  }
+
+  private resetSelection(): void {
+    this.selectedIndex = 0;
+    this.hasNavigated = false;
+  }
+
+  private notifyClipboard(message: string): void {
+    process.stderr.write(`\x1b[33m${message}\x1b[0m\n`);
+    this.render();
+  }
+
+  private queueClipboardAttach(filePath?: string): void {
+    this.clipboardAttachTask = this.clipboardAttachTask.then(async () => {
+      await this.attachClipboardImage(filePath);
+    });
+  }
+
+  private async waitForClipboardAttach(): Promise<void> {
+    await this.clipboardAttachTask;
+  }
+
+  private async attachClipboardImage(filePath?: string): Promise<boolean> {
+    try {
+      const image = await readClipboardImage(filePath);
+
+      if (!image) {
+        this.notifyClipboard(
+          "No image on clipboard. Copy a screenshot or image first."
+        );
+
+        return false;
+      }
+
+      validateImageAttachments([...this.attachedImages, image]);
+      this.attachedImages.push(image);
+      this.resetSelection();
+      this.cursorVisible = true;
+      this.render();
+
+      return true;
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Failed to read clipboard image.";
+
+      this.notifyClipboard(message);
+
+      return false;
+    }
+  }
+
+  private finishBracketedPaste(pasted: string): void {
+    this.inBracketedPaste = false;
+    this.pasteBuffer = "";
+    this.startBlink();
+
+    const normalized = normalizePastedText(pasted);
+    const filePath = pastedImagePath(pasted);
+
+    if (filePath) {
+      this.queueClipboardAttach(filePath);
+
+      return;
+    }
+
+    if (normalized.trim()) {
+      this.textPastes.push({
+        end: this.value.length + normalized.length,
+        start: this.value.length,
+      });
+      this.value += normalized;
+      this.resetSelection();
+      this.cursorVisible = true;
+      this.render();
+
+      return;
+    }
+
+    this.queueClipboardAttach();
+  }
+
+  private dropBracketedPasteOverflow(): void {
+    this.inBracketedPaste = false;
+    this.pasteBuffer = "";
+    this.startBlink();
+    this.notifyClipboard(
+      "Paste dropped: content exceeded the 256 KB bracketed-paste limit."
+    );
+  }
+
+  private appendBracketedPaste(chunk: string): void {
+    this.pasteBuffer += chunk;
+
+    const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END);
+
+    if (endIndex >= 0) {
+      const pasted = this.pasteBuffer.slice(0, endIndex);
+      this.finishBracketedPaste(pasted);
+
+      return;
+    }
+
+    if (this.pasteBuffer.length > MAX_BRACKETED_PASTE_BYTES) {
+      this.dropBracketedPasteOverflow();
+    }
+  }
+
+  private applySuggestion(
+    suggestion: PromptSuggestion,
+    submitAfter = false
+  ): void {
+    this.value = suggestion.insertValue.trimEnd();
+    this.textPastes = [];
+    this.selectedIndex = 0;
+    this.hasNavigated = false;
+    this.cursorVisible = true;
+
+    if (submitAfter) {
+      void this.waitForClipboardAttach().then(() => {
+        this.submitValue();
+      });
+
+      return;
+    }
+
+    this.render();
+  }
+
+  private submitValue(): void {
+    const result: PromptLineResult = {
+      images: this.attachedImages.length > 0 ? this.attachedImages : undefined,
+      text: this.value,
+    };
+
+    this.value = "";
+    this.textPastes = [];
+    this.attachedImages = [];
+    this.resetSelection();
+    this.cursorVisible = true;
+    this.render();
+    void this.onSubmit(result);
+  }
+
+  private async submit(): Promise<void> {
+    await this.waitForClipboardAttach();
+
+    const suggestions = this.currentSuggestions();
+
+    const suggestion = suggestions[this.selectedIndex] ?? suggestions[0];
+
+    if (suggestion && (this.hasNavigated || suggestion.submitOnEnter)) {
+      this.applySuggestion(suggestion, true);
+
+      return;
+    }
+
+    this.submitValue();
+  }
+
+  private onData = (key: string): void => {
+    if (!key) {
+      return;
+    }
+
+    if (key === "\u001b" && this.onAbortStream) {
+      this.onAbortStream();
+
+      return;
+    }
+
+    if (this.inBracketedPaste) {
+      this.appendBracketedPaste(key);
+
+      return;
+    }
+
+    if (key.includes(BRACKETED_PASTE_START)) {
+      this.stopBlink();
+      const startIndex = key.indexOf(BRACKETED_PASTE_START);
+      const before = key.slice(0, startIndex);
+
+      if (before) {
+        this.value += before;
+      }
+
+      this.inBracketedPaste = true;
+      this.pasteBuffer = "";
+      this.appendBracketedPaste(
+        key.slice(startIndex + BRACKETED_PASTE_START.length)
+      );
+
+      return;
+    }
+
+    if (key === "\u0003") {
+      this.onCancel();
+
+      return;
+    }
+
+    const mouse = key.match(/^\x1b\[<(\d+);\d+;\d+M$/);
+
+    if (mouse) {
+      // biome-ignore lint/suspicious/noBitwiseOperators: SGR mouse buttons encode Shift/Alt/Ctrl in bits 2–4.
+      const button = Number(mouse[1]) & ~28;
+
+      if (button === 64 || button === 65) {
+        this.onScrollHistory?.(button === 64 ? "line_up" : "line_down");
+      }
+
+      return;
+    }
+
+    if (key === "\u0004" && this.value.length === 0) {
+      this.onCancel();
+
+      return;
+    }
+
+    if (
+      key === "\n" ||
+      key === "\u001b\r" ||
+      matchesKey(key, Key.shift("enter"))
+    ) {
+      this.value += "\n";
+      this.resetSelection();
+      this.cursorVisible = true;
+      this.render();
+
+      return;
+    }
+
+    if (key === "\r") {
+      void this.submit();
+
+      return;
+    }
+
+    if (key === "\u001b[A") {
+      const suggestions = this.currentSuggestions();
+
+      if (suggestions.length > 0) {
+        this.hasNavigated = true;
+        this.selectedIndex =
+          (this.selectedIndex - 1 + suggestions.length) % suggestions.length;
+        this.render();
+      } else if (this.value.length === 0) {
+        // Some terminals emit wheel as arrow keys; treat empty-composer arrows as history scroll.
+        this.onScrollHistory?.("line_up");
+      }
+
+      return;
+    }
+
+    if (key === "\u001b[B") {
+      const suggestions = this.currentSuggestions();
+
+      if (suggestions.length > 0) {
+        this.hasNavigated = true;
+        this.selectedIndex = (this.selectedIndex + 1) % suggestions.length;
+        this.render();
+      } else if (this.value.length === 0) {
+        this.onScrollHistory?.("line_down");
+      }
+
+      return;
+    }
+
+    if (key === "\t") {
+      const suggestions = this.currentSuggestions();
+      const suggestion = suggestions[this.selectedIndex] ?? suggestions[0];
+
+      if (suggestion) {
+        this.applySuggestion(suggestion);
+      }
+
+      return;
+    }
+
+    if (matchesKey(key, Key.ctrl("v"))) {
+      this.queueClipboardAttach();
+
+      return;
+    }
+
+    if (key === "\u001b[5~") {
+      this.onScrollHistory?.("page_up");
+
+      return;
+    }
+
+    if (key === "\u001b[6~") {
+      this.onScrollHistory?.("page_down");
+
+      return;
+    }
+
+    if (key === "\u001b[H" || key === "\u001b[1~") {
+      this.onScrollHistory?.("home");
+
+      return;
+    }
+
+    if (key === "\u001b[F" || key === "\u001b[4~") {
+      this.onScrollHistory?.("end");
+
+      return;
+    }
+
+    if (key === "\u007f" || key === "\b") {
+      const lastPaste = this.textPastes.at(-1);
+
+      if (lastPaste && lastPaste.end === this.value.length) {
+        this.value = this.value.slice(0, lastPaste.start);
+        this.textPastes.pop();
+      } else if (this.value.length > 0) {
+        this.value = this.value.slice(0, -1);
+      } else if (this.attachedImages.length > 0) {
+        this.attachedImages.pop();
+      }
+
+      this.resetSelection();
+      this.cursorVisible = true;
+      this.render();
+
+      return;
+    }
+
+    if (key.startsWith("\u001b")) {
+      return;
+    }
+
+    if (key.length > 1) {
+      const printable = [...key]
+        .filter((char) => char >= " " && char !== "\u007f")
+        .join("");
+
+      if (!printable) {
+        return;
+      }
+
+      this.stopBlink();
+      this.value += normalizePastedText(printable);
+      this.resetSelection();
+      this.cursorVisible = true;
+      this.render();
+      this.startBlink();
+
+      return;
+    }
+
+    if (key.length === 1 && key >= " ") {
+      this.value += key;
+      this.resetSelection();
+      this.cursorVisible = true;
+      this.render();
+    }
+  };
+}

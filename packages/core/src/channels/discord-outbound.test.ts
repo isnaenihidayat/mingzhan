@@ -1,0 +1,248 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { z } from "zod";
+import { asTestFetch } from "../channel-test-helpers";
+import type { JsonValue } from "../contract";
+import { getDiscordConfigDir, getDiscordConfigPath } from "../discord-config";
+import { createDiscordOutboundAdapter } from "./discord-outbound";
+
+const owner = { orgId: "org_test", profileId: "agent_test" };
+
+type JsonObject = Record<string, JsonValue>;
+
+const JsonObjectSchema = z.record(z.string(), z.json());
+
+function parseJsonObject(text: string): JsonObject {
+  return JsonObjectSchema.parse(JSON.parse(text));
+}
+
+describe("createDiscordOutboundAdapter", () => {
+  const previousConfigDir = process.env.MINGZHAN_CONFIG_DIR;
+
+  afterEach(async () => {
+    if (previousConfigDir === undefined) {
+      delete process.env.MINGZHAN_CONFIG_DIR;
+    } else {
+      process.env.MINGZHAN_CONFIG_DIR = previousConfigDir;
+    }
+  });
+
+  async function withDiscordConfig(
+    ini: string,
+    run: () => Promise<void>
+  ): Promise<void> {
+    const configDir = await mkdtemp(join(tmpdir(), "mingzhan-discord-outbound-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+    await mkdir(getDiscordConfigDir(owner), { recursive: true });
+    await writeFile(getDiscordConfigPath(owner), ini, "utf8");
+
+    try {
+      await run();
+    } finally {
+      await rm(configDir, { force: true, recursive: true });
+    }
+  }
+
+  test("posts to a guild channel with bot auth and mention suppression", async () => {
+    await withDiscordConfig("bot_token=test-bot-token\n", async () => {
+      const calls: Array<{
+        body: JsonObject;
+        headers: Record<string, string>;
+        url: string;
+      }> = [];
+
+      const adapter = createDiscordOutboundAdapter({
+        fetchImpl: asTestFetch(async (input, init) => {
+          calls.push({
+            body: parseJsonObject(String(init?.body)),
+            headers: Object.fromEntries(new Headers(init?.headers).entries()),
+            url: String(input),
+          });
+
+          return new Response("{}", { status: 200 });
+        }),
+      });
+
+      await expect(
+        adapter.send({
+          ...owner,
+          channelId: "123456789012345678",
+          text: "hello",
+        })
+      ).resolves.toEqual({ ok: true });
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.url).toBe(
+        "https://discord.com/api/v10/channels/123456789012345678/messages"
+      );
+      expect(calls[0]?.headers.authorization).toBe("Bot test-bot-token");
+      expect(calls[0]?.headers["user-agent"]).toStartWith("DiscordBot");
+      expect(calls[0]?.body).toEqual({
+        allowed_mentions: { parse: [] },
+        content: "hello",
+      });
+    });
+  });
+
+  test("opens a DM per paired user then posts to the returned channel", async () => {
+    await withDiscordConfig(
+      "bot_token=test-bot-token\npaired_user_ids=111111111111111111,222222222222222222\n",
+      async () => {
+        const calls: Array<{ body: JsonObject; url: string }> = [];
+
+        const adapter = createDiscordOutboundAdapter({
+          fetchImpl: asTestFetch(async (input, init) => {
+            const url = String(input);
+
+            const body = parseJsonObject(String(init?.body));
+
+            calls.push({ body, url });
+
+            if (url.endsWith("/users/@me/channels")) {
+              const recipient = String(body.recipient_id);
+
+              return Response.json({
+                id: `dm-${recipient}`,
+              });
+            }
+
+            return new Response("{}", { status: 200 });
+          }),
+        });
+
+        await expect(
+          adapter.send({ ...owner, text: "hello" })
+        ).resolves.toEqual({
+          ok: true,
+        });
+
+        expect(calls.map((call) => call.url)).toEqual([
+          "https://discord.com/api/v10/users/@me/channels",
+          "https://discord.com/api/v10/channels/dm-111111111111111111/messages",
+          "https://discord.com/api/v10/users/@me/channels",
+          "https://discord.com/api/v10/channels/dm-222222222222222222/messages",
+        ]);
+        expect(calls[0]?.body).toEqual({ recipient_id: "111111111111111111" });
+        expect(calls[2]?.body).toEqual({ recipient_id: "222222222222222222" });
+      }
+    );
+  });
+
+  test("chunks text longer than 2000 into multiple posts", async () => {
+    await withDiscordConfig("bot_token=test-bot-token\n", async () => {
+      const contents: string[] = [];
+
+      const adapter = createDiscordOutboundAdapter({
+        fetchImpl: asTestFetch(async (_input, init) => {
+          const body = z
+            .object({ content: z.string() })
+            .parse(parseJsonObject(String(init?.body)));
+
+          contents.push(body.content);
+
+          return new Response("{}", { status: 200 });
+        }),
+      });
+
+      await expect(
+        adapter.send({
+          ...owner,
+          channelId: "123456789012345678",
+          text: "a".repeat(2500),
+        })
+      ).resolves.toEqual({ ok: true });
+
+      expect(contents.length).toBeGreaterThan(1);
+      expect(contents.every((chunk) => chunk.length <= 2000)).toBe(true);
+    });
+  });
+
+  test("returns without fetch when the bot token is missing", async () => {
+    await withDiscordConfig("", async () => {
+      let called = false;
+
+      const adapter = createDiscordOutboundAdapter({
+        fetchImpl: asTestFetch(async () => {
+          called = true;
+
+          return new Response("{}", { status: 200 });
+        }),
+      });
+
+      await expect(adapter.send({ ...owner, text: "hello" })).resolves.toEqual({
+        error: "Discord bot token is not configured.",
+        ok: false,
+      });
+      expect(called).toBe(false);
+    });
+  });
+
+  test("returns without fetch when no paired users and no channelId", async () => {
+    await withDiscordConfig("bot_token=test-bot-token\n", async () => {
+      let called = false;
+
+      const adapter = createDiscordOutboundAdapter({
+        fetchImpl: asTestFetch(async () => {
+          called = true;
+
+          return new Response("{}", { status: 200 });
+        }),
+      });
+
+      await expect(adapter.send({ ...owner, text: "hello" })).resolves.toEqual({
+        error: "No Discord user is paired.",
+        ok: false,
+      });
+      expect(called).toBe(false);
+    });
+  });
+
+  test("stops the loop on the first 403 or 429", async () => {
+    await withDiscordConfig(
+      "bot_token=test-bot-token\npaired_user_ids=111111111111111111,222222222222222222\n",
+      async () => {
+        const urls: string[] = [];
+
+        const adapter = createDiscordOutboundAdapter({
+          fetchImpl: asTestFetch(async (input) => {
+            urls.push(String(input));
+
+            if (String(input).endsWith("/users/@me/channels")) {
+              return Response.json({ id: "dm-1" });
+            }
+
+            return new Response("missing access", { status: 403 });
+          }),
+        });
+
+        const result = await adapter.send({ ...owner, text: "hello" });
+        expect(result.ok).toBe(false);
+        expect(result.error).toContain("403");
+        expect(urls.filter((url) => url.includes("/messages"))).toHaveLength(1);
+        expect(
+          urls.filter((url) => url.includes("/users/@me/channels"))
+        ).toHaveLength(1);
+      }
+    );
+  });
+
+  test("rejects empty text", async () => {
+    await withDiscordConfig(
+      "bot_token=test-bot-token\npaired_user_ids=111111111111111111\n",
+      async () => {
+        const adapter = createDiscordOutboundAdapter({
+          fetchImpl: asTestFetch(
+            async () => new Response("{}", { status: 200 })
+          ),
+        });
+
+        await expect(adapter.send({ ...owner, text: "   " })).resolves.toEqual({
+          error: "Message text is empty.",
+          ok: false,
+        });
+      }
+    );
+  });
+});

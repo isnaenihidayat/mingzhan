@@ -1,0 +1,416 @@
+import { describe, expect, test } from "bun:test";
+import type { CustomModelEntry } from "@mingzhan/core";
+import {
+  estimateUsageCostUsd,
+  getExplicitModelPricing,
+  getModelPricing,
+  hasCatalogPricing,
+} from "./pricing";
+
+const openRouterInstance = {
+  apiKey: "sk-test",
+  createdAt: "2026-06-07T10:00:00.000Z",
+  id: "or-1",
+  label: "OpenRouter",
+  type: "openrouter" as const,
+};
+
+const compatibleInstance = {
+  apiKey: "k",
+  baseUrl: "http://localhost:11434/v1",
+  createdAt: "2026-06-07T10:00:00.000Z",
+  id: "cmp-1",
+  label: "Ollama",
+  type: "openai_compatible" as const,
+};
+
+const cerebrasInstance = {
+  apiKey: "csk-test",
+  createdAt: "2026-07-16T10:00:00.000Z",
+  id: "cb-1",
+  label: "Cerebras",
+  type: "cerebras" as const,
+};
+
+const fireworksInstance = {
+  apiKey: "fw-test",
+  createdAt: "2026-07-24T10:00:00.000Z",
+  id: "fw-1",
+  label: "Fireworks",
+  type: "fireworks" as const,
+};
+
+const moonshotInstance = {
+  apiKey: "sk-moonshot-test",
+  baseUrl: "https://api.moonshot.ai/v1",
+  createdAt: "2026-09-08T10:00:00.000Z",
+  id: "ms-1",
+  label: "Moonshot Kimi",
+  type: "moonshot" as const,
+};
+
+describe("estimateUsageCostUsd", () => {
+  test("uses saved Netra rates and counts cached input once", () => {
+    const instance = {
+      apiKey: "netra-key",
+      createdAt: "2026-10-05T00:00:00.000Z",
+      customModels: [
+        {
+          cachedInputPerMillionUsd: 0.05,
+          id: "deepseek/deepseek-v4-flash-0731",
+          inputPerMillionUsd: 0.2,
+          outputPerMillionUsd: 0.5,
+        },
+      ],
+      id: "netra-1",
+      label: "Netra Runtime",
+      type: "netra" as const,
+    };
+
+    expect(
+      getModelPricing("deepseek/deepseek-v4-flash-0731", {
+        providerInstance: instance,
+      })
+    ).toEqual({
+      cachedInputPerMillionUsd: 0.05,
+      inputPerMillionUsd: 0.2,
+      outputPerMillionUsd: 0.5,
+    });
+    expect(
+      estimateUsageCostUsd(
+        "deepseek/deepseek-v4-flash-0731",
+        1200,
+        300,
+        { providerInstance: instance },
+        800
+      )
+    ).toBeCloseTo(0.000_27);
+    expect(
+      getModelPricing("deepseek/deepseek-v4.1-flash", { provider: "netra" })
+    ).toBeNull();
+  });
+  test("prices shared model ids by provider, including subscription zero rates", () => {
+    expect(
+      estimateUsageCostUsd("gpt-5.5", 100_000, 20_000, {
+        provider: "openai",
+        providerInstance: { ...openRouterInstance, type: "chatgpt" },
+      })
+    ).toBeCloseTo(1.1);
+    expect(
+      estimateUsageCostUsd("gpt-5.5", 100_000, 20_000, {
+        provider: "chatgpt",
+      })
+    ).toBe(0);
+    expect(
+      estimateUsageCostUsd("gpt-5.5", 100_000, 20_000, {
+        providerInstance: { ...openRouterInstance, type: "chatgpt" },
+      })
+    ).toBe(0);
+    // Legacy callers without provider context still use the global catalog.
+    expect(estimateUsageCostUsd("gpt-5.5", 100_000, 20_000)).toBeCloseTo(1.1);
+    expect(
+      getExplicitModelPricing("gpt-5.5", { provider: "anthropic" })
+    ).toBeNull();
+  });
+
+  test("estimates direct DeepSeek usage at peak uncached rates", () => {
+    expect(
+      estimateUsageCostUsd("deepseek-flash", 2_000_000, 500_000)
+    ).toBeCloseTo(1.2);
+    expect(
+      estimateUsageCostUsd("deepseek-v4-pro", 2_000_000, 500_000)
+    ).toBeCloseTo(4.62);
+  });
+
+  test("computes cost from catalog pricing", () => {
+    const cost = estimateUsageCostUsd(
+      "claude-sonnet-4-6",
+      1_000_000,
+      1_000_000
+    );
+
+    expect(cost).toBe(18);
+  });
+
+  test("uses Cloudflare's published input and output rates for exact model ids", () => {
+    // https://developers.cloudflare.com/workers-ai/platform/pricing/
+    // Checked 2026-09-22. Each row guards a separately maintained catalog entry.
+    for (const [id, input, output] of [
+      ["@cf/meta/llama-3.3-70b-instruct-fp8-fast", 0.293, 2.253],
+      ["@cf/meta/llama-3.1-8b-instruct", 0.282, 0.827],
+      ["@cf/meta/llama-4-scout-17b-16e-instruct", 0.27, 0.85],
+      ["@cf/qwen/qwen2.5-coder-32b-instruct", 0.66, 1],
+      ["@cf/deepseek-ai/deepseek-r1-distill-qwen-32b", 0.497, 4.881],
+    ] as const) {
+      expect(getExplicitModelPricing(id, { provider: "cloudflare" })).toEqual({
+        inputPerMillionUsd: input,
+        outputPerMillionUsd: output,
+      });
+    }
+  });
+
+  test("uses fallback pricing for unknown models", () => {
+    const pricing = getModelPricing("vendor/custom-model");
+    expect(pricing?.inputPerMillionUsd).toBe(1);
+    expect(pricing?.outputPerMillionUsd).toBe(3);
+  });
+
+  test("prices gpt-image-2 with Images token rates", () => {
+    const pricing = getModelPricing("gpt-image-2");
+    expect(pricing).toEqual({
+      inputPerMillionUsd: 5,
+      outputPerMillionUsd: 30,
+    });
+    // 1M input + 1M output → $5 + $30
+    expect(estimateUsageCostUsd("gpt-image-2", 1_000_000, 1_000_000)).toBe(35);
+  });
+
+  test("uses saved pricing for openrouter custom models", () => {
+    const cost = estimateUsageCostUsd(
+      "anthropic/claude-sonnet-4-6",
+      1_000_000,
+      1_000_000,
+      {
+        provider: "openrouter",
+        providerInstance: {
+          ...openRouterInstance,
+          customModels: [
+            {
+              id: "anthropic/claude-sonnet-4-6",
+              inputPerMillionUsd: 3,
+              outputPerMillionUsd: 15,
+            },
+          ],
+        },
+      }
+    );
+
+    expect(cost).toBe(18);
+  });
+
+  test("does not estimate openrouter models without saved pricing", () => {
+    expect(
+      getModelPricing("anthropic/claude-sonnet-4-6", {
+        provider: "openrouter",
+        providerInstance: {
+          ...openRouterInstance,
+          customModels: [{ id: "anthropic/claude-sonnet-4-6" }],
+        },
+      })
+    ).toBeNull();
+    expect(
+      estimateUsageCostUsd("anthropic/claude-sonnet-4-6", 1000, 500, {
+        provider: "openrouter",
+        providerInstance: {
+          ...openRouterInstance,
+          customModels: [{ id: "anthropic/claude-sonnet-4-6" }],
+        },
+      })
+    ).toBe(0);
+  });
+
+  test("uses saved pricing for cerebras custom models", () => {
+    const cost = estimateUsageCostUsd("gpt-oss-120b", 1_000_000, 1_000_000, {
+      provider: "cerebras",
+      providerInstance: {
+        ...cerebrasInstance,
+        customModels: [
+          {
+            id: "gpt-oss-120b",
+            inputPerMillionUsd: 0.25,
+            outputPerMillionUsd: 0.69,
+          },
+        ],
+      },
+    });
+
+    expect(cost).toBeCloseTo(0.94, 5);
+  });
+
+  test("uses saved pricing for fireworks custom models", () => {
+    const cost = estimateUsageCostUsd(
+      "accounts/fireworks/models/kimi-k2p6",
+      1_000_000,
+      1_000_000,
+      {
+        provider: "fireworks",
+        providerInstance: {
+          ...fireworksInstance,
+          customModels: [
+            {
+              id: "accounts/fireworks/models/kimi-k2p6",
+              inputPerMillionUsd: 0.5,
+              outputPerMillionUsd: 2,
+            },
+          ],
+        },
+      }
+    );
+
+    expect(cost).toBeCloseTo(2.5, 5);
+  });
+
+  test("uses saved pricing for moonshot discovered models", () => {
+    const cost = estimateUsageCostUsd("kimi-k2.5", 1_000_000, 1_000_000, {
+      provider: "moonshot",
+      providerInstance: {
+        ...moonshotInstance,
+        customModels: [
+          {
+            id: "kimi-k2.5",
+            inputPerMillionUsd: 0.6,
+            outputPerMillionUsd: 2.5,
+          },
+        ],
+      },
+    });
+
+    expect(cost).toBeCloseTo(3.1, 5);
+  });
+
+  test("does not estimate discovery-provider models without saved pricing", () => {
+    // Discovery catalogs are fetched at runtime, so there is no bundled entry
+    // to price against: report unknown instead of DEFAULT_PRICING.
+    expect(
+      getModelPricing("kimi-k2.5", {
+        provider: "moonshot",
+        providerInstance: {
+          ...moonshotInstance,
+          customModels: [{ id: "kimi-k2.5" }],
+        },
+      })
+    ).toBeNull();
+    expect(getModelPricing("MiniMax-M3", { provider: "minimax" })).toBeNull();
+    expect(getModelPricing("glm-5.2", { provider: "zhipu_cn" })).toBeNull();
+  });
+
+  test("does not estimate compatible models without user pricing", () => {
+    const pricing = getModelPricing("llama3.2", {
+      provider: "openai_compatible",
+      providerInstance: {
+        ...compatibleInstance,
+        customModels: [{ id: "llama3.2" }],
+      },
+    });
+
+    expect(pricing).toBeNull();
+    expect(
+      estimateUsageCostUsd("llama3.2", 1000, 500, {
+        provider: "openai_compatible",
+        providerInstance: {
+          ...compatibleInstance,
+          customModels: [{ id: "llama3.2" }],
+        },
+      })
+    ).toBe(0);
+    expect(
+      hasCatalogPricing("llama3.2", {
+        provider: "openai_compatible",
+        providerInstance: {
+          ...compatibleInstance,
+          customModels: [
+            {
+              id: "llama3.2",
+              inputPerMillionUsd: 0,
+              outputPerMillionUsd: 0,
+            },
+          ],
+        },
+      })
+    ).toBe(true);
+  });
+});
+
+describe("getExplicitModelPricing", () => {
+  test("returns null where getModelPricing falls back", () => {
+    expect(getExplicitModelPricing("vendor/custom-model")).toBeNull();
+    expect(getModelPricing("vendor/custom-model")).not.toBeNull();
+  });
+
+  test("returns the catalog rates for a known model", () => {
+    expect(getExplicitModelPricing("claude-sonnet-4-6")).toEqual({
+      inputPerMillionUsd: 3,
+      outputPerMillionUsd: 15,
+    });
+  });
+
+  test("keeps the Images rates for gpt-image-2 on a compatible endpoint without its own rates", () => {
+    expect(
+      getExplicitModelPricing("gpt-image-2", {
+        providerInstance: compatibleInstance,
+      })
+    ).toEqual({ inputPerMillionUsd: 5, outputPerMillionUsd: 30 });
+  });
+
+  test("uses custom endpoint pricing even when the id exists in another catalog", () => {
+    expect(
+      getExplicitModelPricing("gpt-5.5", {
+        provider: "openai_compatible",
+        providerInstance: {
+          ...compatibleInstance,
+          customModels: [
+            { id: "gpt-5.5", inputPerMillionUsd: 2, outputPerMillionUsd: 4 },
+          ],
+        },
+      })
+    ).toEqual({ inputPerMillionUsd: 2, outputPerMillionUsd: 4 });
+  });
+});
+
+describe("estimateUsageCostUsd with a cached prompt slice", () => {
+  const instanceWith = (model: CustomModelEntry) => ({
+    providerInstance: {
+      apiKey: "k",
+      baseUrl: "http://localhost:1/v1",
+      createdAt: "2026-06-07T10:00:00.000Z",
+      customModels: [model],
+      id: "cmp-cached",
+      label: "Cached",
+      type: "openai_compatible" as const,
+    },
+  });
+
+  test("bills the cached slice at its own rate, or the input rate when unset", () => {
+    const priced = estimateUsageCostUsd(
+      "m",
+      1_000_000,
+      0,
+      instanceWith({
+        cachedInputPerMillionUsd: 1,
+        id: "m",
+        inputPerMillionUsd: 10,
+        outputPerMillionUsd: 30,
+      }),
+      400_000
+    );
+
+    // 600k fresh at $10/1M plus 400k cached at $1/1M.
+    expect(priced).toBeCloseTo(6.4, 6);
+
+    // No cached rate published, so an existing install's numbers cannot move.
+    const noCachedRate = instanceWith({
+      id: "m",
+      inputPerMillionUsd: 10,
+      outputPerMillionUsd: 30,
+    });
+
+    expect(estimateUsageCostUsd("m", 1_000_000, 0, noCachedRate, 400_000)).toBe(
+      estimateUsageCostUsd("m", 1_000_000, 0, noCachedRate)
+    );
+  });
+
+  test("clamps a cached count larger than the input it belongs to", () => {
+    const ctx = instanceWith({
+      cachedInputPerMillionUsd: 1,
+      id: "m",
+      inputPerMillionUsd: 10,
+      outputPerMillionUsd: 30,
+    });
+
+    // Unclamped this prices 999k tokens of "fresh" input negatively.
+    expect(estimateUsageCostUsd("m", 1000, 0, ctx, 999_999)).toBeCloseTo(
+      0.001,
+      6
+    );
+  });
+});

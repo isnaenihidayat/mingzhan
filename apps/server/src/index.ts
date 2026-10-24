@@ -1,0 +1,855 @@
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  flushPendingErrorReports,
+  installErrorHandlers,
+  installErrorTrackingSink,
+} from "@mingzhan/core";
+import type { Server } from "bun";
+import { ensureProcessPath } from "./lib/ensure-process-path";
+import { createPluginAgentHost } from "./services/plugin-agent-host";
+
+ensureProcessPath();
+
+if (process.env.MINGZHAN_DESKTOP === "1") {
+  if (!process.connected) {
+    process.exit(0);
+  }
+
+  // Also covers losing Electron while the database is still initializing.
+  process.on("disconnect", () => process.emit("SIGTERM", "SIGTERM"));
+}
+
+// Position is cosmetic: ESM evaluates every import above before this line runs, so a throw
+// inside @mingzhan/db or @mingzhan/agent module init is already past. Everything after is covered.
+installErrorHandlers("server");
+
+/**
+ * Only the server drains the queue. Four processes share one config dir, and the
+ * queue is a read-modify-write on a single file, so draining from all of them would
+ * race. The workers are spawned by the server, so it is the one that is always up.
+ * ponytail: single drainer, give the queue per-process files if a worker ever runs
+ * without a server.
+ */
+void installErrorTrackingSink().then(() => flushPendingErrorReports());
+
+import { generateSkillConsolidateMarkdown } from "@mingzhan/agent";
+import {
+  clearRuntimeServerUrl,
+  DEFAULT_SERVER_HOST,
+  DEFAULT_SERVER_PORT,
+  ensureBundledSkillFiles,
+  getActiveProviderInstance,
+  getUserConfigDir,
+  loadConfig,
+  MINGZHAN_API_VERSION,
+  writeRuntimeServerUrl,
+} from "@mingzhan/core";
+import {
+  createDatabase,
+  type Database,
+  ensureBundledSkillsAssigned,
+  resolveDatabasePath,
+  seedDatabase,
+} from "@mingzhan/db";
+import { createHonoApp, MAX_HTTP_REQUEST_BODY_LIMIT_BYTES } from "./http/app";
+import {
+  disableBunIdleTimeoutForLongHeldRequest,
+  disableBunIdleTimeoutForSse,
+} from "./http/sse-idle-timeout";
+import { createProviderForInstance } from "./providers/create";
+import { runFirstBootSeed } from "./seed";
+import { AgentService } from "./services/agent-service";
+import { AuthService } from "./services/auth-service";
+import { AutomationDeliveryService } from "./services/automation-delivery-service";
+import { AutomationRunner } from "./services/automation-runner";
+import { AutomationService } from "./services/automation-service";
+import { resolveComposioCallbackBaseUrl } from "./services/composio-callback-url";
+import { ComposioService } from "./services/composio-service";
+import { claimLegacyCustomTools } from "./services/custom-tool-handlers";
+import { retireAppUserData } from "./services/data-portability";
+import { openaiProviderKey } from "./services/google-meet/actions";
+import { GoogleMeetService } from "./services/google-meet/service";
+import { LlmUsageTracker } from "./services/llm-usage-tracker";
+import { McpClientManager } from "./services/mcp-client-manager";
+import {
+  createMcpAwareEmailOutboundAdapter,
+  hasAutomationEmailDeliveryPath,
+} from "./services/mcp-email-delivery";
+import { McpService } from "./services/mcp-service";
+import { cleanupInterruptedMeetImports } from "./services/meet-recording-import";
+import { OrgMemoryService } from "./services/org-memory-service";
+import { OrgService } from "./services/org-service";
+import {
+  PluginService,
+  shutdownPluginRuntime,
+} from "./services/plugin-service";
+import {
+  resolveDefaultModelForInstance,
+  resolveProfileProviderSelection,
+} from "./services/provider-instance-helpers";
+import { SkillCuratorService } from "./services/skill-curator-service";
+import { SkillProposalService } from "./services/skill-proposal-service";
+import { SkillSuggestionService } from "./services/skill-suggestion-service";
+import { SkillsService } from "./services/skills-service";
+import { SystemStatusService } from "./services/system-status-service";
+import { WorkerManagerService } from "./services/worker-manager-service";
+import { ensureProviderConfigured } from "./setup";
+import { resolveWebDistDir } from "./static-web";
+import {
+  createAutomationRunHistoryTools,
+  createAutomationTools,
+} from "./tools/automation-tools";
+import { isTenantBashEnabled } from "./tools/bash-config";
+import { createGenerateImageTool } from "./tools/generate-image-tool";
+import { createSaveArtifactTool } from "./tools/save-artifact-tool";
+import { createSessionTools } from "./tools/session-tools";
+import { createSubAgentTool } from "./tools/sub-agent-tool";
+
+const projectRoot = join(dirname(fileURLToPath(import.meta.url)), "../../..");
+
+let workerRecovery: Promise<void> = Promise.resolve();
+
+const host = process.env.MINGZHAN_HOST ?? DEFAULT_SERVER_HOST;
+
+const requestedPort = parsePort(process.env.MINGZHAN_PORT);
+
+const canFallbackToNextPort = process.env.MINGZHAN_PORT == null;
+
+const existingServerUrl = await findRunningMíngZhànServerUrl(host, requestedPort);
+
+if (existingServerUrl) {
+  const runtimeServerUrl = writeRuntimeServerUrl(existingServerUrl);
+  console.log(`MíngZhàn server already running on ${runtimeServerUrl}`);
+  console.log(
+    "Stop it before restarting to pick up code changes (for example: kill $(lsof -ti :4310))."
+  );
+  console.log("Or run: bun run dev:server");
+  process.exit(0);
+}
+
+const { provider, userConfig } = await ensureProviderConfigured();
+
+const config = loadConfig();
+
+const database = await createDatabase(config.databaseUrl, {
+  baseDir: getUserConfigDir(),
+});
+
+const MAX_AUTOMATION_RUN_RESUMES = 2;
+
+await seedDatabase(database.adapter, { grantBash: isTenantBashEnabled() });
+
+await cleanupInterruptedMeetImports();
+
+await claimLegacyCustomTools(database.adapter);
+
+await retireAppUserData(
+  getUserConfigDir(),
+  resolveDatabasePath(config.databaseUrl, { baseDir: getUserConfigDir() })
+);
+
+// Runs are only completed by the process that started them, so a crash or a
+// kill leaves rows claiming work nothing is doing. Settle them before serving.
+// ponytail: correct while this is a single process; two servers would mean one
+// boot settling the other's live runs, which needs a heartbeat to tell apart.
+const interruptedRuns = await database.adapter.failInterruptedRuns();
+
+if (interruptedRuns > 0) {
+  console.log(`Settled ${interruptedRuns} run(s) interrupted by a restart`);
+}
+
+// Automation runs continue from their last saved tool step instead; one that
+// was already resumed twice is failed here.
+const resumableAutomationRuns =
+  await database.adapter.claimInterruptedAutomationRuns(
+    MAX_AUTOMATION_RUN_RESUMES
+  );
+
+// Channel credentials used to be install-wide. On a single-org install that
+// config can only belong to that org, so claim it once before any scope-exact
+// read reports the org as unconfigured.
+const organizations = await database.adapter.listOrganizations();
+
+const authService = new AuthService();
+
+const llmUsageTracker = new LlmUsageTracker(database.adapter);
+
+const agent = new AgentService(
+  userConfig,
+  provider,
+  database.adapter,
+  llmUsageTracker
+);
+
+const composioService = new ComposioService(database.adapter, authService);
+
+const googleMeetService = new GoogleMeetService(
+  database.adapter,
+  getUserConfigDir(),
+  (request, signal) => agent.transcribeAudio(request, signal),
+  () => openaiProviderKey(agent.getUserConfig()),
+  composioService
+);
+
+agent.setServerTools({
+  generateImage: createGenerateImageTool({
+    db: database.adapter,
+    ensureSettingsLoaded: () => agent.ensureImageGenerationSettingsLoaded(),
+    getUserConfig: () => agent.getUserConfig(),
+    recordUsage: (
+      modelId,
+      inputTokens,
+      outputTokens,
+      providerInstance,
+      attribution
+    ) => {
+      llmUsageTracker.record(modelId, inputTokens, outputTokens, {
+        ...attribution,
+        pricingContext: { providerInstance },
+      });
+    },
+  }),
+  googleMeet: googleMeetService.tools(),
+  saveArtifact: createSaveArtifactTool({ db: database.adapter }),
+  session: createSessionTools(agent),
+  subAgent: createSubAgentTool(agent),
+});
+
+await agent.ensureVisionSettingsLoaded();
+
+await agent.ensureTranscriptionSettingsLoaded();
+
+await agent.ensureImageGenerationSettingsLoaded();
+
+// A restart drops the cognito session map, so whatever it was holding can no
+// longer be reached, let alone cleaned up on close.
+const sweptAttachments = await agent.sweepEphemeralAttachments();
+
+if (sweptAttachments > 0) {
+  console.info(
+    `[cognito] swept ${sweptAttachments} attachment(s) left by a previous run`
+  );
+}
+
+const mcpClientManager = new McpClientManager();
+
+const mcpService = new McpService(database.adapter, mcpClientManager);
+
+const skillsService = new SkillsService(database.adapter);
+
+agent.setMcpClientManager(mcpClientManager);
+
+agent.setMcpService(mcpService);
+
+agent.setComposioService(composioService);
+
+agent.setSkillsService(skillsService);
+
+const automationService = new AutomationService(database.adapter, {
+  canSendEmail: (profileId, _orgId) =>
+    hasAutomationEmailDeliveryPath(database.adapter, profileId),
+  getUserTimezone: () => agent.getUserTimezone(),
+});
+
+const automationDeliveryService = new AutomationDeliveryService(
+  automationService,
+  {
+    email: createMcpAwareEmailOutboundAdapter(database.adapter, mcpService),
+  }
+);
+
+const automationRunner = new AutomationRunner(
+  automationService,
+  agent,
+  automationDeliveryService
+);
+
+agent.setAutomationTools(
+  createAutomationTools(automationService, automationRunner)
+);
+
+agent.setAutomationRunHistoryTools(
+  createAutomationRunHistoryTools(automationService)
+);
+
+agent.setAutomationRunner(automationRunner);
+
+if (resumableAutomationRuns.length > 0) {
+  console.log(
+    `Resuming ${resumableAutomationRuns.length} automation run(s) interrupted by a restart`
+  );
+  void automationRunner.resumeInterrupted(resumableAutomationRuns);
+}
+
+const workerManager = new WorkerManagerService(
+  projectRoot,
+  undefined,
+  (providerType) => {
+    const userConfig = agent.getUserConfig();
+    const active = getActiveProviderInstance(userConfig);
+
+    const configured = providerType
+      ? active?.type === providerType && active.apiKey.trim()
+        ? active
+        : userConfig?.providers.find(
+            (provider) =>
+              provider.type === providerType && provider.apiKey.trim()
+          )
+      : active;
+
+    if (!configured) {
+      return null;
+    }
+
+    return {
+      apiKey: configured.apiKey,
+      baseUrl: configured.baseUrl,
+      model: resolveDefaultModelForInstance(configured),
+      type: configured.type,
+    };
+  }
+);
+
+agent.channelWorkers = workerManager;
+
+workerManager.channelOwnerAvailable = async ({ orgId, profileId }) => {
+  const org = await database.adapter.getOrganizationById(orgId);
+
+  return Boolean(
+    org &&
+      !org.archivedAt &&
+      (await database.adapter.listProfilesForOrg(orgId)).some(
+        (profile) => profile.id === profileId
+      )
+  );
+};
+
+try {
+  await workerManager.migrateAgentChannels(database.adapter);
+} catch (error) {
+  console.warn("Channel migration requires attention:", error);
+}
+
+agent.setChannelOwnerCleanup((orgId, profileId) =>
+  workerManager.disableProfileChannels({ orgId, profileId }, true)
+);
+
+const orgService = new OrgService(database.adapter, authService);
+
+agent.setOrgService(orgService);
+
+orgService.beforeArchiveChannels = async (orgId) => {
+  const releaseMeet = googleMeetService.pauseOrganization(orgId);
+  const owners: Array<{ orgId: string; profileId: string }> = [];
+
+  const release = () => {
+    releaseMeet();
+
+    for (const owner of owners) {
+      workerManager.allowProfileChannels(owner);
+    }
+  };
+
+  try {
+    owners.push(
+      ...(await database.adapter.listProfilesForOrg(orgId)).map((profile) => ({
+        orgId,
+        profileId: profile.id,
+      }))
+    );
+    await googleMeetService.stopOrganization(orgId);
+
+    for (const owner of owners) {
+      await workerManager.disableProfileChannels(owner);
+    }
+  } catch (error) {
+    release();
+    throw error;
+  }
+
+  return release;
+};
+
+const pluginService = new PluginService(database.adapter, getUserConfigDir(), {
+  officialPackagesDir: join(projectRoot, "packages/plugins"),
+  onHostRequest: createPluginAgentHost(
+    database.adapter,
+    agent,
+    composioService
+  ),
+  workerManager,
+});
+
+await googleMeetService.initialize();
+
+try {
+  await pluginService.recoverInterruptedPluginOperations();
+} catch (error) {
+  console.warn("Could not recover plugin operations:", error);
+}
+
+skillsService.setPluginService(pluginService);
+
+agent.setPluginService(pluginService);
+
+const orgMemoryService = new OrgMemoryService(database.adapter);
+
+const skillProposalService = new SkillProposalService(
+  database.adapter,
+  skillsService
+);
+
+const skillCuratorService = new SkillCuratorService(
+  database.adapter,
+  skillsService,
+  skillProposalService,
+  {
+    generateMarkdown: async (input) => {
+      const userConfig = agent.getUserConfig();
+
+      if (!userConfig) {
+        return null;
+      }
+
+      const profile = await database.adapter.getProfile(input.profileId);
+
+      if (!profile) {
+        return null;
+      }
+
+      const selection = resolveProfileProviderSelection({
+        defaultProviderId: userConfig.defaultProviderId,
+        profileModel: profile.model,
+        providers: userConfig.providers,
+      });
+
+      if (!selection) {
+        return null;
+      }
+
+      const provider = createProviderForInstance(
+        selection.instance,
+        selection.model
+      );
+
+      return generateSkillConsolidateMarkdown({
+        losers: input.losers,
+        mode: input.mode,
+        provider,
+        winner: input.winner,
+      });
+    },
+  }
+);
+
+agent.setSkillProposalService(skillProposalService);
+
+const skillSuggestionService = new SkillSuggestionService(
+  database.adapter,
+  skillsService,
+  skillProposalService
+);
+
+agent.setSkillSuggestionService(skillSuggestionService);
+
+await runFirstBootSeed({
+  authService,
+  databaseAdapter: database.adapter,
+  orgService,
+});
+
+const systemStatus = new SystemStatusService(
+  agent,
+  automationRunner,
+  workerManager,
+  mcpService,
+  composioService,
+  database.adapter
+);
+
+const webDistDir = resolveWebDistDir(projectRoot);
+
+const app = createHonoApp({
+  agent,
+  authService,
+  automationService,
+  composioService,
+  databaseAdapter: database.adapter,
+  googleMeetService,
+  mcpService,
+  // Windows cannot move an open SQLite file; POSIX restores keep the handle open as before.
+  onBeforeDataRestore: async () => {
+    await workerManager.pauseDataWorkers();
+    await googleMeetService.close();
+
+    if (process.platform === "win32") {
+      database.release();
+    }
+  },
+  onDataRestored: async () => {
+    await database.reopen();
+    await agent.reloadAfterDataRestore();
+    await googleMeetService.reopen();
+    await workerManager.recoverDesiredWorkers();
+  },
+  orgMemoryService,
+  orgService,
+  pluginService,
+  skillCuratorService,
+  skillProposalService,
+  skillSuggestionService,
+  systemStatus,
+  webDistDir,
+  workerManager,
+});
+
+const server = startServer({
+  canFallbackToNextPort,
+  // The limiter needs the peer address, and Bun only exposes it on `server`.
+  fetch: (request: Request, server: Server<unknown>) =>
+    app.fetch(request, { server }),
+  host,
+  preferredPort: requestedPort,
+});
+
+const serverUrl = writeRuntimeServerUrl(
+  `http://${server.hostname}:${server.port}`
+);
+
+const shutdownRuntime = registerRuntimeCleanup(
+  server,
+  serverUrl,
+  database,
+  mcpClientManager,
+  googleMeetService
+);
+
+// Stop before recovering workers if Electron disappeared during initialization.
+if (process.env.MINGZHAN_DESKTOP === "1" && !process.connected) {
+  await shutdownRuntime();
+}
+
+if (server.port !== requestedPort) {
+  console.log(`Port ${requestedPort} is busy. Using ${server.port} instead.`);
+}
+
+console.log(`MíngZhàn server listening on ${serverUrl}`);
+
+console.log(`MíngZhàn database ready at ${config.databaseUrl}`);
+
+void initializeOptionalServices({
+  agent,
+  database,
+  mcpService,
+  skillsService,
+});
+
+try {
+  workerRecovery = (async () => {
+    await workerManager.recoverDesiredWorkers();
+    await pluginService.recoverPluginWorkers();
+  })();
+  await workerRecovery;
+} catch (error) {
+  console.warn("Could not recover platform workers:", error);
+}
+
+if (webDistDir) {
+  console.log(`MíngZhàn web dashboard ready at ${serverUrl}`);
+}
+
+const humanUserCount = await database.adapter.countHumanUsers();
+
+if (humanUserCount > 0 && !agent.providerConfigured) {
+  console.warn(
+    `Provider not configured — complete the setup wizard at ${serverUrl}/setup to enable chat and automations.`
+  );
+}
+
+if (process.env.MINGZHAN_DESKTOP === "1") {
+  process.send?.({ type: "mingzhan-ready", url: serverUrl });
+}
+
+function parsePort(value: string | undefined): number {
+  if (!value?.trim()) {
+    return DEFAULT_SERVER_PORT;
+  }
+
+  const port = Number(value);
+
+  if (!Number.isInteger(port) || port < 0 || port > 65_535) {
+    throw new Error(`Invalid MINGZHAN_PORT: ${value}`);
+  }
+
+  return port;
+}
+
+async function initializeOptionalServices(options: {
+  mcpService: McpService;
+  skillsService: SkillsService;
+  agent: AgentService;
+  database: Database;
+}): Promise<void> {
+  try {
+    await options.mcpService.connectEnabledServers({
+      callbackBaseUrl: resolveComposioCallbackBaseUrl(),
+      reauthorize: false,
+    });
+  } catch (error) {
+    console.warn("Could not connect MCP servers:", error);
+  }
+
+  try {
+    await ensureBundledSkillFiles();
+  } catch (error) {
+    console.warn("Could not install bundled skills:", error);
+  }
+
+  try {
+    await options.skillsService.syncDiscoveredSkills();
+    await ensureBundledSkillsAssigned(options.database.adapter);
+  } catch (error) {
+    console.warn("Could not sync skills:", error);
+  }
+
+  try {
+    await options.agent.ensureSoulScaffolded();
+  } catch (error) {
+    console.warn("Could not scaffold soul templates:", error);
+  }
+}
+
+function startServer(options: {
+  host: string;
+  preferredPort: number;
+  canFallbackToNextPort: boolean;
+  fetch: (
+    request: Request,
+    server: Server<unknown>
+  ) => Response | Promise<Response>;
+}): ReturnType<typeof Bun.serve> {
+  const lastPort = options.canFallbackToNextPort
+    ? Math.min(options.preferredPort + 2000, 65_535)
+    : options.preferredPort;
+
+  let lastError: unknown;
+
+  for (let port = options.preferredPort; port <= lastPort; port += 1) {
+    try {
+      return Bun.serve({
+        async fetch(request, server: Server<unknown>) {
+          disableBunIdleTimeoutForLongHeldRequest(request, server);
+          const response = await options.fetch(request, server);
+          disableBunIdleTimeoutForSse(request, response, server);
+
+          return response;
+        },
+        hostname: options.host,
+        idleTimeout: 255,
+        maxRequestBodySize: MAX_HTTP_REQUEST_BODY_LIMIT_BYTES,
+        port,
+      });
+    } catch (error) {
+      if (
+        !(
+          error instanceof Error &&
+          isAddressInUseError(error) &&
+          options.canFallbackToNextPort
+        )
+      ) {
+        throw error;
+      }
+
+      lastError = error;
+    }
+  }
+
+  throw (
+    lastError ?? new Error("Failed to find an open port for the MíngZhàn server.")
+  );
+}
+
+function isAddressInUseError(error: Error): boolean {
+  return "code" in error && error.code === "EADDRINUSE";
+}
+
+/**
+ * The daemon deletes pm2.pid when it exits, so a pid file that outlives
+ * killDaemon names a daemon still running from this runtime. Left alive, it
+ * keeps the desktop runtime's bun.exe locked and the next launch cannot rebuild it.
+ */
+function killLeftoverPm2Daemon(pidPath: string): void {
+  let pid: number;
+
+  try {
+    pid = Number.parseInt(readFileSync(pidPath, "utf8"), 10);
+  } catch {
+    return;
+  }
+
+  if (!(Number.isInteger(pid) && pid > 0)) {
+    return;
+  }
+
+  // Guard against a reused pid: only a bun process can be our daemon.
+  const task = spawnSync(
+    "tasklist",
+    ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"],
+    { encoding: "utf8", windowsHide: true }
+  );
+
+  if (
+    !task.stdout
+      ?.toLowerCase()
+      .includes(`"${basename(process.execPath).toLowerCase()}"`)
+  ) {
+    return;
+  }
+
+  spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
+    stdio: "ignore",
+    windowsHide: true,
+  });
+}
+
+function registerRuntimeCleanup(
+  server: ReturnType<typeof Bun.serve>,
+  serverUrl: string,
+  database: Database,
+  mcpClientManager: McpClientManager,
+  googleMeetService: GoogleMeetService
+): () => Promise<void> {
+  let cleanedUp = false;
+
+  const cleanup = () => {
+    if (cleanedUp) {
+      return;
+    }
+
+    cleanedUp = true;
+    void shutdownPluginRuntime(1500);
+    void mcpClientManager.disconnectAll();
+    clearRuntimeServerUrl(serverUrl);
+    database.close();
+  };
+
+  process.on("exit", cleanup);
+
+  let stopping = false;
+
+  const shutdown = async () => {
+    if (stopping) {
+      return;
+    }
+
+    stopping = true;
+    await googleMeetService.close();
+
+    if (process.env.MINGZHAN_DESKTOP === "1") {
+      // A quit during startup must not race workers being recreated after shutdown.
+      await workerRecovery.catch(() => {});
+    }
+
+    // Desktop owns a private PM2 home; never stop a normal server's daemon.
+    if (
+      process.env.MINGZHAN_DESKTOP === "1" &&
+      process.env.PM2_HOME &&
+      existsSync(join(process.env.PM2_HOME, "pm2.pid"))
+    ) {
+      const { default: pm2 } = await import("pm2");
+      await new Promise<void>((resolve) => {
+        // Connecting alone takes ~2.5s on Windows, so 3s ran out before pm2
+        // sent the daemon its kill request.
+        const timeout = setTimeout(
+          resolve,
+          process.platform === "win32" ? 5000 : 3000
+        );
+
+        pm2.connect((error) => {
+          if (error) {
+            clearTimeout(timeout);
+            resolve();
+
+            return;
+          }
+
+          pm2.killDaemon(() => {
+            clearTimeout(timeout);
+            pm2.disconnect();
+            resolve();
+          });
+        });
+      });
+
+      if (process.platform === "win32") {
+        killLeftoverPm2Daemon(join(process.env.PM2_HOME, "pm2.pid"));
+      }
+    }
+
+    if (process.env.MINGZHAN_DESKTOP === "1") {
+      await Promise.race([
+        Promise.allSettled([
+          shutdownPluginRuntime(1500),
+          mcpClientManager.disconnectAll(),
+        ]),
+        new Promise((resolve) => setTimeout(resolve, 2000)),
+      ]);
+    }
+
+    cleanup();
+    server.stop(true);
+    process.exit(0);
+  };
+
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    process.on(signal, () => {
+      void shutdown();
+    });
+  }
+
+  return shutdown;
+}
+
+async function findRunningMíngZhànServerUrl(
+  host: string,
+  port: number
+): Promise<string | null> {
+  const serverUrl = `http://${normalizeHealthCheckHost(host)}:${port}`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 400);
+
+  try {
+    const response = await fetch(`${serverUrl}/health`, {
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    // SAFETY: The local health route returns these optional fields on success.
+    const payload = (await response.json()) as {
+      ok?: boolean;
+      apiVersion?: number;
+    };
+
+    return payload.ok === true && payload.apiVersion === MINGZHAN_API_VERSION
+      ? serverUrl
+      : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function normalizeHealthCheckHost(host: string): string {
+  if (host === "0.0.0.0" || host === "::") {
+    return DEFAULT_SERVER_HOST;
+  }
+
+  return host;
+}

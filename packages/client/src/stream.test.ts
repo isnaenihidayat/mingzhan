@@ -1,0 +1,294 @@
+import { describe, expect, test } from "bun:test";
+import { readAgentBrowserInstallStream, readStreamEvents } from "./stream";
+
+function streamFromChunks(chunks: string[]): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+
+  return new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(encoder.encode(chunk));
+      }
+
+      controller.close();
+    },
+  });
+}
+
+describe("readStreamEvents", () => {
+  test("ignores SSE comment keepalive lines", async () => {
+    await expect(
+      readStreamEvents(
+        streamFromChunks([
+          ": ping\n\n",
+          ": ping\n\n",
+          'data: {"type":"done","reply":"ok"}\n\n',
+        ]),
+        { onChunk: () => {} }
+      )
+    ).resolves.toBe("ok");
+  });
+
+  test("accepts an empty terminal done reply", async () => {
+    await expect(
+      readStreamEvents(
+        streamFromChunks(['data: {"type":"done","reply":""}\n\n']),
+        { onChunk: () => {} }
+      )
+    ).resolves.toBe("");
+  });
+
+  test("throws a helpful error when only keepalive comments arrive", async () => {
+    await expect(
+      readStreamEvents(streamFromChunks([": ping\n\n", ": ping\n\n"]), {
+        onChunk: () => {},
+      })
+    ).rejects.toThrow("Only server keepalive events were received");
+  });
+
+  test("times out while a reader is waiting for the first chunk", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start() {},
+    });
+
+    await expect(
+      readStreamEvents(stream, { onChunk: () => {} }, undefined, 10)
+    ).rejects.toThrow("Chat stream timed out after 0s waiting for the model.");
+  });
+
+  test("dispatches tool_input_delta events", async () => {
+    const deltas: Array<{
+      toolCallId: string;
+      delta: string;
+      accumulatedArguments?: string;
+    }> = [];
+
+    await readStreamEvents(
+      streamFromChunks([
+        'data: {"type":"tool_input_delta","toolCallId":"call_1","tool":"write_file","delta":"{\\"path\\"","accumulatedArguments":"{\\"path\\""}\n\n',
+        'data: {"type":"done","reply":"ok"}\n\n',
+      ]),
+      {
+        onChunk: () => {},
+        onToolInputDelta: (event) => {
+          deltas.push({
+            accumulatedArguments: event.accumulatedArguments,
+            delta: event.delta,
+            toolCallId: event.toolCallId,
+          });
+        },
+      }
+    );
+
+    expect(deltas).toEqual([
+      {
+        accumulatedArguments: '{"path"',
+        delta: '{"path"',
+        toolCallId: "call_1",
+      },
+    ]);
+  });
+
+  test("dispatches sub_agent_activity events", async () => {
+    const events: Array<{ parentToolCallId: string; label: string }> = [];
+
+    await readStreamEvents(
+      streamFromChunks([
+        'data: {"type":"sub_agent_activity","parentToolCallId":"call_sa","label":"Reading SOUL.md"}\n\n',
+        'data: {"type":"done","reply":"ok"}\n\n',
+      ]),
+      {
+        onChunk: () => {},
+        onSubAgentActivity: (event) => {
+          events.push(event);
+        },
+      }
+    );
+
+    expect(events).toEqual([
+      { label: "Reading SOUL.md", parentToolCallId: "call_sa" },
+    ]);
+  });
+
+  test("dispatches contextUsage from done events", async () => {
+    const usages: Array<{ usedTokens: number; source: string }> = [];
+
+    await readStreamEvents(
+      streamFromChunks([
+        'data: {"type":"done","reply":"ok","contextUsage":{"usedTokens":1200,"usableContextTokens":180000,"contextWindow":200000,"source":"provider"}}\n\n',
+      ]),
+      {
+        onChunk: () => {},
+        onContextUsage: (usage) => {
+          usages.push({ source: usage.source, usedTokens: usage.usedTokens });
+        },
+      }
+    );
+
+    expect(usages).toEqual([{ source: "provider", usedTokens: 1200 }]);
+  });
+
+  test("treats a caller abort as AbortError instead of an incomplete stream", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      readStreamEvents(
+        streamFromChunks(['data: {"type":"thinking","delta":"hmm"}\n\n']),
+        { onChunk: () => {} },
+        controller.signal
+      )
+    ).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  test("aborts an open stream without reporting a missing reply", async () => {
+    const controller = new AbortController();
+    const encoder = new TextEncoder();
+
+    const stream = new ReadableStream<Uint8Array>({
+      start(streamController) {
+        streamController.enqueue(
+          encoder.encode('data: {"type":"thinking","delta":"hmm"}\n\n')
+        );
+      },
+    });
+
+    const pending = readStreamEvents(
+      stream,
+      { onChunk: () => {} },
+      controller.signal
+    );
+
+    await Promise.resolve();
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  test("stops buffered events when a chunk callback aborts", async () => {
+    const controller = new AbortController();
+    const callbacks: string[] = [];
+
+    const stream = streamFromChunks([
+      [
+        { delta: "first", type: "chunk" },
+        { delta: "late", type: "chunk" },
+        { input: {}, tool: "search", toolCallId: "call_1", type: "tool_start" },
+        { type: "usage", usage: { inputTokens: 1, outputTokens: 1 } },
+        { reply: "firstlate", type: "done" },
+      ]
+        .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+        .join(""),
+    ]);
+
+    await expect(
+      readStreamEvents(
+        stream,
+        {
+          onChunk: (delta) => {
+            callbacks.push(delta);
+            controller.abort();
+          },
+          onDone: () => callbacks.push("done"),
+          onToolStart: () => callbacks.push("tool"),
+          onUsage: () => callbacks.push("usage"),
+        },
+        controller.signal
+      )
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(callbacks).toEqual(["first"]);
+  });
+
+  test("rejects when the done callback aborts before context usage", async () => {
+    const controller = new AbortController();
+    const callbacks: string[] = [];
+
+    await expect(
+      readStreamEvents(
+        streamFromChunks([
+          'data: {"type":"done","reply":"ok","contextUsage":{"usedTokens":1,"usableContextTokens":10,"contextWindow":20,"source":"provider"}}\n\n',
+        ]),
+        {
+          onChunk: () => {},
+          onContextUsage: () => callbacks.push("context usage"),
+          onDone: () => {
+            callbacks.push("done");
+            controller.abort();
+          },
+        },
+        controller.signal
+      )
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(callbacks).toEqual(["done"]);
+  });
+
+  test("surfaces server error events", async () => {
+    await expect(
+      readStreamEvents(
+        streamFromChunks([
+          'data: {"type":"error","error":"OpenCode Zen request failed (429 FreeUsageLimitError): Rate limit exceeded."}\n\n',
+        ]),
+        { onChunk: () => {} }
+      )
+    ).rejects.toThrow("Rate limit exceeded");
+  });
+});
+
+test("agent-browser install stops buffered events after cancellation", async () => {
+  const controller = new AbortController();
+  const callbacks: string[] = [];
+
+  await expect(
+    readAgentBrowserInstallStream(
+      streamFromChunks([
+        'data: {"type":"progress","message":"first"}\n\ndata: {"type":"progress","message":"late"}\n\ndata: {"type":"done","status":{}}\n\n',
+      ]),
+      {
+        onDone: () => callbacks.push("done"),
+        onProgress: (message) => {
+          callbacks.push(message);
+          controller.abort();
+        },
+      },
+      controller.signal
+    )
+  ).rejects.toMatchObject({ name: "AbortError" });
+  expect(callbacks).toEqual(["first"]);
+});
+
+test("terminal done callback does not authorize partial EOF, abort, or error streams", async () => {
+  let done = 0;
+
+  const handlers = {
+    onChunk: () => {},
+    onDone: () => {
+      done += 1;
+    },
+  };
+
+  expect(
+    await readStreamEvents(
+      streamFromChunks(['data: {"type":"chunk","delta":"partial"}\n\n']),
+      handlers
+    )
+  ).toBe("partial");
+  expect(done).toBe(0);
+  await expect(
+    readStreamEvents(
+      streamFromChunks(['data: {"type":"error","error":"failed"}\n\n']),
+      handlers
+    )
+  ).rejects.toThrow();
+  expect(done).toBe(0);
+  const controller = new AbortController();
+  controller.abort();
+  await expect(
+    readStreamEvents(streamFromChunks([]), handlers, controller.signal)
+  ).rejects.toThrow();
+  expect(done).toBe(0);
+  await readStreamEvents(
+    streamFromChunks(['data: {"type":"done","reply":"ok"}\n\n']),
+    handlers
+  );
+  expect(done).toBe(1);
+});

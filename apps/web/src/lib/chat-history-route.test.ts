@@ -1,0 +1,438 @@
+import { describe, expect, test } from "bun:test";
+import {
+  activeChatProfileStorageKey,
+  buildChatPath,
+  buildNewChatPath,
+  CHAT_DRAFT_STORAGE_PREFIX,
+  chatComposerDraftKey,
+  chatProfileIdFromPath,
+  consumeStoredChatDraft,
+  isChatSessionPath,
+  isProfilesPath,
+  lastChatModelStorageKey,
+  parseChatRouteParams,
+  pickKnownProfileId,
+  readComposerDraft,
+  readInitialDraftChatProfileId,
+  readLastChatModel,
+  readRequestedDraftFromNewChatSearch,
+  readRequestedDraftKeyFromNewChatSearch,
+  readRequestedProfileFromNewChatSearch,
+  readStoredActiveChatProfileId,
+  resolveActiveProfileIdFromLocation,
+  resolveDefaultProfileId,
+  resolveProfilesPageProfileId,
+  resolveRecentChatsProfileId,
+  storeChatDraft,
+  storeComposerDraft,
+  writeLastChatModel,
+  writeStoredActiveChatProfileId,
+} from "./chat-history";
+
+describe("chat history route helpers", () => {
+  test("composer drafts restore without consuming, isolate identities and clear", () => {
+    const store = new Map<string, string>();
+    const previous = globalThis.localStorage;
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: (key: string) => store.get(key) ?? null,
+        removeItem: (key: string) => store.delete(key),
+        setItem: (key: string, value: string) => store.set(key, value),
+      },
+    });
+
+    try {
+      const key = chatComposerDraftKey("alice", "org", "profile", "session");
+      storeComposerDraft(key, "unfinished thought");
+      expect(readComposerDraft(key)).toBe("unfinished thought");
+      expect(readComposerDraft(key)).toBe("unfinished thought");
+
+      for (const other of [
+        chatComposerDraftKey("bob", "org", "profile", "session"),
+        chatComposerDraftKey("alice", "other-org", "profile", "session"),
+        chatComposerDraftKey("alice", "org", "other-profile", "session"),
+        chatComposerDraftKey("alice", "org", "profile", "other-session"),
+        chatComposerDraftKey("alice", "org", "profile", null),
+      ]) {
+        expect(readComposerDraft(other)).toBe("");
+      }
+
+      expect(
+        chatComposerDraftKey(undefined, "org", "profile", null)
+      ).toBeNull();
+      storeComposerDraft(null, "not authenticated");
+      storeComposerDraft(key, "");
+      expect(store.size).toBe(0);
+      expect(readComposerDraft(key)).toBe("");
+    } finally {
+      Object.defineProperty(globalThis, "localStorage", {
+        configurable: true,
+        value: previous,
+      });
+    }
+  });
+
+  test("builds and parses chat routes consistently", () => {
+    expect(buildChatPath("profile 1", "session/2")).toBe(
+      "/chat/profile%201/session%2F2"
+    );
+    expect(chatProfileIdFromPath("/chat/profile%201/session%2F2")).toBe(
+      "profile 1"
+    );
+    expect(isChatSessionPath("/chat/profile%201/session%2F2")).toBe(true);
+    expect(chatProfileIdFromPath("/chat/%/s")).toBeNull();
+    expect(isChatSessionPath("/chat/%/s")).toBe(false);
+    expect(isChatSessionPath("/chat")).toBe(false);
+    expect(parseChatRouteParams({ profileId: "p", sessionId: "s" })).toEqual({
+      profileId: "p",
+      sessionId: "s",
+    });
+    expect(parseChatRouteParams({ profileId: "", sessionId: "s" })).toBeNull();
+  });
+
+  test("buildNewChatPath carries profile so ChatPage remount keeps the selection", () => {
+    const path = buildNewChatPath("gary-vee");
+    const url = new URL(path, "http://mingzhan.local");
+    expect(url.pathname).toBe("/chat");
+    expect(url.searchParams.get("new")).toBe("1");
+    expect(url.searchParams.get("profile")).toBe("gary-vee");
+    expect(url.searchParams.get("_")).toBeNull();
+    expect(readRequestedProfileFromNewChatSearch(url.search)).toBe("gary-vee");
+  });
+
+  test("storeChatDraft uses unique keys for rapid calls", () => {
+    const store = new Map<string, string>();
+    const previousSessionStorage = globalThis.sessionStorage;
+    Object.defineProperty(globalThis, "sessionStorage", {
+      configurable: true,
+      value: {
+        getItem: (key: string) => store.get(key) ?? null,
+        removeItem: (key: string) => {
+          store.delete(key);
+        },
+        setItem: (key: string, value: string) => {
+          store.set(key, value);
+        },
+      },
+    });
+
+    try {
+      const keys = Array.from({ length: 20 }, (_, index) =>
+        storeChatDraft(`draft-${index}`)
+      );
+
+      expect(new Set(keys).size).toBe(keys.length);
+      expect(consumeStoredChatDraft(keys[0]!)).toBe("draft-0");
+      expect(consumeStoredChatDraft(keys[1]!)).toBe("draft-1");
+      expect(store.has(`${CHAT_DRAFT_STORAGE_PREFIX}${keys[0]}`)).toBe(false);
+    } finally {
+      Object.defineProperty(globalThis, "sessionStorage", {
+        configurable: true,
+        value: previousSessionStorage,
+      });
+    }
+  });
+
+  test("reads the requested profile only for new chat links", () => {
+    expect(
+      readRequestedProfileFromNewChatSearch("?new=1&profile=default")
+    ).toBe("default");
+    expect(
+      readRequestedProfileFromNewChatSearch("?profile=default")
+    ).toBeNull();
+  });
+
+  test("reads draft params for new chat links", () => {
+    expect(readRequestedDraftFromNewChatSearch("?new=1&draft=fix%20tool")).toBe(
+      "fix tool"
+    );
+    expect(readRequestedDraftKeyFromNewChatSearch("?new=1&draftKey=abc")).toBe(
+      "abc"
+    );
+    expect(readRequestedDraftFromNewChatSearch("?draft=fix")).toBeNull();
+  });
+
+  test("resolveActiveProfileIdFromLocation prefers URL, live chat state, and defaults", () => {
+    const profiles = [{ id: "default" }, { id: "super" }];
+
+    expect(
+      resolveActiveProfileIdFromLocation({
+        pathname: "/chat/default/session-1",
+        profiles,
+        search: "",
+      })
+    ).toBe("default");
+
+    expect(
+      resolveActiveProfileIdFromLocation({
+        liveChatProfileId: "super",
+        pathname: "/chat",
+        profiles,
+        search: "",
+      })
+    ).toBe("super");
+
+    expect(
+      resolveActiveProfileIdFromLocation({
+        pathname: "/chat",
+        profiles,
+        search: "?new=1&profile=super",
+      })
+    ).toBe("super");
+
+    expect(
+      resolveActiveProfileIdFromLocation({
+        liveChatProfileId: "default",
+        pathname: "/profiles",
+        profiles,
+        search: "?profile=super",
+      })
+    ).toBe("super");
+
+    expect(
+      resolveActiveProfileIdFromLocation({
+        liveChatProfileId: "super",
+        pathname: "/profiles/skills/skill-1",
+        profiles,
+        search: "?profile=default",
+      })
+    ).toBe("default");
+  });
+
+  test("isProfilesPath matches the profiles section", () => {
+    expect(isProfilesPath("/profiles")).toBe(true);
+    expect(isProfilesPath("/profiles/skills/skill-1")).toBe(true);
+    expect(isProfilesPath("/chat")).toBe(false);
+  });
+
+  test("resolveProfilesPageProfileId prefers the URL profile", () => {
+    const profiles = [{ id: "default" }, { id: "super" }];
+
+    expect(
+      resolveProfilesPageProfileId({
+        liveChatProfileId: "default",
+        profiles,
+        search: "?profile=super",
+      })
+    ).toBe("super");
+
+    expect(
+      resolveProfilesPageProfileId({
+        liveChatProfileId: "super",
+        profiles,
+        search: "",
+      })
+    ).toBe("super");
+  });
+
+  test("resolveRecentChatsProfileId restores stored selection when URL has no profile", () => {
+    const profiles = [{ id: "default" }, { id: "super" }];
+    const store = new Map<string, string>();
+    const previousLocalStorage = globalThis.localStorage;
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: (key: string) => store.get(key) ?? null,
+        removeItem: (key: string) => {
+          store.delete(key);
+        },
+        setItem: (key: string, value: string) => {
+          store.set(key, value);
+        },
+      },
+    });
+
+    try {
+      writeStoredActiveChatProfileId("super", "org-a");
+
+      expect(
+        resolveRecentChatsProfileId({
+          orgId: "org-a",
+          profiles,
+          search: "",
+        })
+      ).toBe("super");
+
+      expect(
+        resolveRecentChatsProfileId({
+          profiles,
+          search: "?profile=default",
+        })
+      ).toBe("default");
+
+      expect(
+        resolveRecentChatsProfileId({
+          liveChatProfileId: "default",
+          profiles,
+          search: "",
+        })
+      ).toBe("default");
+
+      expect(
+        resolveRecentChatsProfileId({
+          liveChatProfileId: "from-other-org",
+          profiles: [{ id: "org-b" }],
+          search: "?profile=D2jz2yFd3vuHS04T6wmTu",
+        })
+      ).toBe("org-b");
+    } finally {
+      Object.defineProperty(globalThis, "localStorage", {
+        configurable: true,
+        value: previousLocalStorage,
+      });
+    }
+  });
+
+  test("resolveDefaultProfileId picks default or first profile", () => {
+    const profiles = [{ id: "default" }, { id: "super" }];
+    expect(resolveDefaultProfileId(profiles)).toBe("default");
+    expect(resolveDefaultProfileId([{ id: "alpha" }])).toBe("alpha");
+  });
+
+  test("readInitialDraftChatProfileId restores the active org selection", () => {
+    const store = new Map<string, string>();
+    const previousLocalStorage = globalThis.localStorage;
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: (key: string) => store.get(key) ?? null,
+        removeItem: (key: string) => {
+          store.delete(key);
+        },
+        setItem: (key: string, value: string) => {
+          store.set(key, value);
+        },
+      },
+    });
+
+    try {
+      writeStoredActiveChatProfileId("super", "org-a");
+      store.set("mingzhan:active-chat-profile", "global-profile");
+
+      expect(
+        readInitialDraftChatProfileId({
+          orgId: "org-b",
+          search: "",
+        })
+      ).toBe("");
+      expect(store.has("mingzhan:active-chat-profile")).toBe(false);
+
+      expect(
+        readInitialDraftChatProfileId({
+          orgId: "org-a",
+          search: "",
+        })
+      ).toBe("super");
+
+      expect(
+        readInitialDraftChatProfileId({
+          orgId: "org-a",
+          search: "?new=1&profile=default",
+        })
+      ).toBe("default");
+
+      expect(
+        readInitialDraftChatProfileId({
+          orgId: "org-a",
+          routeProfileId: "session-profile",
+          search: "",
+        })
+      ).toBe("session-profile");
+
+      expect(
+        readInitialDraftChatProfileId({
+          currentOrgId: "orgA",
+          currentProfileId: "profileA",
+          orgId: "orgB",
+          routeProfileId: "profileA",
+          search: "",
+        })
+      ).toBe("");
+    } finally {
+      Object.defineProperty(globalThis, "localStorage", {
+        configurable: true,
+        value: previousLocalStorage,
+      });
+    }
+  });
+
+  test("org-scoped active profile storage does not leak across orgs", () => {
+    const store = new Map<string, string>();
+    const previousLocalStorage = globalThis.localStorage;
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: (key: string) => store.get(key) ?? null,
+        removeItem: (key: string) => {
+          store.delete(key);
+        },
+        setItem: (key: string, value: string) => {
+          store.set(key, value);
+        },
+      },
+    });
+
+    try {
+      writeStoredActiveChatProfileId("super", "org-a");
+      writeStoredActiveChatProfileId("default", "org-b");
+
+      expect(readStoredActiveChatProfileId("org-a")).toBe("super");
+      expect(readStoredActiveChatProfileId("org-b")).toBe("default");
+      expect(readStoredActiveChatProfileId("org-c")).toBeNull();
+      expect(store.get(activeChatProfileStorageKey("org-a"))).toBe("super");
+    } finally {
+      Object.defineProperty(globalThis, "localStorage", {
+        configurable: true,
+        value: previousLocalStorage,
+      });
+    }
+  });
+
+  test("pickKnownProfileId validates against the profiles list", () => {
+    const profiles = [{ id: "default" }, { id: "super" }];
+    expect(pickKnownProfileId(profiles, "missing", "super")).toBe("super");
+    expect(pickKnownProfileId(profiles, "missing")).toBeNull();
+  });
+
+  test("remembers the last hand-picked model per profile", () => {
+    const store = new Map<string, string>();
+    const previousLocalStorage = globalThis.localStorage;
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: (key: string) => store.get(key) ?? null,
+        removeItem: (key: string) => {
+          store.delete(key);
+        },
+        setItem: (key: string, value: string) => {
+          store.set(key, value);
+        },
+      },
+    });
+
+    try {
+      expect(readLastChatModel("default")).toBeNull();
+
+      writeLastChatModel("default", "openai-1::gpt-5.6");
+      writeLastChatModel("super", "anthropic-1::claude-opus-5");
+
+      expect(store.get(lastChatModelStorageKey("default"))).toBe(
+        "openai-1::gpt-5.6"
+      );
+      expect(readLastChatModel("default")).toBe("openai-1::gpt-5.6");
+      // Each profile keeps its own pick.
+      expect(readLastChatModel("super")).toBe("anthropic-1::claude-opus-5");
+
+      // A falsy selection forgets that profile's pick, and only that one.
+      writeLastChatModel("default", null);
+      expect(readLastChatModel("default")).toBeNull();
+      expect(readLastChatModel("super")).toBe("anthropic-1::claude-opus-5");
+    } finally {
+      Object.defineProperty(globalThis, "localStorage", {
+        configurable: true,
+        value: previousLocalStorage,
+      });
+    }
+  });
+});

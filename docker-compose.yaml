@@ -1,0 +1,21 @@
+services:
+  mingzhan:
+    image: mingzhan:latest
+    ports:
+      - "4310:4310"
+    environment:
+      - MINGZHAN_CONFIG_DIR=/mingzhan/data
+      # Optional: skip the browser setup wizard on first boot.
+      # All three must be set together or none at all.
+      # - MINGZHAN_SEED_ADMIN_EMAIL=admin@example.com
+      # - MINGZHAN_SEED_ADMIN_NAME=Admin
+      # - MINGZHAN_SEED_ADMIN_PASSWORD=changeme123
+      # Optional: public URL for OAuth callbacks and shared links.
+      # Set this when running behind a reverse proxy.
+      # - MINGZHAN_WEB_PUBLIC_URL=https://mingzhan.example.com
+    volumes:
+      - mingzhan-data:/mingzhan/data
+    restart: unless-stopped
+
+volumes:
+  mingzhan-data:

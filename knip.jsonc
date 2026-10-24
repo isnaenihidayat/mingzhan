@@ -1,0 +1,75 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema-jsonc.json",
+  "ignore": [
+    "tools/oxlint/anti-slop/**",
+    // Bundled skill scripts run through the agent's bash tool, not imports.
+    "packages/core/src/skills/bundled/*/scripts/**"
+  ],
+  // First-run baseline: teach the graph, then ignore leftovers instead of deleting unused code.
+  "workspaces": {
+    "packages/telegram-manager": {
+      // Generated JavaScript is shipped for Git installs; analyze its TypeScript source.
+      "ignore": ["dist/**"]
+    },
+    "apps/desktop": {
+      "entry": ["preload.cjs", "tests/smoke.mjs"],
+      // PowerShell 7 is supplied by the Windows build host.
+      "ignoreBinaries": ["pwsh"],
+      "project": ["*.mjs", "*.cjs", "tests/*.mjs", "scripts/*.mjs"]
+    },
+    "packages/plugins/data-view": {
+      "entry": [
+        "src/actions.ts",
+        "src/ui.tsx",
+        "actions/actions.js",
+        "ui/app.js"
+      ]
+    },
+    "packages/plugins/supermemory": {
+      "entry": [
+        "src/worker.ts",
+        "workers/server.js",
+        "src/actions.ts",
+        "src/ui.tsx",
+        "actions/actions.js",
+        "ui/app.js"
+      ]
+    },
+    "packages/plugins/workflows": {
+      "entry": [
+        "src/actions.ts",
+        "src/ui.tsx",
+        "actions/actions.js",
+        "ui/app.js"
+      ]
+    },
+    "apps/server": {
+      "entry": [
+        "src/index.ts",
+        "scripts/*.ts",
+        "src/testing/cassettes/serve.ts"
+      ],
+      // Bundled ACP agents. The server resolves them by name at run time (acp-agent-presets.ts).
+      "ignoreDependencies": [
+        "@agentclientprotocol/claude-agent-acp",
+        "@agentclientprotocol/codex-acp"
+      ]
+    },
+    "apps/web": {
+      "entry": [
+        "src/shims/*.ts",
+        "sw/service-worker.ts",
+        "public/google-meet-extension/*.js"
+      ]
+    },
+    // Not in package.json#workspaces; Knip would skip it otherwise.
+    "docs/website": {}
+  },
+  // Ships with Windows; desktop quit uses it to confirm a leftover pid is bun.
+  "ignoreBinaries": ["tasklist"],
+  // These are intentional until the duplicate access rules and MDX package metadata are resolved.
+  "ignoreIssues": {
+    "apps/web/src/lib/navigation.ts": ["duplicates"],
+    "docs/website/mdx-components.tsx": ["unlisted"]
+  }
+}

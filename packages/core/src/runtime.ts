@@ -1,0 +1,99 @@
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { normalizeBaseUrl } from "./compatible-provider-config";
+import { PRIVATE_DIR_MODE, PRIVATE_FILE_MODE } from "./fs";
+import { getUserConfigDir, readUserWebPublicUrlSync } from "./user-config";
+
+export const DEFAULT_SERVER_HOST = "127.0.0.1";
+
+export const DEFAULT_SERVER_PORT = 4310;
+
+export const DEFAULT_SERVER_URL = `http://${DEFAULT_SERVER_HOST}:${DEFAULT_SERVER_PORT}`;
+
+function serverUrlPath(): string {
+  return join(getUserConfigDir(), "runtime", "server-url.txt");
+}
+
+export function readRuntimeServerUrl(): string | null {
+  try {
+    const value = normalizeBaseUrl(readFileSync(serverUrlPath(), "utf8"));
+
+    return value || null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeRuntimeServerUrl(url: string): string {
+  const normalized = normalizeBaseUrl(url);
+  mkdirSync(join(getUserConfigDir(), "runtime"), {
+    mode: PRIVATE_DIR_MODE,
+    recursive: true,
+  });
+  writeFileSync(serverUrlPath(), `${normalized}\n`, {
+    encoding: "utf8",
+    mode: PRIVATE_FILE_MODE,
+  });
+
+  return normalized;
+}
+
+export function clearRuntimeServerUrl(expectedUrl?: string): void {
+  if (expectedUrl && readRuntimeServerUrl() !== normalizeBaseUrl(expectedUrl)) {
+    return;
+  }
+
+  try {
+    rmSync(serverUrlPath(), { force: true });
+  } catch {
+    // ignore cleanup errors
+  }
+}
+
+export function resolveServerUrl(
+  env: Record<string, string | undefined> = process.env
+): string {
+  return normalizeBaseUrl(
+    env.MINGZHAN_SERVER_URL?.trim() ||
+      readRuntimeServerUrl() ||
+      DEFAULT_SERVER_URL
+  );
+}
+
+/** Public web app origin for OAuth callbacks from non-browser clients (Telegram, WhatsApp, CLI). */
+export function resolveWebPublicUrl(
+  env: Record<string, string | undefined> = process.env
+): string | undefined {
+  const configured =
+    env.MINGZHAN_WEB_PUBLIC_URL?.trim() || env.MINGZHAN_PUBLIC_URL?.trim();
+
+  if (configured) {
+    return normalizeBaseUrl(configured);
+  }
+
+  const saved = readUserWebPublicUrlSync() ?? undefined;
+
+  // The desktop app serves its UI on loopback only, on a new port each launch.
+  // A public URL in its config came from another install's restored backup,
+  // and honouring it would refuse the desktop UI's own origin.
+  if (saved && env.MINGZHAN_DESKTOP === "1" && !isLoopbackUrl(saved)) {
+    return;
+  }
+
+  return saved;
+}
+
+function isLoopbackUrl(value: string): boolean {
+  try {
+    const { hostname } = new URL(value);
+
+    return (
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "[::1]" ||
+      hostname.endsWith(".localhost")
+    );
+  } catch {
+    return false;
+  }
+}

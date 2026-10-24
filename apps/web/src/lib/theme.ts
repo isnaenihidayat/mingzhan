@@ -1,0 +1,69 @@
+export type Theme = "light" | "dark" | "system";
+
+export type ResolvedTheme = "light" | "dark";
+
+export const THEME_STORAGE_KEY = "mingzhan-theme";
+
+export function isTheme(value: string | null | undefined): value is Theme {
+  return value === "light" || value === "dark" || value === "system";
+}
+
+function getStoredTheme(): Theme | null {
+  try {
+    const stored = localStorage.getItem(THEME_STORAGE_KEY);
+
+    return isTheme(stored) ? stored : null;
+  } catch {
+    return null;
+  }
+}
+
+function getSystemTheme(): ResolvedTheme {
+  if (typeof window === "undefined") {
+    return "dark";
+  }
+
+  return window.matchMedia("(prefers-color-scheme: dark)").matches
+    ? "dark"
+    : "light";
+}
+
+export function resolveTheme(theme: Theme): ResolvedTheme {
+  if (theme === "system") {
+    return getSystemTheme();
+  }
+
+  return theme;
+}
+
+export function getInitialTheme(): Theme {
+  return getStoredTheme() ?? "system";
+}
+
+export function applyTheme(theme: Theme): void {
+  document.documentElement.dataset.theme = theme;
+  const resolved = resolveTheme(theme);
+  document.documentElement.classList.toggle("dark", resolved === "dark");
+  document.documentElement.style.colorScheme = resolved;
+  applyFavicon(resolved);
+}
+
+export function markLogoSrc(resolvedTheme: ResolvedTheme): string {
+  return resolvedTheme === "light"
+    ? "/mingzhan-mark.svg"
+    : "/mingzhan-mark-white.svg";
+}
+
+function applyFavicon(resolved: ResolvedTheme): void {
+  const favicon = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
+
+  if (!favicon) {
+    return;
+  }
+
+  const href = markLogoSrc(resolved);
+
+  if (favicon.getAttribute("href") !== href) {
+    favicon.setAttribute("href", href);
+  }
+}

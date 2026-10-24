@@ -1,0 +1,595 @@
+import { CodeBlock } from "@mingzhan/ui/code-block";
+import { Spinner } from "@mingzhan/ui/spinner";
+import { cn } from "@mingzhan/ui/utils";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { ArtifactMarkdownToc } from "@/components/chat/artifact-markdown-toc";
+import type { ArtifactPreviewMode } from "@/components/chat/artifact-preview-mode-toggle";
+import { SpreadsheetGrid } from "@/components/chat/artifact-spreadsheet-editor";
+import { useAuth } from "@/context/use-auth";
+import {
+  ARTIFACT_FRAME_READY,
+  ARTIFACT_FRAME_URL,
+  ARTIFACT_HTML_IFRAME_SANDBOX,
+  htmlForArtifactPreview,
+  resolveArtifactHtmlAssets,
+} from "@/lib/artifact-html-preview";
+import { parseSpreadsheetText } from "@/lib/artifact-spreadsheet";
+import type { ChatArtifactRef } from "@/lib/chat-artifacts";
+import { client, formatError } from "@/lib/client";
+import { extractMarkdownHeadings } from "@/lib/markdown-toc";
+
+const MessageResponse = lazy(async () => ({
+  default: (await import("@/components/ai-elements/message")).MessageResponse,
+}));
+
+type ArtifactPanelSharedProps = {
+  loading: boolean;
+  error: string | null;
+  canPreview: boolean;
+  artifact: ChatArtifactRef;
+  previewMode?: ArtifactPreviewMode;
+};
+
+export type ArtifactAttachmentPanelBodyProps =
+  | (ArtifactPanelSharedProps & {
+      kind: "pdf";
+      pdfPreviewUrl: string | null;
+    })
+  | (ArtifactPanelSharedProps & {
+      kind: "image";
+      imagePreviewUrl?: string | null;
+    })
+  | (ArtifactPanelSharedProps & {
+      kind: "video";
+      videoPreviewUrl?: string | null;
+    })
+  | (ArtifactPanelSharedProps & {
+      kind: "html";
+      content: string | null;
+      htmlSandbox?: string;
+      profileId?: string;
+    })
+  | (ArtifactPanelSharedProps & {
+      kind: "spreadsheet";
+      content: string | null;
+    })
+  | (ArtifactPanelSharedProps & {
+      kind: "text";
+      content: string | null;
+      format: "markdown" | "plain";
+      language: string | null;
+      streaming?: boolean;
+    });
+
+function renderTextContent({
+  content,
+  format,
+  language,
+  streaming = false,
+  fillHeight = false,
+}: {
+  content: string;
+  format: "markdown" | "plain";
+  language: string | null;
+  streaming?: boolean;
+  fillHeight?: boolean;
+}) {
+  if (format === "markdown") {
+    return (
+      <Suspense fallback={<Spinner className="size-6" />}>
+        <MessageResponse className="text-sm" isAnimating={streaming}>
+          {content}
+        </MessageResponse>
+      </Suspense>
+    );
+  }
+
+  return (
+    <CodeBlock
+      className="rounded-none border-0"
+      code={content}
+      fillHeight={fillHeight}
+      lang={language}
+    />
+  );
+}
+
+type ArtifactBodyPhase =
+  | "loading"
+  | "error"
+  | "source"
+  | "content"
+  | "unavailable"
+  | "empty";
+
+function resolveArtifactBodyPhase({
+  canPreview,
+  error,
+  hasContent,
+  loading,
+  showSource,
+}: {
+  canPreview: boolean;
+  error: string | null;
+  hasContent: boolean;
+  loading: boolean;
+  showSource: boolean;
+}): ArtifactBodyPhase {
+  if (loading) {
+    return "loading";
+  }
+
+  if (error) {
+    return "error";
+  }
+
+  if (hasContent && showSource) {
+    return "source";
+  }
+
+  if (hasContent) {
+    return "content";
+  }
+
+  if (canPreview) {
+    return "empty";
+  }
+
+  return "unavailable";
+}
+
+function ArtifactBodyError({
+  compact,
+  error,
+}: {
+  compact?: boolean;
+  error: string;
+}) {
+  return (
+    <p
+      className={
+        compact ? "text-destructive text-sm" : "p-4 text-destructive text-sm"
+      }
+    >
+      {error}
+    </p>
+  );
+}
+
+function LoadingState({ compact = false }: { compact?: boolean }) {
+  return (
+    <div
+      className={
+        compact
+          ? "flex items-center gap-2 text-muted-foreground text-sm"
+          : "flex flex-1 items-center justify-center gap-2 p-4 text-muted-foreground text-sm"
+      }
+    >
+      <Spinner className="size-4" />
+      Loading preview…
+    </div>
+  );
+}
+
+function UnavailablePreview({ padded }: { padded: boolean }) {
+  return (
+    <p
+      className={
+        padded
+          ? "p-4 text-muted-foreground text-sm"
+          : "text-muted-foreground text-sm"
+      }
+    >
+      Preview is not available for this file type. Download the artifact
+      instead.
+    </p>
+  );
+}
+
+function ArtifactAttachmentImageBody({
+  loading,
+  error,
+  imagePreviewUrl = null,
+  canPreview,
+  artifact,
+}: Extract<ArtifactAttachmentPanelBodyProps, { kind: "image" }>) {
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      {loading ? <LoadingState /> : null}
+      {error ? <p className="p-4 text-destructive text-sm">{error}</p> : null}
+      {!(loading || error) && imagePreviewUrl ? (
+        <div className="flex min-h-0 flex-1 items-center justify-center p-4">
+          <img
+            alt={artifact.filename}
+            className="max-h-[min(70vh,48rem)] max-w-full rounded-lg border border-border bg-muted/20 object-contain"
+            src={imagePreviewUrl}
+          />
+        </div>
+      ) : null}
+      {loading || error || imagePreviewUrl || canPreview ? null : (
+        <UnavailablePreview padded />
+      )}
+    </div>
+  );
+}
+
+function ArtifactAttachmentVideoBody({
+  loading,
+  error,
+  videoPreviewUrl = null,
+  canPreview,
+  artifact,
+}: Extract<ArtifactAttachmentPanelBodyProps, { kind: "video" }>) {
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      {loading ? <LoadingState /> : null}
+      {error ? <p className="p-4 text-destructive text-sm">{error}</p> : null}
+      {!(loading || error) && videoPreviewUrl ? (
+        <div className="flex min-h-0 flex-1 items-center justify-center p-4">
+          <video
+            aria-label={artifact.filename}
+            className="max-h-[min(70vh,48rem)] w-full max-w-[min(100%,24rem)] rounded-lg border border-border bg-black object-contain"
+            controls
+            playsInline
+            preload="metadata"
+            src={videoPreviewUrl}
+          />
+        </div>
+      ) : null}
+      {loading || error || videoPreviewUrl || canPreview ? null : (
+        <UnavailablePreview padded />
+      )}
+    </div>
+  );
+}
+
+function ArtifactHtmlPreview({
+  content,
+  artifactPath,
+  filename,
+  htmlSandbox,
+  profileId,
+}: {
+  content: string;
+  artifactPath: string;
+  filename: string;
+  htmlSandbox: string;
+  profileId?: string;
+}) {
+  const { activeOrg } = useAuth();
+  const orgId = activeOrg?.id;
+
+  const [preview, setPreview] = useState<{
+    content: string;
+    orgId: string | undefined;
+    html: string;
+    error?: string;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!profileId) {
+      return;
+    }
+
+    const controller = new AbortController();
+    const scopedClient = client.forOrg(orgId ?? null);
+    void resolveArtifactHtmlAssets(
+      content,
+      artifactPath,
+      (path) =>
+        scopedClient.readProfileArtifactContent(profileId, path, {
+          inline: true,
+        }),
+      controller.signal
+    )
+      .then((html) => {
+        if (!controller.signal.aborted) {
+          setPreview({ content, html, orgId });
+        }
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) {
+          setPreview({ content, error: formatError(error), html: "", orgId });
+        }
+      });
+
+    return () => controller.abort();
+  }, [content, artifactPath, profileId, orgId]);
+
+  const current =
+    preview?.content === content && preview.orgId === orgId ? preview : null;
+
+  if (profileId && !current) {
+    return <LoadingState />;
+  }
+
+  if (current?.error) {
+    return <ArtifactBodyError error={current.error} />;
+  }
+
+  return (
+    <ArtifactHtmlFrame
+      html={htmlForArtifactPreview(profileId ? (current?.html ?? "") : content)}
+      sandbox={htmlSandbox}
+      title={filename}
+    />
+  );
+}
+
+/** `srcDoc` would inherit the app's CSP and block every artifact script, so
+ * the HTML is handed to the server's permissive `/artifact-frame` page. */
+function ArtifactHtmlFrame({
+  html,
+  sandbox,
+  title,
+}: {
+  html: string;
+  sandbox: string;
+  title: string;
+}) {
+  const frameRef = useRef<HTMLIFrameElement>(null);
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      const frame = frameRef.current?.contentWindow;
+
+      if (
+        frame &&
+        event.source === frame &&
+        event.data === ARTIFACT_FRAME_READY
+      ) {
+        // The sandboxed frame has an opaque origin, so "*" is the only target.
+        frame.postMessage({ mingzhanArtifactHtml: html }, "*");
+      }
+    };
+
+    window.addEventListener("message", onMessage);
+
+    return () => window.removeEventListener("message", onMessage);
+  }, [html]);
+
+  return (
+    <iframe
+      className="min-h-0 w-full flex-1 border-0 bg-background"
+      key={html}
+      ref={frameRef}
+      sandbox={sandbox}
+      src={ARTIFACT_FRAME_URL}
+      title={title}
+    />
+  );
+}
+
+function ArtifactAttachmentHtmlBody({
+  loading,
+  error,
+  content,
+  canPreview,
+  artifact,
+  htmlSandbox = ARTIFACT_HTML_IFRAME_SANDBOX,
+  profileId,
+  previewMode = "preview",
+}: Extract<ArtifactAttachmentPanelBodyProps, { kind: "html" }>) {
+  const phase = resolveArtifactBodyPhase({
+    canPreview,
+    error,
+    hasContent: Boolean(content),
+    loading,
+    showSource: previewMode === "source" && Boolean(content),
+  });
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      {phase === "loading" ? <LoadingState /> : null}
+      {phase === "error" && error ? <ArtifactBodyError error={error} /> : null}
+      {phase === "source" && content
+        ? renderTextContent({
+            content,
+            fillHeight: true,
+            format: "plain",
+            language: "html",
+          })
+        : null}
+      {phase === "content" && content ? (
+        <ArtifactHtmlPreview
+          artifactPath={artifact.path}
+          content={content}
+          filename={artifact.filename}
+          htmlSandbox={htmlSandbox}
+          key={`${profileId}:${artifact.path}`}
+          profileId={profileId}
+        />
+      ) : null}
+      {phase === "unavailable" ? <UnavailablePreview padded /> : null}
+    </div>
+  );
+}
+
+function resolveTextSourceView(
+  previewMode: ArtifactPreviewMode,
+  format: "markdown" | "plain",
+  language: string | null
+) {
+  if (previewMode === "source") {
+    return {
+      sourceFormat: "plain" as const,
+      sourceLanguage: language ?? (format === "markdown" ? "markdown" : null),
+    };
+  }
+
+  return { sourceFormat: format, sourceLanguage: language };
+}
+
+function ArtifactTextRendered({
+  content,
+  rendered,
+  sourceFormat,
+}: {
+  content: string;
+  rendered: ReturnType<typeof renderTextContent>;
+  sourceFormat: "markdown" | "plain";
+}) {
+  const renderedRef = useRef<HTMLDivElement>(null);
+
+  const headings = useMemo(
+    () => (sourceFormat === "markdown" ? extractMarkdownHeadings(content) : []),
+    [content, sourceFormat]
+  );
+
+  if (sourceFormat !== "markdown") {
+    return rendered;
+  }
+
+  return (
+    <>
+      <ArtifactMarkdownToc contentRef={renderedRef} headings={headings} />
+      <div ref={renderedRef}>{rendered}</div>
+    </>
+  );
+}
+
+function ArtifactAttachmentTextBody({
+  loading,
+  error,
+  content,
+  format,
+  language,
+  streaming = false,
+  canPreview,
+  previewMode = "preview",
+}: Extract<ArtifactAttachmentPanelBodyProps, { kind: "text" }>) {
+  const { sourceFormat, sourceLanguage } = resolveTextSourceView(
+    previewMode,
+    format,
+    language
+  );
+
+  const showCodeBlock = Boolean(content && sourceFormat !== "markdown");
+  const showContent = !(loading || error) && Boolean(content);
+  const showUnavailable = !(loading || error || canPreview);
+
+  const rendered = content
+    ? renderTextContent({
+        content,
+        fillHeight: showCodeBlock,
+        format: sourceFormat,
+        language: sourceLanguage,
+        streaming,
+      })
+    : null;
+
+  return (
+    <div
+      className={cn(
+        showCodeBlock ? "flex min-h-0 flex-1 flex-col" : "space-y-4"
+      )}
+    >
+      {loading ? <LoadingState compact /> : null}
+      {error ? <ArtifactBodyError compact error={error} /> : null}
+      {showContent && content && rendered ? (
+        <ArtifactTextRendered
+          content={content}
+          rendered={rendered}
+          sourceFormat={sourceFormat}
+        />
+      ) : null}
+      {showUnavailable ? <UnavailablePreview padded={false} /> : null}
+    </div>
+  );
+}
+
+function ArtifactSpreadsheetPreview({
+  content,
+  filename,
+}: {
+  content: string;
+  filename: string;
+}) {
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <SpreadsheetGrid
+        editable={false}
+        rows={parseSpreadsheetText(filename, content)}
+      />
+    </div>
+  );
+}
+
+function ArtifactAttachmentSpreadsheetBody({
+  loading,
+  error,
+  content,
+  canPreview,
+  artifact,
+  previewMode = "preview",
+}: Extract<ArtifactAttachmentPanelBodyProps, { kind: "spreadsheet" }>) {
+  const phase = resolveArtifactBodyPhase({
+    canPreview,
+    error,
+    hasContent: Boolean(content),
+    loading,
+    showSource: previewMode === "source" && Boolean(content),
+  });
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      {phase === "loading" ? <LoadingState /> : null}
+      {phase === "error" && error ? <ArtifactBodyError error={error} /> : null}
+      {phase === "source" && content
+        ? renderTextContent({
+            content,
+            fillHeight: true,
+            format: "plain",
+            language: null,
+          })
+        : null}
+      {phase === "content" && content ? (
+        <ArtifactSpreadsheetPreview
+          content={content}
+          filename={artifact.filename}
+        />
+      ) : null}
+      {phase === "unavailable" ? <UnavailablePreview padded /> : null}
+    </div>
+  );
+}
+
+export function ArtifactAttachmentPanelBody(
+  props: ArtifactAttachmentPanelBodyProps
+) {
+  switch (props.kind) {
+    case "pdf":
+      return (
+        <div className="flex min-h-0 flex-1 flex-col">
+          {props.loading ? <LoadingState /> : null}
+          {props.error ? <ArtifactBodyError error={props.error} /> : null}
+          {!(props.loading || props.error) && props.pdfPreviewUrl ? (
+            <object
+              aria-label={props.artifact.filename}
+              className="min-h-0 w-full flex-1 border-0"
+              data={props.pdfPreviewUrl}
+              type="application/pdf"
+            >
+              <a download={props.artifact.filename} href={props.pdfPreviewUrl}>
+                Download PDF
+              </a>
+            </object>
+          ) : null}
+        </div>
+      );
+    case "image":
+      return <ArtifactAttachmentImageBody {...props} />;
+    case "video":
+      return <ArtifactAttachmentVideoBody {...props} />;
+    case "html":
+      return <ArtifactAttachmentHtmlBody {...props} />;
+    case "spreadsheet":
+      return <ArtifactAttachmentSpreadsheetBody {...props} />;
+    case "text":
+      return <ArtifactAttachmentTextBody {...props} />;
+    default: {
+      const _exhaustive: never = props;
+
+      return _exhaustive;
+    }
+  }
+}

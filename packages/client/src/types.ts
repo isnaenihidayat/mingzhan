@@ -1,0 +1,94 @@
+import type {
+  AgentQuestionnaire,
+  AgentTodo,
+  AutomationDefinition,
+  ChatContextUsage,
+  ChatMessage,
+  ChatUsage,
+  CompactionResponse,
+  ImageAttachment,
+  SendMessageInput,
+  SendMessageRequest,
+} from "@mingzhan/core/contract";
+
+export interface MíngZhànClientOptions {
+  authToken?: string;
+  baseUrl?: string;
+  /** Browser-style origin for OAuth callbacks when this client has no window (e.g. Telegram bridge). */
+  clientOrigin?: string;
+  credentials?: RequestCredentials;
+  fetch?: (...args: Parameters<typeof fetch>) => ReturnType<typeof fetch>;
+  orgId?: string | null;
+}
+
+export type StreamHandler = (delta: string) => void;
+
+export type JsonValue =
+  | boolean
+  | null
+  | number
+  | string
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
+export interface StreamHandlers {
+  onChunk: StreamHandler;
+  onContextUsage?: (usage: ChatContextUsage) => void;
+  /** Only called when the server sends its terminal done event. */
+  onDone?: () => void;
+  onQuestionnaireUpdated?: (questionnaire: AgentQuestionnaire | null) => void;
+  onSubAgentActivity?: (event: {
+    parentToolCallId: string;
+    label: string;
+  }) => void;
+  onThinking?: StreamHandler;
+  onTodosUpdated?: (todos: AgentTodo[]) => void;
+  onToolEnd?: (event: {
+    toolGroupId?: string;
+    toolCallId: string;
+    tool: string;
+    result: unknown;
+    images?: ImageAttachment[];
+  }) => void;
+  onToolInputDelta?: (event: {
+    toolCallId: string;
+    toolGroupId?: string;
+    tool: string;
+    delta: string;
+    accumulatedArguments?: string;
+  }) => void;
+  onToolStart?: (event: {
+    toolCallId: string;
+    toolGroupId?: string;
+    tool: string;
+    input: Record<string, JsonValue>;
+  }) => void;
+  onUsage?: (usage: ChatUsage) => void;
+}
+
+export type SendMessageArg = string | SendMessageInput;
+
+export interface SendStreamOptions {
+  signal?: AbortSignal;
+  whatsappContextToken?: string;
+  whatsappMessage?: SendMessageRequest["whatsappMessage"];
+}
+
+export interface RemoteChatSession {
+  clear(): Promise<void>;
+  compact(options?: { force?: boolean }): Promise<CompactionResponse>;
+  createAutomation(prompt: string): Promise<AutomationDefinition>;
+  getMessages(options?: { signal?: AbortSignal }): Promise<ChatMessage[]>;
+  id: string;
+  purge(): Promise<void>;
+  send(input: SendMessageArg): Promise<string>;
+  sendStream(
+    input: SendMessageArg,
+    handler: StreamHandler | StreamHandlers,
+    options?: SendStreamOptions
+  ): Promise<string>;
+  subscribeStream(
+    handler: StreamHandler | StreamHandlers,
+    options?: SendStreamOptions
+  ): Promise<{ reconnected: boolean; reply?: string }>;
+}

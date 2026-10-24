@@ -1,0 +1,485 @@
+import type {
+  ChatCompletionResult,
+  ChatMessage,
+  StreamChatHandlers,
+  ThinkingEffort,
+  ToolCall,
+} from "@mingzhan/core";
+import { MíngZhànApiError } from "@mingzhan/core";
+import { z } from "zod";
+
+export type ProviderJsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | ProviderJsonValue[]
+  | ProviderJsonRecord;
+
+export interface ProviderJsonRecord {
+  [key: string]: ProviderJsonValue;
+}
+
+const providerNumberSchema = z.number().finite();
+
+const providerStringSchema = z.string();
+
+export function readProviderNumber<Value>(value: Value): number | undefined {
+  const parsed = providerNumberSchema.safeParse(value);
+
+  return parsed.success ? parsed.data : undefined;
+}
+
+export function readProviderString<Value>(value: Value): string | undefined {
+  const parsed = providerStringSchema.safeParse(value);
+
+  return parsed.success ? parsed.data : undefined;
+}
+
+export function buildTokenUsage(options: {
+  cachedInputTokens?: unknown;
+  inputTokens?: unknown;
+  outputTokens?: unknown;
+  totalTokens?: unknown;
+}): ChatCompletionResult["usage"] | undefined {
+  const cachedInputTokens = readProviderNumber(options.cachedInputTokens);
+  let inputTokens = readProviderNumber(options.inputTokens);
+  let outputTokens = readProviderNumber(options.outputTokens);
+  let totalTokens = readProviderNumber(options.totalTokens);
+
+  if (inputTokens === undefined && outputTokens === undefined) {
+    return;
+  }
+
+  if (
+    inputTokens === undefined &&
+    totalTokens !== undefined &&
+    outputTokens !== undefined
+  ) {
+    inputTokens = Math.max(totalTokens - outputTokens, 0);
+  }
+
+  if (
+    outputTokens === undefined &&
+    totalTokens !== undefined &&
+    inputTokens !== undefined
+  ) {
+    outputTokens = Math.max(totalTokens - inputTokens, 0);
+  }
+
+  if (inputTokens === undefined || outputTokens === undefined) {
+    return;
+  }
+
+  if (totalTokens === undefined) {
+    totalTokens = inputTokens + outputTokens;
+  }
+
+  const usage: NonNullable<ChatCompletionResult["usage"]> = {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+  };
+
+  // A zero carries the same information as the provider saying nothing, and
+  // emitting it would change the shape of every existing usage object.
+  if (cachedInputTokens) {
+    usage.cachedInputTokens = cachedInputTokens;
+  }
+
+  return usage;
+}
+
+export function extractOpenAITokenUsage<Value>(
+  value: Value
+): ChatCompletionResult["usage"] | undefined {
+  const record = readRecord(value);
+  // OpenAI counts cached tokens inside prompt_tokens, so this is a subset.
+  const details = readRecord(record.prompt_tokens_details);
+
+  return buildTokenUsage({
+    cachedInputTokens: details.cached_tokens,
+    inputTokens: record.prompt_tokens,
+    outputTokens: record.completion_tokens,
+    totalTokens: record.total_tokens,
+  });
+}
+
+export function extractGeminiTokenUsage<Value>(
+  value: Value
+): ChatCompletionResult["usage"] | undefined {
+  const record = readRecord(value);
+
+  return buildTokenUsage({
+    cachedInputTokens: record.cachedContentTokenCount,
+    inputTokens: record.promptTokenCount,
+    outputTokens: record.candidatesTokenCount,
+    totalTokens: record.totalTokenCount,
+  });
+}
+
+export function notifyToolInputDelta(
+  handlers: StreamChatHandlers | undefined,
+  call: { id: string; name: string; arguments: string },
+  delta: string
+): void {
+  if (!(handlers?.onToolInputDelta && call.id && call.name && delta)) {
+    return;
+  }
+
+  handlers.onToolInputDelta({
+    accumulatedArguments: call.arguments,
+    delta,
+    tool: call.name,
+    toolCallId: call.id,
+  });
+}
+
+export function buildChatCompletionResult(options: {
+  content: string | null | undefined;
+  providerContent?: unknown[];
+  toolCalls: ToolCall[];
+  thinking?: string | null | undefined;
+  usage?: ChatCompletionResult["usage"];
+}): ChatCompletionResult {
+  const content = options.content?.trim() ?? "";
+  const thinking = options.thinking?.trim();
+
+  const assistantMessage: Extract<ChatMessage, { role: "assistant" }> = {
+    content,
+    role: "assistant",
+  };
+
+  if (options.providerContent?.length) {
+    assistantMessage.providerContent = options.providerContent;
+  }
+
+  if (thinking) {
+    assistantMessage.thinking = thinking;
+  }
+
+  if (options.toolCalls.length > 0) {
+    assistantMessage.toolCalls = options.toolCalls;
+  }
+
+  const result: ChatCompletionResult = {
+    assistantMessage,
+    content,
+    toolCalls: options.toolCalls,
+  };
+
+  if (options.usage) {
+    result.usage = options.usage;
+  }
+
+  return result;
+}
+
+/**
+ * Drop orphaned assistant tool_calls / tool results so partial histories cannot
+ * produce provider 400s ("insufficient tool messages following tool_calls").
+ * Intact tool_call ↔ tool pairs are left untouched.
+ */
+export function sanitizeToolCallHistory(
+  messages: ChatMessage[]
+): ChatMessage[] {
+  const toolResultIds = new Set(
+    messages.flatMap((message) =>
+      message.role === "tool" ? [message.toolCallId] : []
+    )
+  );
+
+  const validToolCallIds = new Set<string>();
+
+  for (const message of messages) {
+    if (message.role !== "assistant" || !message.toolCalls?.length) {
+      continue;
+    }
+
+    const ids = message.toolCalls.map((call) => call.id);
+
+    if (ids.every((id) => toolResultIds.has(id))) {
+      for (const id of ids) {
+        validToolCallIds.add(id);
+      }
+    }
+  }
+
+  return messages.filter((message) => {
+    if (message.role === "assistant" && message.toolCalls?.length) {
+      return message.toolCalls.every((call) => validToolCallIds.has(call.id));
+    }
+
+    if (message.role === "tool") {
+      return validToolCallIds.has(message.toolCallId);
+    }
+
+    return true;
+  });
+}
+
+export interface SseEvent {
+  data: string;
+  event: string;
+}
+
+export async function readSseEvents(
+  body: ReadableStream<Uint8Array>,
+  onEvent: (event: SseEvent) => void | Promise<void>
+): Promise<boolean> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let sawDone = false;
+
+  while (true) {
+    const { done, value } = await reader.read();
+
+    if (value) {
+      buffer += decoder.decode(value, { stream: true });
+    }
+
+    if (done) {
+      buffer += decoder.decode();
+    }
+
+    while (true) {
+      const boundary = findSseBoundary(buffer);
+
+      if (!boundary) {
+        break;
+      }
+
+      const eventBlock = buffer.slice(0, boundary.index);
+      buffer = buffer.slice(boundary.index + boundary.length);
+      sawDone = (await emitSseEvent(eventBlock, onEvent)) || sawDone;
+    }
+
+    if (done) {
+      break;
+    }
+  }
+
+  if (buffer.trim()) {
+    sawDone = (await emitSseEvent(buffer, onEvent)) || sawDone;
+  }
+
+  return sawDone;
+}
+
+async function emitSseEvent(
+  eventBlock: string,
+  onEvent: (event: SseEvent) => void | Promise<void>
+): Promise<boolean> {
+  let event = "message";
+  const dataLines: string[] = [];
+
+  for (const line of eventBlock.split(/\r?\n/)) {
+    const eventValue = readSseField(line, "event:");
+
+    if (eventValue !== null) {
+      event = eventValue.trim() || "message";
+      continue;
+    }
+
+    const dataValue = readSseField(line, "data:");
+
+    if (dataValue !== null) {
+      dataLines.push(dataValue);
+    }
+  }
+
+  const data = dataLines.join("\n");
+  const normalized = data.trim();
+
+  if (normalized === "[DONE]") {
+    return true;
+  }
+
+  if (!normalized) {
+    return false;
+  }
+
+  await onEvent({ data, event });
+
+  return false;
+}
+
+function findSseBoundary(
+  buffer: string
+): { index: number; length: number } | null {
+  const match = /\r?\n\r?\n/.exec(buffer);
+
+  if (!match || match.index === undefined) {
+    return null;
+  }
+
+  return {
+    index: match.index,
+    length: match[0].length,
+  };
+}
+
+function readSseField(line: string, prefix: string): string | null {
+  if (!line.startsWith(prefix)) {
+    return null;
+  }
+
+  let value = line.slice(prefix.length);
+
+  if (value.startsWith(" ")) {
+    value = value.slice(1);
+  }
+
+  return value;
+}
+
+export function parseJsonRecord(raw: string): ProviderJsonRecord {
+  const trimmed = raw.trim();
+
+  if (!trimmed) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed);
+
+    return readRecord(parsed);
+  } catch {
+    return {};
+  }
+}
+
+export interface PendingToolCall {
+  arguments: string;
+  id: string;
+  name: string;
+}
+
+export function mergePendingToolCall(
+  pending: Map<number, PendingToolCall>,
+  toolDelta: {
+    index?: number;
+    id?: string;
+    function?: { name?: string; arguments?: string };
+  }
+): void {
+  const index = toolDelta.index ?? 0;
+
+  const current = pending.get(index) ?? {
+    arguments: "",
+    id: "",
+    name: "",
+  };
+
+  if (toolDelta.id) {
+    current.id = toolDelta.id;
+  }
+
+  if (toolDelta.function?.name) {
+    current.name = toolDelta.function.name;
+  }
+
+  if (toolDelta.function?.arguments) {
+    current.arguments += toolDelta.function.arguments;
+  }
+
+  pending.set(index, current);
+}
+
+export function finalizePendingToolCalls(
+  pending: Map<number, PendingToolCall>
+): ToolCall[] {
+  return [...pending.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, call]) => call)
+    .flatMap((call) => {
+      if (!(call.id && call.name)) {
+        return [];
+      }
+
+      return [
+        {
+          arguments: parseJsonRecord(call.arguments),
+          id: call.id,
+          name: call.name,
+        },
+      ];
+    });
+}
+
+export function readRecord<Value>(value: Value): ProviderJsonRecord {
+  if (!(value instanceof Object) || Array.isArray(value)) {
+    return {};
+  }
+
+  // SAFETY: Provider records come from JSON or SDK-decoded JSON payloads.
+  return value as ProviderJsonRecord;
+}
+
+export function normalizeThinkingEffort(
+  effort: ThinkingEffort | undefined
+): ThinkingEffort {
+  if (effort === "low" || effort === "medium" || effort === "high") {
+    return effort;
+  }
+
+  return "medium";
+}
+
+export function formatHttpErrorBody(
+  label: string,
+  status: number,
+  body: string
+): string {
+  const trimmed = body.trim();
+
+  if (!trimmed) {
+    return `${label} request failed (${status}).`;
+  }
+
+  if (/^<!doctype\s+html|^<html[\s>]/i.test(trimmed)) {
+    return `${label} request failed (${status}): received an HTML error page.`;
+  }
+
+  try {
+    const parsed = parseJsonRecord(trimmed);
+    const nested = parsed.error;
+
+    const record = readRecord(nested);
+    const message = readProviderString(record.message)?.trim() ?? "";
+    const type = readProviderString(record.type)?.trim() ?? "";
+
+    if (message) {
+      return `${label} request failed (${status}${type ? ` ${type}` : ""}): ${message}`;
+    }
+
+    const topLevelMessage = readProviderString(parsed.message)?.trim() ?? "";
+
+    if (topLevelMessage) {
+      return `${label} request failed (${status}): ${topLevelMessage}`;
+    }
+  } catch {
+    // fall through to raw body
+  }
+
+  return `${label} request failed (${status}): ${trimmed.slice(0, 500)}`;
+}
+
+/**
+ * A rejected API key is the caller's config to fix, not a MíngZhàn bug: 400 so
+ * the global error handler's `status >= 500` check never reports it. Anything
+ * else from the provider (rate limits, 5xx, timeouts) stays worth seeing.
+ */
+export function buildProviderHttpError(
+  label: string,
+  status: number,
+  body: string
+): MíngZhànApiError {
+  const clientStatus = status === 401 || status === 403 ? 400 : 502;
+
+  return new MíngZhànApiError(
+    formatHttpErrorBody(label, status, body),
+    clientStatus
+  );
+}

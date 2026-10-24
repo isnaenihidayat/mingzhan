@@ -1,0 +1,142 @@
+import { z } from "@hono/zod-openapi";
+import { MíngZhànApiError } from "@mingzhan/core";
+import type {
+  ArtifactShareStatusResponse,
+  PublishArtifactShareResponse,
+  RevokeArtifactShareResponse,
+} from "@mingzhan/core/contract";
+import { ArtifactShareService } from "../../services/artifact-share-service";
+import { resolveRequestClientOrigin } from "../../services/composio-callback-url";
+import type { ServerOptions } from "../context";
+import {
+  requireActiveOrgIdFromContext,
+  requireOrgMemberFromContext,
+} from "../org-guards";
+import { json, readJson } from "../shared";
+import type { HonoApp } from "../types";
+
+export function registerArtifactShareRoutes(
+  app: HonoApp,
+  options: ServerOptions
+): void {
+  if (!(options.databaseAdapter && options.authService)) {
+    return;
+  }
+
+  const service = new ArtifactShareService(
+    options.databaseAdapter,
+    options.authService
+  );
+
+  app.post("/v1/profiles/:profileId/artifacts/shares", async (c) => {
+    const auth = requireOrgMemberFromContext(c);
+    const orgId = requireActiveOrgIdFromContext(c);
+    const profileId = decodeURIComponent(c.req.param("profileId"));
+
+    const body = await readJson(
+      c.req.raw,
+      z
+        .object({ clientOrigin: z.string().optional(), path: z.string() })
+        .strict()
+    );
+
+    if (!body.path?.trim()) {
+      return json({ error: "path is required" }, 400);
+    }
+
+    const clientOrigin = resolveRequestClientOrigin(
+      c.req.raw,
+      body.clientOrigin
+    );
+
+    const publishRequest = {
+      orgId,
+      profileId,
+      request: c.req.raw,
+      sourcePath: body.path.trim(),
+      userId: auth.user.id,
+    };
+
+    if (clientOrigin) {
+      Object.assign(publishRequest, { clientOrigin });
+    }
+
+    return json<PublishArtifactShareResponse>(
+      await service.publishArtifactShare(publishRequest),
+      201
+    );
+  });
+
+  app.get("/v1/profiles/:profileId/artifacts/shares/status", async (c) => {
+    requireOrgMemberFromContext(c);
+    const orgId = requireActiveOrgIdFromContext(c);
+    const profileId = decodeURIComponent(c.req.param("profileId"));
+    const sourcePath = c.req.query("path");
+
+    if (!sourcePath?.trim()) {
+      return json({ error: "path is required" }, 400);
+    }
+
+    const status = await service.getArtifactShareStatus({
+      orgId,
+      profileId,
+      request: c.req.raw,
+      sourcePath: sourcePath.trim(),
+    });
+
+    if (!status) {
+      return json<ArtifactShareStatusResponse | null>(null);
+    }
+
+    return json(status);
+  });
+
+  app.delete("/v1/profiles/:profileId/artifacts/shares/:shareId", async (c) => {
+    requireOrgMemberFromContext(c);
+    const orgId = requireActiveOrgIdFromContext(c);
+    const profileId = decodeURIComponent(c.req.param("profileId"));
+    const shareId = decodeURIComponent(c.req.param("shareId"));
+
+    return json<RevokeArtifactShareResponse>(
+      await service.revokeArtifactShare({ orgId, profileId, shareId })
+    );
+  });
+
+  app.get("/v1/public/artifact-shares/:token", async (c) => {
+    const token = decodeURIComponent(c.req.param("token"));
+    const metaOnly = c.req.query("meta") === "1";
+
+    try {
+      const { bytes, metadata } = await service.readPublicArtifactShare(token);
+
+      if (metaOnly) {
+        return json(metadata);
+      }
+
+      const downloadName = metadata.filename.replace(/["\\]/g, "_");
+      const disposition = metadata.inlineAllowed ? "inline" : "attachment";
+
+      const contentType = metadata.inlineAllowed
+        ? metadata.mimeType
+        : metadata.mimeType.startsWith("text/")
+          ? "text/plain; charset=utf-8"
+          : "application/octet-stream";
+
+      return new Response(new Uint8Array(bytes), {
+        headers: {
+          "Content-Disposition": `${disposition}; filename="${downloadName}"`,
+          "Content-Type": contentType,
+          "Referrer-Policy": "no-referrer",
+          "X-Artifact-Filename": metadata.filename,
+          "X-Inline-Allowed": metadata.inlineAllowed ? "1" : "0",
+        },
+      });
+    } catch (error) {
+      if (error instanceof MíngZhànApiError && error.status === 404) {
+        return json({ error: "Not found" }, 404);
+      }
+
+      throw error;
+    }
+  });
+}

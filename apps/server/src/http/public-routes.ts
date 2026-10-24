@@ -1,0 +1,40 @@
+const PUBLIC_ROUTES = new Set([
+  "/health",
+  "/artifact-frame",
+  "/docs",
+  "/docs/",
+  "/openapi.json",
+  "/v1/auth/setup",
+  "/v1/auth/setup/import/preview",
+  "/v1/auth/setup/import/restore",
+  "/v1/auth/login",
+  "/v1/auth/passkey/login/options",
+  "/v1/auth/me",
+  "/v1/auth/accept-invite",
+  "/v1/auth/password-reset/request",
+  "/v1/auth/password-reset/complete",
+  "/v1/composio/oauth/callback",
+]);
+
+export function isPublicRouteRequest(
+  method: string,
+  pathname: string
+): boolean {
+  if (pathname === "/v1/auth/me") {
+    return method === "GET";
+  }
+
+  return (
+    PUBLIC_ROUTES.has(pathname) ||
+    /^\/v1\/notify\/[^/]+$/.test(pathname) ||
+    // The stdio bridge an ACP agent starts has no login. The token in the path
+    // is the credential, and it reaches only that chat's MíngZhàn tools.
+    (method === "POST" && /^\/v1\/acp-mcp\/[^/]+$/.test(pathname)) ||
+    // OAuth provider redirect: it carries a single-use code and state, and the
+    // browser arriving here has no MíngZhàn session.
+    (method === "GET" &&
+      /^\/v1\/mcp\/oauth\/callback\/[^/]+$/.test(pathname)) ||
+    (method === "GET" &&
+      /^\/v1\/public\/artifact-shares\/[^/]+$/.test(pathname))
+  );
+}

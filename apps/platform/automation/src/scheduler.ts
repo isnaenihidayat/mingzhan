@@ -1,0 +1,153 @@
+import type { MíngZhànClient } from "@mingzhan/client";
+import { resolveCuratorScheduleAction } from "@mingzhan/core";
+import {
+  AutomationScheduler,
+  type AutomationSchedulerStatus,
+} from "@mingzhan/core/automation-scheduler";
+import type { AutomationSchedule } from "@mingzhan/core/contract";
+
+async function tickSkillCurator(
+  client: Pick<
+    MíngZhànClient,
+    "listSkillCuratorOrgs" | "runSkillCuratorInternal"
+  >,
+  now = new Date()
+): Promise<{ ran: number; skipped: number }> {
+  const { orgs } = await client.listSkillCuratorOrgs();
+  let ran = 0;
+  let skipped = 0;
+
+  for (const org of orgs) {
+    const action = resolveCuratorScheduleAction({
+      enabled: org.skillsCuratorEnabled,
+      lastRunAt: org.skillsCuratorLastRunAt,
+      now,
+    });
+
+    if (action === "skip") {
+      skipped += 1;
+      continue;
+    }
+
+    await client.runSkillCuratorInternal(org.id, { trigger: action });
+    ran += 1;
+  }
+
+  return { ran, skipped };
+}
+
+export class AutomationWorkerScheduler {
+  private readonly scheduler: AutomationScheduler;
+  private pollIntervalMs: number | null = null;
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(
+    private readonly client: MíngZhànClient,
+    private readonly onStatusChange?: (
+      status: AutomationSchedulerStatus
+    ) => void
+  ) {
+    this.scheduler = new AutomationScheduler({
+      getDefaultTimezone: () => this.fetchDefaultTimezone(),
+      listScheduledAutomations: () => this.fetchSchedules(),
+      runAutomation: (id, orgId) => this.runAutomation(id, orgId),
+    });
+  }
+
+  async start(): Promise<void> {
+    await this.scheduler.start();
+    await this.tickCurator();
+    this.notifyStatus();
+  }
+
+  stop(): void {
+    this.stopPolling();
+    this.scheduler.stop();
+    this.notifyStatus();
+  }
+
+  beginPolling(intervalMs: number): void {
+    this.stopPolling();
+    this.pollIntervalMs = intervalMs;
+
+    this.pollTimer = setInterval(async () => {
+      if (this.pollInFlight) {
+        return;
+      }
+
+      this.pollInFlight = true;
+
+      try {
+        const settings = await this.client
+          .getAutomationWorkerSettings()
+          .catch(() => null);
+
+        const nextIntervalMs = settings
+          ? settings.pollIntervalMinutes * 60 * 1000
+          : (this.pollIntervalMs ?? intervalMs);
+
+        if (nextIntervalMs !== this.pollIntervalMs) {
+          this.beginPolling(nextIntervalMs);
+        }
+
+        await this.scheduler.reload();
+        await this.tickCurator();
+        this.notifyStatus();
+      } catch (error) {
+        console.error("Failed to reload automation schedules:", error);
+      } finally {
+        this.pollInFlight = false;
+      }
+    }, intervalMs);
+  }
+
+  private stopPolling(): void {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+  }
+
+  private async tickCurator(): Promise<void> {
+    try {
+      await tickSkillCurator(this.client);
+    } catch (error) {
+      console.error("Failed to tick skill curator:", error);
+    }
+  }
+
+  private async fetchSchedules(): Promise<AutomationSchedule[]> {
+    return this.client.listAutomationSchedules();
+  }
+
+  private async runAutomation(
+    automationId: string,
+    orgId: string
+  ): Promise<{ ok: boolean; skipped?: boolean; error?: string }> {
+    try {
+      await this.client.runAutomationInternal(automationId, orgId);
+
+      return { ok: true };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+
+      return { error: message, ok: false };
+    }
+  }
+
+  private async fetchDefaultTimezone(): Promise<string> {
+    try {
+      return await this.client.getTimezone();
+    } catch {
+      return "UTC";
+    }
+  }
+
+  getStatus(): AutomationSchedulerStatus {
+    return this.scheduler.getStatus();
+  }
+
+  private notifyStatus(): void {
+    this.onStatusChange?.(this.scheduler.getStatus());
+  }
+}

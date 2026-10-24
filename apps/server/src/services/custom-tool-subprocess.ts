@@ -1,0 +1,359 @@
+import { type ChildProcess, spawn } from "node:child_process";
+import path from "node:path";
+import type { ToolContext } from "@mingzhan/core";
+
+// Shared subprocess machinery for custom tool loaders (javascript, python).
+// A registered tool can be written by any org's Super MíngZhàn profile, so both
+// handler types run as a child process with an explicit env allowlist
+// instead of inheriting the server's full environment.
+
+const SIGKILL_GRACE_MS = 5000;
+
+const MAX_OUTPUT_CHARS = 1_000_000;
+
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+// Keep in sync with TOOL_RETRYABLE_EXIT_CODE in custom-tool-handlers.ts
+// (sysexits EX_TEMPFAIL). Avoid importing that module — loaders import us.
+const RETRYABLE_EXIT_CODE = 75;
+
+type SubprocessJsonValue =
+  | boolean
+  | null
+  | number
+  | string
+  | SubprocessJsonValue[]
+  | { [key: string]: SubprocessJsonValue };
+
+/** Signal a dedicated POSIX process group or a Windows process tree.
+ * Callers must spawn with detached: true on POSIX. Windows callers can await
+ * taskkill completion before releasing inherited output handles.
+ */
+export function killProcessTree(
+  child: ChildProcess,
+  signal: NodeJS.Signals
+): Promise<void> {
+  const killChild = () => {
+    try {
+      child.kill(signal);
+    } catch {
+      // already exited
+    }
+  };
+
+  if (!child.pid) {
+    return Promise.resolve();
+  }
+
+  if (process.platform === "win32") {
+    return new Promise((resolve) => {
+      const killer = spawn(
+        path.join(
+          process.env.SystemRoot ?? "C:\\Windows",
+          "System32",
+          "taskkill.exe"
+        ),
+        // Windows has no graceful POSIX group signal. Match child.kill's
+        // forceful termination, while also ending its descendants.
+        ["/F", "/T", "/PID", String(child.pid)],
+        { stdio: "ignore", windowsHide: true }
+      );
+
+      killer.once("error", () => {
+        killChild();
+        resolve();
+      });
+      killer.once("close", (code) => {
+        if (code !== 0) {
+          killChild();
+        }
+
+        resolve();
+      });
+    });
+  }
+
+  try {
+    process.kill(-child.pid, signal);
+  } catch {
+    killChild();
+  }
+
+  return Promise.resolve();
+}
+
+function resolveCustomToolTimeoutMs(): number {
+  const configured = Number(process.env.MINGZHAN_CUSTOM_TOOL_TIMEOUT_MS);
+
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : DEFAULT_TIMEOUT_MS;
+}
+
+function buildAllowlistedSubprocessEnv(
+  workspaceRoot?: string,
+  includeConfigDir = true
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+
+  if (process.env.PATH) {
+    env.PATH = process.env.PATH;
+  }
+
+  if (includeConfigDir && process.env.MINGZHAN_CONFIG_DIR) {
+    env.MINGZHAN_CONFIG_DIR = process.env.MINGZHAN_CONFIG_DIR;
+  }
+
+  if (workspaceRoot) {
+    env.MINGZHAN_WORKSPACE_ROOT = workspaceRoot;
+  }
+
+  return env;
+}
+
+interface SpawnJsonToolTransport {
+  includeConfigDir?: boolean;
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns -- The host callback receives IPC data before its caller validates it.
+  onHostRequest?: (request: unknown, signal: AbortSignal) => Promise<unknown>;
+  timeoutMs?: number;
+}
+
+export interface SpawnJsonToolOptions {
+  args: string[];
+  bin: string;
+  context: ToolContext;
+  /** Working directory for the child. Keeps a tool's relative file access
+   * scoped to its own directory instead of the server's checkout. */
+  cwd: string;
+  /** Extra variables for the child, e.g. a tool's saved configuration. */
+  env?: Record<string, string>;
+  input: unknown;
+  /** Used in error messages, e.g. "Python tool", "JavaScript tool". */
+  label: string;
+  transport?: SpawnJsonToolTransport;
+  workspaceRoot?: string;
+}
+
+/**
+ * Spawns a tool as a subprocess, writes `input` as JSON to stdin, and parses
+ * one JSON value from stdout as the result. Kills the child (SIGTERM, then
+ * SIGKILL after a grace period) if it outlives the timeout or if
+ * `context.signal` aborts.
+ */
+export async function spawnJsonTool(
+  options: SpawnJsonToolOptions
+): Promise<SubprocessJsonValue> {
+  const { args, bin, context, cwd, input, label, transport, workspaceRoot } =
+    options;
+
+  const env = buildAllowlistedSubprocessEnv(
+    workspaceRoot,
+    transport?.includeConfigDir ?? true
+  );
+
+  const timeoutMs = transport?.timeoutMs ?? resolveCustomToolTimeoutMs();
+  Object.assign(env, options.env);
+
+  const result = await new Promise<{ stderr: string; stdout: string }>(
+    (resolve, reject) => {
+      // Node SIGTERMs the child when the turn is cancelled, so a stopped chat
+      // does not leave a tool process holding the session open.
+      const child = spawn(bin, args, {
+        cwd,
+        detached: process.platform !== "win32",
+        env,
+        stdio: transport?.onHostRequest
+          ? ["pipe", "pipe", "pipe", "ipc"]
+          : ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+      });
+
+      const hostAbort = new AbortController();
+
+      let hostRequestPending = false;
+      // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Node types IPC messages as unknown at this boundary.
+      child.on("message", async (message: unknown) => {
+        if (
+          !(transport?.onHostRequest && message) ||
+          // oxlint-disable-next-line anti-slop/no-runtime-typeof -- IPC may contain any serialized value.
+          typeof message !== "object"
+        ) {
+          return;
+        }
+
+        // SAFETY: The object and protocol fields are checked before the request is used.
+        // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- IPC protocol fields are validated below.
+        const request = message as Record<string, unknown>;
+
+        if (
+          request.type !== "mingzhan-host-request" ||
+          // oxlint-disable-next-line anti-slop/no-runtime-typeof -- The protocol id must be a string before it is echoed.
+          typeof request.id !== "string"
+        ) {
+          return;
+        }
+
+        const reply = (payload: { error?: string; result?: unknown }) => {
+          if (child.connected) {
+            child.send(
+              { id: request.id, type: "mingzhan-host-result", ...payload },
+              () => {}
+            );
+          }
+        };
+
+        if (hostRequestPending) {
+          reply({ error: "Host calls must be sequential." });
+
+          return;
+        }
+
+        hostRequestPending = true;
+
+        try {
+          reply({
+            result: await transport.onHostRequest(
+              request.request,
+              hostAbort.signal
+            ),
+          });
+        } catch (error) {
+          reply({
+            error: error instanceof Error ? error.message : String(error),
+          });
+        } finally {
+          hostRequestPending = false;
+        }
+      });
+
+      let stdout = "";
+      let stderr = "";
+      let timedOut = false;
+      let aborted = false;
+
+      const killChild = () => {
+        hostAbort.abort();
+        void killProcessTree(child, "SIGTERM");
+        setTimeout(() => {
+          void killProcessTree(child, "SIGKILL");
+        }, SIGKILL_GRACE_MS).unref();
+      };
+
+      const onAbort = () => {
+        aborted = true;
+        killChild();
+      };
+
+      if (context.signal?.aborted) {
+        onAbort();
+      } else {
+        context.signal?.addEventListener("abort", onAbort, { once: true });
+      }
+
+      const sigtermTimer = setTimeout(() => {
+        killChild();
+        timedOut = true;
+      }, timeoutMs);
+
+      child.stdout?.on("data", (chunk: Buffer | string) => {
+        stdout = appendCapped(stdout, String(chunk));
+      });
+
+      child.stderr?.on("data", (chunk: Buffer | string) => {
+        stderr = appendCapped(stderr, String(chunk));
+      });
+
+      // A child that exits without reading stdin can surface EPIPE here;
+      // the close handler reports the real failure.
+      child.stdin?.on("error", () => {});
+
+      child.once("error", (error) => {
+        hostAbort.abort();
+        clearTimeout(sigtermTimer);
+        reject(error);
+      });
+
+      child.once("close", (exitCode) => {
+        hostAbort.abort();
+        context.signal?.removeEventListener("abort", onAbort);
+        clearTimeout(sigtermTimer);
+        const tail = stderr.trim() || "(no stderr)";
+
+        // A child that traps SIGTERM can still exit 0 after the deadline;
+        // the budget is spent either way, so report the timeout.
+        if (aborted) {
+          reject(new Error(`${label} was cancelled`));
+
+          return;
+        }
+
+        if (timedOut) {
+          reject(
+            new Error(
+              `${label} timed out after ${timeoutMs}ms (exit code ${exitCode ?? "null"}): ${tail}`
+            )
+          );
+
+          return;
+        }
+
+        if (exitCode === 0) {
+          resolve({ stderr, stdout });
+
+          return;
+        }
+
+        // Exit 75 (EX_TEMPFAIL) is the only non-zero code that opts into
+        // retries — the tool author asserts the attempt was side-effect-free.
+        const message = `${label} exit code ${exitCode ?? "null"}: ${tail}`;
+
+        if (exitCode === RETRYABLE_EXIT_CODE) {
+          reject(
+            Object.assign(new Error(message), { retryable: true as const })
+          );
+
+          return;
+        }
+
+        reject(new Error(message));
+      });
+
+      // Write the input payload and close stdin so the child can finish
+      // reading and proceed to run().
+      try {
+        child.stdin?.end(JSON.stringify(input ?? {}));
+      } catch (error) {
+        clearTimeout(sigtermTimer);
+        reject(error);
+      }
+    }
+  );
+
+  const trimmed = result.stdout.trim();
+
+  if (!trimmed) {
+    throw new Error(
+      `${label} produced no output; it must print its JSON result to stdout. stderr: ${result.stderr.trim() || "(empty)"}`
+    );
+  }
+
+  try {
+    // SAFETY: JSON.parse accepts only valid JSON output from the child process.
+    return JSON.parse(trimmed) as SubprocessJsonValue;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `${label} returned non-JSON output: ${message}; stderr: ${result.stderr.trim() || "(empty)"}`
+    );
+  }
+}
+
+function appendCapped(current: string, next: string): string {
+  const combined = current + next;
+
+  if (combined.length <= MAX_OUTPUT_CHARS) {
+    return combined;
+  }
+
+  return combined.slice(-MAX_OUTPUT_CHARS);
+}

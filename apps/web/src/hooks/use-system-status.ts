@@ -1,0 +1,51 @@
+import type {
+  DiscordWorkerStatus,
+  SystemStatusResponse,
+} from "@mingzhan/core/contract";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useAuth } from "@/context/use-auth";
+import { useChannelProfileId } from "@/hooks/use-app-queries";
+import { client } from "@/lib/client";
+import { invalidateQueries } from "@/lib/query-client";
+import { queryKeys } from "@/lib/query-keys";
+
+const REFRESH_INTERVAL_MS = 10_000;
+
+const DEFAULT_DISCORD_WORKER_STATUS: DiscordWorkerStatus = {
+  configured: false,
+  connected: false,
+  ok: true,
+  paired: false,
+  running: false,
+};
+
+function normalizeSystemStatus(
+  status: SystemStatusResponse
+): SystemStatusResponse {
+  return {
+    ...status,
+    discordWorker: status.discordWorker ?? DEFAULT_DISCORD_WORKER_STATUS,
+    // An older server has no Slack bridge; show it as not connected.
+    slackWorker: status.slackWorker ?? DEFAULT_DISCORD_WORKER_STATUS,
+  };
+}
+
+export function useSystemStatusQuery() {
+  const profileId = useChannelProfileId();
+  const { activeOrg } = useAuth();
+  const orgId = activeOrg?.id ?? null;
+  const api = client.forOrg(orgId);
+
+  return useQuery({
+    queryFn: async () =>
+      normalizeSystemStatus(await api.getSystemStatus(profileId)),
+    queryKey: [...queryKeys.systemStatus, orgId, profileId],
+    refetchInterval: REFRESH_INTERVAL_MS,
+  });
+}
+
+export function useRefreshSystemStatus() {
+  const queryClient = useQueryClient();
+
+  return () => invalidateQueries(queryClient, queryKeys.systemStatus);
+}

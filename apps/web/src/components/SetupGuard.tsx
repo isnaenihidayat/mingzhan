@@ -1,0 +1,27 @@
+import { Spinner } from "@mingzhan/ui/spinner";
+import { Navigate, Outlet } from "react-router-dom";
+import { useAppContext } from "@/context/use-app-context";
+import { SETUP_PATH } from "@/lib/navigation";
+
+export function SetupGuard() {
+  const { health, loading, error } = useAppContext();
+
+  if (loading) {
+    return (
+      <div className="flex h-svh items-center justify-center bg-background">
+        <Spinner className="size-6 text-muted-foreground" />
+      </div>
+    );
+  }
+
+  if (error) {
+    return <Outlet />;
+  }
+
+  // Removing the last provider must not lock existing users out of Settings.
+  if (health?.userConfigured !== true) {
+    return <Navigate replace to={SETUP_PATH} />;
+  }
+
+  return <Outlet />;
+}

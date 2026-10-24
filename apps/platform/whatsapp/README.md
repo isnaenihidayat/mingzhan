@@ -1,0 +1,25 @@
+# WhatsApp Bridge
+
+Run the WhatsApp bridge with:
+
+```sh
+bun run dev:whatsapp
+```
+
+Setup flow:
+
+1. Start the server with `bun run dev:server`
+2. Open the web dashboard and go to `Integrations -> WhatsApp`
+3. Save your phone number and profile
+4. Copy the pairing code
+5. In WhatsApp, open `Settings -> Linked Devices -> Link with phone number`
+6. Enter the pairing code
+
+Notes:
+
+- Auth state is stored in `~/.mingzhan/whatsapp/auth/`
+- Chat session mappings are stored in `~/.mingzhan/whatsapp/chat-sessions.json`
+- Restart the bridge after changing the saved phone number
+- Groups reply to a mention of the linked number, a reply to a MíngZhàn message, or a `/command`. Turn off `require_group_mention` in Integrations → WhatsApp to answer without a mention. `allow_unpaired_group_members` decides whether members who are not paired or allowlisted get an answer; a config without it keeps the old rule (open when the mention requirement is off). Pair in a private chat, or mention the bot and send a pairing code in the group.
+
+Optional env: `WHATSAPP_PHONE_NUMBER`, `MINGZHAN_WHATSAPP_PROFILE_ID`, `MINGZHAN_SERVER_URL`.

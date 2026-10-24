@@ -1,0 +1,7 @@
+{
+  "rewrites": [
+    { "source": "/mingzhan", "destination": "/index.html" },
+    { "source": "/mingzhan/", "destination": "/index.html" },
+    { "source": "/mingzhan/:path*", "destination": "/:path*" }
+  ]
+}

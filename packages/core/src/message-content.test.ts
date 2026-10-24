@@ -1,0 +1,330 @@
+import { describe, expect, test } from "bun:test";
+import { MíngZhànApiError } from "./api-error";
+import type { ChatMessage } from "./contract";
+import {
+  countUserImages,
+  estimateUserContentTokens,
+  getUserMessageText,
+  messagesIncludeUserImages,
+  normalizeUserContent,
+  parseDataUrl,
+  parseDocumentDataUrl,
+  stripImagesForCompaction,
+  validateCombinedAttachmentCount,
+  validateDocumentAttachments,
+  validateImageAttachments,
+} from "./message-content";
+
+const tinyPngBase64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+describe("normalizeUserContent", () => {
+  test("returns parts when images present", () => {
+    const result = normalizeUserContent("see this", [
+      { data: tinyPngBase64, mediaType: "image/png" },
+    ]);
+
+    expect(Array.isArray(result)).toBe(true);
+    expect(result).toEqual([
+      { text: "see this", type: "text" },
+      { data: tinyPngBase64, mediaType: "image/png", type: "image" },
+    ]);
+  });
+
+  test("allows image-only message", () => {
+    const result = normalizeUserContent("", [
+      { data: tinyPngBase64, mediaType: "image/png" },
+    ]);
+
+    expect(result).toEqual([
+      { data: tinyPngBase64, mediaType: "image/png", type: "image" },
+    ]);
+  });
+
+  test("returns parts when documents present", () => {
+    const result = normalizeUserContent("summarize", undefined, [
+      {
+        data: "SGVsbG8=",
+        filename: "notes.txt",
+        mediaType: "text/plain",
+      },
+    ]);
+
+    expect(result).toEqual([
+      { text: "summarize", type: "text" },
+      {
+        data: "SGVsbG8=",
+        filename: "notes.txt",
+        mediaType: "text/plain",
+        type: "document",
+      },
+    ]);
+  });
+
+  test("allows document-only message", () => {
+    const result = normalizeUserContent("", undefined, [
+      {
+        data: "SGVsbG8=",
+        filename: "notes.txt",
+        mediaType: "text/plain",
+      },
+    ]);
+
+    expect(result).toEqual([
+      {
+        data: "SGVsbG8=",
+        filename: "notes.txt",
+        mediaType: "text/plain",
+        type: "document",
+      },
+    ]);
+  });
+});
+
+describe("validateImageAttachments", () => {
+  test("rejects unsupported media type", () => {
+    expect(() =>
+      validateImageAttachments([
+        { data: tinyPngBase64, mediaType: "image/bmp" },
+      ])
+    ).toThrow(MíngZhànApiError);
+  });
+
+  test("rejects oversized image", () => {
+    const huge = "A".repeat((6 * 1024 * 1024 * 4) / 3);
+    expect(() =>
+      validateImageAttachments([{ data: huge, mediaType: "image/png" }])
+    ).toThrow(MíngZhànApiError);
+  });
+
+  test.each(["!!!!", "YQ", "====", "data:image/png;base64,!!!!"])(
+    "rejects invalid base64: %s",
+    (data) => {
+      expect(() =>
+        validateImageAttachments([{ data, mediaType: "image/png" }])
+      ).toThrow(MíngZhànApiError);
+    }
+  );
+});
+
+describe("validateDocumentAttachments", () => {
+  test("rejects unsupported media type", () => {
+    expect(() =>
+      validateDocumentAttachments([
+        {
+          data: "YWJj",
+          filename: "bad.bin",
+          mediaType: "application/octet-stream",
+        },
+      ])
+    ).toThrow(MíngZhànApiError);
+  });
+
+  test("accepts markdown attachments", () => {
+    expect(() =>
+      validateDocumentAttachments([
+        {
+          data: "Iw==",
+          filename: "notes.md",
+          mediaType: "text/markdown",
+        },
+      ])
+    ).not.toThrow();
+  });
+
+  test("accepts excel attachments under the size limit", () => {
+    expect(() =>
+      validateDocumentAttachments([
+        {
+          data: "YWJj",
+          filename: "budget.xlsx",
+          mediaType:
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        },
+      ])
+    ).not.toThrow();
+  });
+
+  test("normalizes excel extension when media type is generic", () => {
+    expect(() =>
+      validateDocumentAttachments([
+        {
+          data: "YWJj",
+          filename: "budget.xlsx",
+          mediaType: "application/octet-stream",
+        },
+      ])
+    ).not.toThrow();
+  });
+
+  test("rejects oversized document", () => {
+    const huge = "A".repeat((6 * 1024 * 1024 * 4) / 3);
+    expect(() =>
+      validateDocumentAttachments([
+        { data: huge, filename: "big.pdf", mediaType: "application/pdf" },
+      ])
+    ).toThrow(MíngZhànApiError);
+  });
+
+  test("rejects invalid document base64", () => {
+    expect(() =>
+      validateDocumentAttachments([
+        {
+          data: "!!!!",
+          filename: "notes.txt",
+          mediaType: "text/plain",
+        },
+      ])
+    ).toThrow(MíngZhànApiError);
+  });
+});
+
+describe("validateCombinedAttachmentCount", () => {
+  test("rejects more than five attachments total", () => {
+    expect(() => validateCombinedAttachmentCount(3, 3)).toThrow(MíngZhànApiError);
+  });
+});
+
+describe("getUserMessageText", () => {
+  test("extracts text from parts", () => {
+    expect(
+      getUserMessageText([
+        { text: "line one", type: "text" },
+        { data: tinyPngBase64, mediaType: "image/png", type: "image" },
+        { text: "line two", type: "text" },
+      ])
+    ).toBe("line one\nline two");
+  });
+});
+
+describe("estimateUserContentTokens", () => {
+  test("adds fixed tokens per image", () => {
+    const tokens = estimateUserContentTokens([
+      { text: "hi", type: "text" },
+      { data: tinyPngBase64, mediaType: "image/png", type: "image" },
+    ]);
+
+    expect(tokens).toBeGreaterThan(1400);
+  });
+});
+
+describe("stripImagesForCompaction", () => {
+  test("omits tool images while preserving the tool result and original history", () => {
+    const message: ChatMessage = {
+      attachments: [
+        { data: tinyPngBase64, mediaType: "image/png", type: "image" },
+      ],
+      content: '{"path":"shot.png"}',
+      name: "read_file",
+      role: "tool",
+      toolCallId: "image",
+    };
+
+    const [stripped] = stripImagesForCompaction([message]);
+    expect(stripped).toEqual({ ...message, attachments: undefined });
+    expect(message.attachments).toHaveLength(1);
+  });
+  test("replaces image parts with placeholder text", () => {
+    const result = stripImagesForCompaction([
+      {
+        content: [
+          { text: "diagram", type: "text" },
+          { data: tinyPngBase64, mediaType: "image/png", type: "image" },
+        ],
+        role: "user",
+      },
+    ]);
+
+    expect(result[0]).toEqual({
+      content: "diagram\n[1 image omitted from summary]",
+      role: "user",
+    });
+  });
+});
+
+describe("parseDataUrl", () => {
+  test("parses valid data url", () => {
+    expect(parseDataUrl(`data:image/png;base64,${tinyPngBase64}`)).toEqual({
+      data: tinyPngBase64,
+      mediaType: "image/png",
+    });
+  });
+
+  test("parses data url with parameters", () => {
+    expect(
+      parseDataUrl(`data:image/png;charset=utf-8;base64,${tinyPngBase64}`)
+    ).toEqual({
+      data: tinyPngBase64,
+      mediaType: "image/png",
+    });
+  });
+
+  test("returns null for invalid url", () => {
+    expect(parseDataUrl("not-a-data-url")).toBeNull();
+  });
+});
+
+describe("parseDocumentDataUrl", () => {
+  test("parses document data url with charset parameter", () => {
+    const doc = parseDocumentDataUrl(
+      "data:text/markdown;charset=utf-8;base64,IyBRQSBkb2M=",
+      "qa-test.md"
+    );
+
+    expect(doc).toEqual({
+      data: "IyBRQSBkb2M=",
+      filename: "qa-test.md",
+      mediaType: "text/markdown",
+    });
+  });
+
+  test("parses document data url without explicit mediatype", () => {
+    const doc = parseDocumentDataUrl("data:;base64,IyBRQSBkb2M=", "qa-test.md");
+    expect(doc).toEqual({
+      data: "IyBRQSBkb2M=",
+      filename: "qa-test.md",
+      mediaType: "text/markdown",
+    });
+  });
+
+  test("returns null for non-data url", () => {
+    expect(parseDocumentDataUrl("invalid", "doc.txt")).toBeNull();
+  });
+});
+
+describe("countUserImages", () => {
+  test("counts image parts", () => {
+    expect(
+      countUserImages([
+        { text: "x", type: "text" },
+        { data: tinyPngBase64, mediaType: "image/png", type: "image" },
+      ])
+    ).toBe(1);
+  });
+});
+
+describe("messagesIncludeUserImages", () => {
+  test("detects image parts in user messages", () => {
+    const messages: ChatMessage[] = [
+      { content: "hello", role: "user" },
+      {
+        content: [
+          { text: "see this", type: "text" },
+          { data: "abc", mediaType: "image/png", type: "image" },
+        ],
+        role: "user",
+      },
+    ];
+
+    expect(messagesIncludeUserImages(messages)).toBe(true);
+  });
+
+  test("returns false for text-only history", () => {
+    const messages: ChatMessage[] = [
+      { content: "hello", role: "user" },
+      { content: "hi", role: "assistant" },
+    ];
+
+    expect(messagesIncludeUserImages(messages)).toBe(false);
+  });
+});

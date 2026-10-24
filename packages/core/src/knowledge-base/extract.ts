@@ -1,0 +1,104 @@
+import { convertDocumentBytes } from "../anydoc-text";
+import { DOCX_MEDIA_TYPE, LEGACY_DOC_MEDIA_TYPE } from "../artifact-mime";
+import { convertDocxToMarkdown } from "../docx-text";
+import { MAX_KNOWLEDGE_DOCUMENT_BYTES } from "../message-content";
+
+const KB_ALLOWED_MEDIA_TYPES = new Set([
+  "application/pdf",
+  DOCX_MEDIA_TYPE,
+  LEGACY_DOC_MEDIA_TYPE,
+  "text/plain",
+  "text/csv",
+  "text/markdown",
+]);
+
+const KB_EXTENSION_MEDIA_TYPES = {
+  ".csv": "text/csv",
+  ".doc": LEGACY_DOC_MEDIA_TYPE,
+  ".docx": DOCX_MEDIA_TYPE,
+  ".md": "text/markdown",
+  ".pdf": "application/pdf",
+  ".txt": "text/plain",
+} satisfies Record<string, string>;
+
+export function normalizeKnowledgeBaseMediaType(
+  mediaType: string,
+  filename: string
+): string {
+  const trimmed = mediaType.trim().toLowerCase();
+  const extension = filename.slice(filename.lastIndexOf(".")).toLowerCase();
+
+  const fromExtension = Object.entries(KB_EXTENSION_MEDIA_TYPES).find(
+    ([candidate]) => candidate === extension
+  )?.[1];
+
+  if (fromExtension) {
+    return fromExtension;
+  }
+
+  if (KB_ALLOWED_MEDIA_TYPES.has(trimmed)) {
+    return trimmed;
+  }
+
+  return trimmed;
+}
+
+export function isSupportedKnowledgeBaseMediaType(
+  mediaType: string,
+  filename: string
+): boolean {
+  const normalized = normalizeKnowledgeBaseMediaType(mediaType, filename);
+
+  return KB_ALLOWED_MEDIA_TYPES.has(normalized);
+}
+
+export async function extractText(
+  mediaType: string,
+  filename: string,
+  bytes: Buffer
+): Promise<string> {
+  if (bytes.length > MAX_KNOWLEDGE_DOCUMENT_BYTES) {
+    throw new Error(
+      `Document must be at most ${MAX_KNOWLEDGE_DOCUMENT_BYTES / (1024 * 1024)} MB.`
+    );
+  }
+
+  const normalized = normalizeKnowledgeBaseMediaType(mediaType, filename);
+
+  if (!KB_ALLOWED_MEDIA_TYPES.has(normalized)) {
+    throw new Error(
+      `Unsupported knowledge base document type: ${mediaType}. Allowed: txt, md, csv, pdf, docx.`
+    );
+  }
+
+  if (normalized === "application/pdf") {
+    const { text } = await convertDocumentBytes(bytes, {
+      filename,
+      format: "pdf",
+      mediaType: normalized,
+    });
+
+    return text;
+  }
+
+  // Word-named uploads are decided by their bytes: a real .docx, a legacy OLE .doc
+  // (rejected with an actionable message), or HTML saved under a Word extension.
+  if (normalized === DOCX_MEDIA_TYPE || normalized === LEGACY_DOC_MEDIA_TYPE) {
+    return convertDocxToMarkdown(bytes);
+  }
+
+  return bytes.toString("utf8").trim();
+}
+
+export function buildExtractedTextHeader(options: {
+  filename: string;
+  mediaType: string;
+  uploadedAt: string;
+}): string {
+  return [
+    `# source: ${options.filename}`,
+    `# mediaType: ${options.mediaType}`,
+    `# uploadedAt: ${options.uploadedAt}`,
+    "",
+  ].join("\n");
+}

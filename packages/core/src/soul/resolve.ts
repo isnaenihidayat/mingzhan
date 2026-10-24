@@ -1,0 +1,156 @@
+import { dirname, isAbsolute, join } from "node:path";
+import { getUserConfigDir } from "../user-config";
+import { loadSoulStack } from "./load";
+import type { LoadedSoulStack } from "./types";
+
+/** Reject path segments that would escape `~/.mingzhan/orgs/{id}/...`. */
+export function assertConfigPathSegment(value: string, label: string): string {
+  const trimmed = value.trim();
+
+  if (!trimmed || trimmed === "." || trimmed === "..") {
+    throw new Error(`Invalid ${label}.`);
+  }
+
+  if (
+    trimmed.includes("/") ||
+    trimmed.includes("\\") ||
+    trimmed.includes("\0")
+  ) {
+    throw new Error(`Invalid ${label}.`);
+  }
+
+  return trimmed;
+}
+
+/** Archive filenames are `YYYY-MM.md` — reject anything that could escape the archive dir. */
+export function assertYearMonth(value: string): string {
+  const trimmed = value.trim();
+
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(trimmed)) {
+    throw new Error(`Invalid yearMonth (expected YYYY-MM): ${value}`);
+  }
+
+  return trimmed;
+}
+
+/** Per-profile soul stack: ~/.mingzhan/orgs/{orgId}/profiles/{profileId}/ */
+export function getProfileSoulDir(
+  orgId: string,
+  profileId: string,
+  configDir = getUserConfigDir()
+): string {
+  return join(
+    configDir,
+    "orgs",
+    assertConfigPathSegment(orgId, "orgId"),
+    "profiles",
+    assertConfigPathSegment(profileId, "profileId")
+  );
+}
+
+export function getProfileArtifactsDir(
+  orgId: string,
+  profileId: string
+): string {
+  return join(getProfileSoulDir(orgId, profileId), "artifacts");
+}
+
+/** Files every member of an agent group reads and writes: {orgDir}/groups/{groupId}/shared/ */
+export function getGroupSharedDir(orgId: string, groupId: string): string {
+  return join(
+    getUserConfigDir(),
+    "orgs",
+    assertConfigPathSegment(orgId, "orgId"),
+    "groups",
+    assertConfigPathSegment(groupId, "groupId"),
+    "shared"
+  );
+}
+
+/**
+ * A group's memory, beside its shared folder: {orgDir}/groups/{groupId}/memory.md.
+ * Keyed by the shared folder because that is the one group path a turn carries.
+ */
+export function getGroupMemoryPath(sharedDir: string): string {
+  return join(dirname(sharedDir), "memory.md");
+}
+
+export function getArtifactSharesDir(orgId: string): string {
+  return join(
+    getUserConfigDir(),
+    "orgs",
+    assertConfigPathSegment(orgId, "orgId"),
+    "artifact-shares"
+  );
+}
+
+/** Org-level memory dir: ~/.mingzhan/orgs/{orgId}/ (sibling of the profile dirs). */
+export function getOrgMemoryDir(
+  orgId: string,
+  configDir = getUserConfigDir()
+): string {
+  if (!isAbsolute(configDir)) {
+    throw new Error(
+      "configDir must be an absolute path; relative paths resolve against process.cwd() and break org isolation."
+    );
+  }
+
+  return join(configDir, "orgs", assertConfigPathSegment(orgId, "orgId"));
+}
+
+/** Live org memory file: ~/.mingzhan/orgs/{orgId}/MEMORY.md */
+export function getOrgMemoryFilePath(
+  orgId: string,
+  configDir?: string
+): string {
+  return join(getOrgMemoryDir(orgId, configDir), "MEMORY.md");
+}
+
+/** Org curator reports: ~/.mingzhan/orgs/{orgId}/logs/curator/ */
+export function getOrgCuratorLogDir(
+  orgId: string,
+  configDir = getUserConfigDir()
+): string {
+  return join(getOrgMemoryDir(orgId, configDir), "logs", "curator");
+}
+
+/** Org memory archive dir: ~/.mingzhan/orgs/{orgId}/memory-archive/ */
+export function getOrgMemoryArchiveDir(
+  orgId: string,
+  configDir?: string
+): string {
+  return join(getOrgMemoryDir(orgId, configDir), "memory-archive");
+}
+
+/** Org memory change history dir: ~/.mingzhan/orgs/{orgId}/memory-history/ */
+export function getOrgMemoryHistoryDir(
+  orgId: string,
+  configDir?: string
+): string {
+  return join(getOrgMemoryDir(orgId, configDir), "memory-history");
+}
+
+/** Org memory archive file for a given year-month: ~/.mingzhan/orgs/{orgId}/memory-archive/YYYY-MM.md */
+export function getOrgMemoryArchiveFilePath(
+  orgId: string,
+  yearMonth: string,
+  configDir?: string
+): string {
+  return join(
+    getOrgMemoryArchiveDir(orgId, configDir),
+    `${assertYearMonth(yearMonth)}.md`
+  );
+}
+
+export async function resolveSoulStackForProfile(
+  orgId: string,
+  profileId: string,
+  readMemory?: (content: string) => Promise<string>
+): Promise<LoadedSoulStack | null> {
+  const stack = await loadSoulStack(
+    getProfileSoulDir(orgId, profileId),
+    readMemory
+  );
+
+  return stack.loaded.length > 0 ? stack : null;
+}

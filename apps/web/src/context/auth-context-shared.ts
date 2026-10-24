@@ -1,0 +1,40 @@
+import type {
+  AuthUserResponse,
+  OrganizationSummary,
+  OrgRole,
+  PasskeyCredentialResponse,
+  SetupAuthRequest,
+  UpdateOrganizationRequest,
+  UserOrgSummary,
+} from "@mingzhan/core/contract";
+import { createContext } from "react";
+
+export interface AuthContextValue {
+  activeOrg: (OrganizationSummary & { role?: OrgRole }) | null;
+  archiveOrg: (orgId: string) => Promise<void>;
+  createOrg: (input: { name: string; slug: string }) => Promise<void>;
+  isAuthenticated: boolean;
+  isLoading: boolean;
+  login: (
+    email: string,
+    password: string,
+    mfa?: {
+      backupCode?: string;
+      mfaCode?: string;
+      passkey?: PasskeyCredentialResponse;
+      passkeyChallenge?: string;
+    }
+  ) => Promise<AuthUserResponse>;
+  logout: () => Promise<void>;
+  orgs: UserOrgSummary[];
+  platformOrgs: OrganizationSummary[];
+  platformOrgsError: boolean;
+  refreshPlatformOrgs: () => Promise<void>;
+  refreshSession: () => Promise<void>;
+  setup: (request: SetupAuthRequest) => Promise<void>;
+  switchOrg: (orgId: string) => Promise<void>;
+  updateOrg: (orgId: string, input: UpdateOrganizationRequest) => Promise<void>;
+  user: AuthUserResponse | null;
+}
+
+export const AuthContext = createContext<AuthContextValue | null>(null);

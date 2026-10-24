@@ -1,0 +1,167 @@
+import { expect, test } from "bun:test";
+import { executeToolCall } from "@mingzhan/agent";
+import { toLlmToolDefinition } from "@mingzhan/core";
+import { createInMemoryDatabaseAdapter } from "@mingzhan/db";
+import { estimateToolToken } from "../providers/usage-tracking";
+import { AgentQuestionnaireState } from "../services/agent-questionnaire-state";
+import { createAskUserQuestionTools } from "./ask-user-question-tool";
+
+async function createTool() {
+  const db = createInMemoryDatabaseAdapter();
+  const state = new AgentQuestionnaireState(db);
+
+  await db.upsertSession({
+    agentQuestionnaire: null,
+    agentTodos: [],
+    channel: "web",
+    createdAt: new Date().toISOString(),
+    id: "session_test",
+    model: null,
+    profileId: "default",
+    title: null,
+  });
+
+  const tool = createAskUserQuestionTools(state).find(
+    (entry) => entry.name === "ask_user_question"
+  );
+
+  return { state, tool: tool! };
+}
+
+test("ask_user_question requires sessionId", async () => {
+  const { tool } = await createTool();
+
+  await expect(
+    tool.run({ questions: [], title: "Need input" }, {})
+  ).rejects.toThrow("requires an active chat session");
+});
+
+test("ask_user_question stores the questionnaire with generated ids", async () => {
+  const { tool, state } = await createTool();
+
+  const result = await tool.run(
+    {
+      questions: [
+        {
+          allowCustomAnswer: true,
+          choices: ["Pacific Time", "Eastern Time"],
+          prompt: "What timezone?",
+        },
+      ],
+      title: "Need input",
+    },
+    { sessionId: "session_test" }
+  );
+
+  const stored = await state.get("session_test");
+  expect(result).toMatchObject({ questionnaire: stored });
+  expect(stored?.questions).toEqual([
+    {
+      allowCustomAnswer: true,
+      choices: [
+        { id: "pacific-time", label: "Pacific Time" },
+        { id: "eastern-time", label: "Eastern Time" },
+      ],
+      id: "what-timezone",
+      prompt: "What timezone?",
+    },
+  ]);
+});
+
+test("ask_user_question succeeds through the tool loop without a placeholder", async () => {
+  const { tool, state } = await createTool();
+
+  const result = await executeToolCall(
+    [tool],
+    {
+      arguments: {
+        questions: [{ choices: ["Yes", "No"], prompt: "Continue?" }],
+        title: "Need input",
+      },
+      id: "call_1",
+      name: "ask_user_question",
+    },
+    { sessionId: "session_test" }
+  );
+
+  expect(result).not.toHaveProperty("error");
+  expect(await state.get("session_test")).not.toBeNull();
+});
+
+test("ask_user_question accepts legacy choice objects", async () => {
+  const { tool, state } = await createTool();
+
+  await tool.run(
+    {
+      questions: [
+        {
+          allowCustomAnswer: true,
+          choices: [{ id: "pst", label: "Pacific Time" }],
+          id: "timezone",
+          prompt: "What timezone?",
+        },
+      ],
+      title: "Need input",
+    },
+    { sessionId: "session_test" }
+  );
+
+  const stored = await state.get("session_test");
+  expect(stored?.questions[0]).toMatchObject({
+    allowCustomAnswer: true,
+    choices: [{ id: "pst", label: "Pacific Time" }],
+    id: "timezone",
+    prompt: "What timezone?",
+  });
+});
+
+test("ask_user_question rejects invalid questions without storing partial data", async () => {
+  const { tool, state } = await createTool();
+
+  for (const input of [
+    null,
+    { questions: [{ choices: ["One"], prompt: 7 }], title: "Need input" },
+    {
+      questions: [
+        { choices: ["One"], prompt: "Valid?" },
+        { choices: [" "], prompt: "Invalid?" },
+      ],
+      title: "Need input",
+    },
+  ]) {
+    await expect(
+      tool.run(input, { sessionId: "session_test" })
+    ).rejects.toThrow();
+    expect(await state.get("session_test")).toBeNull();
+  }
+
+  await tool.run(
+    {
+      questions: [{ choices: ["One"], prompt: "Valid?" }],
+      title: "Need input",
+    },
+    { sessionId: "session_test" }
+  );
+
+  const stored = await state.get("session_test");
+
+  await expect(
+    tool.run(
+      {
+        questions: [{ choices: [" "], prompt: "Invalid?" }],
+        title: "Need input",
+      },
+      { sessionId: "session_test" }
+    )
+  ).rejects.toThrow();
+
+  expect(await state.get("session_test")).toEqual(stored);
+});
+
+test("ask_user_question schema stays compact", async () => {
+  const { tool } = await createTool();
+  const estimate = estimateToolToken(toLlmToolDefinition(tool));
+
+  expect(estimate.tokens).toBeLessThan(140);
+  expect(estimate.parametersChars).toBeLessThan(400);
+});

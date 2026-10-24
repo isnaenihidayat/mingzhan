@@ -1,0 +1,112 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  parseWorkerDesiredState,
+  readWorkerDesiredState,
+  setWorkerDesiredRunning,
+} from "./worker-desired-state";
+
+const configDirs: string[] = [];
+
+afterEach(async () => {
+  const previous = configDirs.splice(0);
+
+  for (const dir of previous) {
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
+async function withConfigDir<T>(run: () => Promise<T>): Promise<T> {
+  const dir = await mkdtemp(join(tmpdir(), "mingzhan-worker-desired-"));
+  configDirs.push(dir);
+  const previous = process.env.MINGZHAN_CONFIG_DIR;
+  process.env.MINGZHAN_CONFIG_DIR = dir;
+
+  try {
+    return await run();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.MINGZHAN_CONFIG_DIR;
+    } else {
+      process.env.MINGZHAN_CONFIG_DIR = previous;
+    }
+  }
+}
+
+describe("parseWorkerDesiredState", () => {
+  test("defaults missing keys to false except automation", () => {
+    expect(parseWorkerDesiredState('{"telegram": true}')).toEqual({
+      automation: true,
+      discord: false,
+      slack: false,
+      telegram: true,
+      whatsapp: false,
+    });
+  });
+
+  test("returns defaults for invalid json", () => {
+    expect(parseWorkerDesiredState("not-json")).toEqual({
+      automation: true,
+      discord: false,
+      slack: false,
+      telegram: false,
+      whatsapp: false,
+    });
+  });
+});
+
+describe("worker desired state persistence", () => {
+  test("reads defaults when file is missing", async () => {
+    await withConfigDir(async () => {
+      expect(await readWorkerDesiredState()).toEqual({
+        automation: true,
+        discord: false,
+        slack: false,
+        telegram: false,
+        whatsapp: false,
+      });
+    });
+  });
+
+  test("persists start and stop intent", async () => {
+    await withConfigDir(async () => {
+      await setWorkerDesiredRunning("telegram", true);
+      expect(await readWorkerDesiredState()).toEqual({
+        automation: true,
+        discord: false,
+        slack: false,
+        telegram: true,
+        whatsapp: false,
+      });
+
+      await setWorkerDesiredRunning("whatsapp", true);
+      expect(await readWorkerDesiredState()).toEqual({
+        automation: true,
+        discord: false,
+        slack: false,
+        telegram: true,
+        whatsapp: true,
+      });
+
+      await setWorkerDesiredRunning("automation", false);
+      expect(await readWorkerDesiredState()).toEqual({
+        automation: false,
+        discord: false,
+        slack: false,
+        telegram: true,
+        whatsapp: true,
+      });
+
+      await setWorkerDesiredRunning("telegram", false);
+      expect(await readWorkerDesiredState()).toEqual({
+        automation: false,
+        discord: false,
+        slack: false,
+        telegram: false,
+        whatsapp: true,
+      });
+    });
+  });
+});

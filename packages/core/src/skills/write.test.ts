@@ -1,0 +1,599 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { realpathSync } from "node:fs";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathExists } from "../fs";
+import { getSkillPythonEnvDir } from "./python-env";
+import {
+  assertPathWithinProfileSkillsDir,
+  assertSupportingFileAllowed,
+  assertValidSkillName,
+  composeSkillMarkdown,
+  createSkillFile,
+  deleteSkillDirectory,
+  isPathWithinProfileSkillsDir,
+  patchSkillFile,
+  removeProfileSkillSupportingFile,
+  resolveProfileSkillDirectory,
+  resolveProfileSkillSupportingFilePath,
+  writeProfileSkillSupportingFile,
+  writeRawProfileSkillMarkdown,
+} from "./write";
+
+const ORG_ID = "org_test";
+
+const PROFILE_ID = "profile_default";
+
+describe("createSkillFile", () => {
+  let configDir: string;
+
+  afterEach(async () => {
+    delete process.env.MINGZHAN_CONFIG_DIR;
+
+    if (configDir) {
+      await rm(configDir, { force: true, recursive: true });
+    }
+  });
+
+  test("writes a profile skill to ~/.mingzhan/orgs/{orgId}/profiles/{id}/skills/", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-skill-write-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const directory = await createSkillFile({
+      body: "Call the weather tool with a city name.",
+      description:
+        "Get weather forecasts. Use when the user asks about weather.",
+      name: "weather",
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+    });
+
+    expect(directory).toBe(
+      join(
+        configDir,
+        "orgs",
+        ORG_ID,
+        "profiles",
+        PROFILE_ID,
+        "skills",
+        "weather"
+      )
+    );
+
+    const content = await readFile(join(directory, "SKILL.md"), "utf8");
+    expect(content).toContain("name: weather");
+    expect(content).toContain("Call the weather tool");
+  });
+
+  test("composeSkillMarkdown includes disable-model-invocation when set", () => {
+    const content = composeSkillMarkdown({
+      description: "Deploy the app.",
+      disableModelInvocation: true,
+      name: "deploy",
+    });
+
+    expect(content).toContain("disable-model-invocation: true");
+  });
+
+  test("deleteSkillDirectory removes a managed profile skill directory", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-skill-write-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const directory = await createSkillFile({
+      description: "Capture notes for the user.",
+      name: "notes",
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+    });
+
+    const envDir = getSkillPythonEnvDir(directory);
+    await mkdir(join(envDir, "bin"), { recursive: true });
+
+    await deleteSkillDirectory(directory);
+
+    expect(await pathExists(directory)).toBe(false);
+    expect(await pathExists(envDir)).toBe(false);
+  });
+});
+
+describe("assertValidSkillName", () => {
+  test("accepts kebab-case names", () => {
+    expect(assertValidSkillName("research-paper")).toBe("research-paper");
+  });
+
+  test("rejects path traversal and invalid characters", () => {
+    expect(() => assertValidSkillName("../escape")).toThrow(/lowercase/);
+    expect(() => assertValidSkillName("Bad_Name")).toThrow(/lowercase/);
+    expect(() => assertValidSkillName("a".repeat(65))).toThrow(/lowercase/);
+  });
+});
+
+describe("writeRawProfileSkillMarkdown", () => {
+  let configDir: string;
+
+  afterEach(async () => {
+    delete process.env.MINGZHAN_CONFIG_DIR;
+
+    if (configDir) {
+      await rm(configDir, { force: true, recursive: true });
+    }
+  });
+
+  test("writes raw SKILL.md preserving include-body-on-match", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-skill-raw-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const content = `---
+name: research-paper
+description: Research papers end to end.
+include-body-on-match: true
+---
+
+1. Search.
+2. Summarize.
+`;
+
+    const result = await writeRawProfileSkillMarkdown({
+      content,
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+    });
+
+    expect(result.created).toBe(true);
+    expect(result.name).toBe("research-paper");
+    const onDisk = await readFile(join(result.directory, "SKILL.md"), "utf8");
+    expect(onDisk).toContain("include-body-on-match: true");
+    expect(onDisk).toContain("1. Search.");
+  });
+
+  test("adopts existing valid skill directory when allowExisting", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-skill-adopt-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const directory = join(
+      configDir,
+      "orgs",
+      ORG_ID,
+      "profiles",
+      PROFILE_ID,
+      "skills",
+      "orphan"
+    );
+
+    await mkdir(directory, { recursive: true });
+    await writeFile(
+      join(directory, "SKILL.md"),
+      `---
+name: orphan
+description: Leftover from write_file.
+include-body-on-match: true
+---
+
+Old body.
+`,
+      "utf8"
+    );
+
+    const result = await writeRawProfileSkillMarkdown({
+      allowExisting: true,
+      content: `---
+name: orphan
+description: Leftover from write_file.
+include-body-on-match: true
+---
+
+Old body.
+`,
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+    });
+
+    expect(result.created).toBe(false);
+    expect(result.directory).toBe(realpathSync.native(directory));
+  });
+
+  test("refuses bundled skill names", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-skill-bundled-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    await expect(
+      writeRawProfileSkillMarkdown({
+        content: `---
+name: manage-skills
+description: Should not overwrite bundled.
+---
+
+Nope.
+`,
+        orgId: ORG_ID,
+        profileId: PROFILE_ID,
+      })
+    ).rejects.toThrow(/bundled/i);
+  });
+
+  test("refuses existing skill without allowExisting", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-skill-exists-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const content = `---
+name: dup
+description: First write.
+---
+
+Body.
+`;
+
+    await writeRawProfileSkillMarkdown({
+      content,
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+    });
+
+    await expect(
+      writeRawProfileSkillMarkdown({
+        content,
+        orgId: ORG_ID,
+        profileId: PROFILE_ID,
+      })
+    ).rejects.toThrow(/already exists/);
+  });
+});
+
+describe("patchSkillFile", () => {
+  let configDir: string;
+
+  afterEach(async () => {
+    delete process.env.MINGZHAN_CONFIG_DIR;
+
+    if (configDir) {
+      await rm(configDir, { force: true, recursive: true });
+    }
+  });
+
+  test("applies unique old_string replacement and re-validates", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-skill-patch-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    await writeRawProfileSkillMarkdown({
+      content: `---
+name: deploy
+description: Deploy the service.
+include-body-on-match: true
+---
+
+Use staging first.
+`,
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+    });
+
+    const result = await patchSkillFile({
+      name: "deploy",
+      newString: "Use staging first.\nThen promote to prod.",
+      oldString: "Use staging first.",
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+    });
+
+    expect(result.name).toBe("deploy");
+    const onDisk = await readFile(join(result.directory, "SKILL.md"), "utf8");
+    expect(onDisk).toContain("Then promote to prod.");
+    expect(onDisk).toContain("include-body-on-match: true");
+  });
+
+  test("errors when old_string is missing or duplicated", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-skill-patch-err-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    await writeRawProfileSkillMarkdown({
+      content: `---
+name: repeat
+description: Repeat steps.
+---
+
+step
+step
+`,
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+    });
+
+    await expect(
+      patchSkillFile({
+        name: "repeat",
+        newString: "x",
+        oldString: "missing",
+        orgId: ORG_ID,
+        profileId: PROFILE_ID,
+      })
+    ).rejects.toThrow(/not found|missing/i);
+
+    await expect(
+      patchSkillFile({
+        name: "repeat",
+        newString: "done",
+        oldString: "step",
+        orgId: ORG_ID,
+        profileId: PROFILE_ID,
+      })
+    ).rejects.toThrow(/multiple|duplicate/i);
+  });
+
+  test("refuses patch on bundled skill name", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-skill-patch-bundled-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    await expect(
+      patchSkillFile({
+        name: "manage-skills",
+        newString: "b",
+        oldString: "a",
+        orgId: ORG_ID,
+        profileId: PROFILE_ID,
+      })
+    ).rejects.toThrow(/bundled/i);
+  });
+});
+
+describe("resolveProfileSkillDirectory", () => {
+  let configDir: string;
+
+  afterEach(async () => {
+    delete process.env.MINGZHAN_CONFIG_DIR;
+
+    if (configDir) {
+      await rm(configDir, { force: true, recursive: true });
+    }
+  });
+
+  test("resolves under profile skills dir and rejects escape names", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-skill-resolve-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+    await mkdir(
+      join(configDir, "orgs", ORG_ID, "profiles", PROFILE_ID, "skills"),
+      {
+        recursive: true,
+      }
+    );
+
+    expect(resolveProfileSkillDirectory(ORG_ID, PROFILE_ID, "ok-skill")).toBe(
+      join(
+        realpathSync.native(configDir),
+        "orgs",
+        ORG_ID,
+        "profiles",
+        PROFILE_ID,
+        "skills",
+        "ok-skill"
+      )
+    );
+
+    expect(() =>
+      resolveProfileSkillDirectory(ORG_ID, PROFILE_ID, "../x")
+    ).toThrow();
+  });
+
+  test("refuses symlink escape outside the profile skills dir", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-skill-symlink-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const skillsRoot = join(
+      configDir,
+      "orgs",
+      ORG_ID,
+      "profiles",
+      PROFILE_ID,
+      "skills"
+    );
+
+    const outside = join(configDir, "outside-secret");
+    await mkdir(skillsRoot, { recursive: true });
+    await mkdir(outside, { recursive: true });
+    await writeFile(
+      join(outside, "SKILL.md"),
+      "---\nname: leaked\ndescription: x\n---\n"
+    );
+    await symlink(outside, join(skillsRoot, "leaked"));
+
+    expect(
+      isPathWithinProfileSkillsDir(
+        ORG_ID,
+        PROFILE_ID,
+        join(skillsRoot, "leaked")
+      )
+    ).toBe(false);
+    expect(() =>
+      assertPathWithinProfileSkillsDir(
+        ORG_ID,
+        PROFILE_ID,
+        join(skillsRoot, "leaked", "SKILL.md")
+      )
+    ).toThrow(/outside the profile skills directory/);
+  });
+
+  test.skipIf(process.platform !== "win32")(
+    "counts a differently cased path as inside the profile skills dir on Windows",
+    async () => {
+      configDir = await mkdtemp(join(tmpdir(), "mingzhan-skill-case-"));
+      process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+      const profileDir = join(
+        configDir,
+        "orgs",
+        ORG_ID,
+        "profiles",
+        PROFILE_ID
+      );
+
+      await mkdir(join(profileDir, "skills", "notes"), { recursive: true });
+
+      // NTFS opens each of these inside this profile's skills dir, so the
+      // member-authored code gate has to count them as this profile's own.
+      for (const directory of [
+        join(profileDir, "SKILLS", "notes"),
+        join(profileDir, "Skills", "NOT-YET-CREATED"),
+        join(profileDir, "skills", "notes").toUpperCase(),
+      ]) {
+        expect(
+          isPathWithinProfileSkillsDir(ORG_ID, PROFILE_ID, directory)
+        ).toBe(true);
+      }
+
+      expect(
+        isPathWithinProfileSkillsDir(
+          ORG_ID,
+          "profile_other",
+          join(profileDir, "SKILLS", "notes")
+        )
+      ).toBe(false);
+    }
+  );
+});
+
+describe("profile skill supporting files", () => {
+  let configDir: string;
+
+  afterEach(async () => {
+    delete process.env.MINGZHAN_CONFIG_DIR;
+
+    if (configDir) {
+      await rm(configDir, { force: true, recursive: true });
+    }
+  });
+
+  test("writes nested supporting files and refuses SKILL.md / path escape", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-skill-support-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    await writeRawProfileSkillMarkdown({
+      content: `---
+name: deploy
+description: Deploy the service.
+---
+
+Use staging first.
+`,
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+    });
+
+    expect(() =>
+      assertSupportingFileAllowed("/tmp/skills/demo/SKILL.md")
+    ).toThrow();
+    expect(() =>
+      assertSupportingFileAllowed("/tmp/skills/demo/Tool.js")
+    ).toThrow();
+    expect(() =>
+      assertSupportingFileAllowed("/tmp/skills/demo/skill.md")
+    ).toThrow();
+    expect(() =>
+      resolveProfileSkillSupportingFilePath(
+        ORG_ID,
+        PROFILE_ID,
+        "deploy",
+        "../escape.md"
+      )
+    ).toThrow();
+
+    const skillDir = resolveProfileSkillDirectory(ORG_ID, PROFILE_ID, "deploy");
+    const outside = join(configDir, "outside.txt");
+    const symlinkPath = join(skillDir, "sidecar.md");
+    await symlink(outside, symlinkPath);
+    await expect(
+      writeProfileSkillSupportingFile({
+        content: "ESCAPED\n",
+        name: "deploy",
+        orgId: ORG_ID,
+        profileId: PROFILE_ID,
+        relativePath: "sidecar.md",
+      })
+    ).rejects.toThrow(/symbolic link/i);
+    expect(await pathExists(outside)).toBe(false);
+
+    const written = await writeProfileSkillSupportingFile({
+      content: "- staging\n",
+      name: "deploy",
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+      relativePath: "docs/checklist.md",
+    });
+
+    expect(written.relativePath).toBe("docs/checklist.md");
+    expect(await readFile(written.absolutePath, "utf8")).toContain("- staging");
+
+    await removeProfileSkillSupportingFile({
+      name: "deploy",
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+      relativePath: "docs/checklist.md",
+    });
+    expect(await pathExists(written.absolutePath)).toBe(false);
+  });
+
+  test.skipIf(process.platform !== "win32")(
+    "refuses NTFS alternate data stream names on Windows",
+    async () => {
+      configDir = await mkdtemp(join(tmpdir(), "mingzhan-skill-ads-"));
+      process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+      await writeRawProfileSkillMarkdown({
+        content: `---
+name: deploy
+description: Deploy the service.
+---
+
+Use staging first.
+`,
+        orgId: ORG_ID,
+        profileId: PROFILE_ID,
+      });
+
+      const skillDir = resolveProfileSkillDirectory(
+        ORG_ID,
+        PROFILE_ID,
+        "deploy"
+      );
+
+      // `tool.py::$DATA` is tool.py's own content and `SKILL.md::$DATA` is
+      // SKILL.md's, so neither may slip past the basename refusals.
+      for (const relativePath of [
+        "tool.py::$DATA",
+        "SKILL.md::$DATA",
+        "docs/notes 10:30.md",
+      ]) {
+        await expect(
+          writeProfileSkillSupportingFile({
+            content: "print('run')\n",
+            name: "deploy",
+            orgId: ORG_ID,
+            profileId: PROFILE_ID,
+            relativePath,
+          })
+        ).rejects.toThrow(/alternate data stream/);
+      }
+
+      expect(await pathExists(join(skillDir, "tool.py"))).toBe(false);
+      expect(await readFile(join(skillDir, "SKILL.md"), "utf8")).toContain(
+        "Use staging first."
+      );
+
+      const written = await writeProfileSkillSupportingFile({
+        content: "- staging\n",
+        name: "deploy",
+        orgId: ORG_ID,
+        profileId: PROFILE_ID,
+        relativePath: "docs/checklist.md",
+      });
+
+      expect(await readFile(written.absolutePath, "utf8")).toBe("- staging\n");
+    }
+  );
+});

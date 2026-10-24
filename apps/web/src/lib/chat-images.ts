@@ -1,0 +1,290 @@
+import type {
+  DocumentAttachment,
+  ImageAttachment,
+  MessageContentPart,
+} from "@mingzhan/core/contract";
+import {
+  isImageDescriptionText,
+  parseImageDescriptionText,
+} from "@mingzhan/core/image-content";
+import {
+  normalizeDocumentMediaType,
+  parseDataUrl,
+  parseDocumentDataUrl,
+} from "@mingzhan/core/message-content";
+import type { FileUIPart } from "@/lib/ai-ui-types";
+import {
+  type DisplayDocument,
+  documentDisplayFromContentPart,
+  documentDisplayFromFilePart,
+} from "@/lib/pasted-text";
+
+const IMAGE_ACCEPT = "image/jpeg,image/png,image/gif,image/webp";
+
+export const DOCUMENT_ACCEPT =
+  ".pdf,.docx,.xls,.xlsx,.xlsm,.xlsb,.csv,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,application/vnd.ms-excel.sheet.macroEnabled.12,application/vnd.ms-excel.sheet.binary.macroEnabled.12,text/plain,text/csv,text/markdown";
+
+export const ALL_ATTACHMENT_ACCEPT = `${IMAGE_ACCEPT},${DOCUMENT_ACCEPT}`;
+
+export const MAX_FOLDER_FILES = 20;
+
+export const MAX_FOLDER_BYTES = 20 * 1024 * 1024;
+
+export function fileMatchesAccept(file: File, accept?: string): boolean {
+  if (!accept || accept.trim() === "") {
+    return true;
+  }
+
+  const fileType = file.type.split(";")[0]?.trim().toLowerCase() ?? "";
+  const fileName = file.name.toLowerCase();
+
+  return accept
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+    .some((pattern) => {
+      if (pattern.endsWith("/*")) {
+        return fileType.startsWith(pattern.slice(0, -1));
+      }
+
+      if (pattern.startsWith(".")) {
+        return fileName.endsWith(pattern);
+      }
+
+      return fileType === pattern;
+    });
+}
+
+export type FolderSelection =
+  | { files: File[]; ok: true }
+  | { error: string; ok: false };
+
+/** Keeps the relative path as the file name so the agent sees the structure. */
+export function selectFolderFiles(picked: File[]): FolderSelection {
+  const files: File[] = [];
+  let totalBytes = 0;
+
+  for (const file of picked) {
+    const path = file.webkitRelativePath || file.name;
+
+    if (path.split("/").some((segment) => segment.startsWith("."))) {
+      continue;
+    }
+
+    if (!fileMatchesAccept(file, ALL_ATTACHMENT_ACCEPT)) {
+      continue;
+    }
+
+    totalBytes += file.size;
+    // The File constructor rewrites "/" in names, so set the name directly.
+    Object.defineProperty(file, "name", { value: path });
+    files.push(file);
+  }
+
+  if (files.length === 0) {
+    return { error: "No supported files in this folder.", ok: false };
+  }
+
+  if (files.length > MAX_FOLDER_FILES) {
+    return {
+      error: `Folder has ${files.length} files. The limit is ${MAX_FOLDER_FILES}.`,
+      ok: false,
+    };
+  }
+
+  if (totalBytes > MAX_FOLDER_BYTES) {
+    return {
+      error: `Folder is over ${MAX_FOLDER_BYTES / (1024 * 1024)} MB.`,
+      ok: false,
+    };
+  }
+
+  return { files, ok: true };
+}
+
+const DOCUMENT_MEDIA_TYPES = new Set([
+  "application/pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.ms-excel",
+  "application/vnd.ms-excel.sheet.macroEnabled.12",
+  "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
+  "text/plain",
+  "text/csv",
+  "text/markdown",
+]);
+
+export function isImageFilePart(file: FileUIPart): boolean {
+  return Boolean(file.mediaType?.startsWith("image/"));
+}
+
+export function isDocumentFilePart(file: FileUIPart): boolean {
+  if (isImageFilePart(file)) {
+    return false;
+  }
+
+  const filename = file.filename ?? "";
+  const mediaType = normalizeDocumentMediaType(file.mediaType ?? "", filename);
+
+  return DOCUMENT_MEDIA_TYPES.has(mediaType);
+}
+
+export function filePartsToImageAttachments(
+  files: FileUIPart[]
+): ImageAttachment[] {
+  const images: ImageAttachment[] = [];
+
+  for (const file of files) {
+    if (!isImageFilePart(file)) {
+      continue;
+    }
+
+    const parsed = parseDataUrl(file.url);
+
+    if (parsed) {
+      images.push(parsed);
+    }
+  }
+
+  return images;
+}
+
+export function filePartsToDocumentAttachments(
+  files: FileUIPart[]
+): DocumentAttachment[] {
+  const documents: DocumentAttachment[] = [];
+
+  for (const file of files) {
+    if (!isDocumentFilePart(file)) {
+      continue;
+    }
+
+    const filename = file.filename?.trim() || "document";
+    const parsed = parseDocumentDataUrl(file.url, filename);
+
+    if (parsed) {
+      documents.push(parsed);
+    }
+  }
+
+  return documents;
+}
+
+export function userContentToDisplayImages(
+  content: string | MessageContentPart[]
+): Array<{ url: string; mediaType: string }> {
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- This guard validates decoded external data before the caller uses the domain value.
+  if (typeof content === "string") {
+    return [];
+  }
+
+  return content
+    .filter(
+      (part): part is Extract<typeof part, { type: "image" | "image_ref" }> =>
+        part.type === "image_ref" ||
+        (part.type === "image" && !part.description?.trim())
+    )
+    .map((part) => ({
+      mediaType: part.mediaType,
+      url:
+        part.type === "image_ref"
+          ? `/v1/attachments/${encodeURIComponent(part.attachmentId)}/content`
+          : `data:${part.mediaType};base64,${part.data}`,
+    }));
+}
+
+export interface DisplayImageAttachment {
+  description?: string | null;
+  mediaType: string;
+  url?: string;
+}
+
+export function userContentToDisplayImageAttachments(
+  content: string | MessageContentPart[]
+): DisplayImageAttachment[] {
+  const attachments: DisplayImageAttachment[] = [];
+
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- This guard validates decoded external data before the caller uses the domain value.
+  if (typeof content === "string") {
+    if (isImageDescriptionText(content)) {
+      attachments.push({
+        description: parseImageDescriptionText(content),
+        mediaType: "image/unknown",
+      });
+    }
+
+    return attachments;
+  }
+
+  for (const part of content) {
+    if (part.type === "image" && part.description?.trim()) {
+      attachments.push({
+        description: part.description.trim(),
+        mediaType: part.mediaType,
+        url: `data:${part.mediaType};base64,${part.data}`,
+      });
+      continue;
+    }
+
+    if (part.type === "text" && isImageDescriptionText(part.text)) {
+      attachments.push({
+        description: parseImageDescriptionText(part.text),
+        mediaType: "image/unknown",
+      });
+    }
+  }
+
+  return attachments;
+}
+
+export function stripImageDescriptionsFromDisplayText(
+  content: string | MessageContentPart[]
+): string {
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- This guard validates decoded external data before the caller uses the domain value.
+  if (typeof content === "string") {
+    return isImageDescriptionText(content) ? "" : content;
+  }
+
+  return content
+    .filter(
+      (part): part is Extract<MessageContentPart, { type: "text" }> =>
+        part.type === "text" && !isImageDescriptionText(part.text)
+    )
+    .map((part) => part.text)
+    .join("\n")
+    .trim();
+}
+
+export function filePartsToDisplayDocuments(
+  files: FileUIPart[]
+): DisplayDocument[] {
+  const documents: DisplayDocument[] = [];
+
+  for (const file of files) {
+    if (!isDocumentFilePart(file)) {
+      continue;
+    }
+
+    documents.push(documentDisplayFromFilePart(file));
+  }
+
+  return documents;
+}
+
+export function userContentToDisplayDocuments(
+  content: string | MessageContentPart[]
+): DisplayDocument[] {
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- This guard validates decoded external data before the caller uses the domain value.
+  if (typeof content === "string") {
+    return [];
+  }
+
+  return content
+    .filter(
+      (
+        part
+      ): part is Extract<typeof part, { type: "document" | "document_ref" }> =>
+        part.type === "document" || part.type === "document_ref"
+    )
+    .map((part) => documentDisplayFromContentPart(part));
+}

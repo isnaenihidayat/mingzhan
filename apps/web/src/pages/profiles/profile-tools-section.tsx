@@ -1,0 +1,134 @@
+import type { ProfileDetail } from "@mingzhan/core/contract";
+import { BUILTIN_TOOL_IDS } from "@mingzhan/core/tools/protected";
+import { Button } from "@mingzhan/ui/button";
+import { cn } from "@mingzhan/ui/utils";
+import { Delete02Icon } from "hugeicons-react";
+import { useState } from "react";
+import { Link } from "react-router-dom";
+import { EmailSettingsDialog } from "@/components/EmailSettingsDialog";
+import { useAuth } from "@/context/use-auth";
+import { groupAssignableTools } from "@/hooks/use-plugins";
+import { canUseToolPlayground, toolPlaygroundPath } from "@/lib/navigation";
+import type { RemoveAssignmentTarget } from "@/pages/profiles/profiles-page.shared";
+
+export function ProfileToolsSection({
+  detail,
+  busy,
+  onRemove,
+}: {
+  detail: ProfileDetail;
+  busy: boolean;
+  onRemove: (target: RemoveAssignmentTarget) => void;
+}) {
+  const { user, activeOrg } = useAuth();
+  const canConfigureEmail = user?.isPlatformAdmin === true;
+
+  const canOpenPlayground = canUseToolPlayground(
+    user?.isPlatformAdmin === true,
+    activeOrg?.role
+  );
+
+  const [emailConfigOpen, setEmailConfigOpen] = useState(false);
+
+  const groups = groupAssignableTools(detail.tools);
+
+  return (
+    <div className="pt-5">
+      {detail.tools.length === 0 ? (
+        <p className="type-body text-pretty text-xs">No tools assigned.</p>
+      ) : (
+        <ul className="divide-y divide-border overflow-hidden rounded-xl border border-border bg-card">
+          {groups.map(({ label, tool, tools: members, unit }) => {
+            const name = (
+              <div className="min-w-0">
+                <p className="truncate font-normal text-foreground text-sm leading-tight">
+                  {label}
+                </p>
+                {unit ? (
+                  <p className="truncate text-muted-foreground text-xs">
+                    {members.length} {unit}
+                  </p>
+                ) : null}
+              </div>
+            );
+
+            const onConfigure =
+              canConfigureEmail && tool.id === BUILTIN_TOOL_IDS.email
+                ? () => setEmailConfigOpen(true)
+                : undefined;
+
+            return (
+              <li
+                className="flex items-center justify-between gap-2 px-4 py-3 transition-colors duration-150 ease-out hover:bg-muted/40"
+                key={tool.id}
+              >
+                {canOpenPlayground && !unit ? (
+                  <Link
+                    aria-label={`Open playground for ${tool.name}`}
+                    className={cn(
+                      "min-w-0 flex-1 rounded-sm text-left outline-none transition-[text-decoration-color] duration-150 ease-out",
+                      "underline decoration-transparent underline-offset-2 hover:decoration-foreground/40",
+                      "focus-visible:ring-2 focus-visible:ring-ring/50",
+                      busy && "pointer-events-none opacity-50"
+                    )}
+                    to={toolPlaygroundPath(tool.id, {
+                      fromProfileId: detail.id,
+                    })}
+                  >
+                    {name}
+                  </Link>
+                ) : (
+                  <div className="min-w-0 flex-1">{name}</div>
+                )}
+                <div className="flex shrink-0 items-center gap-1">
+                  {onConfigure ? (
+                    <Button
+                      disabled={busy}
+                      onClick={onConfigure}
+                      size="sm"
+                      type="button"
+                      variant="outline"
+                    >
+                      Configure
+                    </Button>
+                  ) : null}
+                  <Button
+                    aria-label={`Delete ${label}`}
+                    className="relative text-muted-foreground transition-colors duration-150 ease-out after:absolute after:-inset-x-1.5 after:-inset-y-1 hover:text-destructive"
+                    disabled={busy}
+                    onClick={() =>
+                      onRemove({
+                        id: tool.id,
+                        ids: members.map((entry) => entry.id),
+                        kind: "tool",
+                        name: label,
+                      })
+                    }
+                    size="icon-sm"
+                    type="button"
+                    variant="ghost"
+                  >
+                    <Delete02Icon aria-hidden className="size-4" />
+                  </Button>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+
+      {detail.tools.length > 0 ? (
+        <p className="type-body mt-3 text-xs tabular-nums">
+          {groups.length} assigned
+        </p>
+      ) : null}
+
+      {canConfigureEmail ? (
+        <EmailSettingsDialog
+          onOpenChange={setEmailConfigOpen}
+          open={emailConfigOpen}
+        />
+      ) : null}
+    </div>
+  );
+}

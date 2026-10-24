@@ -1,0 +1,2386 @@
+import { Database, type SQLQueryBindings } from "bun:sqlite";
+import { describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  addOrgIdColumnIfMissing,
+  migrateArtifactDesignSkillName,
+  migrateCodingDelegationSkillName,
+  migrateDatabase,
+  migrateSuperMingzhanNaming,
+  moveProfileJoinReferences,
+  resolveSchemaPath,
+} from "./migrate";
+
+interface PluginCleanupRow {
+  plugin_id?: string;
+  skill_id?: string;
+  tool_id?: string;
+}
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+
+test.each(["fresh", "upgrade"])(
+  "organization parent migration preserves tenants and enforces references: %s",
+  (scenario) => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      if (scenario === "upgrade") {
+        db.exec(`
+          DROP INDEX organizations_parent_org_id;
+          ALTER TABLE organizations DROP COLUMN parent_org_id;
+        `);
+      }
+
+      db.exec(`
+        INSERT INTO organizations (id, name, slug, created_at, updated_at)
+          VALUES ('parent', 'Parent', 'parent', 'now', 'now'),
+                 ('team', 'Team', 'team', 'now', 'now');
+        INSERT INTO profiles (id, name, org_id, created_at, updated_at)
+          VALUES ('team-profile', 'Team agent', 'team', 'now', 'now');
+        INSERT INTO users (id, email, name, created_at, updated_at)
+          VALUES ('team-user', 'team@example.com', 'Team user', 'now', 'now');
+        INSERT INTO org_members (org_id, user_id, role, created_at)
+          VALUES ('team', 'team-user', 'admin', 'now');
+      `);
+      const profiles = db.query("SELECT * FROM profiles").all();
+      const memberships = db.query("SELECT * FROM org_members").all();
+
+      migrateDatabase(db);
+      migrateDatabase(db);
+
+      expect(
+        db
+          .query("SELECT id, parent_org_id FROM organizations ORDER BY id")
+          .all()
+      ).toEqual([
+        { id: "parent", parent_org_id: null },
+        { id: "team", parent_org_id: null },
+      ]);
+      expect(db.query("SELECT * FROM profiles").all()).toEqual(profiles);
+      expect(db.query("SELECT * FROM org_members").all()).toEqual(memberships);
+      expect(() =>
+        db.exec(
+          "UPDATE organizations SET parent_org_id = 'missing' WHERE id = 'team'"
+        )
+      ).toThrow();
+      expect(() =>
+        db.exec("UPDATE organizations SET parent_org_id = id WHERE id = 'team'")
+      ).toThrow();
+
+      db.exec(
+        "UPDATE organizations SET parent_org_id = 'parent' WHERE id = 'team'"
+      );
+      migrateDatabase(db);
+      expect(
+        db
+          .query("SELECT parent_org_id FROM organizations WHERE id = 'team'")
+          .get()
+      ).toEqual({ parent_org_id: "parent" });
+      expect(() =>
+        db.exec("DELETE FROM organizations WHERE id = 'parent'")
+      ).toThrow();
+      expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      db.exec("DELETE FROM organizations WHERE id = 'team'");
+      db.exec("DELETE FROM organizations WHERE id = 'parent'");
+      expect(db.query("SELECT id FROM organizations").all()).toEqual([]);
+    } finally {
+      db.close();
+    }
+  }
+);
+
+test.each(["fresh", "upgrade"])(
+  "shared resource migration preserves explicit publications and source links: %s",
+  (scenario) => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      if (scenario === "upgrade") {
+        db.exec(
+          "DROP TABLE shared_agent_instances; DROP TABLE org_shared_resources;"
+        );
+      }
+
+      db.exec(`
+        INSERT INTO organizations (id, name, slug, created_at, updated_at)
+          VALUES ('parent', 'Parent', 'parent', 'now', 'now'), ('team', 'Team', 'team', 'now', 'now');
+        UPDATE organizations SET parent_org_id = 'parent' WHERE id = 'team';
+        INSERT INTO profiles (id, name, org_id, is_default, created_at, updated_at)
+          VALUES ('source', 'Source', 'parent', 1, 'now', 'now'), ('instance', 'Instance', 'team', 1, 'now', 'now'), ('duplicate', 'Duplicate', 'team', 0, 'now', 'now');
+      `);
+      const profiles = db.query("SELECT * FROM profiles ORDER BY id").all();
+      migrateDatabase(db);
+      migrateDatabase(db);
+      expect(db.query("SELECT * FROM org_shared_resources").all()).toEqual([]);
+      expect(db.query("SELECT * FROM shared_agent_instances").all()).toEqual(
+        []
+      );
+      expect(db.query("SELECT * FROM profiles ORDER BY id").all()).toEqual(
+        profiles
+      );
+
+      const publish = db.query(
+        "INSERT INTO org_shared_resources (id, org_id, resource_kind, resource_id, created_at, updated_at) VALUES (?, ?, ?, ?, 'now', 'now')"
+      );
+
+      for (const kind of ["knowledge", "skill", "agent", "tool", "model"]) {
+        publish.run(
+          kind,
+          "parent",
+          kind,
+          kind === "agent" ? "source" : "resource"
+        );
+      }
+
+      expect(() =>
+        publish.run("duplicate", "parent", "agent", "source")
+      ).toThrow();
+      expect(() =>
+        publish.run("invalid", "parent", "secret", "resource")
+      ).toThrow();
+      expect(() =>
+        publish.run("missing", "missing", "agent", "source")
+      ).toThrow();
+
+      const instance = db.query(
+        "INSERT INTO shared_agent_instances (profile_id, team_org_id, source_org_id, source_profile_id, publication_id, created_at) VALUES (?, ?, 'parent', 'source', 'agent', 'now')"
+      );
+
+      instance.run("instance", "team");
+      expect(() => instance.run("duplicate", "team")).toThrow();
+      expect(() => instance.run("missing", "team")).toThrow();
+      expect(() => instance.run("duplicate", "missing")).toThrow();
+
+      const publications = db
+        .query("SELECT * FROM org_shared_resources ORDER BY id")
+        .all();
+
+      const instances = db.query("SELECT * FROM shared_agent_instances").all();
+      migrateDatabase(db);
+      migrateDatabase(db);
+      expect(
+        db.query("SELECT * FROM org_shared_resources ORDER BY id").all()
+      ).toEqual(publications);
+      expect(db.query("SELECT * FROM shared_agent_instances").all()).toEqual(
+        instances
+      );
+      db.exec(
+        "DELETE FROM org_shared_resources WHERE id = 'agent'; DELETE FROM profiles WHERE id = 'source';"
+      );
+      expect(db.query("SELECT * FROM shared_agent_instances").all()).toEqual(
+        instances
+      );
+      expect(
+        db.query("SELECT id FROM profiles WHERE id = 'instance'").get()
+      ).toEqual({ id: "instance" });
+      db.exec("DELETE FROM profiles WHERE id = 'instance';");
+      expect(db.query("SELECT * FROM shared_agent_instances").all()).toEqual(
+        []
+      );
+      db.exec(
+        "DELETE FROM organizations WHERE id = 'team'; DELETE FROM organizations WHERE id = 'parent';"
+      );
+      expect(db.query("SELECT * FROM org_shared_resources").all()).toEqual([]);
+      expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      db.close();
+    }
+  }
+);
+
+test.each(["fresh", "upgrade"])(
+  "team request migration retains recovery records: %s",
+  (scenario) => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      if (scenario === "upgrade") {
+        db.exec("DROP TABLE org_team_creation_requests;");
+      }
+
+      db.exec(
+        "INSERT INTO organizations (id, name, slug, created_at, updated_at) VALUES ('parent', 'Parent', 'parent', 'now', 'now'), ('team', 'Team', 'team', 'now', 'now');"
+      );
+      migrateDatabase(db);
+      migrateDatabase(db);
+      expect(
+        db.query("SELECT * FROM org_team_creation_requests").all()
+      ).toEqual([]);
+      db.exec(
+        "INSERT INTO org_team_creation_requests (parent_org_id, request_id, request_hash, creator_user_id, admin_user_id, team_org_id, created_at) VALUES ('parent', 'request', 'hash', 'creator', 'admin', 'team', 'now');"
+      );
+
+      const requests = db
+        .query("SELECT * FROM org_team_creation_requests")
+        .all();
+
+      migrateDatabase(db);
+      migrateDatabase(db);
+      expect(
+        db.query("SELECT * FROM org_team_creation_requests").all()
+      ).toEqual(requests);
+      db.exec(
+        "UPDATE org_team_creation_requests SET completed_at = 'done'; DELETE FROM organizations WHERE id = 'team';"
+      );
+      migrateDatabase(db);
+      expect(
+        db
+          .query(
+            "SELECT team_org_id, completed_at FROM org_team_creation_requests"
+          )
+          .get()
+      ).toEqual({ completed_at: "done", team_org_id: "team" });
+      db.exec("DELETE FROM organizations WHERE id = 'parent';");
+      expect(
+        db.query("SELECT * FROM org_team_creation_requests").all()
+      ).toEqual([]);
+    } finally {
+      db.close();
+    }
+  }
+);
+
+function closeDatabase(db: Database): void {
+  try {
+    db.close(true);
+  } catch {
+    // bun on macOS throws "database is locked" from close(true) while the
+    // transient statements migrateDatabase prepares are not yet collected.
+    // The lazy close defers to GC, which is enough for test cleanup.
+    db.close();
+  }
+}
+
+test.each(["normal upgrade", "retry after failed cleanup"])(
+  "removes legacy Google Meet plugin records: %s",
+  (scenario) => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      for (const orgId of ["org-a", "org-b"]) {
+        db.query(
+          "INSERT INTO organizations (id, name, slug, created_at, updated_at) VALUES (?, ?, ?, 'now', 'now')"
+        ).run(orgId, orgId, orgId);
+        db.query(
+          "INSERT INTO profiles (id, name, org_id, created_at, updated_at) VALUES (?, ?, ?, 'now', 'now')"
+        ).run(orgId, orgId, orgId);
+
+        for (const pluginId of ["google-meet", "notes"]) {
+          const id = `${orgId}-${pluginId}`;
+          db.query(
+            "INSERT INTO org_plugins (org_id, plugin_id, lifecycle_state, revision, created_at, updated_at) VALUES (?, ?, 'enabled', 1, 'now', 'now')"
+          ).run(orgId, pluginId);
+          db.query(
+            "INSERT INTO tools (id, name, description, handler_type, plugin_id, org_id, created_at, updated_at) VALUES (?, ?, '', 'plugin', ?, ?, 'now', 'now')"
+          ).run(id, id, pluginId, orgId);
+          db.query(
+            "INSERT INTO skills (id, name, description, source_path, plugin_id, org_id, created_at, updated_at) VALUES (?, ?, '', ?, ?, ?, 'now', 'now')"
+          ).run(id, id, id, pluginId, orgId);
+          db.query("INSERT INTO profile_tools VALUES (?, ?)").run(orgId, id);
+          db.query("INSERT INTO profile_skills VALUES (?, ?)").run(orgId, id);
+        }
+      }
+
+      for (const pluginId of ["google-meet", "notes"]) {
+        for (const version of ["1.0.0", "2.0.0"]) {
+          db.query(
+            "INSERT INTO plugin_releases (plugin_id, version, manifest, digest, created_at) VALUES (?, ?, '{}', '', 'now')"
+          ).run(pluginId, version);
+        }
+      }
+
+      db.exec(`
+        UPDATE profiles SET is_default = 1 WHERE id = 'org-a';
+        INSERT INTO tools (id, name, description, handler_type, org_id, created_at, updated_at)
+          VALUES ('builtin-meet', 'google_meet_status', '', 'builtin', 'org-a', 'now', 'now');
+        INSERT INTO skills (id, name, description, source_path, org_id, created_at, updated_at)
+          VALUES ('bundled-meet', 'google-meet', '', 'bundled/google-meet/SKILL.md', 'org-a', 'now', 'now');
+        INSERT INTO profile_tools VALUES ('org-a', 'builtin-meet');
+        INSERT INTO profile_skills VALUES ('org-a', 'bundled-meet');
+      `);
+
+      const tables = [
+        "tools",
+        "skills",
+        "org_plugins",
+        "plugin_releases",
+        "profile_tools",
+        "profile_skills",
+        "profiles",
+        "organizations",
+      ];
+
+      const before = tables.map((table) =>
+        db
+          .query<PluginCleanupRow, SQLQueryBindings[]>(`SELECT * FROM ${table}`)
+          .all()
+      );
+
+      if (scenario === "retry after failed cleanup") {
+        db.exec(`
+          CREATE TRIGGER fail_meet_cleanup BEFORE DELETE ON plugin_releases
+          WHEN OLD.plugin_id = 'google-meet'
+          BEGIN SELECT RAISE(ABORT, 'forced failure'); END;
+        `);
+        expect(() => migrateDatabase(db)).toThrow();
+        expect(
+          tables.map((table) =>
+            db
+              .query<PluginCleanupRow, SQLQueryBindings[]>(
+                `SELECT * FROM ${table}`
+              )
+              .all()
+          )
+        ).toEqual(before);
+        db.exec("DROP TRIGGER fail_meet_cleanup");
+      }
+
+      migrateDatabase(db);
+      migrateDatabase(db);
+
+      for (const [index, table] of tables.entries()) {
+        const retained = before[index].filter(
+          (row) =>
+            row.plugin_id !== "google-meet" &&
+            !String(row.tool_id ?? row.skill_id ?? "").endsWith("-google-meet")
+        );
+
+        expect(db.query(`SELECT * FROM ${table}`).all()).toEqual(retained);
+      }
+
+      expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      db.close();
+    }
+  }
+);
+
+test("adds automation transcripts to existing databases idempotently", () => {
+  const db = new Database(":memory:");
+
+  try {
+    migrateDatabase(db);
+    db.exec("ALTER TABLE automation_runs DROP COLUMN progress");
+    migrateDatabase(db);
+    migrateDatabase(db);
+
+    const columns = db
+      .query<{ name: string }, SQLQueryBindings[]>(
+        "PRAGMA table_info(automation_runs)"
+      )
+      .all();
+
+    expect(columns.filter((column) => column.name === "progress")).toHaveLength(
+      1
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("adds the artifacts owner table to existing databases", () => {
+  const db = new Database(":memory:");
+
+  try {
+    migrateDatabase(db);
+    db.exec("DROP TABLE artifacts");
+    migrateDatabase(db);
+    migrateDatabase(db);
+
+    const columns = db
+      .query<{ name: string }, SQLQueryBindings[]>(
+        "PRAGMA table_info(artifacts)"
+      )
+      .all()
+      .map((column) => column.name);
+
+    expect(columns).toContain("user_id");
+  } finally {
+    db.close();
+  }
+});
+
+describe("legacy profile id migration", () => {
+  test("renames legacy default and super bot profiles and preserves references", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      db.exec(`
+        INSERT INTO profiles (
+          id,
+          name,
+          system_prompt,
+          model,
+          thinking_enabled,
+          thinking_effort,
+          is_super,
+          created_at,
+          updated_at
+        ) VALUES
+          ('profile_default', 'Buddy', 'default prompt', NULL, NULL, NULL, 0, '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z'),
+          ('profile_super_bot', 'Super Bot', 'super prompt', NULL, NULL, NULL, 1, '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z');
+
+        INSERT INTO tools (
+          id,
+          name,
+          description,
+          handler_type,
+          handler_config,
+          created_at,
+          updated_at
+        ) VALUES (
+          'tool_bash',
+          'bash',
+          'bash tool',
+          'bash',
+          '{}',
+          '2026-06-19T00:00:00.000Z',
+          '2026-06-19T00:00:00.000Z'
+        );
+
+        INSERT INTO mcp_servers (
+          id,
+          name,
+          transport,
+          config,
+          enabled,
+          status,
+          last_error,
+          cached_tools,
+          created_at,
+          updated_at
+        ) VALUES (
+          'mcp_test',
+          'Test MCP',
+          'stdio',
+          '{}',
+          1,
+          'disconnected',
+          NULL,
+          '[]',
+          '2026-06-19T00:00:00.000Z',
+          '2026-06-19T00:00:00.000Z'
+        );
+
+        INSERT INTO skills (
+          id,
+          name,
+          description,
+          source_path,
+          has_tool,
+          disable_model_invocation,
+          enabled,
+          created_at,
+          updated_at
+        ) VALUES (
+          'skill_test',
+          'Test Skill',
+          'skill',
+          '/tmp/test-skill',
+          0,
+          0,
+          1,
+          '2026-06-19T00:00:00.000Z',
+          '2026-06-19T00:00:00.000Z'
+        );
+
+        INSERT INTO profile_tools (profile_id, tool_id) VALUES
+          ('profile_default', 'tool_bash'),
+          ('profile_super_bot', 'tool_bash');
+
+        INSERT INTO profile_mcp_servers (profile_id, server_id) VALUES
+          ('profile_default', 'mcp_test'),
+          ('profile_super_bot', 'mcp_test');
+
+        INSERT INTO profile_skills (profile_id, skill_id) VALUES
+          ('profile_default', 'skill_test'),
+          ('profile_super_bot', 'skill_test');
+
+        INSERT INTO sessions (id, profile_id, channel, created_at, updated_at, title, agent_todos) VALUES
+          ('session_default', 'profile_default', 'cli', '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z', NULL, '[]'),
+          ('session_super', 'profile_super_bot', 'cli', '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z', NULL, '[]');
+
+        INSERT INTO automations (
+          id,
+          name,
+          version,
+          definition,
+          profile_id,
+          enabled,
+          created_at,
+          updated_at
+        ) VALUES
+          ('automation_default', 'Automation', 1, '{}', 'profile_default', 1, '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z'),
+          ('automation_super', 'Automation', 1, '{}', 'profile_super_bot', 1, '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z');
+
+        INSERT INTO organizations (
+          id, name, slug, created_at, updated_at
+        ) VALUES (
+          'org_legacy', 'Legacy Org', 'legacy-org',
+          '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z'
+        );
+      `);
+
+      migrateDatabase(db);
+
+      const profiles = db
+        .prepare<
+          {
+            id: string;
+          },
+          SQLQueryBindings[]
+        >("SELECT id FROM profiles ORDER BY id")
+        .all();
+
+      const profileTools = db
+        .prepare<{ profile_id: string }, SQLQueryBindings[]>(
+          "SELECT profile_id FROM profile_tools ORDER BY profile_id"
+        )
+        .all();
+
+      const profileMcpServers = db
+        .prepare<{ profile_id: string }, SQLQueryBindings[]>(
+          "SELECT profile_id FROM profile_mcp_servers ORDER BY profile_id"
+        )
+        .all();
+
+      const profileSkills = db
+        .prepare<{ profile_id: string }, SQLQueryBindings[]>(
+          "SELECT profile_id FROM profile_skills ORDER BY profile_id"
+        )
+        .all();
+
+      const sessions = db
+        .prepare<{ profile_id: string }, SQLQueryBindings[]>(
+          "SELECT profile_id FROM sessions ORDER BY id"
+        )
+        .all();
+
+      const automations = db
+        .prepare<{ profile_id: string }, SQLQueryBindings[]>(
+          "SELECT profile_id FROM automations ORDER BY id"
+        )
+        .all();
+
+      const foreignKeyViolations = db.prepare("PRAGMA foreign_key_check").all();
+
+      expect(profiles.map((row) => row.id)).toEqual(["default", "super_bot"]);
+      expect(profileTools.map((row) => row.profile_id)).toEqual([
+        "default",
+        "super_bot",
+      ]);
+      expect(profileMcpServers.map((row) => row.profile_id)).toEqual([
+        "default",
+        "super_bot",
+      ]);
+      expect(profileSkills.map((row) => row.profile_id)).toEqual([
+        "default",
+        "super_bot",
+      ]);
+      expect(sessions.map((row) => row.profile_id)).toEqual([
+        "default",
+        "super_bot",
+      ]);
+      expect(automations.map((row) => row.profile_id)).toEqual([
+        "default",
+        "super_bot",
+      ]);
+      expect(foreignKeyViolations).toHaveLength(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("legacy profile rename keeps every profile column and reference", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      // org_a sorts first, so the org-default reset does not touch org_b.
+      db.exec(`
+        INSERT INTO organizations (id, name, slug, created_at, updated_at)
+        VALUES
+          ('org_a', 'A', 'a', '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z'),
+          ('org_b', 'B', 'b', '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z');
+
+        INSERT INTO profiles (
+          id, name, system_prompt, is_super, org_id, is_default,
+          automations_enabled, skills_write_approval, skills_post_turn_review,
+          skills_curator_consolidate_enabled, acp_agent, acp_settings,
+          owner_user_id, shared_with_team, created_at, updated_at
+        ) VALUES (
+          'profile_super_bot', 'Super', 'prompt', 1, 'org_b', 1,
+          0, 1, 0, 1, 'claude', '{"mode":"plan"}',
+          'user_1', 0, '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z'
+        );
+
+        INSERT INTO composio_toolkits (
+          id, org_id, toolkit_slug, display_name, status, created_at, updated_at
+        ) VALUES (
+          'tk_1', 'org_b', 'gmail', 'Gmail', 'active',
+          '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z'
+        );
+        INSERT INTO profile_composio_toolkits (profile_id, toolkit_id)
+        VALUES ('profile_super_bot', 'tk_1');
+
+        INSERT INTO org_shared_resources (
+          id, org_id, resource_kind, resource_id, created_at, updated_at
+        ) VALUES (
+          'pub_1', 'org_b', 'agent', 'profile_super_bot',
+          '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z'
+        );
+      `);
+
+      const columns = db
+        .prepare<{ name: string }, SQLQueryBindings[]>(
+          "PRAGMA table_info(profiles)"
+        )
+        .all()
+        .map((column) => column.name)
+        .filter((name) => name !== "id");
+
+      const selectProfile = db.prepare(
+        `SELECT ${columns.join(", ")} FROM profiles WHERE id = ?`
+      );
+
+      const expected = selectProfile.get("profile_super_bot");
+
+      migrateDatabase(db);
+      migrateDatabase(db);
+
+      expect(selectProfile.get("super_bot")).toEqual(expected);
+      expect(selectProfile.get("profile_super_bot")).toBeNull();
+      expect(
+        db.prepare("SELECT profile_id FROM profile_composio_toolkits").all()
+      ).toEqual([{ profile_id: "super_bot" }]);
+      expect(
+        db.prepare("SELECT resource_id FROM org_shared_resources").all()
+      ).toEqual([{ resource_id: "super_bot" }]);
+      expect(db.prepare("PRAGMA foreign_key_check").all()).toHaveLength(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("legacy profile is kept when another org owns the canonical id", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      db.exec(`
+        INSERT INTO organizations (id, name, slug, created_at, updated_at)
+        VALUES
+          ('org_a', 'A', 'a', '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z'),
+          ('org_b', 'B', 'b', '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z');
+
+        INSERT INTO profiles (id, name, org_id, created_at, updated_at)
+        VALUES
+          ('default', 'A default', 'org_a', '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z'),
+          ('profile_default', 'B default', 'org_b', '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z');
+
+        INSERT INTO sessions (id, profile_id, channel, created_at, updated_at)
+        VALUES ('s_b', 'profile_default', 'web', '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z');
+      `);
+
+      migrateDatabase(db);
+
+      expect(
+        db.prepare("SELECT id, org_id FROM profiles ORDER BY id").all()
+      ).toEqual([
+        { id: "default", org_id: "org_a" },
+        { id: "profile_default", org_id: "org_b" },
+      ]);
+      expect(db.prepare("SELECT profile_id FROM sessions").all()).toEqual([
+        { profile_id: "profile_default" },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("super mingzhan naming migration", () => {
+  test("renames the stock super profile and its change events only", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+      db.exec(`
+        INSERT INTO organizations (id, name, slug, created_at, updated_at)
+        VALUES ('org_a', 'A', 'a', '2026-10-16T00:00:00.000Z', '2026-10-16T00:00:00.000Z');
+        INSERT INTO profiles (id, name, system_prompt, model, is_super, org_id, created_at, updated_at)
+        VALUES
+          ('p_stock', 'Super Bot', '', NULL, 1, 'org_a', '2026-10-16T00:00:00.000Z', '2026-10-16T00:00:00.000Z'),
+          ('p_custom', 'Atlas', '', NULL, 1, 'org_a', '2026-10-16T00:00:00.000Z', '2026-10-16T00:00:00.000Z'),
+          ('p_regular', 'Super Bot', '', NULL, 0, 'org_a', '2026-10-16T00:00:00.000Z', '2026-10-16T00:00:00.000Z');
+        INSERT INTO profile_change_events (id, org_id, profile_id, source, field, created_at)
+        VALUES ('e1', 'org_a', 'p_stock', 'super_bot', 'system_prompt', '2026-10-16T00:00:00.000Z');
+      `);
+
+      migrateSuperMingzhanNaming(db);
+
+      expect(
+        db.prepare("SELECT id, name FROM profiles ORDER BY id").all()
+      ).toEqual([
+        { id: "p_custom", name: "Atlas" },
+        { id: "p_regular", name: "Super Bot" },
+        { id: "p_stock", name: "Super MíngZhàn" },
+      ]);
+      expect(
+        db.prepare("SELECT source FROM profile_change_events").get()
+      ).toEqual({ source: "super_mingzhan" });
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("save-artifact skill rename migration", () => {
+  const insertSkill = (db: Database, id: string, name: string) =>
+    db
+      .prepare(
+        `INSERT INTO skills (
+          id, name, description, source_path, has_tool,
+          disable_model_invocation, enabled, created_at, updated_at
+        ) VALUES (?, ?, '', ?, 0, 0, 1, '2026-10-16T00:00:00.000Z', '2026-10-16T00:00:00.000Z')`
+      )
+      .run(id, name, `/tmp/.mingzhan/agent/skills/${name}/SKILL.md`);
+
+  const insertProfile = (db: Database, id: string) =>
+    db
+      .prepare(
+        `INSERT INTO profiles (id, name, system_prompt, model, is_super, created_at, updated_at)
+        VALUES (?, ?, '', NULL, 0, '2026-10-16T00:00:00.000Z', '2026-10-16T00:00:00.000Z')`
+      )
+      .run(id, id);
+
+  test("renames save-artifact skill records to artifact-design", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+      insertSkill(db, "skill_artifact", "save-artifact");
+
+      migrateArtifactDesignSkillName(db);
+
+      expect(
+        db
+          .prepare("SELECT name, source_path FROM skills WHERE id = ?")
+          .get("skill_artifact")
+      ).toEqual({
+        name: "artifact-design",
+        source_path: "/tmp/.mingzhan/agent/skills/artifact-design/SKILL.md",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  test("moves profile assignments to artifact-design without duplicates", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+      insertProfile(db, "ops");
+      insertProfile(db, "both");
+      insertSkill(db, "skill_legacy", "save-artifact");
+      insertSkill(db, "skill_canonical", "artifact-design");
+      db.exec(`
+        INSERT INTO profile_skills (profile_id, skill_id) VALUES
+          ('ops', 'skill_legacy'),
+          ('both', 'skill_legacy'),
+          ('both', 'skill_canonical');
+      `);
+
+      migrateArtifactDesignSkillName(db);
+
+      expect(
+        db.prepare("SELECT id FROM skills WHERE name LIKE '%artifact%'").all()
+      ).toEqual([{ id: "skill_canonical" }]);
+      expect(
+        db
+          .prepare(
+            "SELECT profile_id, skill_id FROM profile_skills ORDER BY profile_id"
+          )
+          .all()
+      ).toEqual([
+        { profile_id: "both", skill_id: "skill_canonical" },
+        { profile_id: "ops", skill_id: "skill_canonical" },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("coding-delegation skill rename migration", () => {
+  test("renames coding-delegation skill records to coding-agent", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      db.exec(`
+        INSERT INTO skills (
+          id,
+          name,
+          description,
+          source_path,
+          has_tool,
+          disable_model_invocation,
+          enabled,
+          created_at,
+          updated_at
+        ) VALUES (
+          'skill_coding',
+          'coding-delegation',
+          'Delegate repo work to a coding agent',
+          '/tmp/.mingzhan/agent/skills/coding-delegation/SKILL.md',
+          0,
+          0,
+          1,
+          '2026-06-19T00:00:00.000Z',
+          '2026-06-19T00:00:00.000Z'
+        );
+      `);
+
+      migrateCodingDelegationSkillName(db);
+
+      const skill = db
+        .prepare<{ name: string; source_path: string }, SQLQueryBindings[]>(
+          "SELECT name, source_path FROM skills WHERE id = ?"
+        )
+        .get("skill_coding");
+
+      expect(skill?.name).toBe("coding-agent");
+      expect(skill?.source_path).toBe(
+        "/tmp/.mingzhan/agent/skills/coding-agent/SKILL.md"
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  test("merges legacy coding-delegation records when coding-agent already exists", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      db.exec(`
+        INSERT INTO profiles (id, name, system_prompt, model, is_super, created_at, updated_at)
+        VALUES ('super_bot', 'Super Bot', '', NULL, 1, '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z');
+
+        INSERT INTO skills (
+          id,
+          name,
+          description,
+          source_path,
+          has_tool,
+          disable_model_invocation,
+          enabled,
+          created_at,
+          updated_at
+        ) VALUES
+          (
+            'skill_legacy',
+            'coding-delegation',
+            'Legacy coding delegation',
+            '/tmp/.mingzhan/agent/skills/coding-delegation/SKILL.md',
+            0,
+            0,
+            1,
+            '2026-06-19T00:00:00.000Z',
+            '2026-06-19T00:00:00.000Z'
+          ),
+          (
+            'skill_canonical',
+            'coding-agent',
+            'Coding agent',
+            '/tmp/.mingzhan/agent/skills/coding-agent/SKILL.md',
+            0,
+            0,
+            1,
+            '2026-06-19T00:00:00.000Z',
+            '2026-06-19T00:00:00.000Z'
+          );
+
+        INSERT INTO profile_skills (profile_id, skill_id)
+        VALUES ('super_bot', 'skill_legacy');
+      `);
+
+      migrateCodingDelegationSkillName(db);
+
+      const skills = db
+        .prepare<{ id: string; name: string }, SQLQueryBindings[]>(
+          "SELECT id, name FROM skills WHERE name LIKE 'coding%' ORDER BY name"
+        )
+        .all();
+
+      const assignment = db
+        .prepare<{ skill_id: string }, SQLQueryBindings[]>(
+          "SELECT skill_id FROM profile_skills WHERE profile_id = ?"
+        )
+        .get("super_bot");
+
+      expect(skills).toEqual([{ id: "skill_canonical", name: "coding-agent" }]);
+      expect(assignment?.skill_id).toBe("skill_canonical");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("rolls back the whole merge when one legacy row fails to delete", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      db.exec(`
+        INSERT INTO profiles (id, name, system_prompt, model, is_super, created_at, updated_at)
+        VALUES ('super_bot', 'Super Bot', '', NULL, 1, '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z');
+
+        INSERT INTO skills (
+          id, name, description, source_path, has_tool,
+          disable_model_invocation, enabled, created_at, updated_at
+        ) VALUES
+          ('skill_legacy_a', 'coding-delegation', 'Legacy A', '/tmp/a/coding-delegation/SKILL.md', 0, 0, 1, '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z'),
+          ('skill_legacy_b', 'coding-delegation', 'Legacy B', '/tmp/b/coding-delegation/SKILL.md', 0, 0, 1, '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z'),
+          ('skill_canonical', 'coding-agent', 'Coding agent', '/tmp/c/coding-agent/SKILL.md', 0, 0, 1, '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z');
+
+        -- The merge deletes legacy rows one at a time, so aborting on the
+        -- second one leaves the first already gone unless the step is atomic.
+        CREATE TRIGGER fail_second_legacy_delete
+        BEFORE DELETE ON skills
+        WHEN OLD.id = 'skill_legacy_b'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced migration failure');
+        END;
+      `);
+
+      expect(() => migrateDatabase(db)).toThrow();
+
+      const remaining = db
+        .prepare<{ id: string }, SQLQueryBindings[]>(
+          "SELECT id FROM skills WHERE name = 'coding-delegation' ORDER BY id"
+        )
+        .all();
+
+      expect(remaining).toEqual([
+        { id: "skill_legacy_a" },
+        { id: "skill_legacy_b" },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("install-wide name uniqueness", () => {
+  function insertTool(db: Database, id: string, name: string): void {
+    db.prepare(
+      `INSERT INTO tools (id, name, description, handler_type, handler_config, created_at, updated_at)
+       VALUES (?, ?, '', 'bash', '{}', '2026-08-17T00:00:00.000Z', '2026-08-17T00:00:00.000Z')`
+    ).run(id, name);
+  }
+
+  function insertServer(db: Database, id: string, name: string): void {
+    db.prepare(
+      `INSERT INTO mcp_servers (id, name, transport, config, enabled, status, last_error, cached_tools, created_at, updated_at)
+       VALUES (?, ?, 'stdio', '{}', 1, 'disconnected', NULL, '[]', '2026-08-17T00:00:00.000Z', '2026-08-17T00:00:00.000Z')`
+    ).run(id, name);
+  }
+
+  test("rejects a second tool or MCP server with the same name", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      insertTool(db, "tool_1", "bash");
+      insertServer(db, "mcp_1", "github");
+
+      expect(() => insertTool(db, "tool_2", "bash")).toThrow();
+      expect(() => insertServer(db, "mcp_2", "github")).toThrow();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("still migrates a database that already holds duplicates", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+      db.exec("DROP INDEX IF EXISTS tools_global_name_unique");
+      insertTool(db, "tool_1", "bash");
+      insertTool(db, "tool_2", "bash");
+
+      expect(() => migrateDatabase(db)).not.toThrow();
+      expect(db.query("SELECT count(*) c FROM tools").get()).toEqual({ c: 2 });
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("skill org id backfill", () => {
+  test("recovers the owning org from source_path and leaves global skills alone", () => {
+    const configDir = mkdtempSync(join(tmpdir(), "mingzhan-skill-org-backfill-"));
+    const originalConfigDir = process.env.MINGZHAN_CONFIG_DIR;
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      // Rows as every pre-fix install has them: org_id never written.
+      db.prepare(
+        `INSERT INTO skills (
+          id, name, description, source_path, has_tool,
+          disable_model_invocation, enabled, created_at, updated_at
+        ) VALUES (?, ?, '', ?, 0, 0, 1, '2026-08-17T00:00:00.000Z', '2026-08-17T00:00:00.000Z')`
+      ).run(
+        "skill_org_a",
+        "deploy-notes",
+        join(
+          configDir,
+          "orgs",
+          "org_a",
+          "profiles",
+          "profile_a",
+          "skills",
+          "deploy-notes"
+        )
+      );
+      db.prepare(
+        `INSERT INTO skills (
+          id, name, description, source_path, has_tool,
+          disable_model_invocation, enabled, created_at, updated_at
+        ) VALUES (?, ?, '', ?, 0, 0, 1, '2026-08-17T00:00:00.000Z', '2026-08-17T00:00:00.000Z')`
+      ).run(
+        "skill_global",
+        "weather",
+        join(configDir, "agent", "skills", "weather")
+      );
+
+      migrateDatabase(db);
+
+      const rows = db
+        .prepare<{ id: string; org_id: string | null }, SQLQueryBindings[]>(
+          "SELECT id, org_id FROM skills ORDER BY id"
+        )
+        .all();
+
+      expect(rows).toEqual([
+        { id: "skill_global", org_id: null },
+        { id: "skill_org_a", org_id: "org_a" },
+      ]);
+
+      // Two global skills may not share a source_path, which the org-scoped
+      // index alone cannot enforce.
+      expect(() =>
+        db
+          .prepare(
+            `INSERT INTO skills (
+              id, name, description, source_path, has_tool,
+              disable_model_invocation, enabled, created_at, updated_at
+            ) VALUES (?, ?, '', ?, 0, 0, 1, '2026-08-17T00:00:00.000Z', '2026-08-17T00:00:00.000Z')`
+          )
+          .run(
+            "skill_global_copy",
+            "weather",
+            join(configDir, "agent", "skills", "weather")
+          )
+      ).toThrow();
+    } finally {
+      db.close();
+      rmSync(configDir, { force: true, recursive: true });
+
+      if (originalConfigDir === undefined) {
+        delete process.env.MINGZHAN_CONFIG_DIR;
+      } else {
+        process.env.MINGZHAN_CONFIG_DIR = originalConfigDir;
+      }
+    }
+  });
+});
+
+describe("session org id backfill", () => {
+  test("recovers the owning org from the profile and leaves orphan sessions alone", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      // Rows as every pre-fix install has them: org_id never written.
+      db.exec(`
+        INSERT INTO organizations (id, name, slug, created_at, updated_at)
+          VALUES ('org_a', 'Org A', 'org-a', 'now', 'now');
+        INSERT INTO profiles (id, name, org_id, created_at, updated_at)
+          VALUES ('profile_a', 'Agent A', 'org_a', 'now', 'now');
+      `);
+      db.exec("PRAGMA foreign_keys = OFF");
+      db.exec(`
+        INSERT INTO sessions (id, profile_id, channel, created_at, updated_at)
+          VALUES ('session_a', 'profile_a', 'web', 'now', 'now'),
+                 ('session_orphan', 'profile_gone', 'web', 'now', 'now');
+      `);
+      db.exec("PRAGMA foreign_keys = ON");
+
+      migrateDatabase(db);
+
+      expect(
+        db.query("SELECT id, org_id FROM sessions ORDER BY id").all()
+      ).toEqual([
+        { id: "session_a", org_id: "org_a" },
+        { id: "session_orphan", org_id: null },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("schema path resolution", () => {
+  test("resolves schema.sql from the db package during source execution", () => {
+    const schemaPath = resolveSchemaPath();
+
+    expect(schemaPath).toBe(resolve(repoRoot, "packages/db/sql/schema.sql"));
+  });
+
+  test("falls back to the workspace schema when running from the bundled server output", () => {
+    const schemaPath = resolveSchemaPath({
+      cwd: repoRoot,
+      moduleDir: resolve(repoRoot, "apps/server/dist"),
+    });
+
+    expect(schemaPath).toBe(resolve(repoRoot, "packages/db/sql/schema.sql"));
+  });
+});
+
+describe("schema bootstrap version", () => {
+  test("applies schema.sql once while compatibility migrations keep running", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+      db.exec("DROP TABLE artifact_shares; DROP TABLE attachments;");
+
+      migrateDatabase(db);
+
+      const artifactSharesTable = db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'artifact_shares'"
+        )
+        .get();
+
+      const attachmentsTable = db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'attachments'"
+        )
+        .get();
+
+      expect(artifactSharesTable).toBeNull();
+      expect(attachmentsTable).toEqual({ name: "attachments" });
+
+      const schemaVersion = db
+        .prepare<{ version: number }, SQLQueryBindings[]>(
+          "SELECT version FROM schema_version"
+        )
+        .get();
+
+      const foreignKeys = db
+        .prepare<
+          {
+            foreign_keys: number;
+          },
+          SQLQueryBindings[]
+        >("PRAGMA foreign_keys")
+        .get();
+
+      expect(schemaVersion?.version).toBe(1);
+      expect(foreignKeys?.foreign_keys).toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("automations enabled column", () => {
+  const selectAutomationsEnabled = (db: Database) =>
+    db
+      .prepare<{ automations_enabled: number; id: string }, SQLQueryBindings[]>(
+        "SELECT id, automations_enabled FROM profiles ORDER BY id"
+      )
+      .all();
+
+  test("keeps the stored value of existing profiles", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+      db.exec(`
+        INSERT INTO profiles (id, name, automations_enabled, created_at, updated_at)
+        VALUES
+          ('profile_off', 'Off', 0, '2026-10-20T00:00:00.000Z', '2026-10-20T00:00:00.000Z'),
+          ('profile_on', 'On', 1, '2026-10-20T00:00:00.000Z', '2026-10-20T00:00:00.000Z');
+      `);
+
+      migrateDatabase(db);
+
+      expect(selectAutomationsEnabled(db)).toEqual([
+        { automations_enabled: 0, id: "profile_off" },
+        { automations_enabled: 1, id: "profile_on" },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("keeps automations on for profiles from before the column", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+      db.exec(`
+        ALTER TABLE profiles DROP COLUMN automations_enabled;
+        INSERT INTO profiles (id, name, created_at, updated_at)
+        VALUES ('profile_legacy', 'Legacy', '2026-10-20T00:00:00.000Z', '2026-10-20T00:00:00.000Z');
+      `);
+
+      migrateDatabase(db);
+      db.exec(`
+        INSERT INTO profiles (id, name, created_at, updated_at)
+        VALUES ('profile_new', 'New', '2026-10-20T00:00:00.000Z', '2026-10-20T00:00:00.000Z');
+      `);
+
+      expect(selectAutomationsEnabled(db)).toEqual([
+        { automations_enabled: 1, id: "profile_legacy" },
+        { automations_enabled: 0, id: "profile_new" },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("chat session schema", () => {
+  test("adds model and tree data to legacy sessions", () => {
+    const db = new Database(":memory:");
+
+    try {
+      db.exec(`
+        CREATE TABLE sessions (
+          id TEXT PRIMARY KEY NOT NULL,
+          profile_id TEXT NOT NULL,
+          channel TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+      `);
+
+      migrateDatabase(db);
+
+      const columns = db
+        .prepare<
+          {
+            name: string;
+          },
+          SQLQueryBindings[]
+        >("PRAGMA table_info(sessions)")
+        .all();
+
+      expect(columns.some((column) => column.name === "model")).toBe(true);
+      expect(columns.some((column) => column.name === "updated_at")).toBe(true);
+      expect(
+        columns.some((column) => column.name === "parent_session_id")
+      ).toBe(true);
+      expect(
+        columns.some((column) => column.name === "branch_message_index")
+      ).toBe(true);
+      expect(
+        db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE name = 'session_user_order'"
+          )
+          .get()
+      ).not.toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("gives chats without a live owner to the first platform admin", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+      db.exec(`
+        PRAGMA foreign_keys = OFF;
+        INSERT INTO profiles (id, name, created_at, updated_at)
+          VALUES ('p', 'Agent', 'now', 'now');
+        INSERT INTO users (id, email, password_hash, created_at, updated_at)
+          VALUES ('member', 'm@example.com', 'x', '2026-01-01', 'now');
+        INSERT INTO sessions (id, profile_id, channel, user_id, created_at, updated_at)
+          VALUES ('no_owner', 'p', 'web', NULL, 'now', 'now'),
+                 ('deleted_owner', 'p', 'web', 'gone', 'now', 'now'),
+                 ('owned', 'p', 'web', 'member', 'now', 'now');
+      `);
+
+      const owners = () =>
+        db
+          .prepare<{ id: string; user_id: string | null }, SQLQueryBindings[]>(
+            "SELECT id, user_id FROM sessions ORDER BY id"
+          )
+          .all();
+
+      // Before setup there is no platform admin to hand the chats to.
+      migrateDatabase(db);
+      expect(owners()).toEqual([
+        { id: "deleted_owner", user_id: "gone" },
+        { id: "no_owner", user_id: null },
+        { id: "owned", user_id: "member" },
+      ]);
+
+      db.exec(`
+        INSERT INTO users (id, email, password_hash, is_platform_admin, created_at, updated_at)
+          VALUES ('admin_new', 'new@example.com', 'x', 1, '2026-03-01', 'now'),
+                 ('admin_first', 'first@example.com', 'x', 1, '2026-02-01', 'now');
+      `);
+      migrateDatabase(db);
+      migrateDatabase(db);
+
+      expect(owners()).toEqual([
+        { id: "deleted_owner", user_id: "admin_first" },
+        { id: "no_owner", user_id: "admin_first" },
+        { id: "owned", user_id: "member" },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("does not assign shared messaging chats to a platform admin", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+      db.exec(`
+        PRAGMA foreign_keys = OFF;
+        INSERT INTO profiles (id, name, created_at, updated_at)
+          VALUES ('p', 'Agent', 'now', 'now');
+        INSERT INTO users (id, email, password_hash, is_platform_admin, created_at, updated_at)
+          VALUES ('admin', 'admin@example.com', 'x', 1, 'now', 'now');
+      `);
+
+      for (const channel of ["discord", "slack", "telegram", "whatsapp"]) {
+        for (const owner of [null, "deleted_user"]) {
+          const id = `${channel}-${owner}`;
+          db.prepare(
+            "INSERT INTO sessions (id, profile_id, channel, user_id, created_at, updated_at) VALUES (?, 'p', ?, ?, 'now', 'now')"
+          ).run(id, channel, owner);
+        }
+      }
+
+      const owners = () =>
+        db.prepare("SELECT id, user_id FROM sessions ORDER BY id").all();
+
+      const before = owners();
+
+      migrateDatabase(db);
+      migrateDatabase(db);
+      expect(owners()).toEqual(before);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("browser session schema", () => {
+  test("creates browser session storage with the expected columns", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      const columns = db
+        .prepare<
+          {
+            name: string;
+          },
+          SQLQueryBindings[]
+        >("PRAGMA table_info(browser_sessions)")
+        .all();
+
+      const indexes = db
+        .prepare<
+          {
+            name: string;
+          },
+          SQLQueryBindings[]
+        >("PRAGMA index_list(browser_sessions)")
+        .all();
+
+      expect(columns.map((column) => column.name)).toEqual([
+        "id",
+        "user_id",
+        "session_token_hash",
+        "csrf_token_hash",
+        "created_at",
+        "expires_at",
+        "revoked_at",
+        "last_used_at",
+        "active_org_id",
+      ]);
+      expect(
+        indexes.some(
+          (index) => index.name === "browser_sessions_token_hash_unique"
+        )
+      ).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("password reset schema", () => {
+  test("creates single-use password reset token storage", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      const columns = db
+        .prepare<{ name: string }, SQLQueryBindings[]>(
+          "PRAGMA table_info(password_reset_tokens)"
+        )
+        .all();
+
+      const indexes = db
+        .prepare<{ name: string }, SQLQueryBindings[]>(
+          "PRAGMA index_list(password_reset_tokens)"
+        )
+        .all();
+
+      expect(columns.map((column) => column.name)).toEqual([
+        "id",
+        "user_id",
+        "token_hash",
+        "expires_at",
+        "consumed_at",
+        "created_at",
+      ]);
+      expect(
+        indexes.some(
+          (index) => index.name === "password_reset_tokens_token_hash_unique"
+        )
+      ).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("organization schema migration", () => {
+  test("keeps the default profile a user chose in the first org", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      db.exec(`
+        INSERT INTO organizations (id, name, slug, created_at, updated_at)
+        VALUES ('org_a', 'A', 'a', '2026-06-21', '2026-06-21');
+
+        INSERT INTO profiles (id, name, org_id, is_default, created_at, updated_at)
+        VALUES
+          ('default', 'Buddy', 'org_a', 0, '2026-06-21', '2026-06-21'),
+          ('custom', 'Custom', 'org_a', 1, '2026-06-22', '2026-06-22'),
+          ('other', 'Other', 'org_a', 1, '2026-06-23', '2026-06-23');
+      `);
+
+      migrateDatabase(db);
+      migrateDatabase(db);
+
+      expect(
+        db.prepare("SELECT id, is_default FROM profiles ORDER BY id").all()
+      ).toEqual([
+        { id: "custom", is_default: 1 },
+        { id: "default", is_default: 0 },
+        { id: "other", is_default: 0 },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("creates org tables and allows org with admin member", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      db.exec(`
+        INSERT INTO users (
+          id, email, password_hash, is_platform_admin, created_at, updated_at
+        ) VALUES (
+          'user_admin', 'admin@example.com', 'hash', 1,
+          '2026-06-21T00:00:00.000Z', '2026-06-21T00:00:00.000Z'
+        );
+
+        INSERT INTO organizations (
+          id, name, slug, created_at, updated_at
+        ) VALUES (
+          'org_acme', 'Acme', 'acme',
+          '2026-06-21T00:00:00.000Z', '2026-06-21T00:00:00.000Z'
+        );
+
+        INSERT INTO org_members (org_id, user_id, role, created_at) VALUES (
+          'org_acme', 'user_admin', 'admin', '2026-06-21T00:00:00.000Z'
+        );
+      `);
+
+      const fkCheck = db.prepare("PRAGMA foreign_key_check").all();
+      expect(fkCheck).toEqual([]);
+
+      const member = db
+        .prepare<
+          {
+            role: string;
+            user_context: string | null;
+          },
+          SQLQueryBindings[]
+        >(
+          "SELECT role, user_context FROM org_members WHERE org_id = ? AND user_id = ?"
+        )
+        .get("org_acme", "user_admin");
+
+      expect(member?.role).toBe("admin");
+      expect(member?.user_context).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("copies legacy users.user_context into empty org_members rows", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      db.exec(`
+        INSERT INTO users (
+          id, email, password_hash, is_platform_admin, user_context,
+          created_at, updated_at
+        ) VALUES (
+          'user_legacy', 'legacy@example.com', 'hash', 0,
+          '# From users table',
+          '2026-06-21T00:00:00.000Z', '2026-06-21T00:00:00.000Z'
+        );
+
+        INSERT INTO organizations (
+          id, name, slug, created_at, updated_at
+        ) VALUES (
+          'org_acme', 'Acme', 'acme',
+          '2026-06-21T00:00:00.000Z', '2026-06-21T00:00:00.000Z'
+        );
+
+        INSERT INTO org_members (org_id, user_id, role, created_at) VALUES (
+          'org_acme', 'user_legacy', 'member', '2026-06-21T00:00:00.000Z'
+        );
+      `);
+
+      migrateDatabase(db);
+
+      const member = db
+        .prepare<{ user_context: string | null }, SQLQueryBindings[]>(
+          "SELECT user_context FROM org_members WHERE org_id = ? AND user_id = ?"
+        )
+        .get("org_acme", "user_legacy");
+
+      expect(member?.user_context).toBe("# From users table");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("rolls back profile org backfill when a related update fails", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+      db.exec(`
+        INSERT INTO organizations (id, name, slug, created_at, updated_at)
+        VALUES ('org_legacy', 'Legacy', 'legacy', '2026-01-01', '2026-01-01');
+
+        INSERT INTO profiles (
+          id, name, system_prompt, model, is_super, org_id, is_default,
+          created_at, updated_at
+        ) VALUES (
+          'default', 'Default', '', NULL, 0, NULL, 0,
+          '2026-01-01', '2026-01-01'
+        );
+
+        INSERT INTO automations (
+          id, name, version, definition, profile_id, org_id, enabled,
+          created_at, updated_at
+        ) VALUES (
+          'automation_legacy', 'Legacy', 1, '{}', 'default', NULL, 1,
+          '2026-01-01', '2026-01-01'
+        );
+
+        CREATE TRIGGER fail_automation_org_backfill
+        BEFORE UPDATE OF org_id ON automations
+        BEGIN
+          SELECT RAISE(ABORT, 'forced migration failure');
+        END;
+      `);
+
+      expect(() => migrateDatabase(db)).toThrow();
+      expect(
+        db
+          .prepare("SELECT org_id, is_default FROM profiles WHERE id = ?")
+          .get("default")
+      ).toEqual({ is_default: 0, org_id: null });
+      expect(
+        db
+          .prepare("SELECT org_id FROM automations WHERE id = ?")
+          .get("automation_legacy")
+      ).toEqual({ org_id: null });
+    } finally {
+      db.close();
+    }
+  });
+
+  test("rejects duplicate organization slug", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      db.prepare(`
+        INSERT INTO organizations (
+          id, name, slug, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?)
+      `).run(
+        "org_a",
+        "Org A",
+        "acme",
+        "2026-06-21T00:00:00.000Z",
+        "2026-06-21T00:00:00.000Z"
+      );
+
+      let error: unknown;
+
+      try {
+        db.prepare(`
+          INSERT INTO organizations (
+            id, name, slug, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?)
+        `).run(
+          "org_b",
+          "Org B",
+          "acme",
+          "2026-06-21T00:00:00.000Z",
+          "2026-06-21T00:00:00.000Z"
+        );
+      } catch (caught) {
+        error = caught;
+      }
+
+      expect(error).toBeDefined();
+      expect(String(error)).toContain("UNIQUE");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("rejects org_member with unknown org_id", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      db.prepare(`
+        INSERT INTO users (
+          id, email, password_hash, is_platform_admin, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        "user_1",
+        "user@example.com",
+        "hash",
+        0,
+        "2026-06-21T00:00:00.000Z",
+        "2026-06-21T00:00:00.000Z"
+      );
+
+      let error: unknown;
+
+      try {
+        db.prepare(`
+          INSERT INTO org_members (org_id, user_id, role, created_at) VALUES (?, ?, ?, ?)
+        `).run("missing_org", "user_1", "admin", "2026-06-21T00:00:00.000Z");
+      } catch (caught) {
+        error = caught;
+      }
+
+      expect(error).toBeDefined();
+      expect(String(error)).toContain("FOREIGN KEY");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("adds is_platform_admin to legacy users table", () => {
+    const db = new Database(":memory:");
+
+    try {
+      db.exec(`
+        CREATE TABLE users (
+          id TEXT PRIMARY KEY NOT NULL,
+          email TEXT NOT NULL,
+          password_hash TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+      `);
+
+      migrateDatabase(db);
+
+      const columns = db
+        .prepare<
+          {
+            name: string;
+          },
+          SQLQueryBindings[]
+        >("PRAGMA table_info(users)")
+        .all();
+
+      expect(columns.map((column) => column.name)).toContain(
+        "is_platform_admin"
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  test("adds archived_at to legacy organizations table", () => {
+    const db = new Database(":memory:");
+
+    try {
+      db.exec(`
+        CREATE TABLE organizations (
+          id TEXT PRIMARY KEY NOT NULL,
+          name TEXT NOT NULL,
+          slug TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+      `);
+      db.exec(`
+        INSERT INTO organizations (id, name, slug, created_at, updated_at)
+        VALUES ('org_legacy', 'Legacy', 'legacy', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+      `);
+
+      migrateDatabase(db);
+
+      const columns = db
+        .prepare<{ name: string }, SQLQueryBindings[]>(
+          "PRAGMA table_info(organizations)"
+        )
+        .all();
+
+      expect(columns.map((column) => column.name)).toContain("archived_at");
+      expect(columns.map((column) => column.name)).toContain(
+        "allowed_invite_domains"
+      );
+
+      const row = db
+        .prepare<{ archived_at: string | null }, SQLQueryBindings[]>(
+          "SELECT archived_at FROM organizations WHERE id = ?"
+        )
+        .get("org_legacy");
+
+      expect(row?.archived_at).toBeNull();
+      expect(
+        db
+          .prepare<{ allowed_invite_domains: string }, SQLQueryBindings[]>(
+            "SELECT allowed_invite_domains FROM organizations WHERE id = ?"
+          )
+          .get("org_legacy")?.allowed_invite_domains
+      ).toBe("[]");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("adds org_id to tenant tables and composite unique indexes", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      for (const tableName of [
+        "profiles",
+        "sessions",
+        "automations",
+        "tools",
+        "mcp_servers",
+        "skills",
+        "llm_usage_stats",
+        "workspace_settings",
+      ]) {
+        const columns = db
+          .prepare<{ name: string }, SQLQueryBindings[]>(
+            `PRAGMA table_info(${tableName})`
+          )
+          .all();
+
+        expect(columns.map((column) => column.name)).toContain("org_id");
+      }
+
+      const toolIndexes = db
+        .prepare<{ name: string }, SQLQueryBindings[]>(
+          "PRAGMA index_list(tools)"
+        )
+        .all();
+
+      expect(
+        toolIndexes.some((index) => index.name === "tools_org_name_unique")
+      ).toBe(true);
+      expect(
+        toolIndexes.some((index) => index.name === "tools_name_unique")
+      ).toBe(false);
+
+      db.exec(`
+        INSERT INTO organizations (
+          id, name, slug, created_at, updated_at
+        ) VALUES
+          ('org_a', 'Org A', 'org-a', '2026-06-21T00:00:00.000Z', '2026-06-21T00:00:00.000Z'),
+          ('org_b', 'Org B', 'org-b', '2026-06-21T00:00:00.000Z', '2026-06-21T00:00:00.000Z');
+
+        INSERT INTO tools (
+          id, name, description, handler_type, handler_config, org_id, created_at, updated_at
+        ) VALUES
+          ('tool_a', 'bash', 'bash', 'bash', '{}', 'org_a', '2026-06-21T00:00:00.000Z', '2026-06-21T00:00:00.000Z'),
+          ('tool_b', 'bash', 'bash', 'bash', '{}', 'org_b', '2026-06-21T00:00:00.000Z', '2026-06-21T00:00:00.000Z');
+      `);
+
+      const fkCheck = db.prepare("PRAGMA foreign_key_check").all();
+      expect(fkCheck).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("creates channel_org_mappings with foreign keys", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+
+      db.exec(`
+        INSERT INTO users (
+          id, email, password_hash, is_platform_admin, created_at, updated_at
+        ) VALUES (
+          'user_1', 'user@example.com', 'hash', 0,
+          '2026-06-21T00:00:00.000Z', '2026-06-21T00:00:00.000Z'
+        );
+
+        INSERT INTO organizations (
+          id, name, slug, created_at, updated_at
+        ) VALUES (
+          'org_acme', 'Acme', 'acme',
+          '2026-06-21T00:00:00.000Z', '2026-06-21T00:00:00.000Z'
+        );
+
+        INSERT INTO channel_org_mappings (
+          channel, channel_user_id, user_id, org_id, created_at
+        ) VALUES (
+          'telegram', 'tg_123', 'user_1', 'org_acme', '2026-06-21T00:00:00.000Z'
+        );
+      `);
+
+      const fkCheck = db.prepare("PRAGMA foreign_key_check").all();
+      expect(fkCheck).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("migration SQL hardening", () => {
+  test("rejects unexpected tenant table names before SQLite can run injected ATTACH statements", () => {
+    const db = new Database(":memory:");
+    const attachPath = "/tmp/mingzhan-migrate-attach-test.sqlite";
+
+    rmSync(attachPath, { force: true });
+
+    try {
+      db.exec("CREATE TABLE profiles (id TEXT PRIMARY KEY NOT NULL);");
+
+      expect(() =>
+        addOrgIdColumnIfMissing(
+          db,
+          `profiles ADD COLUMN hacked TEXT; ATTACH DATABASE '${attachPath}' AS injected; --`
+        )
+      ).toThrow("Unsupported tenant org table");
+      expect(existsSync(attachPath)).toBe(false);
+    } finally {
+      rmSync(attachPath, { force: true });
+      db.close();
+    }
+  });
+
+  test("rejects unexpected profile join targets before building dynamic SQL", () => {
+    const db = new Database(":memory:");
+
+    try {
+      db.exec(`
+        CREATE TABLE profile_tools (
+          profile_id TEXT NOT NULL,
+          tool_id TEXT NOT NULL,
+          PRIMARY KEY (profile_id, tool_id)
+        );
+      `);
+
+      expect(() =>
+        moveProfileJoinReferences(
+          db,
+          "profile_tools",
+          "tool_id; ATTACH DATABASE '/tmp/ignored.sqlite' AS injected; --",
+          "legacy",
+          "canonical"
+        )
+      ).toThrow("Unsupported profile join target");
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("llm usage org scope", () => {
+  // The ledger as it was before it had an owner: one install-wide row, plus
+  // one row per model, neither keyed by org.
+  function legacyUsageDatabase(orgIds: string[]): Database {
+    const db = new Database(":memory:");
+    migrateDatabase(db);
+
+    for (const orgId of orgIds) {
+      db.query(
+        "INSERT INTO organizations (id, name, slug, created_at, updated_at) VALUES (?, ?, ?, 'now', 'now')"
+      ).run(orgId, orgId, orgId);
+    }
+
+    db.exec(`
+      DROP TABLE llm_usage_stats;
+      DROP TABLE llm_usage_model_stats;
+      CREATE TABLE llm_usage_stats (
+        id TEXT PRIMARY KEY NOT NULL,
+        request_count INTEGER NOT NULL DEFAULT 0,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        estimated_cost_usd REAL NOT NULL DEFAULT 0,
+        tracked_since TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        org_id TEXT
+      );
+      CREATE TABLE llm_usage_model_stats (
+        model_id TEXT PRIMARY KEY NOT NULL,
+        request_count INTEGER NOT NULL DEFAULT 0,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        estimated_cost_usd REAL NOT NULL DEFAULT 0,
+        tracked_since TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO llm_usage_stats VALUES ('global', 7, 900, 300, 1.25, '2026-01-01', '2026-02-01', NULL);
+      INSERT INTO llm_usage_model_stats VALUES ('gpt-4o', 5, 700, 200, 1, '2026-01-01', '2026-02-01');
+      INSERT INTO llm_usage_model_stats VALUES ('gpt-4o-mini', 2, 200, 100, 0.25, '2026-01-02', '2026-02-01');
+    `);
+
+    return db;
+  }
+
+  function usageRows(db: Database) {
+    return {
+      byModel: db
+        .query("SELECT * FROM llm_usage_model_stats ORDER BY model_id")
+        .all(),
+      totals: db.query("SELECT * FROM llm_usage_stats").all(),
+    };
+  }
+
+  test("keeps the history under the only org", () => {
+    const db = legacyUsageDatabase(["org-solo"]);
+
+    try {
+      migrateDatabase(db);
+
+      const migrated = usageRows(db);
+      expect(migrated.totals).toEqual([
+        {
+          estimated_cost_usd: 1.25,
+          id: "global",
+          input_tokens: 900,
+          org_id: "org-solo",
+          output_tokens: 300,
+          request_count: 7,
+          tracked_since: "2026-01-01",
+          updated_at: "2026-02-01",
+        },
+      ]);
+      expect(migrated.byModel).toMatchObject([
+        { input_tokens: 700, model_id: "gpt-4o", org_id: "org-solo" },
+        { input_tokens: 200, model_id: "gpt-4o-mini", org_id: "org-solo" },
+      ]);
+
+      migrateDatabase(db);
+      expect(usageRows(db)).toEqual(migrated);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("resets the history when more than one org could own it", () => {
+    const db = legacyUsageDatabase(["org-a", "org-b"]);
+
+    try {
+      migrateDatabase(db);
+      expect(usageRows(db)).toEqual({ byModel: [], totals: [] });
+
+      db.exec(`
+        INSERT INTO llm_usage_stats (org_id, id, tracked_since, updated_at)
+          VALUES ('org-a', 'global', 'now', 'now'), ('org-b', 'global', 'now', 'now');
+        INSERT INTO llm_usage_model_stats (org_id, model_id, tracked_since, updated_at)
+          VALUES ('org-a', 'gpt-4o', 'now', 'now'), ('org-b', 'gpt-4o', 'now', 'now');
+      `);
+      const recorded = usageRows(db);
+
+      migrateDatabase(db);
+      expect(usageRows(db)).toEqual(recorded);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("llm usage by agent and user", () => {
+  test("moves existing org totals into the unattributed group once", () => {
+    const db = new Database(":memory:");
+
+    try {
+      migrateDatabase(db);
+      // The ledger as it was before usage had an agent or user.
+      db.exec(`
+        DROP TABLE llm_usage_actor_stats;
+        INSERT INTO llm_usage_stats (
+          org_id, id, request_count, input_tokens, output_tokens,
+          estimated_cost_usd, tracked_since, updated_at
+        ) VALUES
+          ('org-a', 'default', 7, 900, 300, 1.25, '2026-01-01', '2026-02-01'),
+          ('org-b', 'default', 2, 50, 10, 0.5, '2026-01-03', '2026-02-01');
+      `);
+
+      migrateDatabase(db);
+
+      const rows = () =>
+        db
+          .query(
+            "SELECT org_id, profile_id, user_id, request_count, input_tokens, output_tokens, estimated_cost_usd FROM llm_usage_actor_stats ORDER BY org_id"
+          )
+          .all();
+
+      const migrated = rows();
+      expect(migrated).toEqual([
+        {
+          estimated_cost_usd: 1.25,
+          input_tokens: 900,
+          org_id: "org-a",
+          output_tokens: 300,
+          profile_id: "",
+          request_count: 7,
+          user_id: "",
+        },
+        {
+          estimated_cost_usd: 0.5,
+          input_tokens: 50,
+          org_id: "org-b",
+          output_tokens: 10,
+          profile_id: "",
+          request_count: 2,
+          user_id: "",
+        },
+      ]);
+
+      migrateDatabase(db);
+      expect(rows()).toEqual(migrated);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("upgrading skill proposals preserves pending content and adds supporting files once", () => {
+  const db = new Database(":memory:");
+
+  try {
+    migrateDatabase(db);
+    db.exec("ALTER TABLE skill_proposals DROP COLUMN supporting_files");
+    db.exec("PRAGMA foreign_keys = OFF");
+    db.exec(`INSERT INTO skill_proposals (id, org_id, profile_id, action, skill_name, content, status, created_at)
+      VALUES ('pending', 'org', 'profile', 'create', 'demo', 'original content', 'pending', '2026-01-01')`);
+    migrateDatabase(db);
+    migrateDatabase(db);
+    expect(
+      db
+        .query(
+          "SELECT content, supporting_files FROM skill_proposals WHERE id = 'pending'"
+        )
+        .get()
+    ).toEqual({ content: "original content", supporting_files: null });
+  } finally {
+    db.close();
+  }
+});
+
+describe("ephemeral attachment marking", () => {
+  test("adds the ephemeral column and defaults existing rows to 0", () => {
+    const db = new Database(":memory:");
+
+    try {
+      // A pre-migration attachments table, as an older install has it.
+      db.exec(`
+        CREATE TABLE attachments (
+          id TEXT PRIMARY KEY NOT NULL,
+          org_id TEXT,
+          profile_id TEXT NOT NULL,
+          session_id TEXT,
+          channel TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          filename TEXT,
+          media_type TEXT NOT NULL,
+          size_bytes INTEGER NOT NULL,
+          storage_path TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        INSERT INTO attachments (
+          id, org_id, profile_id, session_id, channel, kind, filename,
+          media_type, size_bytes, storage_path, created_at
+        ) VALUES (
+          'att_old', NULL, 'profile_test', NULL, 'web', 'image', NULL,
+          'image/png', 10, 'a/b.png', '2026-09-01T00:00:00.000Z'
+        );
+      `);
+
+      migrateDatabase(db);
+
+      const columns = db
+        .prepare<{ name: string }, SQLQueryBindings[]>(
+          "PRAGMA table_info(attachments)"
+        )
+        .all();
+
+      expect(columns.some((column) => column.name === "ephemeral")).toBe(true);
+
+      const existing = db
+        .prepare<{ ephemeral: number }, SQLQueryBindings[]>(
+          "SELECT ephemeral FROM attachments WHERE id = 'att_old'"
+        )
+        .get();
+
+      expect(existing?.ephemeral).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("pre-org profile retention: legacy profiles and their history survive until an organization adopts them", () => {
+  const db = new Database(":memory:");
+
+  const snapshot = () =>
+    [
+      "profiles",
+      "profile_tools",
+      "sessions",
+      "session_messages",
+      "automations",
+    ].map((table) => db.query(`SELECT * FROM ${table} ORDER BY rowid`).all());
+
+  try {
+    migrateDatabase(db);
+    db.exec(`
+      INSERT INTO profiles (id, name, system_prompt, is_super, created_at, updated_at)
+      VALUES ('profile_legacy', 'Legacy', 'legacy prompt', 0, '2026-01-01', '2026-01-01');
+
+      INSERT INTO tools (id, name, description, handler_type, created_at, updated_at)
+      VALUES ('tool_legacy', 'legacy_tool', 'Legacy tool', 'builtin', '2026-01-01', '2026-01-01');
+
+      INSERT INTO profile_tools (profile_id, tool_id)
+      VALUES ('profile_legacy', 'tool_legacy');
+
+      INSERT INTO sessions (id, profile_id, channel, title, created_at, updated_at)
+      VALUES ('session_legacy', 'profile_legacy', 'web', 'Old chat', '2026-01-01', '2026-01-01');
+
+      INSERT INTO session_messages (id, session_id, seq, payload, created_at)
+      VALUES ('message_legacy', 'session_legacy', 0, '{"role":"user","content":"keep me"}', '2026-01-01');
+
+      INSERT INTO automations (id, name, version, definition, profile_id, created_at, updated_at)
+      VALUES ('automation_legacy', 'Legacy', 1, '{}', 'profile_legacy', '2026-01-01', '2026-01-01');
+    `);
+    const beforeOrg = snapshot();
+
+    // Every boot until setup creates the first organization.
+    migrateDatabase(db);
+    migrateDatabase(db);
+    expect(snapshot()).toEqual(beforeOrg);
+
+    db.exec(`
+      INSERT INTO organizations (id, name, slug, created_at, updated_at)
+      VALUES ('org_acme', 'Acme', 'acme', '2026-01-02', '2026-01-02');
+    `);
+    migrateDatabase(db);
+
+    expect(
+      db
+        .query(
+          "SELECT org_id, is_default FROM profiles WHERE id = 'profile_legacy'"
+        )
+        .get()
+    ).toEqual({ is_default: 1, org_id: "org_acme" });
+    expect(
+      db
+        .query("SELECT org_id FROM automations WHERE id = 'automation_legacy'")
+        .get()
+    ).toEqual({ org_id: "org_acme" });
+    expect(
+      db
+        .query(
+          "SELECT session_id FROM session_messages WHERE id = 'message_legacy'"
+        )
+        .get()
+    ).toEqual({ session_id: "session_legacy" });
+    expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+
+    const adopted = snapshot();
+    migrateDatabase(db);
+    expect(snapshot()).toEqual(adopted);
+  } finally {
+    db.close();
+  }
+});
+
+test("file pins migrate existing databases, survive reopen and cascade with profiles", () => {
+  const directory = mkdtempSync(join(tmpdir(), "mingzhan-file-pins-"));
+  const filename = join(directory, "pins.sqlite");
+  let db = new Database(filename);
+
+  try {
+    migrateDatabase(db);
+    db.exec("DROP TABLE file_pins");
+    migrateDatabase(db);
+    db.exec(`
+      INSERT INTO organizations (id, name, slug, created_at, updated_at) VALUES ('pin-org', 'Pins', 'pins', 'now', 'now');
+      INSERT INTO users (id, email, password_hash, created_at, updated_at) VALUES ('pin-user', 'pins@example.com', 'unused', 'now', 'now');
+      INSERT INTO profiles (id, name, org_id, created_at, updated_at) VALUES ('pin-profile', 'Pins', 'pin-org', 'now', 'now');
+      INSERT INTO file_pins VALUES ('pin-org', 'pin-user', 'pin-profile', 'notes.md');
+    `);
+    closeDatabase(db);
+    db = new Database(filename);
+    migrateDatabase(db);
+    expect(db.query("SELECT path FROM file_pins").all()).toEqual([
+      { path: "notes.md" },
+    ]);
+    db.exec("DELETE FROM profiles WHERE id = 'pin-profile'");
+    expect(db.query("SELECT path FROM file_pins").all()).toEqual([]);
+  } finally {
+    closeDatabase(db);
+    rmSync(directory, { force: true, recursive: true });
+  }
+});
+
+test("llm quota reservations: an upgrade drops the old counter table and its false exhaustion", () => {
+  const db = new Database(":memory:");
+
+  try {
+    migrateDatabase(db);
+    db.exec(`
+      INSERT INTO organizations (id, name, slug, created_at, updated_at)
+      VALUES ('org_acme', 'Acme', 'acme', '2026-01-01', '2026-01-01');
+      DROP TABLE org_llm_quota_reservations;
+      CREATE TABLE org_llm_monthly_quota (
+        org_id TEXT NOT NULL,
+        month TEXT NOT NULL,
+        reserved_turns INTEGER NOT NULL DEFAULT 0,
+        reserved_tokens INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (org_id, month)
+      );
+      INSERT INTO org_llm_monthly_quota
+      VALUES ('org_acme', '2026-10', 900, 9000000, '2026-10-01');
+    `);
+
+    migrateDatabase(db);
+    migrateDatabase(db);
+
+    const tables = db
+      .query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'org_llm_%quota%' ORDER BY name"
+      )
+      .all();
+
+    expect(tables).toEqual([{ name: "org_llm_quota_reservations" }]);
+    expect(
+      db.query("SELECT COUNT(*) AS held FROM org_llm_quota_reservations").get()
+    ).toEqual({ held: 0 });
+  } finally {
+    db.close();
+  }
+});
+
+test("upgrades drop the removed token optimiser table and column", () => {
+  const db = new Database(":memory:");
+
+  try {
+    migrateDatabase(db);
+    db.exec(
+      "CREATE TABLE tool_output_savings (org_id TEXT); ALTER TABLE workspace_settings ADD COLUMN token_optimizer_enabled INTEGER"
+    );
+    migrateDatabase(db);
+    migrateDatabase(db);
+    expect(
+      db
+        .query(
+          "SELECT name FROM sqlite_master WHERE name = 'tool_output_savings'"
+        )
+        .get()
+    ).toBeNull();
+    expect(
+      db
+        .query<{ name: string }, SQLQueryBindings[]>(
+          "PRAGMA table_info(workspace_settings)"
+        )
+        .all()
+        .map((column) => column.name)
+    ).not.toContain("token_optimizer_enabled");
+  } finally {
+    db.close();
+  }
+});

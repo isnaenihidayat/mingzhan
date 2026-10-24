@@ -1,0 +1,2159 @@
+import { Database } from "bun:sqlite";
+import { afterEach, describe, expect, test } from "bun:test";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { getProfileSoulDir, writeArtifactShareSnapshot } from "@mingzhan/core";
+import type { UpdateProfileRequest } from "@mingzhan/core/contract";
+import { BASH_TOOL_ID } from "@mingzhan/core/tools/protected";
+import {
+  createInMemoryDatabaseAdapter,
+  createSqliteDatabase,
+  ensureBashToolDefinition,
+  ensureBuiltinToolDefinitions,
+} from "@mingzhan/db";
+import { setupTestConfigDir } from "../test-config-dir";
+import { ProfileService } from "./profile-service";
+import { sessionHistoryArchivePath } from "./session-persistence";
+import { sessionTurnRegistry } from "./session-turn-registry";
+
+const originalConfigDir = process.env.MINGZHAN_CONFIG_DIR;
+
+const tinyPngBase64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+const ORG_ID = "org_test";
+
+const PYTHON_ECHO_TOOL = `import json
+import sys
+
+def run(input, context):
+    return {"echoed": input.get("message")}
+
+if __name__ == "__main__":
+    payload = json.loads(sys.stdin.read() or "{}")
+    sys.stdout.write(json.dumps(run(payload, {})))
+`;
+
+describe("profile service createTool", () => {
+  let tempConfigDir = "";
+
+  afterEach(async () => {
+    if (originalConfigDir === undefined) {
+      delete process.env.MINGZHAN_CONFIG_DIR;
+    } else {
+      process.env.MINGZHAN_CONFIG_DIR = originalConfigDir;
+    }
+
+    if (tempConfigDir) {
+      await rm(tempConfigDir, { force: true, recursive: true });
+      tempConfigDir = "";
+    }
+  });
+
+  test("defaults to an executable javascript tool", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-tool-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+    const toolsDir = path.join(tempConfigDir, "orgs", "org_test", "tools");
+    await mkdir(toolsDir, { recursive: true });
+
+    await writeFile(
+      path.join(toolsDir, "echo.js"),
+      `export async function run(input) {
+  return input;
+}
+`,
+      "utf8"
+    );
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+
+    const tool = await service.createTool(
+      {
+        description: "Echo input",
+        handlerConfig: { modulePath: "echo.js" },
+        name: "echo",
+      },
+      "org_test"
+    );
+
+    expect(tool.handlerType).toBe("javascript");
+  });
+
+  test("creates a python tool when handlerType is python", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-tool-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+    const toolsDir = path.join(tempConfigDir, "orgs", "org_test", "tools");
+    await mkdir(toolsDir, { recursive: true });
+
+    await writeFile(path.join(toolsDir, "echo.py"), PYTHON_ECHO_TOOL);
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+
+    const tool = await service.createTool(
+      {
+        description: "Echo input",
+        handlerConfig: { modulePath: "echo.py" },
+        handlerType: "python",
+        name: "echo_py",
+      },
+      "org_test"
+    );
+
+    expect(tool.handlerType).toBe("python");
+  });
+
+  test("persists handlerConfig.parameters for python tools", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-tool-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+    const toolsDir = path.join(tempConfigDir, "orgs", "org_test", "tools");
+    await mkdir(toolsDir, { recursive: true });
+
+    await writeFile(path.join(toolsDir, "echo.py"), PYTHON_ECHO_TOOL);
+
+    const parameters = {
+      properties: { message: { type: "string" } },
+      required: ["message"],
+      type: "object",
+    };
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+
+    const tool = await service.createTool(
+      {
+        description: "Echo input",
+        handlerConfig: {
+          modulePath: "echo.py",
+          parameters,
+          requiresApiKey: true,
+        },
+        handlerType: "python",
+        name: "echo_py",
+      },
+      "org_test"
+    );
+
+    expect(tool.handlerConfig).toEqual({
+      modulePath: "echo.py",
+      parameters,
+      requiresApiKey: true,
+    });
+    expect(tool.parameters).toEqual(parameters);
+
+    const stored = await service.getTool(tool.id);
+    expect(stored.tool.handlerConfig).toEqual({
+      modulePath: "echo.py",
+      parameters,
+      requiresApiKey: true,
+    });
+    expect(stored.tool.parameters).toEqual(parameters);
+  });
+
+  test("creates a python tool without parameters using a permissive schema", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-tool-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+    const toolsDir = path.join(tempConfigDir, "orgs", "org_test", "tools");
+    await mkdir(toolsDir, { recursive: true });
+
+    await writeFile(path.join(toolsDir, "echo.py"), PYTHON_ECHO_TOOL);
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+
+    const tool = await service.createTool(
+      {
+        description: "Echo input",
+        handlerConfig: { modulePath: "echo.py" },
+        handlerType: "python",
+        name: "echo_py",
+      },
+      "org_test"
+    );
+
+    expect(tool.handlerConfig).toEqual({ modulePath: "echo.py" });
+    expect(tool.parameters).toEqual({
+      additionalProperties: true,
+      type: "object",
+    });
+  });
+
+  test("rejects non-object handlerConfig.parameters", async () => {
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+
+    for (const parameters of [["message"], "message", null]) {
+      await expect(
+        service.createTool(
+          {
+            description: "Bad params",
+            handlerConfig: { modulePath: "echo.py", parameters },
+            handlerType: "python",
+            name: "bad_params",
+          },
+          "org_test"
+        )
+      ).rejects.toThrow();
+    }
+  });
+
+  test("rejects unsupported handler types", async () => {
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+
+    await expect(
+      service.createTool(
+        {
+          description: "Bad tool",
+          handlerConfig: { modulePath: "bad-tool.js" },
+          handlerType: "custom",
+          name: "bad-tool",
+        },
+        "org_test"
+      )
+    ).rejects.toThrow(/javascript or python tools can be created/i);
+  });
+});
+
+describe("profile service avatar", () => {
+  let tempConfigDir = "";
+
+  afterEach(async () => {
+    if (originalConfigDir === undefined) {
+      delete process.env.MINGZHAN_CONFIG_DIR;
+    } else {
+      process.env.MINGZHAN_CONFIG_DIR = originalConfigDir;
+    }
+
+    if (tempConfigDir) {
+      await rm(tempConfigDir, { force: true, recursive: true });
+      tempConfigDir = "";
+    }
+  });
+
+  test("creates new profiles with automations off", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-automations-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const db = createInMemoryDatabaseAdapter();
+    const service = new ProfileService(db);
+    const created = await service.createProfile(ORG_ID, { name: "New Bot" });
+
+    expect(created.profile.automationsEnabled).toBe(false);
+    expect((await db.getProfile(created.profile.id))?.automationsEnabled).toBe(
+      false
+    );
+  });
+
+  test("uploads, serves, and deletes profile avatars", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-avatar-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+    const created = await service.createProfile(ORG_ID, { name: "Avatar Bot" });
+    const profileId = created.profile.id;
+
+    expect(created.profile.hasAvatar).toBe(false);
+
+    const updated = await service.uploadProfileAvatar(ORG_ID, profileId, {
+      data: tinyPngBase64,
+      mediaType: "image/png",
+    });
+
+    expect(updated.profile.hasAvatar).toBe(true);
+
+    const avatar = await service.getProfileAvatar(ORG_ID, profileId);
+    expect(avatar.mediaType).toBe("image/png");
+    expect(avatar.bytes.length).toBeGreaterThan(0);
+
+    await service.deleteProfileAvatar(ORG_ID, profileId);
+
+    const afterDelete = await service.getProfile(ORG_ID, profileId);
+    expect(afterDelete.profile.hasAvatar).toBe(false);
+  });
+});
+
+describe("profile service createProfile", () => {
+  let tempConfigDir = "";
+
+  afterEach(async () => {
+    if (originalConfigDir === undefined) {
+      delete process.env.MINGZHAN_CONFIG_DIR;
+    } else {
+      process.env.MINGZHAN_CONFIG_DIR = originalConfigDir;
+    }
+
+    if (tempConfigDir) {
+      await rm(tempConfigDir, { force: true, recursive: true });
+      tempConfigDir = "";
+    }
+  });
+
+  test("scaffolds soul templates for new profiles", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-soul-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+    const created = await service.createProfile(ORG_ID, { name: "Soul Bot" });
+
+    const soulDir = path.join(
+      tempConfigDir,
+      "orgs",
+      ORG_ID,
+      "profiles",
+      created.profile.id
+    );
+
+    const soulContent = await readFile(path.join(soulDir, "SOUL.md"), "utf8");
+
+    expect(soulContent.trim().length).toBeGreaterThan(0);
+    await expect(
+      readFile(path.join(soulDir, "STYLE.md"), "utf8")
+    ).resolves.toMatch(/\S/);
+  });
+
+  test("assigns basic tools when the built-in tools exist", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-default-tools-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const db = createInMemoryDatabaseAdapter();
+    await ensureBuiltinToolDefinitions(db);
+
+    const service = new ProfileService(db);
+    const created = await service.createProfile(ORG_ID, { name: "Skill Bot" });
+    const tools = await db.listToolsForProfile(created.profile.id);
+
+    expect(tools.map((tool) => tool.name)).toContain("read_file");
+    expect(tools.map((tool) => tool.name)).toContain("write_file");
+    expect(tools.map((tool) => tool.name)).toContain("edit_file");
+    expect(tools.map((tool) => tool.name)).toContain("search_files");
+    expect(tools.map((tool) => tool.name)).toContain("knowledge_base_search");
+    expect(tools.map((tool) => tool.name)).toContain("web_fetch");
+    expect(tools.map((tool) => tool.name)).not.toContain(
+      "update_profile_memory"
+    );
+    expect(tools.map((tool) => tool.name)).not.toContain("web_search");
+    const listed = await service.listProfileTools(ORG_ID, created.profile.id);
+    expect(listed.tools).toHaveLength(tools.length);
+
+    for (const tool of tools) {
+      expect(listed.tools).toContainEqual(
+        expect.objectContaining({
+          createdAt: tool.createdAt,
+          handlerConfig: tool.handlerConfig,
+          id: tool.id,
+          updatedAt: tool.updatedAt,
+        })
+      );
+    }
+
+    await expect(
+      service.listProfileTools("other_org", created.profile.id)
+    ).rejects.toThrow();
+  });
+
+  test("assigns default bundled skills when they exist", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-default-skills-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const db = createInMemoryDatabaseAdapter();
+    const now = new Date().toISOString();
+    await db.upsertSkill({
+      createdAt: now,
+      createdBy: "bundled",
+      description:
+        "Create, update, inspect, or manage reusable profile skills.",
+      disableModelInvocation: false,
+      enabled: true,
+      hasTool: false,
+      id: "skill_manage_skills",
+      name: "manage-skills",
+      sourcePath: path.join(tempConfigDir, "agent", "skills", "manage-skills"),
+      updatedAt: now,
+    });
+
+    const service = new ProfileService(db);
+    const created = await service.createProfile(ORG_ID, { name: "Skill Bot" });
+    const skills = await db.listSkillsForProfile(created.profile.id);
+
+    expect(skills.map((skill) => skill.name)).toContain("manage-skills");
+  });
+
+  test("skips missing basic built-in tools without failing", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-missing-tools-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const db = createInMemoryDatabaseAdapter();
+
+    const service = new ProfileService(db);
+
+    const created = await service.createProfile(ORG_ID, {
+      name: "No Tools Bot",
+    });
+
+    const tools = await db.listToolsForProfile(created.profile.id);
+
+    expect(tools).toEqual([]);
+  });
+
+  test("writes generated soul files and keeps memory empty", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-generated-soul-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+
+    const created = await service.createProfile(ORG_ID, {
+      name: "Support Bot",
+      soulFiles: {
+        "INSTRUCTIONS.md": "# Instructions\n\nEscalate billing risks.",
+        "SOUL.md": "# Support Bot\n\nHelps customers.",
+        "STYLE.md": "# Style\n\nClear and kind.",
+      },
+    });
+
+    const soulDir = path.join(
+      tempConfigDir,
+      "orgs",
+      ORG_ID,
+      "profiles",
+      created.profile.id
+    );
+
+    await expect(
+      readFile(path.join(soulDir, "SOUL.md"), "utf8")
+    ).resolves.toContain("# Support Bot");
+    await expect(
+      readFile(path.join(soulDir, "STYLE.md"), "utf8")
+    ).resolves.toContain("Clear and kind");
+    await expect(
+      readFile(path.join(soulDir, "INSTRUCTIONS.md"), "utf8")
+    ).resolves.toContain("Escalate billing risks");
+    await expect(
+      readFile(path.join(soulDir, "MEMORY.md"), "utf8")
+    ).resolves.toBe("");
+  });
+
+  test("rejects unsupported generated soul file keys", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-bad-soul-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+
+    await expect(
+      service.createProfile(ORG_ID, {
+        name: "Bad Soul Bot",
+        // SAFETY: The test fixture matches the contract used by this test.
+        soulFiles: {
+          "../SOUL.md": "# Bad",
+        } as never,
+      })
+    ).rejects.toThrow(/unsupported soul file/i);
+  });
+
+  test("stores profile model selection", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-model-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+
+    const created = await service.createProfile(ORG_ID, {
+      model: "openai:gpt-5",
+      name: "Model Bot",
+    });
+
+    expect(created.profile.model).toBe("openai:gpt-5");
+
+    const updated = await service.updateProfile(ORG_ID, created.profile.id, {
+      model: "anthropic:claude-sonnet-4",
+    });
+
+    expect(updated.profile.model).toBe("anthropic:claude-sonnet-4");
+  });
+
+  test("generates a random id when id is omitted", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-random-id-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+
+    const created = await service.createProfile(ORG_ID, {
+      name: "Research Assistant",
+    });
+
+    expect(created.profile.id).toMatch(/^[0-9A-Za-z]{21}$/);
+  });
+
+  test("lets two orgs create profiles with the same name", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-cross-org-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+
+    const first = await service.createProfile("org_first", {
+      name: "Penulis",
+    });
+
+    const second = await service.createProfile("org_second", {
+      name: "Penulis",
+    });
+
+    expect(first.profile.id).toMatch(/^[0-9A-Za-z]{21}$/);
+    expect(second.profile.id).toMatch(/^[0-9A-Za-z]{21}$/);
+    expect(second.profile.id).not.toBe(first.profile.id);
+    expect(first.profile.name).toBe("Penulis");
+    expect(second.profile.name).toBe("Penulis");
+  });
+
+  test("uses a custom profile id when provided", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-custom-id-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+
+    const created = await service.createProfile(ORG_ID, {
+      id: "research-bot",
+      name: "Research Bot",
+    });
+
+    expect(created.profile.id).toBe("research-bot");
+  });
+
+  test("rejects duplicate custom profile ids", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-duplicate-id-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+
+    await service.createProfile(ORG_ID, { id: "support", name: "Support" });
+
+    await expect(
+      service.createProfile(ORG_ID, { id: "support", name: "Support 2" })
+    ).rejects.toThrow(/already taken/i);
+  });
+
+  test("rejects custom profile ids taken by another org", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-cross-org-id-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+
+    await service.createProfile("org_first", {
+      id: "support",
+      name: "Support",
+    });
+
+    await expect(
+      service.createProfile("org_second", { id: "support", name: "Support 2" })
+    ).rejects.toThrow(/already taken/i);
+  });
+
+  test("create and clone refuse an id claimed after the taken check", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-claim-race-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const db = createInMemoryDatabaseAdapter();
+    const service = new ProfileService(db);
+    const source = await service.createProfile("org_second", { name: "Src" });
+
+    await db.createProfileIfAbsent({
+      createdAt: "2020-01-01T00:00:00.000Z",
+      id: "imported",
+      isSuper: false,
+      model: null,
+      name: "Imported",
+      orgId: "org_first",
+      systemPrompt: "first org prompt",
+    });
+
+    // The taken check runs before a concurrent import inserts its row.
+    const realGetProfile = db.getProfile.bind(db);
+    db.getProfile = async (id) =>
+      id === "imported" ? null : await realGetProfile(id);
+
+    await expect(
+      service.createProfile("org_second", { id: "imported", name: "Mine" })
+    ).rejects.toThrow(/already taken/i);
+
+    await expect(
+      service.cloneProfile("org_second", source.profile.id, { id: "imported" })
+    ).rejects.toThrow(/already taken/i);
+
+    expect(await realGetProfile("imported")).toMatchObject({
+      name: "Imported",
+      orgId: "org_first",
+      systemPrompt: "first org prompt",
+    });
+  });
+
+  test("resolves legacy slug ids via getProfile and getProfileForOrg", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-legacy-slug-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const db = createInMemoryDatabaseAdapter();
+    const service = new ProfileService(db);
+    await service.createProfile(ORG_ID, {
+      id: "legacy-writer",
+      name: "Legacy Writer",
+    });
+
+    expect((await db.getProfile("legacy-writer"))?.name).toBe("Legacy Writer");
+    expect((await db.getProfileForOrg("legacy-writer", ORG_ID))?.name).toBe(
+      "Legacy Writer"
+    );
+    await expect(
+      service.getProfile(ORG_ID, "legacy-writer")
+    ).resolves.toMatchObject({ profile: { id: "legacy-writer" } });
+  });
+
+  test.skipIf(process.platform !== "win32")(
+    "rejects ids that differ only by case, which share a folder on Windows",
+    async () => {
+      tempConfigDir = await mkdtemp(
+        path.join(os.tmpdir(), "mingzhan-profile-case-id-")
+      );
+      process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+      const service = new ProfileService(createInMemoryDatabaseAdapter());
+
+      await service.createProfile(ORG_ID, { id: "Sales", name: "Sales" });
+
+      await expect(
+        service.createProfile(ORG_ID, { id: "sales", name: "Sales 2" })
+      ).rejects.toMatchObject({
+        message: `Profile id "sales" is already taken.`,
+        status: 409,
+      });
+    }
+  );
+
+  test("rejects invalid custom profile ids", async () => {
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+
+    await expect(
+      service.createProfile(ORG_ID, { id: "../escape", name: "Bad Bot" })
+    ).rejects.toThrow(/profile id must/i);
+  });
+});
+
+describe("profile service updateProfile", () => {
+  let tempConfigDir = "";
+
+  afterEach(async () => {
+    if (originalConfigDir === undefined) {
+      delete process.env.MINGZHAN_CONFIG_DIR;
+    } else {
+      process.env.MINGZHAN_CONFIG_DIR = originalConfigDir;
+    }
+
+    if (tempConfigDir) {
+      await rm(tempConfigDir, { force: true, recursive: true });
+      tempConfigDir = "";
+    }
+  });
+
+  test("updates provided soul files without clearing omitted ones", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-update-soul-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+
+    const created = await service.createProfile(ORG_ID, {
+      name: "Support Bot",
+      soulFiles: {
+        "INSTRUCTIONS.md": "# Instructions\n\nEscalate billing risks.",
+        "SOUL.md": "# Support Bot\n\nHelps customers.",
+        "STYLE.md": "# Style\n\nClear and kind.",
+      },
+    });
+
+    const soulDir = path.join(
+      tempConfigDir,
+      "orgs",
+      ORG_ID,
+      "profiles",
+      created.profile.id
+    );
+
+    await service.updateProfile(ORG_ID, created.profile.id, {
+      soulFiles: {
+        "SOUL.md": "# Support Bot\n\nHelps customers with refunds.",
+      },
+    });
+
+    await expect(
+      readFile(path.join(soulDir, "SOUL.md"), "utf8")
+    ).resolves.toContain("Helps customers with refunds");
+    await expect(
+      readFile(path.join(soulDir, "STYLE.md"), "utf8")
+    ).resolves.toContain("Clear and kind");
+    await expect(
+      readFile(path.join(soulDir, "INSTRUCTIONS.md"), "utf8")
+    ).resolves.toContain("Escalate billing risks");
+  });
+});
+
+describe("profile service assignSkill", () => {
+  let tempConfigDir = "";
+  const originalPath = process.env.PATH ?? "";
+  const originalDisableFixPath = process.env.MINGZHAN_DISABLE_FIX_PATH;
+
+  afterEach(async () => {
+    if (originalConfigDir === undefined) {
+      delete process.env.MINGZHAN_CONFIG_DIR;
+    } else {
+      process.env.MINGZHAN_CONFIG_DIR = originalConfigDir;
+    }
+
+    process.env.PATH = originalPath;
+
+    if (originalDisableFixPath === undefined) {
+      delete process.env.MINGZHAN_DISABLE_FIX_PATH;
+    } else {
+      process.env.MINGZHAN_DISABLE_FIX_PATH = originalDisableFixPath;
+    }
+
+    if (tempConfigDir) {
+      await rm(tempConfigDir, { force: true, recursive: true });
+      tempConfigDir = "";
+    }
+  });
+
+  test("assigns coding-agent without requiring a ready coding harness", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-assign-skill-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+    process.env.PATH = tempConfigDir;
+    process.env.MINGZHAN_DISABLE_FIX_PATH = "1";
+
+    const db = createInMemoryDatabaseAdapter();
+    await ensureBuiltinToolDefinitions(db);
+    const now = new Date().toISOString();
+    await db.upsertSkill({
+      createdAt: now,
+      createdBy: "bundled",
+      description: "Delegate coding work",
+      disableModelInvocation: false,
+      enabled: true,
+      hasTool: false,
+      id: "skill_coding_delegation",
+      name: "coding-agent",
+      sourcePath: "/tmp/coding-agent",
+      updatedAt: now,
+    });
+
+    const service = new ProfileService(db);
+    const created = await service.createProfile(ORG_ID, { name: "Worker Bot" });
+
+    const updated = await service.assignSkill(ORG_ID, created.profile.id, {
+      skillId: "skill_coding_delegation",
+    });
+
+    expect(
+      updated.profile.skills.some(
+        (skill) => skill.id === "skill_coding_delegation"
+      )
+    ).toBe(true);
+  });
+
+  test("rejects another organization's skill and allows a shared skill", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-skill-scope-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const db = createInMemoryDatabaseAdapter();
+    const service = new ProfileService(db);
+    const created = await service.createProfile(ORG_ID, { name: "Worker Bot" });
+    const now = new Date().toISOString();
+
+    for (const [id, orgId] of [
+      ["other-skill", "other-org"],
+      ["shared-skill", null],
+    ] as const) {
+      await db.upsertSkill({
+        createdAt: now,
+        createdBy: "human",
+        description: id,
+        disableModelInvocation: false,
+        enabled: true,
+        hasTool: false,
+        id,
+        name: id,
+        orgId,
+        sourcePath: `/tmp/${id}`,
+        updatedAt: now,
+      });
+    }
+
+    await expect(
+      service.assignSkill(ORG_ID, created.profile.id, {
+        skillId: "other-skill",
+      })
+    ).rejects.toMatchObject({ status: 404 });
+
+    const updated = await service.assignSkill(ORG_ID, created.profile.id, {
+      skillId: "shared-skill",
+    });
+
+    expect(updated.profile.skills.map((skill) => skill.id)).toEqual([
+      "shared-skill",
+    ]);
+  });
+});
+
+describe("profile service knowledge base", () => {
+  let tempConfigDir = "";
+
+  afterEach(async () => {
+    if (originalConfigDir === undefined) {
+      delete process.env.MINGZHAN_CONFIG_DIR;
+    } else {
+      process.env.MINGZHAN_CONFIG_DIR = originalConfigDir;
+    }
+
+    if (tempConfigDir) {
+      await rm(tempConfigDir, { force: true, recursive: true });
+      tempConfigDir = "";
+    }
+  });
+
+  test("uploads, lists, and deletes knowledge base documents", async () => {
+    tempConfigDir = await mkdtemp(path.join(os.tmpdir(), "mingzhan-profile-kb-"));
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+    const created = await service.createProfile(ORG_ID, { name: "KB Bot" });
+    const profileId = created.profile.id;
+
+    const uploaded = await service.uploadKnowledgeBaseDocument(
+      ORG_ID,
+      profileId,
+      {
+        data: Buffer.from("project fact", "utf8").toString("base64"),
+        filename: "notes.txt",
+        mediaType: "text/plain",
+      }
+    );
+
+    expect(uploaded.document.status).toBe("ready");
+    expect(uploaded.outcome).toBe("created");
+    expect(uploaded.profileId).toBe(profileId);
+
+    const listed = await service.listKnowledgeBase(ORG_ID, profileId);
+    expect(listed.documents).toHaveLength(1);
+    expect(listed.documents[0]?.filename).toBe("notes.txt");
+
+    const deleted = await service.deleteKnowledgeBaseDocument(
+      ORG_ID,
+      profileId,
+      uploaded.document.id
+    );
+
+    expect(deleted.deleted).toBe(true);
+
+    const afterDelete = await service.listKnowledgeBase(ORG_ID, profileId);
+    expect(afterDelete.documents).toHaveLength(0);
+  });
+
+  test("rejects duplicate knowledge base uploads with 409 and supports replace", async () => {
+    tempConfigDir = await mkdtemp(path.join(os.tmpdir(), "mingzhan-profile-kb-"));
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+    const created = await service.createProfile(ORG_ID, { name: "KB Bot" });
+    const profileId = created.profile.id;
+
+    const attachment = {
+      data: Buffer.from("project fact", "utf8").toString("base64"),
+      filename: "notes.txt",
+      mediaType: "text/plain",
+    };
+
+    const first = await service.uploadKnowledgeBaseDocument(
+      ORG_ID,
+      profileId,
+      attachment
+    );
+
+    await expect(
+      service.uploadKnowledgeBaseDocument(ORG_ID, profileId, attachment)
+    ).rejects.toMatchObject({ status: 409 });
+
+    const replaced = await service.uploadKnowledgeBaseDocument(
+      ORG_ID,
+      profileId,
+      attachment,
+      "replace"
+    );
+
+    expect(replaced.outcome).toBe("replaced");
+    expect(replaced.document.id).not.toBe(first.document.id);
+
+    const listed = await service.listKnowledgeBase(ORG_ID, profileId);
+    expect(listed.documents).toHaveLength(1);
+  });
+
+  test("readKnowledgeBaseDocument returns preview text and download bytes", async () => {
+    tempConfigDir = await mkdtemp(path.join(os.tmpdir(), "mingzhan-profile-kb-"));
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+    const created = await service.createProfile(ORG_ID, { name: "KB Bot" });
+    const profileId = created.profile.id;
+
+    const uploaded = await service.uploadKnowledgeBaseDocument(
+      ORG_ID,
+      profileId,
+      {
+        data: Buffer.from("project fact", "utf8").toString("base64"),
+        filename: "notes.txt",
+        mediaType: "text/plain",
+      }
+    );
+
+    const preview = await service.readKnowledgeBaseDocument(
+      ORG_ID,
+      profileId,
+      uploaded.document.id,
+      { render: "text" }
+    );
+
+    expect(preview.contentType).toBe("text/plain");
+    expect(preview.bytes.toString("utf8")).toBe("project fact");
+
+    const download = await service.readKnowledgeBaseDocument(
+      ORG_ID,
+      profileId,
+      uploaded.document.id
+    );
+
+    expect(download.bytes.toString("utf8")).toBe("project fact");
+  });
+
+  test("readKnowledgeBaseDocument throws for unknown document", async () => {
+    tempConfigDir = await mkdtemp(path.join(os.tmpdir(), "mingzhan-profile-kb-"));
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+
+    const service = new ProfileService(createInMemoryDatabaseAdapter());
+    const created = await service.createProfile(ORG_ID, { name: "KB Bot" });
+    const profileId = created.profile.id;
+
+    await expect(
+      service.readKnowledgeBaseDocument(ORG_ID, profileId, "kb_nope", {
+        render: "text",
+      })
+    ).rejects.toThrow(/not found/);
+  });
+});
+
+describe("profile service cloneProfile", () => {
+  let tempConfigDir = "";
+
+  afterEach(async () => {
+    if (originalConfigDir === undefined) {
+      delete process.env.MINGZHAN_CONFIG_DIR;
+    } else {
+      process.env.MINGZHAN_CONFIG_DIR = originalConfigDir;
+    }
+
+    if (tempConfigDir) {
+      await rm(tempConfigDir, { force: true, recursive: true });
+      tempConfigDir = "";
+    }
+  });
+
+  async function setup() {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-clone-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+    const db = createInMemoryDatabaseAdapter();
+    await ensureBuiltinToolDefinitions(db);
+    const service = new ProfileService(db);
+
+    const source = await service.createProfile(ORG_ID, {
+      model: "anthropic:claude-sonnet-4-6",
+      name: "Research Bot",
+      systemPrompt: "You research things.",
+    });
+
+    return { db, service, sourceId: source.profile.id };
+  }
+
+  const soulDirOf = (profileId: string) =>
+    path.join(tempConfigDir, "orgs", ORG_ID, "profiles", profileId);
+
+  test("copies prompt, model and assignments onto a new independent id", async () => {
+    const { db, service, sourceId } = await setup();
+    const before = await service.getProfile(ORG_ID, sourceId);
+
+    const cloned = await service.cloneProfile(ORG_ID, sourceId, {});
+    const clone = cloned.profile;
+
+    expect(clone.id).not.toBe(sourceId);
+    expect(clone.name).toBe("Research Bot (copy)");
+    expect(clone.isDefault).toBe(false);
+    expect(clone.isSuper).toBe(false);
+    expect(clone.systemPrompt).toBe("You research things.");
+    expect(clone.model).toBe("anthropic:claude-sonnet-4-6");
+    expect(clone.tools.map((tool) => tool.id).sort()).toEqual(
+      before.profile.tools.map((tool) => tool.id).sort()
+    );
+    expect(await db.listSkillsForProfile(clone.id)).toHaveLength(
+      (await db.listSkillsForProfile(sourceId)).length
+    );
+  });
+
+  test("copies the soul files but leaves MEMORY.md at the template", async () => {
+    const { service, sourceId } = await setup();
+    const sourceDir = soulDirOf(sourceId);
+    await writeFile(path.join(sourceDir, "SOUL.md"), "# Source soul\n", "utf8");
+    await writeFile(
+      path.join(sourceDir, "MEMORY.md"),
+      "- remembered something private\n",
+      "utf8"
+    );
+
+    const { profile } = await service.cloneProfile(ORG_ID, sourceId, {});
+    const cloneDir = soulDirOf(profile.id);
+
+    expect(await readFile(path.join(cloneDir, "SOUL.md"), "utf8")).toContain(
+      "# Source soul"
+    );
+    expect(
+      await readFile(path.join(cloneDir, "MEMORY.md"), "utf8")
+    ).not.toContain("remembered something private");
+  });
+
+  test("does not share the source soul directory", async () => {
+    const { service, sourceId } = await setup();
+    const { profile } = await service.cloneProfile(ORG_ID, sourceId, {});
+
+    await writeFile(
+      path.join(soulDirOf(profile.id), "SOUL.md"),
+      "# Edited on the clone\n",
+      "utf8"
+    );
+
+    expect(
+      await readFile(path.join(soulDirOf(sourceId), "SOUL.md"), "utf8")
+    ).not.toContain("Edited on the clone");
+  });
+
+  test("copies knowledge base documents", async () => {
+    const { service, sourceId } = await setup();
+    const kbDir = path.join(soulDirOf(sourceId), "knowledge-base");
+    await mkdir(kbDir, { recursive: true });
+    await writeFile(path.join(kbDir, "doc_1--notes.txt"), "kb body", "utf8");
+
+    const { profile } = await service.cloneProfile(ORG_ID, sourceId, {});
+
+    expect(
+      await readFile(
+        path.join(soulDirOf(profile.id), "knowledge-base", "doc_1--notes.txt"),
+        "utf8"
+      )
+    ).toBe("kb body");
+  });
+
+  test("clone migrates legacy knowledge base", async () => {
+    const { service, sourceId } = await setup();
+    const legacyDir = path.join(soulDirOf(sourceId), "data", "knowledge-base");
+    await rm(path.join(soulDirOf(sourceId), "knowledge-base"), {
+      force: true,
+      recursive: true,
+    });
+    await mkdir(legacyDir, { recursive: true });
+    await writeFile(
+      path.join(legacyDir, "doc_1--notes.txt"),
+      "kb body",
+      "utf8"
+    );
+
+    const { profile } = await service.cloneProfile(ORG_ID, sourceId, {});
+
+    expect(
+      await readFile(
+        path.join(soulDirOf(profile.id), "knowledge-base", "doc_1--notes.txt"),
+        "utf8"
+      )
+    ).toBe("kb body");
+  });
+
+  test("gives each clone a unique id", async () => {
+    const { service, sourceId } = await setup();
+    const first = await service.cloneProfile(ORG_ID, sourceId, {});
+    const second = await service.cloneProfile(ORG_ID, sourceId, {});
+
+    expect(second.profile.id).not.toBe(first.profile.id);
+    expect(first.profile.name).toBe("Research Bot (copy)");
+    expect(second.profile.name).toBe("Research Bot (copy)");
+  });
+
+  test.skipIf(process.platform !== "win32")(
+    "clones get a random id even when a case-similar id is taken on Windows",
+    async () => {
+      const { service, sourceId } = await setup();
+
+      const taken = await service.createProfile(ORG_ID, {
+        id: "Research-Bot-Copy",
+        name: "Taken",
+      });
+
+      const clone = await service.cloneProfile(ORG_ID, sourceId, {});
+
+      expect(clone.profile.id).not.toBe(taken.profile.id);
+      expect(clone.profile.id).not.toBe(taken.profile.id.toLowerCase());
+      expect(clone.profile.id).toMatch(/^[0-9A-Za-z]{21}$/);
+      expect(clone.profile.name).toBe("Research Bot (copy)");
+    }
+  );
+
+  test("refuses to clone Super MíngZhàn and writes nothing", async () => {
+    const { db, service } = await setup();
+
+    const superMingzhan = await service.createProfile(ORG_ID, {
+      isSuper: true,
+      name: "Super MíngZhàn",
+    });
+
+    const countBefore = (await db.listProfilesForOrg(ORG_ID)).length;
+
+    await expect(
+      service.cloneProfile(ORG_ID, superMingzhan.profile.id, {})
+    ).rejects.toThrow(/cannot be cloned/i);
+
+    expect(await db.listProfilesForOrg(ORG_ID)).toHaveLength(countBefore);
+  });
+
+  test("carries MCP server assignments across", async () => {
+    const { db, service, sourceId } = await setup();
+    await db.upsertMcpServer({
+      cachedTools: [],
+      config: { command: "echo" },
+      createdAt: new Date().toISOString(),
+      enabled: true,
+      id: "mcp_1",
+      lastError: null,
+      name: "Echo",
+      orgId: ORG_ID,
+      status: "disconnected",
+      transport: "stdio",
+      updatedAt: new Date().toISOString(),
+    });
+    await db.assignMcpServerToProfile(sourceId, "mcp_1");
+
+    const { profile } = await service.cloneProfile(ORG_ID, sourceId, {});
+
+    expect(profile.mcpServers.map((server) => server.id)).toEqual(["mcp_1"]);
+  });
+
+  test("copies the avatar", async () => {
+    const { service, sourceId } = await setup();
+    await service.uploadProfileAvatar(ORG_ID, sourceId, {
+      data: tinyPngBase64,
+      mediaType: "image/png",
+    });
+
+    const { profile } = await service.cloneProfile(ORG_ID, sourceId, {});
+
+    expect(profile.hasAvatar).toBe(true);
+    await expect(
+      service.getProfileAvatar(ORG_ID, profile.id)
+    ).resolves.toBeTruthy();
+  });
+
+  test("clones the org default without the clone becoming default", async () => {
+    const { db, service, sourceId } = await setup();
+    const source = await db.getProfile(sourceId);
+    await db.upsertProfile({ ...source!, isDefault: true });
+
+    const { profile } = await service.cloneProfile(ORG_ID, sourceId, {});
+
+    expect(profile.isDefault).toBe(false);
+    expect((await db.getProfile(sourceId))?.isDefault).toBe(true);
+  });
+
+  test("404s on a missing source", async () => {
+    const { service } = await setup();
+
+    await expect(
+      service.cloneProfile(ORG_ID, "does-not-exist", {})
+    ).rejects.toThrow(/not found/i);
+  });
+
+  test("failed clone removes partial profile and workspace", async () => {
+    const { db, service, sourceId } = await setup();
+    const kbDir = path.join(soulDirOf(sourceId), "knowledge-base");
+    await mkdir(kbDir, { recursive: true });
+    await writeFile(path.join(kbDir, "doc_1--notes.txt"), "kb body", "utf8");
+
+    const destId = "ghost-clone";
+    const destKbPath = path.join(soulDirOf(destId), "knowledge-base");
+    await mkdir(path.dirname(destKbPath), { recursive: true });
+    await writeFile(destKbPath, "blocker", "utf8");
+
+    await expect(
+      service.cloneProfile(ORG_ID, sourceId, { id: destId })
+    ).rejects.toThrow();
+
+    expect(await db.getProfile(destId)).toBeFalsy();
+    await expect(access(soulDirOf(destId))).rejects.toThrow();
+    expect(await db.listToolsForProfile(destId)).toHaveLength(0);
+
+    const retry = await service.cloneProfile(ORG_ID, sourceId, {
+      id: destId,
+    });
+
+    expect(retry.profile.id).toBe(destId);
+    expect(retry.profile.tools.length).toBeGreaterThan(0);
+  });
+});
+
+describe("profile service deleteProfile", () => {
+  let tempConfigDir = "";
+
+  afterEach(async () => {
+    if (originalConfigDir === undefined) {
+      delete process.env.MINGZHAN_CONFIG_DIR;
+    } else {
+      process.env.MINGZHAN_CONFIG_DIR = originalConfigDir;
+    }
+
+    if (tempConfigDir) {
+      await rm(tempConfigDir, { force: true, recursive: true });
+      tempConfigDir = "";
+    }
+  });
+
+  async function setup() {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-delete-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+    const db = createInMemoryDatabaseAdapter();
+
+    return { db, service: new ProfileService(db) };
+  }
+
+  async function markDefault(
+    db: ReturnType<typeof createInMemoryDatabaseAdapter>,
+    profileId: string
+  ) {
+    const profile = await db.getProfile(profileId);
+    await db.upsertProfile({ ...profile!, isDefault: true });
+  }
+
+  test("blocks deleting the default when the org has fewer than 3 profiles", async () => {
+    const { db, service } = await setup();
+    const first = await service.createProfile(ORG_ID, { name: "Default Bot" });
+    await service.createProfile(ORG_ID, { name: "Second" });
+    await markDefault(db, first.profile.id);
+
+    await expect(
+      service.deleteProfile(ORG_ID, first.profile.id)
+    ).rejects.toThrow(/at least 3 profiles/);
+
+    expect((await db.getProfile(first.profile.id))?.isDefault).toBe(true);
+  });
+
+  test("removes the deleted profile workspace without touching another profile", async () => {
+    const { db, service } = await setup();
+    const removed = await service.createProfile(ORG_ID, { name: "Removed" });
+    const kept = await service.createProfile(ORG_ID, { name: "Kept" });
+    const removedDir = getProfileSoulDir(ORG_ID, removed.profile.id);
+    const keptDir = getProfileSoulDir(ORG_ID, kept.profile.id);
+    const artifactDir = path.join(removedDir, "artifacts");
+    await mkdir(artifactDir, { recursive: true });
+    await writeFile(path.join(artifactDir, "report.md"), "private data");
+
+    await service.deleteProfile(ORG_ID, removed.profile.id);
+
+    expect(await db.getProfile(removed.profile.id)).toBeNull();
+    await expect(access(removedDir)).rejects.toThrow();
+    expect(
+      (await readFile(path.join(keptDir, "SOUL.md"), "utf8")).length
+    ).toBeGreaterThan(0);
+  });
+
+  test("removes artifact share snapshots before their rows cascade", async () => {
+    const { db, service } = await setup();
+    const removed = await service.createProfile(ORG_ID, { name: "Removed" });
+    const shareId = "share_delete_test";
+
+    const storagePath = await writeArtifactShareSnapshot({
+      bytes: Buffer.from("shared private data"),
+      filename: "report.md",
+      orgId: ORG_ID,
+      shareId,
+    });
+
+    await db.createArtifactShare({
+      createdAt: new Date().toISOString(),
+      createdByUserId: "user_test",
+      filename: "report.md",
+      id: shareId,
+      mimeType: "text/markdown",
+      orgId: ORG_ID,
+      profileId: removed.profile.id,
+      revokedAt: null,
+      sizeBytes: 19,
+      sourcePath: "artifacts/report.md",
+      storagePath,
+      tokenHash: "share_token_hash",
+    });
+
+    await service.deleteProfile(ORG_ID, removed.profile.id);
+
+    await expect(access(storagePath)).rejects.toThrow();
+  });
+
+  test("deletes the default when the org has 3 profiles and promotes a successor", async () => {
+    const { db, service } = await setup();
+    const first = await service.createProfile(ORG_ID, { name: "Default Bot" });
+    const second = await service.createProfile(ORG_ID, { name: "Second" });
+    await service.createProfile(ORG_ID, { name: "Third" });
+    await markDefault(db, first.profile.id);
+
+    await service.deleteProfile(ORG_ID, first.profile.id);
+
+    expect(await db.getProfile(first.profile.id)).toBeNull();
+    expect((await db.getDefaultProfileForOrg(ORG_ID))?.id).toBe(
+      second.profile.id
+    );
+  });
+
+  test("keeps files and the default when database deletion fails", async () => {
+    const { db, service } = await setup();
+    const first = await service.createProfile(ORG_ID, { name: "Default Bot" });
+    const second = await service.createProfile(ORG_ID, { name: "Second" });
+    await service.createProfile(ORG_ID, { name: "Third" });
+    await markDefault(db, first.profile.id);
+
+    const soulPath = path.join(
+      getProfileSoulDir(ORG_ID, first.profile.id),
+      "SOUL.md"
+    );
+
+    const soul = await readFile(soulPath, "utf8");
+    const deleteProfile = db.deleteProfileAndPromoteDefault;
+    db.deleteProfileAndPromoteDefault = async () => {
+      throw new Error("Database unavailable");
+    };
+
+    await expect(
+      service.deleteProfile(ORG_ID, first.profile.id)
+    ).rejects.toThrow();
+    db.deleteProfileAndPromoteDefault = deleteProfile;
+
+    expect(await readFile(soulPath, "utf8")).toBe(soul);
+    expect((await db.getProfile(first.profile.id))?.isDefault).toBe(true);
+    expect((await db.getProfile(second.profile.id))?.isDefault).toBe(false);
+    await expect(
+      db.deleteProfileAndPromoteDefault(first.profile.id, ORG_ID, "missing")
+    ).rejects.toThrow();
+    expect((await db.getProfile(first.profile.id))?.isDefault).toBe(true);
+    expect(await readFile(soulPath, "utf8")).toBe(soul);
+  });
+
+  test("keeps a newer default selected during deletion", async () => {
+    const { db, service } = await setup();
+    const first = await service.createProfile(ORG_ID, { name: "Default Bot" });
+    const second = await service.createProfile(ORG_ID, { name: "Second" });
+    const third = await service.createProfile(ORG_ID, { name: "Third" });
+    await markDefault(db, first.profile.id);
+    service.beforeChannelOwnerDelete = async () => {
+      await markDefault(db, third.profile.id);
+    };
+
+    await service.deleteProfile(ORG_ID, first.profile.id);
+
+    expect((await db.getProfile(second.profile.id))?.isDefault).toBe(false);
+    expect((await db.getProfile(third.profile.id))?.isDefault).toBe(true);
+  });
+
+  test("keeps a target promoted to default during deletion", async () => {
+    const { db, service } = await setup();
+    const first = await service.createProfile(ORG_ID, { name: "Default Bot" });
+    const second = await service.createProfile(ORG_ID, { name: "Second" });
+    await service.createProfile(ORG_ID, { name: "Third" });
+    await markDefault(db, first.profile.id);
+    service.beforeChannelOwnerDelete = async () => {
+      await markDefault(db, second.profile.id);
+    };
+
+    await expect(
+      service.deleteProfile(ORG_ID, second.profile.id)
+    ).rejects.toThrow();
+
+    expect((await db.getProfile(second.profile.id))?.isDefault).toBe(true);
+    expect(
+      await readFile(
+        path.join(getProfileSoulDir(ORG_ID, second.profile.id), "SOUL.md"),
+        "utf8"
+      )
+    ).toBeTruthy();
+  });
+
+  test("does not promote Super MíngZhàn as the new default", async () => {
+    const { db, service } = await setup();
+    const first = await service.createProfile(ORG_ID, { name: "Default Bot" });
+    await service.createProfile(ORG_ID, {
+      isSuper: true,
+      name: "Super MíngZhàn",
+    });
+    const third = await service.createProfile(ORG_ID, { name: "Writer" });
+    await markDefault(db, first.profile.id);
+
+    await service.deleteProfile(ORG_ID, first.profile.id);
+
+    expect((await db.getDefaultProfileForOrg(ORG_ID))?.id).toBe(
+      third.profile.id
+    );
+  });
+});
+
+describe("profile service plugin tool org scope", () => {
+  let tempConfigDir = "";
+
+  afterEach(async () => {
+    if (originalConfigDir === undefined) {
+      delete process.env.MINGZHAN_CONFIG_DIR;
+    } else {
+      process.env.MINGZHAN_CONFIG_DIR = originalConfigDir;
+    }
+
+    if (tempConfigDir) {
+      await rm(tempConfigDir, { force: true, recursive: true });
+      tempConfigDir = "";
+    }
+  });
+
+  test("listTools omits another org's plugin-owned tools", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const service = new ProfileService(db);
+    const now = new Date().toISOString();
+    await db.upsertTool({
+      createdAt: now,
+      description: "Other org write",
+      handlerConfig: { actionKey: "write" },
+      handlerType: "plugin",
+      id: "tool_other",
+      name: "notes_write_other",
+      orgId: "org_other",
+      pluginId: "notes",
+      pluginKey: "write",
+      updatedAt: now,
+    });
+    await db.upsertTool({
+      createdAt: now,
+      description: "This org write",
+      handlerConfig: { actionKey: "write" },
+      handlerType: "plugin",
+      id: "tool_mine",
+      name: "notes_write_mine",
+      orgId: ORG_ID,
+      pluginId: "notes",
+      pluginKey: "write",
+      updatedAt: now,
+    });
+
+    const listed = await service.listTools(ORG_ID);
+    expect(listed.tools.some((tool) => tool.id === "tool_other")).toBe(false);
+    expect(listed.tools.some((tool) => tool.id === "tool_mine")).toBe(true);
+  });
+
+  test("assignTool rejects a plugin tool owned by another org", async () => {
+    tempConfigDir = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-profile-plugin-org-")
+    );
+    process.env.MINGZHAN_CONFIG_DIR = tempConfigDir;
+    const db = createInMemoryDatabaseAdapter();
+    const service = new ProfileService(db);
+    const profile = await service.createProfile(ORG_ID, { name: "Scoped" });
+    const now = new Date().toISOString();
+    await db.upsertTool({
+      createdAt: now,
+      description: "Other org write",
+      handlerConfig: { actionKey: "write" },
+      handlerType: "plugin",
+      id: "tool_other",
+      name: "notes_write_other",
+      orgId: "org_other",
+      pluginId: "notes",
+      pluginKey: "write",
+      updatedAt: now,
+    });
+
+    await expect(
+      service.assignTool(ORG_ID, profile.profile.id, { toolId: "tool_other" })
+    ).rejects.toMatchObject({ status: 404 });
+    expect(
+      (await db.listToolsForProfile(profile.profile.id)).some(
+        (tool) => tool.id === "tool_other"
+      )
+    ).toBe(false);
+  });
+});
+
+describe("shared profile configuration", () => {
+  setupTestConfigDir("profile-shared-config-");
+
+  async function setup() {
+    const db = createInMemoryDatabaseAdapter();
+    const service = new ProfileService(db);
+    const now = new Date().toISOString();
+
+    for (const id of ["parent", "team", "other"]) {
+      await db.upsertOrganization({
+        createdAt: now,
+        id,
+        name: id,
+        parentOrgId: id === "team" ? "parent" : null,
+        slug: id,
+        updatedAt: now,
+      });
+    }
+
+    const source = await service.createProfile("parent", {
+      id: "template",
+      name: "Template",
+      systemPrompt: "Published instructions",
+    });
+
+    const publication = await db.publishOrgSharedResource({
+      createdAt: now,
+      id: "publication",
+      orgId: "parent",
+      resourceId: source.profile.id,
+      resourceKind: "agent",
+      updatedAt: now,
+    });
+
+    const profile = await db.createSharedAgentInstance(
+      "team",
+      publication.id,
+      "shared_instance",
+      now
+    );
+
+    const teamDir = getProfileSoulDir("team", profile.id);
+    await mkdir(teamDir, { recursive: true });
+
+    for (const file of [
+      "SOUL.md",
+      "STYLE.md",
+      "INSTRUCTIONS.md",
+      "MEMORY.md",
+      "USER.md",
+    ]) {
+      await writeFile(path.join(teamDir, file), `Team ${file}`);
+    }
+
+    return { db, profile, publication, service, source, teamDir };
+  }
+
+  test("template field changes fail before records, files, or audit history change", async () => {
+    const { db, profile, service, teamDir } = await setup();
+    const stored = await db.getProfile(profile.id);
+
+    const requests: UpdateProfileRequest[] = [
+      { name: "Changed" },
+      { model: "changed-provider::model" },
+      { systemPrompt: "Changed instructions" },
+      { acpAgent: { args: [], command: "changed" } },
+      { acpAgent: null },
+      { automationsEnabled: false },
+      { skillsCuratorConsolidateEnabled: true },
+      { skillsPostTurnReview: true },
+      { skillsWriteApproval: false },
+      { soulFiles: { "SOUL.md": "Changed soul" } },
+      { soulFiles: { "STYLE.md": "Changed style" } },
+      { soulFiles: { "INSTRUCTIONS.md": "Changed instructions" } },
+      {
+        soulFiles: {
+          "MEMORY.md": "Changed memory",
+          "STYLE.md": "Changed style",
+        },
+      },
+      { name: "Changed", soulFiles: { "MEMORY.md": "Changed memory" } },
+    ];
+
+    for (const request of requests) {
+      await expect(
+        service.updateProfile("team", profile.id, request, {
+          actorUserId: "actor",
+          source: "dashboard",
+        })
+      ).rejects.toMatchObject({ status: 403 });
+    }
+
+    expect(await db.getProfile(profile.id)).toEqual(stored);
+    expect(await db.listProfileChangeEvents("team", profile.id)).toEqual([]);
+
+    for (const file of [
+      "SOUL.md",
+      "STYLE.md",
+      "INSTRUCTIONS.md",
+      "MEMORY.md",
+      "USER.md",
+    ]) {
+      expect(await readFile(path.join(teamDir, file), "utf8")).toBe(
+        `Team ${file}`
+      );
+    }
+
+    await db.deleteOrgSharedResource("parent", "publication");
+    await expect(
+      service.updateProfile("team", profile.id, { name: "Local copy" })
+    ).rejects.toMatchObject({ status: 403 });
+    await expect(
+      service.updateProfile("other", profile.id, { name: "Foreign" })
+    ).rejects.toMatchObject({ status: 404 });
+    expect(await db.getProfile(profile.id)).toEqual(stored);
+  });
+
+  test("shared assignments, cloning, transfer, and avatar changes are read-only", async () => {
+    const { db, profile, service, teamDir } = await setup();
+    const now = new Date().toISOString();
+    await db.upsertTool({
+      createdAt: now,
+      description: "Test",
+      handlerConfig: {},
+      handlerType: "bash",
+      id: "tool_local",
+      name: "local",
+      orgId: "team",
+      updatedAt: now,
+    });
+    await db.upsertSkill({
+      createdAt: now,
+      createdBy: "human",
+      description: "Test",
+      disableModelInvocation: false,
+      enabled: true,
+      hasTool: false,
+      id: "skill_local",
+      name: "local",
+      orgId: "team",
+      sourcePath: path.join(teamDir, "skills", "local"),
+      updatedAt: now,
+    });
+    await db.upsertMcpServer({
+      cachedTools: [],
+      config: { command: "echo" },
+      createdAt: now,
+      enabled: true,
+      id: "server",
+      lastError: null,
+      name: "Echo",
+      status: "disconnected",
+      transport: "stdio",
+      updatedAt: now,
+    });
+    await db.assignToolToProfile(profile.id, "tool_local");
+    await db.assignSkillToProfile(profile.id, "skill_local");
+    await db.assignMcpServerToProfile(profile.id, "server");
+    const before = await db.getProfile(profile.id);
+
+    const actions = [
+      () => service.assignTool("team", profile.id, { toolId: "tool_local" }),
+      () => service.unassignTool("team", profile.id, "tool_local"),
+      () => service.assignSkill("team", profile.id, { skillId: "skill_local" }),
+      () => service.unassignSkill("team", profile.id, "skill_local"),
+      () => service.assignMcpServer("team", profile.id, { serverId: "server" }),
+      () => service.unassignMcpServer("team", profile.id, "server"),
+      () => service.cloneProfile("team", profile.id, { id: "copy" }),
+      () =>
+        service.moveProfile("team", profile.id, { organizationId: "other" }),
+      () =>
+        service.uploadProfileAvatar("team", profile.id, {
+          data: tinyPngBase64,
+          mediaType: "image/png",
+        }),
+      () => service.deleteProfileAvatar("team", profile.id),
+    ];
+
+    for (const action of actions) {
+      await expect(action()).rejects.toMatchObject({ status: 403 });
+    }
+
+    expect(await db.getProfile(profile.id)).toEqual(before);
+    expect(
+      (await db.listToolsForProfile(profile.id)).map((tool) => tool.id)
+    ).toEqual(["tool_local"]);
+    expect(
+      (await db.listSkillsForProfile(profile.id)).map((skill) => skill.id)
+    ).toEqual(["skill_local"]);
+    expect(
+      (await db.listMcpServersForProfile(profile.id)).map((server) => server.id)
+    ).toEqual(["server"]);
+    expect(await db.getProfile("copy")).toBeNull();
+    expect(await db.getProfileForOrg(profile.id, "other")).toBeNull();
+    expect(await db.listProfileChangeEvents("team", profile.id)).toEqual([]);
+    expect(await readFile(path.join(teamDir, "MEMORY.md"), "utf8")).toBe(
+      "Team MEMORY.md"
+    );
+    expect((await service.getProfile("team", profile.id)).profile.id).toBe(
+      profile.id
+    );
+  });
+
+  test("team memory remains writable and shared instances cannot become the default profile", async () => {
+    const { db, profile, service, source, teamDir } = await setup();
+    const sourceDir = getProfileSoulDir("parent", source.profile.id);
+
+    const parentMemory = await readFile(
+      path.join(sourceDir, "MEMORY.md"),
+      "utf8"
+    );
+
+    const updated = await service.updateProfile(
+      "team",
+      profile.id,
+      { soulFiles: { "MEMORY.md": "New private memory" } },
+      { actorUserId: "actor", source: "dashboard" }
+    );
+
+    expect(updated.profile.name).toBe("Template");
+    expect(updated.profile.systemPrompt).toBe("Published instructions");
+    expect(await readFile(path.join(teamDir, "MEMORY.md"), "utf8")).toBe(
+      "New private memory"
+    );
+    expect(await readFile(path.join(sourceDir, "MEMORY.md"), "utf8")).toBe(
+      parentMemory
+    );
+    expect(
+      (await db.listProfileChangeEvents("team", profile.id)).map(
+        (event) => event.field
+      )
+    ).toEqual(["soul.memory"]);
+
+    const local = await service.createProfile("team", {
+      id: "default",
+      name: "Default",
+    });
+
+    await db.upsertProfile({
+      ...(await db.getProfile(local.profile.id))!,
+      isDefault: true,
+    });
+    await service.createProfile("team", {
+      id: "super",
+      isSuper: true,
+      name: "Super",
+    });
+    await expect(service.deleteProfile("team", "default")).rejects.toThrow();
+    expect((await db.getProfile("default"))?.isDefault).toBe(true);
+    expect((await db.getProfile(profile.id))?.isDefault).toBe(false);
+    await service.createProfile("team", { id: "local", name: "Local" });
+    await service.updateProfile("team", "local", { name: "Changed local" });
+    await service.deleteProfile("team", "default");
+    expect(await db.getProfile("default")).toBeNull();
+    expect((await db.getProfile("local"))?.isDefault).toBe(true);
+    expect((await db.getProfile(profile.id))?.isDefault).toBe(false);
+    expect(
+      (await db.getSharedAgentInstance("team", profile.id))?.sourceProfileId
+    ).toBe(source.profile.id);
+  });
+});
+
+describe("profile organization transfer", () => {
+  setupTestConfigDir("profile-transfer-");
+  test("moves workspace and sessions without changing profile identity", async () => {
+    const configDir = process.env.MINGZHAN_CONFIG_DIR!;
+    const db = createInMemoryDatabaseAdapter();
+    const service = new ProfileService(db);
+    const now = new Date().toISOString();
+
+    for (const id of ["source", "destination"]) {
+      await db.upsertOrganization({
+        createdAt: now,
+        id,
+        name: id,
+        slug: id,
+        updatedAt: now,
+      });
+    }
+
+    const { profile } = await service.createProfile("source", {
+      name: "Moving bot",
+    });
+
+    const sourceDir = path.join(configDir, "orgs/source/profiles", profile.id);
+
+    const targetDir = path.join(
+      configDir,
+      "orgs/destination/profiles",
+      profile.id
+    );
+
+    await writeFile(path.join(sourceDir, "MEMORY.md"), "Remember me");
+    await db.upsertSession({
+      agentQuestionnaire: null,
+      agentTodos: [],
+      channel: "web",
+      createdAt: now,
+      id: "moving-session",
+      model: null,
+      profileId: profile.id,
+      title: null,
+    });
+    await service.moveProfile("source", profile.id, {
+      organizationId: "destination",
+    });
+    expect(await db.getProfileForOrg(profile.id, "source")).toBeNull();
+    expect((await db.getProfileForOrg(profile.id, "destination"))?.name).toBe(
+      "Moving bot"
+    );
+    expect((await db.getSession("moving-session"))?.profileId).toBe(profile.id);
+    expect(await readFile(path.join(targetDir, "MEMORY.md"), "utf8")).toBe(
+      "Remember me"
+    );
+    expect(await Bun.file(path.join(sourceDir, "MEMORY.md")).exists()).toBe(
+      false
+    );
+  });
+
+  test("profile transfer preserves related data and rolls back database and files on failure", async () => {
+    const configDir = process.env.MINGZHAN_CONFIG_DIR!;
+    const databasePath = path.join(configDir, "transfer.sqlite");
+    const database = await createSqliteDatabase(`file:${databasePath}`);
+    const raw = new Database(databasePath);
+
+    try {
+      const db = database.adapter;
+      const service = new ProfileService(db);
+      const now = new Date().toISOString();
+
+      for (const id of ["source", "destination"]) {
+        await db.upsertOrganization({
+          createdAt: now,
+          id,
+          name: id,
+          slug: id,
+          updatedAt: now,
+        });
+      }
+
+      const { profile } = await service.createProfile("source", {
+        name: "Transfer data",
+      });
+
+      const { profile: successor } = await service.createProfile("source", {
+        name: "Successor",
+      });
+
+      const stored = (await db.getProfile(profile.id))!;
+      await db.upsertProfile({ ...stored, isDefault: true });
+
+      const sourceDir = path.join(
+        configDir,
+        "orgs/source/profiles",
+        profile.id
+      );
+
+      const targetDir = path.join(
+        configDir,
+        "orgs/destination/profiles",
+        profile.id
+      );
+
+      await writeFile(path.join(sourceDir, "MEMORY.md"), "Keep my memory");
+      await db.upsertSession({
+        agentQuestionnaire: null,
+        agentTodos: [],
+        channel: "web",
+        createdAt: now,
+        id: "transfer-session",
+        model: null,
+        profileId: profile.id,
+        title: null,
+      });
+      const archive = sessionHistoryArchivePath("source", "transfer-session");
+      await mkdir(path.dirname(archive), { recursive: true });
+      await writeFile(archive, "archived history");
+      raw
+        .query(
+          "INSERT INTO automations (id, name, version, definition, profile_id, org_id, enabled, created_at, updated_at) VALUES ('transfer-auto', 'Automation', 1, '{}', ?, 'source', 1, ?, ?)"
+        )
+        .run(profile.id, now, now);
+      raw
+        .query(
+          "INSERT INTO workflows (id, name, version, definition, profile_id, org_id, enabled, created_at, updated_at) VALUES ('transfer-flow', 'Workflow', 1, '{}', ?, 'source', 1, ?, ?)"
+        )
+        .run(profile.id, now, now);
+      raw
+        .query(
+          "INSERT INTO attachments (id, org_id, profile_id, channel, kind, media_type, size_bytes, storage_path, created_at) VALUES ('transfer-attachment', 'source', ?, 'web', 'image', 'image/png', 3, ?, ?)"
+        )
+        .run(
+          profile.id,
+          path.join(sourceDir, "attachments/transfer-attachment"),
+          now
+        );
+      raw
+        .query(
+          "INSERT INTO skills (id, name, description, source_path, org_id, created_at, updated_at) VALUES ('source-skill', 'Source skill', '', '/source/skill', 'source', ?, ?)"
+        )
+        .run(now, now);
+      await db.assignSkillToProfile(profile.id, "source-skill");
+      raw
+        .query(
+          "INSERT INTO composio_toolkits (id, org_id, toolkit_slug, display_name, status, created_at, updated_at) VALUES ('source-toolkit', 'source', 'gmail', 'Gmail', 'connected', ?, ?)"
+        )
+        .run(now, now);
+      raw
+        .query(
+          "INSERT INTO profile_composio_toolkits (profile_id, toolkit_id) VALUES (?, 'source-toolkit')"
+        )
+        .run(profile.id);
+      raw
+        .query(
+          "INSERT INTO skills (id, name, description, source_path, org_id, created_at, updated_at) VALUES ('local-skill', 'Local skill', '', ?, 'source', ?, ?)"
+        )
+        .run(path.join(sourceDir, "skills/local"), now, now);
+      await db.assignSkillToProfile(profile.id, "local-skill");
+      raw.exec(
+        "CREATE TRIGGER fail_transfer BEFORE UPDATE OF org_id ON attachments BEGIN SELECT RAISE(ABORT, 'test failure'); END"
+      );
+      await expect(
+        service.moveProfile("source", profile.id, {
+          organizationId: "destination",
+        })
+      ).rejects.toThrow();
+      expect((await db.getProfile(profile.id))?.orgId).toBe("source");
+      expect((await db.getProfile(successor.id))?.isDefault).toBe(false);
+      expect(await readFile(path.join(sourceDir, "MEMORY.md"), "utf8")).toBe(
+        "Keep my memory"
+      );
+      expect(await readFile(archive, "utf8")).toBe("archived history");
+      expect(await Bun.file(path.join(targetDir, "MEMORY.md")).exists()).toBe(
+        false
+      );
+      raw.exec("DROP TRIGGER fail_transfer");
+      await mkdir(targetDir, { recursive: true });
+      await writeFile(path.join(targetDir, "existing.txt"), "Do not overwrite");
+      await expect(
+        service.moveProfile("source", profile.id, {
+          organizationId: "destination",
+        })
+      ).rejects.toMatchObject({ status: 409 });
+      expect(await readFile(path.join(targetDir, "existing.txt"), "utf8")).toBe(
+        "Do not overwrite"
+      );
+      await rm(targetDir, { recursive: true });
+      await db.upsertProfile({
+        ...(await db.getProfile(successor.id))!,
+        isSuper: true,
+      });
+      await expect(
+        service.moveProfile("source", profile.id, {
+          organizationId: "destination",
+        })
+      ).rejects.toMatchObject({ status: 409 });
+      await db.upsertProfile({
+        ...(await db.getProfile(successor.id))!,
+        isSuper: false,
+      });
+      await db.assignSkillToProfile(successor.id, "local-skill");
+      await expect(
+        service.moveProfile("source", profile.id, {
+          organizationId: "destination",
+        })
+      ).rejects.toMatchObject({ status: 409 });
+      await db.unassignSkillFromProfile(successor.id, "local-skill");
+
+      sessionTurnRegistry.beginTurn("transfer-session");
+      await expect(
+        service.moveProfile("source", profile.id, {
+          organizationId: "destination",
+        })
+      ).rejects.toMatchObject({ status: 409 });
+      sessionTurnRegistry.endTurn("transfer-session", {
+        reply: "",
+        type: "done",
+      });
+      raw
+        .query(
+          "INSERT INTO automation_runs (id, automation_id, status, started_at) VALUES ('active-transfer', 'transfer-auto', 'running', ?)"
+        )
+        .run(now);
+      await expect(
+        service.moveProfile("source", profile.id, {
+          organizationId: "destination",
+        })
+      ).rejects.toMatchObject({ status: 409 });
+      raw.exec(
+        "UPDATE automation_runs SET status = 'completed' WHERE id = 'active-transfer'"
+      );
+      await service.moveProfile("source", profile.id, {
+        organizationId: "destination",
+      });
+      expect((await db.getProfile(successor.id))?.isDefault).toBe(true);
+      expect((await db.getProfile(profile.id))?.isDefault).toBe(false);
+
+      for (const table of [
+        "sessions",
+        "attachments",
+        "automations",
+        "workflows",
+      ]) {
+        expect(
+          raw
+            .query(`SELECT org_id FROM ${table} WHERE profile_id = ?`)
+            .get(profile.id)
+        ).toEqual({ org_id: "destination" });
+      }
+
+      expect((await db.getAutomation("transfer-auto"))?.enabled).toBe(false);
+      expect((await db.getWorkflow("transfer-flow"))?.enabled).toBe(false);
+      expect(await db.listProfileComposioToolkits(profile.id)).toHaveLength(0);
+      expect(
+        (await db.listSkillsForProfile(profile.id)).map((skill) => skill.id)
+      ).toEqual(["local-skill"]);
+      expect((await db.getSkill("local-skill"))?.sourcePath).toBe(
+        path.join(targetDir, "skills/local")
+      );
+      expect(
+        raw
+          .query(
+            "SELECT storage_path FROM attachments WHERE id = 'transfer-attachment'"
+          )
+          .get()
+      ).toEqual({
+        storage_path: path.join(targetDir, "attachments/transfer-attachment"),
+      });
+      expect(
+        await readFile(
+          sessionHistoryArchivePath("destination", "transfer-session"),
+          "utf8"
+        )
+      ).toBe("archived history");
+      expect(await Bun.file(archive).exists()).toBe(false);
+      await expect(
+        service.moveProfile("source", profile.id, {
+          organizationId: "destination",
+        })
+      ).rejects.toMatchObject({ status: 404 });
+      await expect(
+        service.moveProfile("destination", profile.id, {
+          organizationId: "destination",
+        })
+      ).rejects.toMatchObject({ status: 400 });
+      await expect(
+        service.moveProfile("destination", profile.id, {
+          organizationId: "missing",
+        })
+      ).rejects.toMatchObject({ status: 404 });
+      raw.exec(
+        "UPDATE organizations SET archived_at = '2026-01-01' WHERE id = 'source'"
+      );
+      await expect(
+        service.moveProfile("destination", profile.id, {
+          organizationId: "source",
+        })
+      ).rejects.toMatchObject({ status: 404 });
+      raw.exec(
+        "UPDATE organizations SET archived_at = NULL WHERE id = 'source'"
+      );
+      await db.upsertProfile({
+        ...(await db.getProfile(profile.id))!,
+        isSuper: true,
+      });
+      await expect(
+        service.moveProfile("destination", profile.id, {
+          organizationId: "source",
+        })
+      ).rejects.toMatchObject({ status: 400 });
+      expect(await readFile(path.join(targetDir, "MEMORY.md"), "utf8")).toBe(
+        "Keep my memory"
+      );
+    } finally {
+      raw.close(true);
+      database.close();
+    }
+  });
+});
+
+describe("profile service with bash turned off", () => {
+  const originalTenantBash = process.env.MINGZHAN_TENANT_BASH;
+
+  afterEach(() => {
+    if (originalConfigDir === undefined) {
+      delete process.env.MINGZHAN_CONFIG_DIR;
+    } else {
+      process.env.MINGZHAN_CONFIG_DIR = originalConfigDir;
+    }
+
+    if (originalTenantBash === undefined) {
+      delete process.env.MINGZHAN_TENANT_BASH;
+    } else {
+      process.env.MINGZHAN_TENANT_BASH = originalTenantBash;
+    }
+  });
+
+  test("refuses to assign bash to a profile", async () => {
+    process.env.MINGZHAN_CONFIG_DIR = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-bash-off-")
+    );
+    process.env.MINGZHAN_TENANT_BASH = "0";
+    const db = createInMemoryDatabaseAdapter();
+    await ensureBuiltinToolDefinitions(db);
+    await ensureBashToolDefinition(db);
+    const service = new ProfileService(db);
+    const { profile } = await service.createProfile(ORG_ID, { name: "Ops" });
+
+    await expect(
+      service.assignTool(ORG_ID, profile.id, { toolId: BASH_TOOL_ID })
+    ).rejects.toMatchObject({ status: 403 });
+
+    await rm(process.env.MINGZHAN_CONFIG_DIR, { force: true, recursive: true });
+  });
+});

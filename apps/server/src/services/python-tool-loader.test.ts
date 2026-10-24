@@ -1,0 +1,694 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { realpathSync } from "node:fs";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { resolveCustomToolModulePath } from "./custom-tool-shared";
+import {
+  makeCustomToolRecord,
+  setupCustomToolsDir,
+} from "./custom-tool-test-helpers";
+import { loadPythonTool, resolvePythonBin } from "./python-tool-loader";
+
+const originalConfigDir = process.env.MINGZHAN_CONFIG_DIR;
+
+const originalPythonBin = process.env.MINGZHAN_PYTHON_BIN;
+
+const setupToolsDir = setupCustomToolsDir;
+
+const makeRecord = (overrides = {}) =>
+  makeCustomToolRecord({
+    handlerConfig: { modulePath: "echo.py" },
+    handlerType: "python",
+    ...overrides,
+  });
+
+describe("resolvePythonBin", () => {
+  afterEach(() => {
+    if (originalPythonBin === undefined) {
+      delete process.env.MINGZHAN_PYTHON_BIN;
+    } else {
+      process.env.MINGZHAN_PYTHON_BIN = originalPythonBin;
+    }
+  });
+
+  test.skipIf(process.platform === "win32")("defaults to python3", () => {
+    delete process.env.MINGZHAN_PYTHON_BIN;
+    expect(resolvePythonBin()).toBe("python3");
+  });
+
+  test("accepts bare python3 and python", () => {
+    expect(resolvePythonBin("python3")).toBe("python3");
+    expect(resolvePythonBin("python")).toBe("python");
+    expect(resolvePythonBin("python3.12")).toBe("python3.12");
+  });
+
+  test("rejects bare names that are not python", () => {
+    expect(() => resolvePythonBin("bash")).toThrow(/bare name/i);
+    expect(() => resolvePythonBin("node")).toThrow(/bare name/i);
+  });
+
+  test("rejects relative paths", () => {
+    expect(() => resolvePythonBin("./python3")).toThrow(/absolute path/i);
+  });
+
+  test("rejects absolute paths outside the allowlist", () => {
+    expect(() => resolvePythonBin("/tmp/python3")).toThrow(/allowlist/i);
+    expect(() => resolvePythonBin("/bin/bash")).toThrow(/basename/i);
+    expect(() =>
+      resolvePythonBin("/opt/homebrew/Cellar/pythonfoo/bin/python3")
+    ).toThrow(/allowlist/i);
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "accepts Homebrew Cellar python and python@ paths by prefix",
+    () => {
+      expect(
+        resolvePythonBin("/opt/homebrew/Cellar/python@3.12/3.12.0/bin/python3")
+      ).toBe("/opt/homebrew/Cellar/python@3.12/3.12.0/bin/python3");
+      expect(
+        resolvePythonBin("/opt/homebrew/Cellar/python/3.12.0/bin/python3")
+      ).toBe("/opt/homebrew/Cellar/python/3.12.0/bin/python3");
+    }
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "accepts /usr/bin/python3 when present",
+    () => {
+      expect(resolvePythonBin("/usr/bin/python3")).toBe("/usr/bin/python3");
+    }
+  );
+});
+
+describe.skipIf(process.platform !== "win32")(
+  "resolvePythonBin on Windows",
+  () => {
+    const originalLocalAppData = process.env.LOCALAPPDATA;
+    const originalProgramFiles = process.env.ProgramFiles;
+    let tempDir = "";
+
+    afterEach(async () => {
+      process.env.LOCALAPPDATA = originalLocalAppData;
+      process.env.ProgramFiles = originalProgramFiles;
+
+      if (originalPythonBin === undefined) {
+        delete process.env.MINGZHAN_PYTHON_BIN;
+      } else {
+        process.env.MINGZHAN_PYTHON_BIN = originalPythonBin;
+      }
+
+      if (tempDir) {
+        await rm(tempDir, { force: true, recursive: true });
+        tempDir = "";
+      }
+    });
+
+    // Canonical, because a runner's tmpdir can be an 8.3 short path that the
+    // resolver expands before comparing.
+    async function useFakeInstallRoots(): Promise<void> {
+      tempDir = realpathSync.native(
+        await mkdtemp(path.join(os.tmpdir(), "mingzhan-python-bin-"))
+      );
+      process.env.LOCALAPPDATA = path.join(tempDir, "Local");
+      process.env.ProgramFiles = path.join(tempDir, "Program Files");
+    }
+
+    async function fakeInterpreter(...segments: string[]): Promise<string> {
+      const file = path.join(tempDir, ...segments);
+      await mkdir(path.dirname(file), { recursive: true });
+      await writeFile(file, "", "utf8");
+
+      return file;
+    }
+
+    test("defaults to python, because python3 is the Store stub", () => {
+      delete process.env.MINGZHAN_PYTHON_BIN;
+      expect(resolvePythonBin()).toBe("python");
+    });
+
+    test("accepts an .exe suffix on bare names and nothing else", () => {
+      expect(resolvePythonBin("python.exe")).toBe("python.exe");
+      expect(resolvePythonBin("python3.13.exe")).toBe("python3.13.exe");
+      expect(() => resolvePythonBin("bash.exe")).toThrow(/bare name/i);
+      expect(() => resolvePythonBin("python.exe.bat")).toThrow(/bare name/i);
+    });
+
+    test("accepts python.org install roots read from the environment", async () => {
+      await useFakeInstallRoots();
+
+      const perUser = await fakeInterpreter(
+        "Local",
+        "Programs",
+        "Python",
+        "Python313",
+        "python.exe"
+      );
+
+      const allUsers = await fakeInterpreter(
+        "Program Files",
+        "Python313-arm64",
+        "python.exe"
+      );
+
+      expect(resolvePythonBin(perUser)).toBe(perUser);
+      expect(resolvePythonBin(allUsers)).toBe(allUsers);
+      // NTFS is case-insensitive, so the comparison must be too.
+      expect(resolvePythonBin(perUser.toUpperCase())).toBe(
+        perUser.toUpperCase()
+      );
+    });
+
+    test("rejects interpreters outside the install roots", async () => {
+      await useFakeInstallRoots();
+
+      const sibling = await fakeInterpreter(
+        "Local",
+        "Programs",
+        "Pythonic",
+        "python.exe"
+      );
+
+      const unversioned = await fakeInterpreter(
+        "Program Files",
+        "PythonTools",
+        "python.exe"
+      );
+
+      const elsewhere = await fakeInterpreter("bin", "python.exe");
+
+      expect(() => resolvePythonBin(sibling)).toThrow(/allowlist/i);
+      expect(() => resolvePythonBin(unversioned)).toThrow(/allowlist/i);
+      expect(() => resolvePythonBin(elsewhere)).toThrow(/allowlist/i);
+      // A drive-less POSIX path would spawn C:\usr\bin\python.exe here.
+      expect(() => resolvePythonBin("/usr/bin/python3")).toThrow(/allowlist/i);
+    });
+  }
+);
+
+describe("python tool loader", () => {
+  let configDir = "";
+
+  afterEach(async () => {
+    if (originalConfigDir === undefined) {
+      delete process.env.MINGZHAN_CONFIG_DIR;
+    } else {
+      process.env.MINGZHAN_CONFIG_DIR = originalConfigDir;
+    }
+
+    if (originalPythonBin === undefined) {
+      delete process.env.MINGZHAN_PYTHON_BIN;
+    } else {
+      process.env.MINGZHAN_PYTHON_BIN = originalPythonBin;
+    }
+
+    if (configDir) {
+      await rm(configDir, { force: true, recursive: true });
+      configDir = "";
+    }
+  });
+
+  test("loads a module and runs run(input) with JSON over stdin", async () => {
+    const { configDir: dir, toolsDir } = await setupToolsDir();
+    configDir = dir;
+
+    await writeFile(
+      path.join(toolsDir, "echo.py"),
+      `import json, os, sys
+
+def run(input, context):
+    return {"echoed": input.get("message"), "root": os.environ.get("MINGZHAN_WORKSPACE_ROOT", "")}
+
+if __name__ == "__main__":
+    payload = json.loads(sys.stdin.read() or "{}")
+    sys.stdout.write(json.dumps(run(payload, {})))
+`,
+      "utf8"
+    );
+
+    const tool = await loadPythonTool(makeRecord());
+
+    expect(tool).not.toBeNull();
+    expect(tool?.name).toBe("echo");
+    expect(tool?.parallelSafe).not.toBe(true);
+
+    // SAFETY: The test fixture matches the contract used by this test.
+    const result = (await tool!.run(
+      { message: "hello" },
+      { orgId: "org_a", workspaceRoot: "/tmp/mingzhan-ws" }
+    )) as { echoed: string; root: string };
+
+    expect(result.echoed).toBe("hello");
+    // The loader must forward context.workspaceRoot to the child process as
+    // MINGZHAN_WORKSPACE_ROOT.
+    expect(result.root).toBe("/tmp/mingzhan-ws");
+  });
+
+  test("rejects a disallowed MINGZHAN_PYTHON_BIN before spawn", async () => {
+    const { configDir: dir, toolsDir } = await setupToolsDir();
+    configDir = dir;
+
+    await writeFile(
+      path.join(toolsDir, "echo.py"),
+      `import json, sys
+def run(input, context):
+    return input
+if __name__ == "__main__":
+    sys.stdout.write(json.dumps(run(json.loads(sys.stdin.read() or "{}"), {})))
+`,
+      "utf8"
+    );
+
+    process.env.MINGZHAN_PYTHON_BIN = "/tmp/not-an-allowlisted-python";
+    const tool = await loadPythonTool(makeRecord());
+    await expect(tool!.run({}, { orgId: "org_a" })).rejects.toThrow(
+      /allowlist/i
+    );
+  });
+
+  test("returns an error tool when the module file is missing", async () => {
+    const { configDir: dir } = await setupToolsDir();
+    configDir = dir;
+
+    const tool = await loadPythonTool(makeRecord());
+
+    // SAFETY: The test fixture matches the contract used by this test.
+    const result = (await tool!.run({}, { orgId: "org_a" })) as {
+      error: string;
+    };
+
+    expect(result.error).toContain("echo.py");
+  });
+
+  test("returns an error tool when the module lacks a run function", async () => {
+    const { configDir: dir, toolsDir } = await setupToolsDir();
+    configDir = dir;
+
+    await writeFile(
+      path.join(toolsDir, "norun.py"),
+      `# no run() defined
+print("hi")
+`,
+      "utf8"
+    );
+
+    const tool = await loadPythonTool(
+      makeRecord({ handlerConfig: { modulePath: "norun.py" }, name: "norun" })
+    );
+
+    // SAFETY: The test fixture matches the contract used by this test.
+    const result = (await tool!.run({}, { orgId: "org_a" })) as {
+      error: string;
+    };
+
+    expect(result.error).toMatch(/run\s*\(/i);
+  });
+
+  test("returns an error tool when the module lacks a stdin/stdout harness", async () => {
+    const { configDir: dir, toolsDir } = await setupToolsDir();
+    configDir = dir;
+
+    await writeFile(
+      path.join(toolsDir, "noharness.py"),
+      `def run(input, context):
+    return input
+`,
+      "utf8"
+    );
+
+    const tool = await loadPythonTool(
+      makeRecord({
+        handlerConfig: { modulePath: "noharness.py" },
+        name: "noharness",
+      })
+    );
+
+    // SAFETY: The test fixture matches the contract used by this test.
+    const result = (await tool!.run({}, { orgId: "org_a" })) as {
+      error: string;
+    };
+
+    expect(result.error).toMatch(/__main__/i);
+  });
+
+  test("returns an error tool when the module exits non-zero", async () => {
+    const { configDir: dir, toolsDir } = await setupToolsDir();
+    configDir = dir;
+
+    await writeFile(
+      path.join(toolsDir, "boom.py"),
+      `import json, sys
+def run(input, context):
+    sys.stderr.write("kaboom\\n")
+    sys.exit(7)
+
+if __name__ == "__main__":
+    payload = json.loads(sys.stdin.read() or "{}")
+    sys.stdout.write(json.dumps(run(payload, {})))
+`,
+      "utf8"
+    );
+
+    const tool = await loadPythonTool(
+      makeRecord({ handlerConfig: { modulePath: "boom.py" }, name: "boom" })
+    );
+
+    // A failed spawn must reject so the retry policy can retry transient
+    // failures; executeToolCall turns the throw into `{ error }` for callers.
+    const err = await tool!
+      .run({}, { orgId: "org_a" })
+      .catch((error: Error) => error);
+
+    expect(err).toBeInstanceOf(Error);
+    // SAFETY: The test fixture matches the contract used by this test.
+    expect((err as Error).message).toMatch(/exit code/i);
+    // SAFETY: The test fixture matches the contract used by this test.
+    expect((err as Error).message).toContain("kaboom");
+  });
+
+  test("returns an error tool when stdout is not valid JSON", async () => {
+    const { configDir: dir, toolsDir } = await setupToolsDir();
+    configDir = dir;
+
+    await writeFile(
+      path.join(toolsDir, "badjson.py"),
+      `import json, sys
+def run(input, context):
+    return None
+
+if __name__ == "__main__":
+    payload = json.loads(sys.stdin.read() or "{}")
+    run(payload, {})
+    sys.stdout.write("not json")
+`,
+      "utf8"
+    );
+
+    const tool = await loadPythonTool(
+      makeRecord({
+        handlerConfig: { modulePath: "badjson.py" },
+        name: "badjson",
+      })
+    );
+
+    await expect(tool!.run({}, { orgId: "org_a" })).rejects.toThrow(
+      /non-json/i
+    );
+  });
+
+  test("returns an error tool when the module prints nothing to stdout", async () => {
+    const { configDir: dir, toolsDir } = await setupToolsDir();
+    configDir = dir;
+
+    await writeFile(
+      path.join(toolsDir, "silent.py"),
+      `import json, sys
+def run(input, context):
+    return None
+
+if __name__ == "__main__":
+    payload = json.loads(sys.stdin.read() or "{}")
+    result = run(payload, {})
+    if result is not None:
+        sys.stdout.write(json.dumps(result))
+`,
+      "utf8"
+    );
+
+    const tool = await loadPythonTool(
+      makeRecord({
+        handlerConfig: { modulePath: "silent.py" },
+        name: "silent",
+      })
+    );
+
+    await expect(tool!.run({}, { orgId: "org_a" })).rejects.toThrow(
+      /no output/i
+    );
+  });
+
+  test("runs with cwd scoped to the tools directory, not the server checkout", async () => {
+    const { configDir: dir, toolsDir } = await setupToolsDir();
+    configDir = dir;
+
+    await writeFile(
+      path.join(toolsDir, "cwd_probe.py"),
+      `import json, os, sys
+
+def run(input, context):
+    return {"cwd": os.getcwd()}
+
+if __name__ == "__main__":
+    payload = json.loads(sys.stdin.read() or "{}")
+    sys.stdout.write(json.dumps(run(payload, {})))
+`,
+      "utf8"
+    );
+
+    const tool = await loadPythonTool(
+      makeRecord({
+        handlerConfig: { modulePath: "cwd_probe.py" },
+        name: "cwd_probe",
+      })
+    );
+
+    // SAFETY: The test fixture matches the contract used by this test.
+    const result = (await tool!.run({}, { orgId: "org_a" })) as { cwd: string };
+    expect(realpathSync(result.cwd)).toBe(realpathSync(toolsDir));
+  });
+
+  test("cannot read a secret-shaped env var from the parent process", async () => {
+    const { configDir: dir, toolsDir } = await setupToolsDir();
+    configDir = dir;
+
+    await writeFile(
+      path.join(toolsDir, "env_probe.py"),
+      `import json, os, sys
+
+def run(input, context):
+    return {"secret": os.environ.get("MINGZHAN_TEST_CANARY_SECRET")}
+
+if __name__ == "__main__":
+    payload = json.loads(sys.stdin.read() or "{}")
+    sys.stdout.write(json.dumps(run(payload, {})))
+`,
+      "utf8"
+    );
+
+    const tool = await loadPythonTool(
+      makeRecord({
+        handlerConfig: { modulePath: "env_probe.py" },
+        name: "env_probe",
+      })
+    );
+
+    process.env.MINGZHAN_TEST_CANARY_SECRET = "canary-not-a-real-secret";
+
+    try {
+      // SAFETY: The test fixture matches the contract used by this test.
+      const result = (await tool!.run({}, { orgId: "org_a" })) as {
+        secret: string | null;
+      };
+
+      expect(result.secret).toBeNull();
+    } finally {
+      delete process.env.MINGZHAN_TEST_CANARY_SECRET;
+    }
+  });
+
+  test("rejects on timeout even when the module exits 0", async () => {
+    const { configDir: dir, toolsDir } = await setupToolsDir();
+    configDir = dir;
+
+    await writeFile(
+      path.join(toolsDir, "stubborn.py"),
+      `import json, signal, sys, time
+
+got_sigterm = False
+
+def run(input, context):
+    return {"ok": True}
+
+def _on_sigterm(signum, frame):
+    global got_sigterm
+    got_sigterm = True
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    payload = json.loads(sys.stdin.read() or "{}")
+    sys.stdout.write(json.dumps(run(payload, {})))
+    sys.stdout.flush()
+    while not got_sigterm:
+        time.sleep(0.02)
+    sys.exit(0)
+`,
+      "utf8"
+    );
+
+    const tool = await loadPythonTool(
+      makeRecord({
+        handlerConfig: { modulePath: "stubborn.py" },
+        name: "stubborn",
+      })
+    );
+
+    process.env.MINGZHAN_CUSTOM_TOOL_TIMEOUT_MS = "200";
+
+    try {
+      await expect(tool!.run({}, { orgId: "org_a" })).rejects.toThrow(
+        /timed out/i
+      );
+    } finally {
+      delete process.env.MINGZHAN_CUSTOM_TOOL_TIMEOUT_MS;
+    }
+  });
+
+  test("rejects module paths outside the tools directory", async () => {
+    const { configDir: dir } = await setupToolsDir();
+    configDir = dir;
+
+    expect(() => resolveCustomToolModulePath("../escape.py")).toThrow(
+      /must stay inside/i
+    );
+  });
+});
+
+describe("tool resolver", () => {
+  let configDir = "";
+
+  afterEach(async () => {
+    if (originalConfigDir === undefined) {
+      delete process.env.MINGZHAN_CONFIG_DIR;
+    } else {
+      process.env.MINGZHAN_CONFIG_DIR = originalConfigDir;
+    }
+
+    if (configDir) {
+      await rm(configDir, { force: true, recursive: true });
+      configDir = "";
+    }
+  });
+
+  test("resolves python tools from storage", async () => {
+    const { configDir: dir, toolsDir } = await setupToolsDir();
+    configDir = dir;
+
+    await writeFile(
+      path.join(toolsDir, "adder.py"),
+      `import json, sys
+
+def run(input, context):
+    return {"sum": int(input["a"]) + int(input["b"])}
+
+if __name__ == "__main__":
+    sys.stdout.write(json.dumps(run(json.loads(sys.stdin.read() or "{}"), {})))
+`,
+      "utf8"
+    );
+
+    const { resolveToolsFromStorage } = await import("./tool-resolver");
+
+    const tools = await resolveToolsFromStorage([
+      {
+        createdAt: new Date().toISOString(),
+        description: "Add two numbers",
+        handlerConfig: { modulePath: "adder.py" },
+        handlerType: "python",
+        id: "tool_adder_py",
+        name: "adder_py",
+        orgId: "org_a",
+        updatedAt: new Date().toISOString(),
+      },
+    ]);
+
+    expect(tools).toHaveLength(1);
+    expect(await tools[0]!.run({ a: 2, b: 3 }, { orgId: "org_a" })).toEqual({
+      sum: 5,
+    });
+  });
+});
+
+describe("agent-service playground dispatch", () => {
+  let configDir = "";
+
+  afterEach(async () => {
+    if (originalConfigDir === undefined) {
+      delete process.env.MINGZHAN_CONFIG_DIR;
+    } else {
+      process.env.MINGZHAN_CONFIG_DIR = originalConfigDir;
+    }
+
+    if (configDir) {
+      await rm(configDir, { force: true, recursive: true });
+      configDir = "";
+    }
+  });
+
+  test("runToolPlayground executes a python tool instead of its error stub", async () => {
+    const { configDir: dir, toolsDir } = await setupToolsDir();
+    configDir = dir;
+    await mkdir(path.join(configDir, "orgs", "org_playground", "tools"), {
+      recursive: true,
+    });
+
+    await writeFile(
+      path.join(configDir, "orgs", "org_playground", "tools", "shout.py"),
+      `import json, sys
+
+def run(input, context):
+    return {"shouted": str(input.get("message", "")).upper()}
+
+if __name__ == "__main__":
+    sys.stdout.write(json.dumps(run(json.loads(sys.stdin.read() or "{}"), {})))
+`,
+      "utf8"
+    );
+
+    const { createInMemoryDatabaseAdapter } = await import("@mingzhan/db");
+    const databaseAdapter = createInMemoryDatabaseAdapter();
+    const now = new Date().toISOString();
+
+    await databaseAdapter.upsertOrganization({
+      createdAt: now,
+      id: "org_playground",
+      name: "Playground Org",
+      slug: "playground-org",
+      updatedAt: now,
+    });
+    await databaseAdapter.upsertProfile({
+      createdAt: now,
+      id: "profile_playground",
+      isSuper: false,
+      model: null,
+      name: "playground",
+      orgId: "org_playground",
+      systemPrompt: "",
+      updatedAt: now,
+    });
+    await databaseAdapter.upsertTool({
+      createdAt: now,
+      description: "Shout a message",
+      handlerConfig: { modulePath: "shout.py" },
+      handlerType: "python",
+      id: "tool_shout",
+      name: "shout",
+      orgId: "org_playground",
+      updatedAt: now,
+    });
+    await databaseAdapter.assignToolToProfile(
+      "profile_playground",
+      "tool_shout"
+    );
+
+    const { AgentService } = await import("./agent-service");
+    const agentService = new AgentService(null, null, databaseAdapter);
+
+    const response = await agentService.runToolPlayground(
+      "tool_shout",
+      { message: "hello" },
+      { orgId: "org_playground", userId: "user_1" }
+    );
+
+    expect(response.ok).toBe(true);
+    expect(response.result).toEqual({ shouted: "HELLO" });
+  });
+});

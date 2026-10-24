@@ -1,0 +1,66 @@
+import type { AgentQuestionAnswer } from "@mingzhan/core/contract";
+import type { ChatListItem } from "@/lib/chat-history";
+
+export type IndexedMessage = { message: ChatListItem; index: number };
+
+export type MessageTurn =
+  | { kind: "user"; message: ChatListItem; index: number }
+  | {
+      kind: "assistant";
+      messages: IndexedMessage[];
+      questionnaireAnswers?: AgentQuestionAnswer[];
+    };
+
+export function groupMessagesIntoTurns(
+  messages: ChatListItem[]
+): MessageTurn[] {
+  const turns: MessageTurn[] = [];
+  let currentAssistantTurn: IndexedMessage[] | null = null;
+
+  for (const [index, message] of messages.entries()) {
+    if (message.role === "user") {
+      if (
+        message.questionnaireAnswers?.length &&
+        currentAssistantTurn?.some(
+          ({ message: item }) => item.tool === "ask_user_question"
+        )
+      ) {
+        turns.push({
+          kind: "assistant",
+          messages: currentAssistantTurn,
+          questionnaireAnswers: message.questionnaireAnswers,
+        });
+        currentAssistantTurn = null;
+        continue;
+      }
+
+      if (currentAssistantTurn) {
+        turns.push({ kind: "assistant", messages: currentAssistantTurn });
+        currentAssistantTurn = null;
+      }
+
+      turns.push({ index, kind: "user", message });
+      continue;
+    }
+
+    currentAssistantTurn ??= [];
+    currentAssistantTurn.push({ index, message });
+  }
+
+  if (currentAssistantTurn) {
+    turns.push({ kind: "assistant", messages: currentAssistantTurn });
+  }
+
+  return turns;
+}
+
+export function turnKey(turn: MessageTurn): string {
+  if (turn.kind === "user") {
+    return turn.message.id;
+  }
+
+  // Stable for the life of the turn so tool/assistant appends do not remount Virtuoso rows.
+  const first = turn.messages[0]?.message.id;
+
+  return first ? `assistant:${first}` : "assistant:empty";
+}

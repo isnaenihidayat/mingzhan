@@ -1,0 +1,1789 @@
+import type {
+  MíngZhànClient,
+  RemoteChatSession,
+  SendMessageArg,
+  StreamHandlers,
+} from "@mingzhan/client";
+import {
+  type AgentChannel,
+  formatClientError,
+  type HealthResponse,
+  type InitSoulResponse,
+  type InitUserContextResponse,
+  type ListUserOrgsResponse,
+  type ModelsResponse,
+  type ProfileSummary,
+  type SendMessageInput,
+  type SoulStatusResponse,
+  type UserContextStatusResponse,
+} from "@mingzhan/core";
+import { isAbortError } from "@mingzhan/core/channel-active-stream";
+import { loadSavedCliOrgId, saveCliProfileId } from "./cli-config";
+import {
+  effectiveModelState,
+  formatSlashCommands,
+  resolveModelSwitchTarget,
+  resolveSlashCommand,
+  resolveSuggestions,
+} from "./commands";
+import { formatCliDisplayPath } from "./display-path";
+import { mergeSendInput, parseImageLine } from "./image-input";
+import { createSerializedQueue, type PendingMessage } from "./message-queue";
+import { switchChatOrg } from "./org";
+import { PersistentPrompt } from "./persistent-prompt";
+import {
+  type CliProfileOptions,
+  resolveProfileInput,
+  resolveStartupProfile,
+} from "./profile";
+import {
+  PromptCancelledError,
+  type PromptLineResult,
+  promptLine,
+} from "./prompt";
+import { styledLine } from "./styled-text";
+import { TerminalInput } from "./terminal-input";
+import { getTerminalColumns } from "./terminal-layout";
+import { TerminalRenderer } from "./terminal-renderer";
+import { printLine } from "./terminal-safe";
+import { stripAnsi, truncateText } from "./text-measure";
+import { ThinkingIndicator } from "./thinking-indicator";
+
+async function sendStreamCancellable(
+  session: RemoteChatSession,
+  input: SendMessageArg,
+  handlers: StreamHandlers,
+  options?: { signal?: AbortSignal }
+): Promise<{ aborted: boolean }> {
+  try {
+    await session.sendStream(input, handlers, options);
+
+    return { aborted: false };
+  } catch (error) {
+    if (isAbortError(error)) {
+      return { aborted: true };
+    }
+
+    throw error;
+  }
+}
+
+const HELP_TEXT = `${formatSlashCommands()}\n\n@/path/to/image.png [message]   attach an image from file\n/paste                            attach image from clipboard (recommended)\nCtrl+V / Cmd+V (empty paste)      attach image when terminal supports it\nPageUp/PageDown                   scroll conversation history\nHome/End                          jump to oldest/newest visible history`;
+
+/** Debounce bare ESC so alt-prefix / slow paste chunks do not abort. */
+const ESC_ABORT_DEBOUNCE_MS = 50;
+
+const MAX_PENDING_MESSAGES = 20;
+
+// ponytail: fixed preview cap; add interactive expansion if full tool history is needed.
+const MAX_TOOL_PREVIEW_LENGTH = 160;
+
+type CliJsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | CliJsonValue[]
+  | { [key: string]: CliJsonValue };
+
+type ToolPreviewValue = CliJsonValue | undefined;
+
+type ToolInput = Record<string, CliJsonValue>;
+
+export function previewToolValue(value: ToolPreviewValue): string {
+  let text: string;
+
+  if (Object.prototype.toString.call(value) === "[object String]") {
+    text = String(value).replace(/\s+/g, " ");
+  } else {
+    try {
+      text = JSON.stringify(value) ?? String(value);
+    } catch {
+      text = String(value);
+    }
+  }
+
+  return text.length > MAX_TOOL_PREVIEW_LENGTH
+    ? `${text.slice(0, MAX_TOOL_PREVIEW_LENGTH - 1)}…`
+    : text;
+}
+
+interface CliToolResult {
+  error?: unknown;
+  isError?: boolean;
+}
+
+function isCliToolResult(value: unknown): value is CliToolResult {
+  return value instanceof Object && !Array.isArray(value);
+}
+
+export function toolResultFailed(result: CliToolResult): boolean {
+  return result.isError === true || result.error != null;
+}
+
+export function formatToolCall(
+  tool: string,
+  input: ToolInput,
+  status: "running" | "done" | "error",
+  elapsedMs?: number,
+  width = getTerminalColumns()
+): string {
+  const detail = input.path ?? input.file_path ?? input.command ?? input.query;
+
+  const summary =
+    Object.prototype.toString.call(detail) === "[object String]"
+      ? formatCliDisplayPath(String(detail))
+      : "";
+
+  const marker = status === "running" ? "⠋" : status === "error" ? "✗" : "✓";
+
+  const duration =
+    elapsedMs === undefined ? "" : `  ${(elapsedMs / 1000).toFixed(1)}s`;
+
+  const text = stripAnsi(`${marker} ${tool}${summary ? `  ${summary}` : ""}`)
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return truncateText(
+    `${truncateText(text, Math.max(1, width - duration.length - 2))}${duration}`,
+    Math.max(1, width - 2)
+  );
+}
+
+interface RunChatOptions {
+  channel: AgentChannel;
+  client: MíngZhànClient;
+  codingWorkspaceRoot?: string;
+  offline?: boolean;
+  profileId?: CliProfileOptions["profileId"];
+  signal?: AbortSignal;
+  /** When true, /soul prints absolute filesystem paths. */
+  verbose?: boolean;
+}
+
+export function needsTrailingStreamNewline(lastChunk: string | null): boolean {
+  return lastChunk === null || !lastChunk.endsWith("\n");
+}
+
+/** Promise-based chat exit — no setInterval polling of an `exiting` flag. */
+export function createChatExitController(signal?: AbortSignal) {
+  let exiting = false;
+  let resolveWait: (() => void) | null = null;
+
+  const requestExit = (): void => {
+    exiting = true;
+    resolveWait?.();
+    resolveWait = null;
+  };
+
+  return {
+    get exiting() {
+      return exiting;
+    },
+    requestExit,
+    async wait(): Promise<void> {
+      signal?.addEventListener("abort", requestExit);
+
+      try {
+        if (signal?.aborted) {
+          requestExit();
+        }
+
+        await new Promise<void>((resolve) => {
+          resolveWait = resolve;
+
+          if (exiting) {
+            resolveWait = null;
+            resolve();
+          }
+        });
+      } finally {
+        signal?.removeEventListener("abort", requestExit);
+      }
+    },
+  };
+}
+
+export function formatBusyDropLine(dropCount: number): string {
+  if (dropCount >= 3) {
+    return `[busy] ignored input (${dropCount} while processing)`;
+  }
+
+  return "[busy]";
+}
+
+export async function runChat(options: RunChatOptions): Promise<void> {
+  const startup = await resolveStartupProfile(options.client, {
+    profileId: options.profileId,
+  });
+
+  let currentProfileId = startup.profileId;
+  let currentProfile = startup.profile;
+
+  let session = await options.client.createSession(options.channel, {
+    codingWorkspaceRoot: options.codingWorkspaceRoot,
+    profileId: currentProfileId,
+  });
+
+  const terminalInput = new TerminalInput();
+  const renderer = new TerminalRenderer(terminalInput);
+  const useStickyInput = renderer.apply();
+
+  printLine(` Profile: ${currentProfile.name} (${currentProfile.id})`);
+  console.log("");
+
+  if (options.offline) {
+    console.log(
+      " Server has no provider configured. Chat runs in offline mode."
+    );
+    console.log("");
+  } else {
+    try {
+      await printCurrentModel(
+        options.client,
+        (line) => printLine(` ${line}`),
+        currentProfile
+      );
+    } catch (error) {
+      printError(error);
+      console.log(
+        "Restart the server to pick up the latest API:\n  bun run dev:server"
+      );
+    }
+
+    console.log("");
+  }
+
+  if (useStickyInput) {
+    terminalInput.start();
+    await renderer.anchorFromCursor();
+
+    await runStickyChat({
+      currentProfile,
+      currentProfileId,
+      onProfileChange: (profileId, profile) => {
+        currentProfileId = profileId;
+        currentProfile = profile;
+      },
+      onSessionChange: (next) => {
+        session = next;
+      },
+      options,
+      renderer,
+      session,
+      terminalInput,
+    });
+
+    return;
+  }
+
+  await runBlockingChat({
+    currentProfileId,
+    onSessionChange: (next) => {
+      session = next;
+    },
+    options,
+    session,
+  });
+}
+
+interface ChatContext {
+  currentProfileId: string;
+  onSessionChange: (session: RemoteChatSession) => void;
+  options: RunChatOptions;
+  session: RemoteChatSession;
+}
+
+async function runStickyChat(
+  context: ChatContext & {
+    renderer: TerminalRenderer;
+    terminalInput: TerminalInput;
+    currentProfile: ProfileSummary;
+    onProfileChange: (profileId: string, profile: ProfileSummary) => void;
+  }
+): Promise<void> {
+  const { options, renderer, terminalInput } = context;
+  let session = context.session;
+  let currentProfileId = context.currentProfileId;
+  let currentProfile = context.currentProfile;
+
+  let isStreaming = false;
+  let activeCommands = 0;
+  let switchingOrg = false;
+  let orgsCache: ListUserOrgsResponse["orgs"] = [];
+  let currentOrgId = await loadSavedCliOrgId();
+
+  try {
+    orgsCache = (await options.client.listUserOrgs()).orgs;
+  } catch {
+    // Keep chat available if the organization list cannot be loaded.
+  }
+
+  let abortController: AbortController | null = null;
+  let lastUserMessage: string | null = null;
+  let modelsCache: ModelsResponse | null = null;
+  let profilesCache: ProfileSummary[] = [];
+  const queue: PendingMessage[] = [];
+  const sendQueue = createSerializedQueue();
+  const thinkingIndicator = new ThinkingIndicator();
+  let prompt: PersistentPrompt | null = null;
+  const chatExit = createChatExitController(options.signal);
+  thinkingIndicator.setRenderer(renderer);
+
+  async function refreshModelsCache() {
+    try {
+      modelsCache = await options.client.getModels();
+    } catch {
+      modelsCache = null;
+    }
+  }
+
+  async function refreshProfilesCache() {
+    try {
+      const response = await options.client.listProfiles();
+      profilesCache = response.profiles;
+    } catch {
+      profilesCache = [];
+    }
+  }
+
+  await refreshProfilesCache();
+
+  if (!options.offline) {
+    await refreshModelsCache();
+  }
+
+  function writeOutput(text: string): void {
+    renderer.appendOutputLine(text);
+  }
+
+  function writeError(cause: unknown): void {
+    for (const line of formatErrorLines(cause)) {
+      writeOutput(line);
+    }
+  }
+
+  function syncPendingMessages(): void {
+    renderer.setPendingMessages([...queue]);
+  }
+
+  function createStreamHandlers(): StreamHandlers & { finishTools(): void } {
+    const activeTools = new Map<
+      string,
+      { tool: string; input: ToolInput; startedAt: number }
+    >();
+
+    let completed = 0;
+    let failedCount = 0;
+    let startedAt: number | undefined;
+    let endedAt = 0;
+
+    const toolSummary = () =>
+      `${completed} ${completed === 1 ? "tool" : "tools"} completed${failedCount ? ` · ${failedCount} failed` : ""}`;
+
+    const showRunningTool = () => {
+      const active = activeTools.values().next().value;
+      renderer.setStatusLine(
+        active
+          ? styledLine(
+              formatToolCall(
+                active.tool,
+                active.input,
+                "running",
+                undefined,
+                Math.max(
+                  1,
+                  getTerminalColumns() - ` · ${completed} done`.length
+                )
+              ) + ` · ${completed} done`,
+              {
+                dim: true,
+              }
+            )
+          : styledLine(toolSummary(), { dim: true })
+      );
+    };
+
+    const finishTools = () => {
+      if (startedAt === undefined) {
+        return;
+      }
+
+      const interrupted = activeTools.size;
+
+      const elapsed =
+        ((interrupted ? performance.now() : endedAt) - startedAt) / 1000;
+
+      renderer.setStatusLine(null);
+      renderer.appendToolLine(
+        styledLine(
+          `${failedCount || interrupted ? "✗" : "✓"} ${toolSummary()}${interrupted ? ` · ${interrupted} interrupted` : ""} · ${elapsed.toFixed(1)}s`,
+          { dim: true }
+        )
+      );
+      completed = 0;
+      failedCount = 0;
+      startedAt = undefined;
+    };
+
+    return {
+      finishTools,
+      onChunk: (delta) => {
+        thinkingIndicator.stop();
+
+        if (activeTools.size === 0) {
+          finishTools();
+        }
+
+        renderer.appendStreamChunk(delta);
+      },
+      onThinking: () => {
+        if (activeTools.size > 0) {
+          return;
+        }
+
+        finishTools();
+        thinkingIndicator.start();
+      },
+      onToolEnd: (event) => {
+        const active = activeTools.get(event.toolCallId);
+        activeTools.delete(event.toolCallId);
+
+        const failed =
+          isCliToolResult(event.result) && toolResultFailed(event.result);
+
+        completed += 1;
+        failedCount += Number(failed);
+        endedAt = performance.now();
+
+        if (activeTools.size === 0) {
+          thinkingIndicator.start();
+        } else {
+          showRunningTool();
+        }
+
+        if (failed) {
+          renderer.appendToolLine(
+            styledLine(
+              formatToolCall(
+                event.tool,
+                active?.input ?? {},
+                "error",
+                active ? performance.now() - active.startedAt : undefined
+              ),
+              {
+                color: "red",
+                dim: true,
+              }
+            )
+          );
+          const serializedResult = JSON.stringify(event.result);
+
+          const previewValue: ToolPreviewValue =
+            serializedResult === undefined
+              ? String(event.result)
+              : JSON.parse(serializedResult);
+
+          renderer.appendToolLine(
+            styledLine(`  ${previewToolValue(previewValue)}`, { color: "red" })
+          );
+        }
+      },
+      onToolStart: (event) => {
+        thinkingIndicator.stop();
+        startedAt ??= performance.now();
+        const serializedInput = JSON.stringify(event.input);
+        activeTools.set(event.toolCallId, {
+          input: serializedInput ? JSON.parse(serializedInput) : {},
+          startedAt: performance.now(),
+          tool: event.tool,
+        });
+        showRunningTool();
+      },
+    };
+  }
+
+  async function sendMessageStream(
+    input: SendMessageInput
+  ): Promise<{ aborted: boolean }> {
+    if (!thinkingIndicator.isActive()) {
+      thinkingIndicator.start();
+    }
+
+    const handlers = createStreamHandlers();
+
+    try {
+      return await sendStreamCancellable(session, input, handlers, {
+        signal: abortController?.signal,
+      });
+    } catch (error) {
+      thinkingIndicator.stop();
+      throw error;
+    } finally {
+      handlers.finishTools();
+    }
+  }
+
+  async function runOneSend(message: PendingMessage): Promise<void> {
+    abortController = new AbortController();
+
+    let aborted = false;
+    let caught: unknown;
+
+    try {
+      renderer.beginStream();
+
+      if (!message.echoed) {
+        renderer.appendUserMessage(message.line, { placement: "scroll" });
+      }
+
+      try {
+        const result = await sendMessageStream(message.sendInput);
+        aborted = result.aborted;
+      } catch (error) {
+        caught = error;
+      }
+    } finally {
+      abortController = null;
+      thinkingIndicator.stop();
+      renderer.endStream();
+    }
+
+    // Post-stream output — the stream buffer is now flushed into the VirtualMessageList,
+    // so any appended output appears after the assistant's response, not before it.
+    if (caught !== undefined) {
+      writeError(caught);
+    } else if (aborted) {
+      renderer.appendOutputLine(styledLine("[stopped]", { dim: true }));
+    }
+  }
+
+  async function startSend(message: PendingMessage): Promise<void> {
+    if (chatExit.exiting) {
+      return;
+    }
+
+    if (isStreaming) {
+      writeOutput("Wait for the current response to finish.");
+
+      return;
+    }
+
+    // Reserve the whole drain before yielding, including async /paste arrivals.
+    isStreaming = true;
+    lastUserMessage = message.sendInput.message || message.line;
+    await sendQueue.enqueue(async () => {
+      try {
+        let current: PendingMessage | undefined = message;
+
+        while (current && !chatExit.exiting) {
+          try {
+            await runOneSend(current);
+          } catch (error) {
+            abortController = null;
+            writeError(error);
+          }
+
+          current = queue.shift();
+          syncPendingMessages();
+        }
+      } finally {
+        isStreaming = false;
+      }
+    });
+  }
+
+  async function handleChatMessage(
+    promptResult: PromptLineResult
+  ): Promise<void> {
+    const messageClient = options.client;
+    const line = promptResult.text.trim();
+    const hasImages = Boolean(promptResult.images?.length);
+
+    if (!(line || hasImages)) {
+      return;
+    }
+
+    let sendInput: SendMessageInput;
+
+    try {
+      const fromPath = await parseImageLine(line);
+      sendInput = mergeSendInput(line, {
+        fromPath,
+        promptImages: promptResult.images,
+      });
+    } catch (error) {
+      writeError(error);
+
+      return;
+    }
+
+    if (switchingOrg || messageClient !== options.client) {
+      writeOutput(
+        "Chat changed while preparing the message. Please send it again."
+      );
+
+      return;
+    }
+
+    if (isStreaming && queue.length >= MAX_PENDING_MESSAGES) {
+      writeOutput(
+        "Pending queue is full. Wait for a response before sending again."
+      );
+
+      return;
+    }
+
+    lastUserMessage = sendInput.message || line;
+
+    const pending: PendingMessage = {
+      images: promptResult.images,
+      line,
+      sendInput,
+    };
+
+    renderer.scrollToLatest();
+
+    if (isStreaming) {
+      renderer.appendUserMessage(line, { placement: "below_status" });
+      queue.push({ ...pending, echoed: true });
+      syncPendingMessages();
+
+      return;
+    }
+
+    await startSend(pending);
+  }
+
+  async function handleSlashCommand(
+    line: string
+  ): Promise<"handled" | "exit" | "unhandled"> {
+    if (isExitCommand(line)) {
+      return "exit";
+    }
+
+    if (line === "/clear") {
+      if (isStreaming) {
+        writeOutput("Wait for the current response to finish.");
+
+        return "handled";
+      }
+
+      await session.clear();
+      lastUserMessage = null;
+      renderer.clear();
+
+      return "handled";
+    }
+
+    if (line === "/compact") {
+      if (isStreaming) {
+        writeOutput("Wait for the current response to finish.");
+
+        return "handled";
+      }
+
+      try {
+        const result = await session.compact({ force: true });
+        writeOutput(
+          `Compacted (${result.action}). Messages: ${result.messagesAfter}`
+        );
+      } catch (error) {
+        writeError(error);
+      }
+
+      return "handled";
+    }
+
+    if (line === "/help") {
+      for (const helpLine of HELP_TEXT.split("\n")) {
+        writeOutput(helpLine);
+      }
+
+      return "handled";
+    }
+
+    if (line === "/status") {
+      try {
+        await printStatus(
+          options.client,
+          writeOutput,
+          currentProfile,
+          modelsCache
+        );
+      } catch (error) {
+        writeError(error);
+      }
+
+      return "handled";
+    }
+
+    if (line === "/paste") {
+      if (isStreaming) {
+        writeOutput("Wait for the current response to finish.");
+
+        return "handled";
+      }
+
+      try {
+        const { readClipboardImage } = await import("./clipboard-image");
+        const image = await readClipboardImage();
+
+        if (!image) {
+          writeOutput(
+            "No image on clipboard. Copy a screenshot or image first."
+          );
+
+          return "handled";
+        }
+
+        await startSend({
+          images: [image],
+          line: "",
+          sendInput: { images: [image], message: "" },
+        });
+      } catch (error) {
+        writeError(error);
+      }
+
+      return "handled";
+    }
+
+    if (line === "/thinking" || line.startsWith("/thinking ")) {
+      return handleThinkingCommand(line);
+    }
+
+    if (line === "/debug" || line.startsWith("/debug ")) {
+      return handleDebugCommand(line);
+    }
+
+    if (line === "/model" || line.startsWith("/model ")) {
+      return handleModelCommand(line);
+    }
+
+    if (line === "/profile" || line.startsWith("/profile ")) {
+      return handleProfileCommand(line);
+    }
+
+    if (line === "/org" || line.startsWith("/org ")) {
+      if (isStreaming || queue.length > 0 || activeCommands > 1) {
+        writeOutput("Wait for the current response or command to finish.");
+
+        return "handled";
+      }
+
+      switchingOrg = true;
+
+      try {
+        const next = await switchChatOrg(
+          options.client,
+          line.slice("/org".length).trim(),
+          options.channel,
+          writeOutput,
+          options.codingWorkspaceRoot
+        );
+
+        if (next) {
+          currentOrgId = next.orgId;
+          options.client = next.client;
+          options.offline = next.offline;
+          currentProfile = next.profile;
+          currentProfileId = next.profile.id;
+          session = next.session;
+          context.onProfileChange(currentProfileId, currentProfile);
+          context.onSessionChange(session);
+          lastUserMessage = null;
+          modelsCache = null;
+          profilesCache = [];
+          renderer.clear();
+          await refreshProfilesCache();
+          await refreshModelsCache();
+          writeOutput(
+            `Organization switched. Chatting with ${currentProfile.name}.`
+          );
+        }
+      } catch (error) {
+        writeError(error);
+      } finally {
+        switchingOrg = false;
+      }
+
+      return "handled";
+    }
+
+    if (line.startsWith("/create")) {
+      return handleCreateCommand(line);
+    }
+
+    // /learn is sent as a normal chat turn; the server expands it when
+    // skill_manage is available. Keep it unhandled so autocomplete still works.
+    if (line === "/learn" || line.startsWith("/learn ")) {
+      return "unhandled";
+    }
+
+    if (line === "/soul" || line.startsWith("/soul ")) {
+      return handleSoulCommand(line);
+    }
+
+    if (line === "/user" || line.startsWith("/user ")) {
+      return handleUserCommand(line);
+    }
+
+    return "unhandled";
+  }
+
+  async function handleThinkingCommand(line: string): Promise<"handled"> {
+    const arg = line.slice("/thinking".length).trim().toLowerCase();
+
+    if (!arg) {
+      try {
+        const settings = await options.client.getThinkingSettings();
+        writeOutput(
+          `Thinking: ${settings.enabled ? "on" : "off"} (${settings.effort} effort)`
+        );
+      } catch (error) {
+        writeError(error);
+      }
+
+      return "handled";
+    }
+
+    if (isStreaming) {
+      writeOutput("Wait for the current response to finish.");
+
+      return "handled";
+    }
+
+    try {
+      const current = await options.client.getThinkingSettings();
+      let enabled = current.enabled;
+      let effort = current.effort;
+
+      if (arg === "on") {
+        enabled = true;
+      } else if (arg === "off") {
+        enabled = false;
+      } else if (arg === "low" || arg === "medium" || arg === "high") {
+        enabled = true;
+        effort = arg;
+      } else {
+        writeOutput("Usage: /thinking [on|off|low|medium|high]");
+
+        return "handled";
+      }
+
+      const saved = await options.client.setThinkingSettings({
+        effort,
+        enabled,
+      });
+
+      session = await options.client.createSession(options.channel, {
+        codingWorkspaceRoot: options.codingWorkspaceRoot,
+        profileId: currentProfileId,
+      });
+      context.onSessionChange(session);
+      lastUserMessage = null;
+      writeOutput(
+        `Thinking ${saved.enabled ? "enabled" : "disabled"} (${saved.effort} effort). Chat history reset.`
+      );
+    } catch (error) {
+      writeError(error);
+    }
+
+    syncPendingMessages();
+
+    return "handled";
+  }
+
+  async function handleDebugCommand(line: string): Promise<"handled"> {
+    const arg = line.slice("/debug".length).trim().toLowerCase();
+
+    if (!arg) {
+      writeOutput(
+        `Debug overlay: ${renderer.isDebugOverlayEnabled() ? "on" : "off"}`
+      );
+
+      return "handled";
+    }
+
+    if (arg !== "on" && arg !== "off") {
+      writeOutput("Usage: /debug [on|off]");
+
+      return "handled";
+    }
+
+    renderer.setDebugOverlay(arg === "on");
+    writeOutput(`Debug overlay ${arg}.`);
+
+    return "handled";
+  }
+
+  async function handleModelCommand(line: string): Promise<"handled"> {
+    const modelArg = line.slice("/model".length).trim();
+
+    if (isStreaming) {
+      writeOutput("Wait for the current response to finish.");
+
+      return "handled";
+    }
+
+    if (!modelArg) {
+      await refreshModelsCache();
+
+      if (!modelsCache?.models.length) {
+        writeOutput("No models available.");
+
+        return "handled";
+      }
+
+      prompt?.prefill("/model ");
+
+      return "handled";
+    }
+
+    try {
+      const cached = modelsCache ?? (await options.client.getModels());
+      const target = resolveModelSwitchTarget(cached, modelArg);
+
+      if (target === "unknown") {
+        writeOutput(`Unknown model: ${modelArg}`);
+
+        return "handled";
+      }
+
+      if (target === "ambiguous") {
+        writeOutput(
+          `Ambiguous model: ${modelArg}. Choose a provider-specific model from /model.`
+        );
+
+        return "handled";
+      }
+
+      const model = `${target.providerId}::${target.modelId}`;
+      session = await options.client.createSession(options.channel, {
+        codingWorkspaceRoot: options.codingWorkspaceRoot,
+        model,
+        profileId: currentProfileId,
+      });
+      currentProfile = { ...currentProfile, model };
+      context.onSessionChange(session);
+      lastUserMessage = null;
+      writeOutput(`Model switched to ${target.modelId}. Chat history reset.`);
+    } catch (error) {
+      writeError(error);
+    }
+
+    syncPendingMessages();
+
+    return "handled";
+  }
+
+  async function handleProfileCommand(line: string): Promise<"handled"> {
+    const profileArg = line.slice("/profile".length).trim();
+
+    if (!profileArg) {
+      for (const profileLine of formatProfilesLines(
+        profilesCache,
+        currentProfileId
+      )) {
+        writeOutput(profileLine);
+      }
+
+      return "handled";
+    }
+
+    if (isStreaming) {
+      writeOutput("Wait for the current response to finish.");
+
+      return "handled";
+    }
+
+    try {
+      await refreshProfilesCache();
+      const nextProfile = resolveProfileInput(profilesCache, profileArg);
+
+      if (!nextProfile) {
+        writeOutput(`Unknown profile: ${profileArg}`);
+
+        return "handled";
+      }
+
+      if (nextProfile.id === currentProfileId) {
+        writeOutput(`Already using ${nextProfile.name}.`);
+
+        return "handled";
+      }
+
+      currentProfileId = nextProfile.id;
+      currentProfile = nextProfile;
+      context.onProfileChange(currentProfileId, currentProfile);
+      await saveCliProfileId(currentProfileId);
+      session = await options.client.createSession(options.channel, {
+        codingWorkspaceRoot: options.codingWorkspaceRoot,
+        profileId: currentProfileId,
+      });
+      context.onSessionChange(session);
+      lastUserMessage = null;
+      writeOutput(
+        `Profile switched to ${currentProfile.name}. Chat history reset.`
+      );
+    } catch (error) {
+      writeError(error);
+    }
+
+    syncPendingMessages();
+
+    return "handled";
+  }
+
+  async function handleCreateCommand(line: string): Promise<"handled"> {
+    if (isStreaming) {
+      writeOutput("Wait for the current response to finish.");
+
+      return "handled";
+    }
+
+    const promptText = line.slice("/create".length).trim() || lastUserMessage;
+
+    if (!promptText) {
+      writeOutput("Usage: /create [prompt]");
+
+      return "handled";
+    }
+
+    try {
+      const automation = await session.createAutomation(promptText);
+      writeOutput(JSON.stringify(automation, null, 2));
+    } catch (error) {
+      writeError(error);
+    }
+
+    return "handled";
+  }
+
+  async function handleSoulCommand(line: string): Promise<"handled"> {
+    if (isStreaming) {
+      writeOutput("Wait for the current response to finish.");
+
+      return "handled";
+    }
+
+    const subcommand = line.slice("/soul".length).trim().toLowerCase();
+
+    try {
+      if (subcommand === "init") {
+        const result = await options.client.initProfileSoul(currentProfileId);
+
+        for (const outputLine of formatSoulInitLines(result, options.verbose)) {
+          writeOutput(outputLine);
+        }
+      } else {
+        const status =
+          await options.client.getProfileSoulStatus(currentProfileId);
+
+        for (const outputLine of formatSoulStatusLines(
+          status,
+          options.verbose
+        )) {
+          writeOutput(outputLine);
+        }
+      }
+    } catch (error) {
+      writeError(error);
+    }
+
+    return "handled";
+  }
+
+  async function handleUserCommand(line: string): Promise<"handled"> {
+    if (isStreaming) {
+      writeOutput("Wait for the current response to finish.");
+
+      return "handled";
+    }
+
+    const subcommand = line.slice("/user".length).trim().toLowerCase();
+
+    try {
+      if (subcommand === "init") {
+        const result = await options.client.initUserContext();
+
+        for (const outputLine of formatUserInitLines(result)) {
+          writeOutput(outputLine);
+        }
+      } else {
+        const status = await options.client.getUserContext();
+
+        for (const outputLine of formatUserStatusLines(status)) {
+          writeOutput(outputLine);
+        }
+      }
+    } catch (error) {
+      writeError(error);
+    }
+
+    return "handled";
+  }
+
+  prompt = new PersistentPrompt({
+    getSuggestions: (input) => {
+      const active = effectiveModelState(currentProfile, modelsCache);
+
+      return resolveSuggestions({
+        currentModel: active.modelId,
+        currentOrgId,
+        currentProfileId,
+        currentProviderId: active.providerId,
+        input,
+        models: modelsCache?.models,
+        orgs: orgsCache,
+        profiles: profilesCache,
+      });
+    },
+    onAbortStream: () => {
+      if (isStreaming && abortController) {
+        abortController.abort();
+      }
+    },
+    onCancel: () => {
+      if (isStreaming && abortController) {
+        abortController.abort();
+
+        return;
+      }
+
+      chatExit.requestExit();
+    },
+    onScrollHistory: (event) => {
+      if (event === "line_up") {
+        renderer.scrollLines(1);
+
+        return;
+      }
+
+      if (event === "line_down") {
+        renderer.scrollLines(-1);
+
+        return;
+      }
+
+      if (event === "page_up") {
+        renderer.scrollPage(1);
+
+        return;
+      }
+
+      if (event === "page_down") {
+        renderer.scrollPage(-1);
+
+        return;
+      }
+
+      if (event === "home") {
+        renderer.scrollPage(10_000);
+
+        return;
+      }
+
+      renderer.scrollToLatest();
+    },
+    onSubmit: async (result) => {
+      if (switchingOrg) {
+        writeOutput("Wait for the organization switch to finish.");
+
+        return;
+      }
+
+      const line = result.text.trim();
+      const hasImages = Boolean(result.images?.length);
+
+      if (!(line || hasImages)) {
+        return;
+      }
+
+      if (resolveSlashCommand(line) || isExitCommand(line)) {
+        let outcome: "handled" | "exit" | "unhandled";
+        activeCommands += 1;
+
+        try {
+          outcome = await handleSlashCommand(line);
+        } finally {
+          activeCommands -= 1;
+        }
+
+        if (outcome === "exit") {
+          chatExit.requestExit();
+
+          return;
+        }
+
+        if (outcome === "handled") {
+          return;
+        }
+      }
+
+      await handleChatMessage(result);
+    },
+    renderer,
+    terminalInput,
+  });
+
+  syncPendingMessages();
+  prompt.start();
+
+  function cleanupChat(): void {
+    prompt.stop();
+    renderer.reset();
+    terminalInput.stop();
+  }
+
+  await chatExit.wait();
+  cleanupChat();
+}
+
+async function runBlockingChat(context: ChatContext): Promise<void> {
+  const { options } = context;
+  let session = context.session;
+  let currentProfileId = context.currentProfileId;
+  let processing = false;
+  let busyDrops = 0;
+  let modelsCache: ModelsResponse | null = null;
+  let profilesCache: ProfileSummary[] = [];
+
+  async function refreshModelsCache() {
+    try {
+      modelsCache = await options.client.getModels();
+    } catch {
+      modelsCache = null;
+    }
+  }
+
+  async function refreshProfilesCache() {
+    try {
+      const response = await options.client.listProfiles();
+      profilesCache = response.profiles;
+    } catch {
+      profilesCache = [];
+    }
+  }
+
+  await refreshProfilesCache();
+
+  if (!options.offline) {
+    await refreshModelsCache();
+  }
+
+  const thinkingIndicator = new ThinkingIndicator();
+  let lastChunk: string | null = null;
+  let abortController: AbortController | null = null;
+
+  function createStreamHandlers(): StreamHandlers {
+    return {
+      onChunk: (delta) => {
+        thinkingIndicator.stop();
+        lastChunk = delta;
+        process.stdout.write(delta);
+      },
+      onThinking: () => {
+        thinkingIndicator.start();
+      },
+      onToolEnd: (event) => {
+        process.stdout.write(`\x1b[2m [tool: ${event.tool} done] \x1b[0m\n`);
+        thinkingIndicator.start();
+      },
+      onToolStart: (event) => {
+        thinkingIndicator.stop();
+        process.stdout.write(`\n\x1b[2m [tool: ${event.tool}] \x1b[0m\n`);
+      },
+    };
+  }
+
+  async function sendMessageStream(
+    input: SendMessageInput
+  ): Promise<{ aborted: boolean }> {
+    lastChunk = null;
+    abortController = new AbortController();
+    thinkingIndicator.start();
+
+    const stopEscListener = startEscAbortListener(() => {
+      abortController?.abort();
+    });
+
+    try {
+      return await sendStreamCancellable(
+        session,
+        input,
+        createStreamHandlers(),
+        {
+          signal: abortController.signal,
+        }
+      );
+    } catch (error) {
+      thinkingIndicator.stop();
+      throw error;
+    } finally {
+      stopEscListener();
+      abortController = null;
+    }
+  }
+
+  function finishStreamOutput(aborted: boolean): void {
+    thinkingIndicator.stop();
+
+    if (aborted) {
+      if (needsTrailingStreamNewline(lastChunk)) {
+        process.stdout.write("\n");
+      }
+
+      process.stdout.write("\x1b[2m[stopped]\x1b[0m\n");
+
+      return;
+    }
+
+    if (needsTrailingStreamNewline(lastChunk)) {
+      process.stdout.write("\n");
+    }
+  }
+
+  try {
+    while (true) {
+      let promptResult: PromptLineResult;
+
+      try {
+        promptResult = await promptLine("> ");
+      } catch (error) {
+        if (error instanceof PromptCancelledError) {
+          break;
+        }
+
+        throw error;
+      }
+
+      const line = promptResult.text.trim();
+      const hasImages = Boolean(promptResult.images?.length);
+
+      if (!(line || hasImages)) {
+        continue;
+      }
+
+      if (line && isExitCommand(line)) {
+        break;
+      }
+
+      if (processing) {
+        busyDrops += 1;
+        process.stdout.write(
+          `\x1b[2m${formatBusyDropLine(busyDrops)}\x1b[0m\n`
+        );
+        continue;
+      }
+
+      const registeredCommand = resolveSlashCommand(line);
+
+      if (line === "/clear") {
+        try {
+          await session.clear();
+          printLine("Chat history cleared.");
+        } catch (error) {
+          printError(error);
+        }
+
+        continue;
+      }
+
+      if (line === "/help") {
+        for (const helpLine of HELP_TEXT.split("\n")) {
+          printLine(helpLine);
+        }
+
+        continue;
+      }
+
+      if (line === "/status") {
+        const currentProfile =
+          profilesCache.find((entry) => entry.id === currentProfileId) ?? null;
+
+        try {
+          await printStatus(
+            options.client,
+            printLine,
+            currentProfile,
+            modelsCache
+          );
+        } catch (error) {
+          printError(error);
+        }
+
+        continue;
+      }
+
+      if (line === "/org" || line.startsWith("/org ")) {
+        try {
+          const next = await switchChatOrg(
+            options.client,
+            line.slice("/org".length).trim(),
+            options.channel,
+            printLine,
+            options.codingWorkspaceRoot
+          );
+
+          if (next) {
+            options.client = next.client;
+            options.offline = next.offline;
+            currentProfileId = next.profile.id;
+            session = next.session;
+            context.onSessionChange(session);
+            await refreshProfilesCache();
+            await refreshModelsCache();
+            printLine(
+              `Organization switched. Chatting with ${next.profile.name}.`
+            );
+          }
+        } catch (error) {
+          printError(error);
+        }
+
+        continue;
+      }
+
+      if (registeredCommand && registeredCommand.name !== "/learn") {
+        printLine(
+          `${registeredCommand.name} requires an interactive terminal.`
+        );
+        continue;
+      }
+
+      processing = true;
+
+      let sendInput: SendMessageInput;
+
+      try {
+        const fromPath = await parseImageLine(line);
+        sendInput = mergeSendInput(line, {
+          fromPath,
+          promptImages: promptResult.images,
+        });
+      } catch (error) {
+        printError(error);
+        processing = false;
+        continue;
+      }
+
+      try {
+        const { aborted } = await sendMessageStream(sendInput);
+        finishStreamOutput(aborted);
+      } catch (error) {
+        printError(error);
+      } finally {
+        processing = false;
+        busyDrops = 0;
+      }
+    }
+  } finally {
+    disableRawModeIfActive(process.stdin);
+
+    if (process.stdin.isTTY) {
+      process.stdin.pause();
+    }
+
+    if (process.stdout.isTTY) {
+      process.stdout.write("\x1b[?25h");
+    }
+  }
+}
+
+async function printCurrentModel(
+  client: MíngZhànClient,
+  write: (text: string) => void = printLine,
+  profile: ProfileSummary,
+  cachedModels: ModelsResponse | null = null
+): Promise<void> {
+  const models = cachedModels ?? (await client.getModels());
+  const active = effectiveModelState(profile, models);
+
+  if (!(models.provider && active.modelId)) {
+    write("No model configured.");
+
+    return;
+  }
+
+  write(`Provider: ${models.provider}`);
+  write(`Model: ${active.modelId}`);
+}
+
+export function formatStatusLines(
+  health: HealthResponse,
+  models: ModelsResponse | null,
+  profile: ProfileSummary | null
+): string[] {
+  const lines = [
+    `Server: ${health.ok ? "ok" : "degraded"}`,
+    `Provider configured: ${health.providerConfigured ? "yes" : "no"}`,
+  ];
+
+  if (!health.providerConfigured) {
+    lines.push("Chat runs in offline mode without an API key.");
+
+    return lines;
+  }
+
+  const active = profile
+    ? effectiveModelState(profile, models)
+    : { modelId: null, providerId: models?.currentProviderId ?? null };
+
+  if (profile) {
+    lines.push(`Profile: ${profile.name}`);
+  }
+
+  lines.push(`Provider: ${models?.provider ?? "unknown"}`);
+  lines.push(`Model: ${active.modelId ?? "none"}`);
+
+  return lines;
+}
+
+async function printStatus(
+  client: MíngZhànClient,
+  write: (text: string) => void,
+  profile: ProfileSummary | null,
+  cachedModels: ModelsResponse | null
+): Promise<void> {
+  const health = await client.health();
+
+  const models = health.providerConfigured
+    ? (cachedModels ?? (await client.getModels()))
+    : null;
+
+  for (const line of formatStatusLines(health, models, profile)) {
+    write(line);
+  }
+}
+
+function formatError(cause: unknown): string {
+  return formatClientError(cause);
+}
+
+export function formatErrorLines(cause: unknown): string[] {
+  return ["", ...formatError(cause).split(/\r?\n/)];
+}
+
+/** Disable raw mode only when stdin is a TTY currently in raw mode. */
+export function disableRawModeIfActive(
+  stdin: NodeJS.ReadStream = process.stdin
+): void {
+  if (!(stdin.isTTY && stdin.isRaw)) {
+    return;
+  }
+
+  try {
+    stdin.setRawMode(false);
+  } catch {
+    // Cleanup must not throw if the TTY rejects the mode change.
+  }
+}
+
+/** Await cleanup, then exit. Used by CLI signal handlers. */
+export async function runCleanupThenExit(
+  cleanup: () => void | Promise<void>,
+  exitProcess: (code: number) => void = (code) => {
+    process.exit(code);
+  }
+): Promise<void> {
+  try {
+    await cleanup();
+  } catch {
+    // Always exit after cleanup attempt.
+  } finally {
+    exitProcess(0);
+  }
+}
+
+export function isEscInterruptKey(key: string): boolean {
+  return key === "\u001b";
+}
+
+/**
+ * Bare ESC only aborts after a quiet window. Extra bytes cancel the abort
+ * (alt-prefix, CSI, or slow paste fragments).
+ */
+export function createDebouncedEscAbortHandler(
+  onAbort: () => void,
+  debounceMs = ESC_ABORT_DEBOUNCE_MS
+) {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearPending = (): void => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+
+  return {
+    dispose: clearPending,
+    onData(chunk: Buffer | string): void {
+      const key = String(chunk);
+
+      if (isEscInterruptKey(key)) {
+        clearPending();
+        timer = setTimeout(() => {
+          timer = null;
+          onAbort();
+        }, debounceMs);
+
+        return;
+      }
+
+      clearPending();
+    },
+  };
+}
+
+function startEscAbortListener(onAbort: () => void): () => void {
+  if (!process.stdin.isTTY) {
+    return () => {};
+  }
+
+  const stdin = process.stdin;
+  const wasRaw = stdin.isRaw;
+  const handler = createDebouncedEscAbortHandler(onAbort);
+
+  stdin.setEncoding("utf8");
+  stdin.setRawMode(true);
+  stdin.resume();
+  stdin.on("data", handler.onData);
+
+  return () => {
+    handler.dispose();
+    stdin.off("data", handler.onData);
+
+    if (!wasRaw) {
+      disableRawModeIfActive(stdin);
+    }
+  };
+}
+
+function printError(cause: unknown): void {
+  for (const line of formatErrorLines(cause)) {
+    printLine(line);
+  }
+}
+
+function formatProfilesLines(
+  profiles: ProfileSummary[],
+  currentProfileId: string | null
+): string[] {
+  const lines = ["Profiles:"];
+
+  for (const profile of profiles) {
+    const markers = [
+      profile.id === currentProfileId ? "current" : null,
+      profile.isSuper ? "orchestrator" : null,
+    ]
+      .filter(Boolean)
+      .join(", ");
+
+    lines.push(`  ${profile.name}${markers ? ` (${markers})` : ""}`);
+  }
+
+  lines.push("Use /profile <name> to switch.");
+
+  return lines;
+}
+
+export function formatSoulStatusLines(
+  status: SoulStatusResponse,
+  verbose = false
+): string[] {
+  const lines = [
+    `Soul directory: ${formatCliDisplayPath(status.directory, verbose)}`,
+    `Active: ${status.active ? "yes" : "no"}`,
+  ];
+
+  if (status.profileId) {
+    lines.push(`Profile: ${status.profileId}`);
+  }
+
+  lines.push(
+    "Files:",
+    `  SOUL.md     ${status.files.soul ? "✓" : "—"}`,
+    `  STYLE.md    ${status.files.style ? "✓" : "—"}`,
+    `  INSTRUCTIONS.md ${status.files.instructions ? "✓" : "—"}`,
+    `  MEMORY.md   ${status.files.memory ? "✓" : "—"}`,
+    `  examples/   ${status.files.examples ? "✓" : "—"}`
+  );
+
+  if (status.active) {
+    lines.push(
+      "Edit the files above to shape agent identity. Start a new session to reload."
+    );
+  } else {
+    lines.push(
+      "Soul files are missing. Run /soul init to scaffold templates for this profile."
+    );
+  }
+
+  return lines;
+}
+
+function formatSoulInitLines(
+  result: InitSoulResponse,
+  verbose = false
+): string[] {
+  const lines = [
+    `Soul directory: ${formatCliDisplayPath(result.directory, verbose)}`,
+  ];
+
+  if (result.created.length === 0) {
+    lines.push("Templates already exist — nothing created.");
+
+    return lines;
+  }
+
+  lines.push("Created:");
+
+  for (const file of result.created) {
+    lines.push(`  ${file}`);
+  }
+
+  lines.push(
+    "Edit SOUL.md, STYLE.md, and INSTRUCTIONS.md, then start a new session."
+  );
+
+  return lines;
+}
+
+function formatUserStatusLines(status: UserContextStatusResponse): string[] {
+  const lines = [`Active: ${status.active ? "yes" : "no"}`];
+
+  if (status.active) {
+    lines.push(
+      "Edit USER.md from the account menu (web). Start a new session to reload."
+    );
+  } else {
+    lines.push(
+      "Run /user init to scaffold USER.md, or edit it from the account menu (web)."
+    );
+  }
+
+  return lines;
+}
+
+function formatUserInitLines(result: InitUserContextResponse): string[] {
+  const lines: string[] = [];
+
+  if (result.created) {
+    lines.push(
+      "Created USER.md. Edit it from the account menu (web), then start a new session."
+    );
+  } else {
+    lines.push("Template already exists — nothing created.");
+  }
+
+  return lines;
+}
+
+function isExitCommand(line: string): boolean {
+  const normalized = line.trim().toLowerCase();
+
+  return normalized === "/exit" || normalized === "/quit";
+}

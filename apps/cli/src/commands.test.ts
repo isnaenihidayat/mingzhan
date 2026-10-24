@@ -1,0 +1,189 @@
+import { describe, expect, test } from "bun:test";
+import type {
+  ListUserOrgsResponse,
+  ModelsResponse,
+  ProfileSummary,
+} from "@mingzhan/core";
+import {
+  effectiveModelState,
+  parseModelCommandArg,
+  resolveModelSwitchTarget,
+  resolveSuggestions,
+} from "./commands";
+
+const profile: ProfileSummary = {
+  createdAt: "",
+  hasAvatar: false,
+  id: "default",
+  isSuper: false,
+  mcpServerCount: 0,
+  model: "gpt-4o",
+  name: "Default",
+  soulActive: false,
+  toolCount: 0,
+  updatedAt: "",
+};
+
+const modelsCache: ModelsResponse = {
+  currentProviderId: "provider-a",
+  displayName: null,
+  models: [
+    {
+      id: "claude-sonnet-4-20250514",
+      name: "Claude Sonnet",
+      provider: "anthropic",
+      providerId: "provider-a",
+    },
+    {
+      id: "gpt-4o",
+      name: "GPT-4o",
+      provider: "openai",
+      providerId: "provider-b",
+    },
+    {
+      id: "shared-model",
+      name: "Shared",
+      provider: "anthropic",
+      providerId: "provider-a",
+    },
+    {
+      id: "shared-model",
+      name: "Shared",
+      provider: "openai",
+      providerId: "provider-b",
+    },
+  ],
+  provider: "anthropic",
+  providers: [
+    {
+      createdAt: "",
+      hasApiKey: true,
+      id: "provider-a",
+      label: "Anthropic",
+      modelCount: 1,
+      type: "anthropic",
+    },
+    {
+      createdAt: "",
+      hasApiKey: true,
+      id: "provider-b",
+      label: "OpenAI",
+      modelCount: 1,
+      type: "openai",
+    },
+  ],
+};
+
+describe("parseModelCommandArg", () => {
+  test("parses provider-qualified model ids", () => {
+    expect(parseModelCommandArg("provider-b::gpt-4o")).toEqual({
+      modelId: "gpt-4o",
+      providerId: "provider-b",
+    });
+  });
+});
+
+describe("resolveModelSwitchTarget", () => {
+  test("uses explicit provider ids", () => {
+    expect(resolveModelSwitchTarget(modelsCache, "provider-b::gpt-4o")).toEqual(
+      {
+        modelId: "gpt-4o",
+        providerId: "provider-b",
+      }
+    );
+  });
+
+  test("falls back to the current provider for duplicate ids", () => {
+    expect(resolveModelSwitchTarget(modelsCache, "shared-model")).toEqual({
+      modelId: "shared-model",
+      providerId: "provider-a",
+    });
+  });
+
+  test("requires provider qualification when ids are ambiguous", () => {
+    expect(
+      resolveModelSwitchTarget(
+        { ...modelsCache, currentProviderId: null },
+        "shared-model"
+      )
+    ).toBe("ambiguous");
+  });
+});
+
+describe("effectiveModelState", () => {
+  test("prefers profile model overrides", () => {
+    expect(effectiveModelState(profile, modelsCache)).toEqual({
+      modelId: "gpt-4o",
+      providerId: "provider-b",
+    });
+  });
+
+  test("returns null model when profile has no model", () => {
+    expect(
+      effectiveModelState({ ...profile, model: null }, modelsCache)
+    ).toEqual({
+      modelId: null,
+      providerId: "provider-a",
+    });
+  });
+});
+
+describe("model command", () => {
+  test("opens before enter selects a model", () => {
+    const closed = resolveSuggestions({
+      input: "/model",
+      models: modelsCache.models,
+    });
+
+    const open = resolveSuggestions({
+      input: "/model ",
+      models: modelsCache.models,
+    });
+
+    expect(closed[0]?.submitOnEnter).toBeUndefined();
+    expect(open[0]?.submitOnEnter).toBe(true);
+  });
+});
+
+test("org picker opens before selection and filters organizations", () => {
+  const orgs: ListUserOrgsResponse["orgs"] = [
+    {
+      createdAt: "",
+      id: "org_a",
+      name: "Acme Team",
+      role: "admin",
+      slug: "acme",
+      updatedAt: "",
+    },
+    {
+      createdAt: "",
+      id: "org_b",
+      name: "Personal",
+      role: "admin",
+      slug: "personal",
+      updatedAt: "",
+    },
+  ];
+
+  expect(
+    resolveSuggestions({ input: "/org", orgs })[0]?.submitOnEnter
+  ).toBeUndefined();
+
+  const choices = resolveSuggestions({
+    currentOrgId: "org_a",
+    input: "/org ",
+    orgs,
+  });
+
+  expect(choices).toHaveLength(2);
+  expect(choices[0]).toMatchObject({
+    insertValue: "/org org_a",
+    submitOnEnter: true,
+  });
+  expect(choices[0]?.description).toContain("current");
+  expect(
+    resolveSuggestions({ input: "/org TEAM", orgs }).map(
+      (choice) => choice.insertValue
+    )
+  ).toEqual(["/org org_a"]);
+});

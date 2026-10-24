@@ -1,0 +1,705 @@
+import { resolveCloudflareAccountInput } from "@mingzhan/core/cloudflare-provider-config";
+import type {
+  ChatgptOAuthCredentials,
+  CreateProviderResponse,
+  CustomModelEntry,
+  OllamaHostMode,
+  OpenRouterRoutingSettings,
+  ProviderModelOption,
+  WireApi,
+  XaiOAuthCredentials,
+} from "@mingzhan/core/contract";
+import { defaultDiscoveryBaseUrl } from "@mingzhan/core/discovery-providers";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import type { ModelListRow } from "@/components/ModelListEditor";
+import { normalizeModelListRows } from "@/components/model-list-editor.shared";
+import { useAppContext } from "@/context/use-app-context";
+import { useAuth } from "@/context/use-auth";
+import { useModelsQuery, useProvidersQuery } from "@/hooks/use-app-queries";
+import type { ModelsDevRow } from "@/hooks/use-models-dev";
+import { formatError } from "@/lib/client";
+import {
+  appendOpenRouterModelRow,
+  buildCreateProviderRequest,
+  defaultModelForProvider,
+  defaultOllamaSetupBaseUrl,
+  filterModelsByProvider,
+  firstAvailableProviderOption,
+  getModelDisplayName,
+  hasOpenCodeZenProvider,
+  isProviderTypeAlreadyConfigured,
+  isShortlistCapabilityProvider,
+  modelsFromCustomRows,
+  modelsFromOpenRouterRows,
+  modelsFromShortlistRows,
+  resolveOpenRouterSetupModel,
+  type SelectedProvider,
+  validateApiKeyForProvider,
+  validateBaseUrlInput,
+  validateCustomModelsInput,
+  validateDisplayNameInput,
+  validateOpenRouterModelsInput,
+  validateShortlistCapabilityModelsInput,
+} from "@/lib/models";
+
+interface UseProviderSetupFormOptions {
+  onSuccess?: (result: CreateProviderResponse) => void;
+}
+
+const EMPTY_CATALOG: ProviderModelOption[] = [];
+
+export function useProviderSetupForm(
+  options: UseProviderSetupFormOptions = {}
+) {
+  const { createProvider } = useAppContext();
+  const { isAuthenticated } = useAuth();
+
+  const { data: catalogResponse, error: catalogQueryError } = useModelsQuery({
+    enabled: isAuthenticated,
+  });
+
+  const { data: providersResponse } = useProvidersQuery({
+    enabled: isAuthenticated,
+  });
+
+  const catalog =
+    catalogResponse?.catalog ?? catalogResponse?.models ?? EMPTY_CATALOG;
+
+  const configuredTypes = useMemo(() => {
+    const types = new Set<string>();
+
+    for (const provider of providersResponse?.providers ?? []) {
+      types.add(provider.type);
+    }
+
+    return types;
+  }, [providersResponse?.providers]);
+
+  const openCodeZenConfigured = useMemo(
+    () => hasOpenCodeZenProvider(providersResponse?.providers ?? []),
+    [providersResponse?.providers]
+  );
+
+  const [selectedProvider, setSelectedProvider] =
+    useState<SelectedProvider>("openai");
+
+  const [apiKey, setApiKey] = useState("");
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [apiKeyTouched, setApiKeyTouched] = useState(false);
+  const [apiKeyError, setApiKeyError] = useState<string | null>(null);
+  const [selectedModel, setSelectedModel] = useState("");
+  const [openRouterModels, setOpenRouterModels] = useState<ModelListRow[]>([]);
+
+  const [openRouterRouting, setOpenRouterRouting] =
+    useState<OpenRouterRoutingSettings>({});
+
+  const [openRouterModelsError, setOpenRouterModelsError] = useState<
+    string | null
+  >(null);
+
+  const [shortlistModels, setShortlistModels] = useState<ModelListRow[]>([]);
+
+  const [shortlistModelsError, setShortlistModelsError] = useState<
+    string | null
+  >(null);
+
+  const [ollamaHostMode, setOllamaHostMode] = useState<OllamaHostMode>("local");
+  const [displayName, setDisplayName] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [wireApi, setWireApi] = useState<WireApi>("chat");
+  const [customModels, setCustomModels] = useState<ModelListRow[]>([]);
+  const [extraModels, setExtraModels] = useState<ProviderModelOption[]>([]);
+
+  const [subscriptionModels, setSubscriptionModels] = useState<
+    ProviderModelOption[]
+  >([]);
+
+  const [displayNameError, setDisplayNameError] = useState<string | null>(null);
+  const [baseUrlError, setBaseUrlError] = useState<string | null>(null);
+  const [modelsError, setModelsError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [xaiOAuth, setXaiOAuth] = useState<XaiOAuthCredentials | null>(null);
+
+  const [chatgptOAuth, setChatgptOAuth] =
+    useState<ChatgptOAuthCredentials | null>(null);
+
+  useEffect(() => {
+    if (catalogQueryError) {
+      setFormError(formatError(catalogQueryError));
+    }
+  }, [catalogQueryError]);
+
+  useEffect(() => {
+    setSelectedProvider((current) => {
+      if (!isProviderTypeAlreadyConfigured(current, configuredTypes)) {
+        return current;
+      }
+
+      return firstAvailableProviderOption(configuredTypes, current);
+    });
+  }, [configuredTypes]);
+
+  const filteredModels = useMemo(() => {
+    if (
+      selectedProvider === "openai_compatible" ||
+      selectedProvider === "netra" ||
+      selectedProvider === "ollama"
+    ) {
+      return modelsFromCustomRows(customModels).map((model) =>
+        selectedProvider === "ollama"
+          ? { ...model, provider: "ollama" as const }
+          : selectedProvider === "netra"
+            ? { ...model, provider: "netra" as const }
+            : model
+      );
+    }
+
+    if (selectedProvider === "openrouter") {
+      return modelsFromOpenRouterRows(openRouterModels);
+    }
+
+    if (isShortlistCapabilityProvider(selectedProvider)) {
+      return modelsFromShortlistRows(selectedProvider, shortlistModels);
+    }
+
+    if (
+      (selectedProvider === "chatgpt" || selectedProvider === "xai_oauth") &&
+      subscriptionModels.length > 0
+    ) {
+      return subscriptionModels;
+    }
+
+    const catalogModels = filterModelsByProvider(catalog, selectedProvider);
+    const catalogIds = new Set(catalogModels.map((model) => model.id));
+
+    const extras = extraModels.filter(
+      (model) =>
+        model.provider === selectedProvider && !catalogIds.has(model.id)
+    );
+
+    return [...catalogModels, ...extras];
+  }, [
+    catalog,
+    selectedProvider,
+    customModels,
+    openRouterModels,
+    shortlistModels,
+    extraModels,
+    subscriptionModels,
+  ]);
+
+  const ollamaApiKeyOptions = useMemo(
+    () => ({ ollamaHostMode }),
+    [ollamaHostMode]
+  );
+
+  useEffect(() => {
+    if (filteredModels.length === 0) {
+      return;
+    }
+
+    setSelectedModel((current) => {
+      if (current && filteredModels.some((model) => model.id === current)) {
+        return current;
+      }
+
+      return defaultModelForProvider(filteredModels, selectedProvider);
+    });
+  }, [selectedProvider, filteredModels]);
+
+  const handleApiKeyBlur = useCallback(() => {
+    setApiKeyTouched(true);
+    setApiKeyError(
+      validateApiKeyForProvider(apiKey, selectedProvider, ollamaApiKeyOptions)
+    );
+  }, [apiKey, selectedProvider, ollamaApiKeyOptions]);
+
+  const handleApiKeyChange = useCallback(
+    (value: string) => {
+      setApiKey(value);
+
+      if (formError) {
+        setFormError(null);
+      }
+
+      if (apiKeyTouched) {
+        setApiKeyError(
+          validateApiKeyForProvider(
+            value,
+            selectedProvider,
+            ollamaApiKeyOptions
+          )
+        );
+      } else if (apiKeyError) {
+        setApiKeyError(null);
+      }
+    },
+    [
+      apiKeyTouched,
+      apiKeyError,
+      formError,
+      selectedProvider,
+      ollamaApiKeyOptions,
+    ]
+  );
+
+  const handleProviderSelect = useCallback(
+    (provider: SelectedProvider) => {
+      if (isProviderTypeAlreadyConfigured(provider, configuredTypes)) {
+        return;
+      }
+
+      setSelectedProvider(provider);
+
+      if (provider === "ollama") {
+        setOllamaHostMode("local");
+        setBaseUrl(defaultOllamaSetupBaseUrl("local"));
+        setCustomModels([]);
+      }
+
+      if (provider === "netra") {
+        setBaseUrl(defaultDiscoveryBaseUrl("netra") ?? "");
+        setDisplayName("Netra Runtime");
+        setCustomModels([]);
+      }
+
+      if (provider !== "openrouter") {
+        setOpenRouterModels([]);
+        setOpenRouterModelsError(null);
+      }
+
+      if (!isShortlistCapabilityProvider(provider)) {
+        setShortlistModels([]);
+        setShortlistModelsError(null);
+      }
+
+      if (
+        provider !== "openai_compatible" &&
+        provider !== "ollama" &&
+        provider !== "netra"
+      ) {
+        setBaseUrl("");
+        setDisplayNameError(null);
+        setBaseUrlError(null);
+        setModelsError(null);
+      }
+
+      if (provider === "openai_compatible") {
+        setBaseUrl("");
+        setCustomModels([]);
+      }
+
+      setXaiOAuth(null);
+      setSubscriptionModels([]);
+
+      if (provider !== "chatgpt") {
+        setChatgptOAuth(null);
+      }
+    },
+    [configuredTypes]
+  );
+
+  const handleSubscriptionModelsChange = useCallback(
+    (entries: CustomModelEntry[]) => {
+      setSubscriptionModels(
+        entries.map((entry, index) => ({
+          default: entry.default === true || index === 0,
+          id: entry.id,
+          name: entry.name?.trim() || entry.id,
+          provider: selectedProvider,
+          supportsVision: entry.supportsVision !== false,
+        }))
+      );
+    },
+    [selectedProvider]
+  );
+
+  const selectOpenRouterModel = useCallback(
+    (modelId: string, modelName: string, extra?: Partial<CustomModelEntry>) => {
+      setOpenRouterModels((current) =>
+        appendOpenRouterModelRow(current, modelId, modelName, extra)
+      );
+      setSelectedModel(modelId);
+      setOpenRouterModelsError(null);
+    },
+    []
+  );
+
+  const handleBrowseSelect = useCallback(
+    (provider: SelectedProvider, modelId: string, row: ModelsDevRow) => {
+      if (isProviderTypeAlreadyConfigured(provider, configuredTypes)) {
+        return;
+      }
+
+      if (row.isZen && openCodeZenConfigured) {
+        return;
+      }
+
+      const browsedContext =
+        row.context > 0 ? { contextWindow: row.context } : {};
+
+      handleProviderSelect(provider);
+
+      if (provider === "openrouter") {
+        selectOpenRouterModel(modelId, row.modelName, browsedContext);
+      } else if (provider === "openai_compatible") {
+        setDisplayName(row.providerName);
+        setBaseUrl(row.apiUrl.replace(/\/$/, ""));
+        setCustomModels([
+          { id: modelId, name: row.modelName, ...browsedContext },
+        ]);
+        setSelectedModel(modelId);
+      } else if (provider === "opencode_go") {
+        setExtraModels((current) => {
+          if (
+            current.some(
+              (model) => model.provider === provider && model.id === modelId
+            )
+          ) {
+            return current;
+          }
+
+          return [
+            ...current,
+            {
+              id: modelId,
+              name: row.modelName,
+              provider,
+              // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- This optional field must stay absent when no value exists to preserve the wire payload contract.
+              ...(row.context > 0 ? { contextWindow: row.context } : {}),
+            },
+          ];
+        });
+        setSelectedModel(modelId);
+      } else {
+        setExtraModels((current) => {
+          if (
+            current.some(
+              (model) => model.provider === provider && model.id === modelId
+            )
+          ) {
+            return current;
+          }
+
+          return [
+            ...current,
+            {
+              id: modelId,
+              name: row.modelName,
+              provider,
+              // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- This optional field must stay absent when no value exists to preserve the wire payload contract.
+              ...(row.context > 0 ? { contextWindow: row.context } : {}),
+            },
+          ];
+        });
+        setSelectedModel(modelId);
+        setBaseUrl(row.apiUrl.replace(/\/$/, ""));
+      }
+    },
+    [
+      configuredTypes,
+      openCodeZenConfigured,
+      handleProviderSelect,
+      selectOpenRouterModel,
+    ]
+  );
+
+  const { onSuccess } = options;
+
+  const handleShortlistModelsChange = useCallback((rows: ModelListRow[]) => {
+    setShortlistModels(rows);
+    setShortlistModelsError(null);
+  }, []);
+
+  const handleOllamaHostModeChange = useCallback(
+    (hostMode: OllamaHostMode) => {
+      setOllamaHostMode(hostMode);
+
+      if (apiKeyTouched) {
+        setApiKeyError(
+          validateApiKeyForProvider(apiKey, "ollama", {
+            ollamaHostMode: hostMode,
+          })
+        );
+      } else {
+        setApiKeyError(null);
+      }
+    },
+    [apiKey, apiKeyTouched]
+  );
+
+  const handleOpenRouterModelsChange = useCallback((rows: ModelListRow[]) => {
+    setOpenRouterModels(rows);
+    setOpenRouterModelsError(null);
+  }, []);
+
+  const handleSubmit = useCallback(
+    async (event: React.FormEvent) => {
+      event.preventDefault();
+
+      const trimmedKey = apiKey.trim();
+
+      const nextApiKeyError = validateApiKeyForProvider(
+        trimmedKey,
+        selectedProvider,
+        ollamaApiKeyOptions
+      );
+
+      const nextOpenRouterModelsError =
+        selectedProvider === "openrouter"
+          ? validateOpenRouterModelsInput(openRouterModels)
+          : null;
+
+      const nextShortlistModelsError = isShortlistCapabilityProvider(
+        selectedProvider
+      )
+        ? validateShortlistCapabilityModelsInput(shortlistModels)
+        : null;
+
+      const nextDisplayNameError =
+        selectedProvider === "openai_compatible"
+          ? validateDisplayNameInput(displayName)
+          : null;
+
+      const nextBaseUrlError =
+        selectedProvider === "openai_compatible" ||
+        selectedProvider === "ollama"
+          ? validateBaseUrlInput(baseUrl)
+          : selectedProvider === "cloudflare"
+            ? resolveCloudflareAccountInput(baseUrl)
+              ? null
+              : "Enter a Cloudflare account ID or Workers AI URL."
+            : null;
+
+      const nextModelsError =
+        selectedProvider === "openai_compatible" ||
+        selectedProvider === "netra" ||
+        selectedProvider === "ollama"
+          ? validateCustomModelsInput(customModels)
+          : null;
+
+      setApiKeyTouched(true);
+      setApiKeyError(nextApiKeyError);
+      setOpenRouterModelsError(nextOpenRouterModelsError);
+      setShortlistModelsError(nextShortlistModelsError);
+      setDisplayNameError(nextDisplayNameError);
+      setBaseUrlError(nextBaseUrlError);
+      setModelsError(nextModelsError);
+
+      if (nextApiKeyError) {
+        document.getElementById("api-key")?.focus();
+
+        return;
+      }
+
+      if (nextOpenRouterModelsError) {
+        return;
+      }
+
+      if (nextShortlistModelsError) {
+        return;
+      }
+
+      if (nextDisplayNameError) {
+        document.getElementById("provider-display-name")?.focus();
+
+        return;
+      }
+
+      if (nextBaseUrlError) {
+        document
+          .getElementById(
+            selectedProvider === "ollama"
+              ? "ollama-base-url"
+              : selectedProvider === "cloudflare"
+                ? "cloudflare-account-id"
+                : "provider-base-url"
+          )
+          ?.focus();
+
+        return;
+      }
+
+      if (nextModelsError) {
+        return;
+      }
+
+      if (isProviderTypeAlreadyConfigured(selectedProvider, configuredTypes)) {
+        setFormError("This provider is already added.");
+
+        return;
+      }
+
+      if (selectedProvider === "xai_oauth" && !xaiOAuth) {
+        setFormError("Sign in with Grok before saving.");
+
+        return;
+      }
+
+      if (selectedProvider === "chatgpt" && !chatgptOAuth) {
+        setFormError("Sign in with ChatGPT before saving.");
+
+        return;
+      }
+
+      const modelToSave =
+        selectedProvider === "openrouter"
+          ? resolveOpenRouterSetupModel(openRouterModels, selectedModel)
+          : isShortlistCapabilityProvider(selectedProvider)
+            ? resolveOpenRouterSetupModel(shortlistModels, selectedModel)
+            : selectedProvider === "ollama"
+              ? resolveOpenRouterSetupModel(customModels, selectedModel)
+              : selectedModel;
+
+      setBusy(true);
+      setFormError(null);
+
+      try {
+        const resolvedCloudflareBaseUrl =
+          selectedProvider === "cloudflare"
+            ? resolveCloudflareAccountInput(baseUrl)
+            : null;
+
+        const result = await createProvider(
+          buildCreateProviderRequest({
+            apiKey: trimmedKey,
+            baseUrl: resolvedCloudflareBaseUrl ?? baseUrl,
+            chatgptOAuth: chatgptOAuth ?? undefined,
+            customModels:
+              (selectedProvider === "chatgpt" && subscriptionModels.length) ||
+              selectedProvider === "xai_oauth"
+                ? filteredModels.map((entry) => ({
+                    default: entry.id === modelToSave,
+                    id: entry.id,
+                    name: entry.name,
+                    supportsVision: entry.supportsVision !== false,
+                  }))
+                : selectedProvider === "openai_compatible" ||
+                    selectedProvider === "netra" ||
+                    selectedProvider === "ollama"
+                  ? normalizeModelListRows(customModels).map((entry) => ({
+                      ...entry,
+                      default: entry.id === modelToSave,
+                    }))
+                  : selectedProvider === "openrouter"
+                    ? normalizeModelListRows(openRouterModels)
+                    : isShortlistCapabilityProvider(selectedProvider)
+                      ? normalizeModelListRows(shortlistModels)
+                      : selectedProvider === "opencode_go" && modelToSave
+                        ? normalizeModelListRows([
+                            {
+                              default: true,
+                              id: modelToSave,
+                              name: getModelDisplayName(
+                                filteredModels,
+                                modelToSave
+                              ),
+                            },
+                          ])
+                        : undefined,
+            displayName,
+            hostMode:
+              selectedProvider === "ollama" ? ollamaHostMode : undefined,
+            model: modelToSave || undefined,
+            openRouterRouting,
+            provider: selectedProvider,
+            wireApi:
+              selectedProvider === "openai_compatible" ? wireApi : undefined,
+            xaiOAuth:
+              selectedProvider === "xai_oauth"
+                ? (xaiOAuth ?? undefined)
+                : undefined,
+          })
+        );
+
+        setApiKey("");
+        setApiKeyTouched(false);
+        setShowApiKey(false);
+        setXaiOAuth(null);
+        setChatgptOAuth(null);
+        setSubscriptionModels([]);
+        setOpenRouterModels([]);
+        setOpenRouterRouting({});
+        setShortlistModels([]);
+        setCustomModels([]);
+        onSuccess?.(result);
+      } catch (err) {
+        setFormError(formatError(err));
+        document.getElementById("api-key")?.focus();
+      } finally {
+        setBusy(false);
+      }
+    },
+    [
+      apiKey,
+      baseUrl,
+      xaiOAuth,
+      chatgptOAuth,
+      openRouterModels,
+      openRouterRouting,
+      shortlistModels,
+      ollamaHostMode,
+      ollamaApiKeyOptions,
+      customModels,
+      displayName,
+      selectedModel,
+      selectedProvider,
+      configuredTypes,
+      createProvider,
+      onSuccess,
+      filteredModels,
+      subscriptionModels,
+      wireApi,
+    ]
+  );
+
+  return {
+    apiKey,
+    apiKeyError,
+    baseUrl,
+    baseUrlError,
+    busy,
+    catalog,
+    chatgptOAuth,
+    configuredTypes,
+    customModels,
+    displayName,
+    displayNameError,
+    filteredModels,
+    formatSuccessMessage: (result: CreateProviderResponse) =>
+      `${result.provider.label} connected with ${getModelDisplayName(catalog, result.initialModel)}.`,
+    formError,
+    handleApiKeyBlur,
+    handleApiKeyChange,
+    handleBrowseSelect,
+    handleOllamaHostModeChange,
+    handleOpenRouterModelsChange,
+    handleProviderSelect,
+    handleShortlistModelsChange,
+    handleSubmit,
+    handleSubscriptionModelsChange,
+    modelsError,
+    ollamaHostMode,
+    openCodeZenConfigured,
+    openRouterModels,
+    openRouterModelsError,
+    openRouterRouting,
+    selectedModel,
+    selectedProvider,
+    setBaseUrl,
+    setChatgptOAuth,
+    setCustomModels,
+    setDisplayName,
+    setOpenRouterRouting,
+    setSelectedModel,
+    setShowApiKey,
+    setWireApi,
+    setXaiOAuth,
+    shortlistModels,
+    shortlistModelsError,
+    showApiKey,
+    wireApi,
+    xaiOAuth,
+  };
+}

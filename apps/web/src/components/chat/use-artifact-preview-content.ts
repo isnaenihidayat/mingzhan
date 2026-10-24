@@ -1,0 +1,263 @@
+import { useEffect, useState } from "react";
+import {
+  type ChatArtifactRef,
+  isHtmlArtifactMimeType,
+  isImageArtifactMimeType,
+  isTextArtifactMimeType,
+  isVideoArtifactMimeType,
+  looksLikeUtf8Text,
+  resolveArtifactMimeType,
+} from "@/lib/chat-artifacts";
+import { client, formatError } from "@/lib/client";
+
+export function useAuthenticatedImagePreview(
+  profileId: string | null | undefined,
+  artifactPath: string | null | undefined
+) {
+  const [blob, setBlob] = useState<Blob | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const url = useBlobObjectUrl(blob);
+
+  useEffect(() => {
+    if (!(profileId?.trim() && artifactPath?.trim())) {
+      setBlob(null);
+      setError(null);
+
+      return;
+    }
+
+    let cancelled = false;
+    setBlob(null);
+    setError(null);
+
+    void client
+      .readProfileArtifactContent(profileId, artifactPath, { inline: true })
+      .then((result) => {
+        if (cancelled) {
+          return;
+        }
+
+        const filename = artifactPath.split("/").pop() ?? artifactPath;
+
+        const contentType = resolveArtifactMimeType(
+          result.contentType,
+          filename
+        );
+
+        if (!isImageArtifactMimeType(contentType)) {
+          setBlob(null);
+          setError(
+            "Preview is not available for this file type. Download instead."
+          );
+
+          return;
+        }
+
+        setBlob(new Blob([result.data], { type: contentType }));
+      })
+      .catch((fetchError) => {
+        if (!cancelled) {
+          setBlob(null);
+          setError(formatError(fetchError));
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [artifactPath, profileId]);
+
+  return { error, url };
+}
+
+function useBlobObjectUrl(blob: Blob | null) {
+  const [url, setUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!blob) {
+      setUrl(null);
+
+      return;
+    }
+
+    const nextUrl = URL.createObjectURL(blob);
+    setUrl(nextUrl);
+
+    return () => URL.revokeObjectURL(nextUrl);
+  }, [blob]);
+
+  return url;
+}
+
+export function useArtifactPreviewContent({
+  open,
+  canPreview,
+  isHtml,
+  isImage,
+  isVideo,
+  isPdf,
+  isWordDocument,
+  profileId,
+  artifact,
+}: {
+  open: boolean;
+  canPreview: boolean;
+  isHtml: boolean;
+  isImage: boolean;
+  isVideo: boolean;
+  isPdf: boolean;
+  isWordDocument: boolean;
+  profileId: string;
+  artifact: ChatArtifactRef;
+}) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [content, setContent] = useState<string | null>(null);
+  const [mediaBlob, setMediaBlob] = useState<Blob | null>(null);
+  const mediaPreviewUrl = useBlobObjectUrl(mediaBlob);
+  const isBinaryMedia = isImage || isVideo || isPdf;
+  // Load image bytes eagerly so chat chips can show a real thumbnail before the panel opens.
+  const shouldLoad = open || isImage;
+
+  useEffect(() => {
+    if (!(shouldLoad && canPreview)) {
+      return;
+    }
+
+    if (isBinaryMedia) {
+      if (mediaBlob !== null) {
+        return;
+      }
+    } else if (content !== null) {
+      return;
+    }
+
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+
+    void client
+      .readProfileArtifactContent(profileId, artifact.path, {
+        inline: true,
+        render: isWordDocument ? "markdown" : undefined,
+      })
+      .then((result) => {
+        if (cancelled) {
+          return;
+        }
+
+        const contentType = resolveArtifactMimeType(
+          result.contentType,
+          artifact.filename
+        );
+
+        const servedAsHtml = isHtmlArtifactMimeType(contentType);
+        const servedAsImage = isImageArtifactMimeType(contentType);
+        const servedAsVideo = isVideoArtifactMimeType(contentType);
+
+        if (isPdf) {
+          if (contentType !== "application/pdf") {
+            setError(
+              "Preview is not available for this file type. Download instead."
+            );
+
+            return;
+          }
+
+          setMediaBlob(new Blob([result.data], { type: contentType }));
+
+          return;
+        }
+
+        if (isImage) {
+          if (!servedAsImage) {
+            setError(
+              "Preview is not available for this file type. Download instead."
+            );
+
+            return;
+          }
+
+          setMediaBlob(new Blob([result.data], { type: contentType }));
+
+          return;
+        }
+
+        if (isVideo) {
+          if (!servedAsVideo) {
+            setError(
+              "Preview is not available for this file type. Download instead."
+            );
+
+            return;
+          }
+
+          setMediaBlob(new Blob([result.data], { type: contentType }));
+
+          return;
+        }
+
+        if (isHtml ? !servedAsHtml : servedAsHtml) {
+          setError(
+            "Preview is not available for this file type. Download instead."
+          );
+
+          return;
+        }
+
+        if (
+          !(
+            isHtml ||
+            isTextArtifactMimeType(contentType) ||
+            looksLikeUtf8Text(new Uint8Array(result.data))
+          )
+        ) {
+          setError(
+            "Preview is not available for this file type. Download instead."
+          );
+
+          return;
+        }
+
+        setContent(new TextDecoder().decode(result.data));
+      })
+      .catch((fetchError) => {
+        if (!cancelled) {
+          setError(formatError(fetchError));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    shouldLoad,
+    canPreview,
+    content,
+    mediaBlob,
+    isBinaryMedia,
+    isHtml,
+    isImage,
+    isVideo,
+    isPdf,
+    isWordDocument,
+    profileId,
+    artifact.path,
+    artifact.filename,
+  ]);
+
+  return {
+    content,
+    error,
+    imagePreviewUrl: isImage ? mediaPreviewUrl : null,
+    loading,
+    pdfPreviewUrl: isPdf ? mediaPreviewUrl : null,
+    setContent,
+    videoPreviewUrl: isVideo ? mediaPreviewUrl : null,
+  };
+}

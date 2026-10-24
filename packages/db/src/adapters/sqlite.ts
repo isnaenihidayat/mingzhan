@@ -1,0 +1,7528 @@
+import { Database, type SQLQueryBindings } from "bun:sqlite";
+import { chmodSync } from "node:fs";
+import { sep } from "node:path";
+import type {
+  AcpAgentConfig,
+  AgentQuestionnaire,
+  ChatMessage,
+} from "@mingzhan/core";
+import {
+  decryptCredential,
+  derivePluginToolName,
+  encryptCredential,
+  getUserMessageText,
+  MíngZhànApiError,
+  PRIVATE_FILE_MODE,
+} from "@mingzhan/core";
+import { LOCAL_CLIENT_USER_ID } from "@mingzhan/core/local-auth";
+import { LLM_USAGE_STATS_ID, WORKSPACE_SETTINGS_ID } from "../constants";
+import { ensureDatabaseDirectory, resolveDatabasePath } from "../database-url";
+import { migrateDatabase } from "../migrate";
+import type {
+  BeginOrgTeamCreationInput,
+  CompareAndSetOrgPluginStateInput,
+  DatabaseAdapter,
+  OrgMemoryProposalStatus,
+  PluginPublishResult,
+  PublishOrgPluginReleaseInput,
+  StoredArtifactOwnerRecord,
+  StoredArtifactShareRecord,
+  StoredAttachmentRecord,
+  StoredAuditEvent,
+  StoredAutomationRecord,
+  StoredAutomationRunRecord,
+  StoredAutomationRunStepRecord,
+  StoredBrowserSessionRecord,
+  StoredComposioToolkitRecord,
+  StoredComposioUserConnectionRecord,
+  StoredLlmUsageActorStatsRecord,
+  StoredLlmUsageDailyStatsRecord,
+  StoredLlmUsageModelStatsRecord,
+  StoredLlmUsageStatsRecord,
+  StoredMcpServerRecord,
+  StoredNotificationDestinationRecord,
+  StoredOrganizationRecord,
+  StoredOrgInviteRecord,
+  StoredOrgMemberRecord,
+  StoredOrgMemoryProposal,
+  StoredOrgPluginRecord,
+  StoredOrgSharedResourceRecord,
+  StoredOrgTeamCreationRecord,
+  StoredPasskeyRecord,
+  StoredPluginReleaseRecord,
+  StoredProfileChangeEvent,
+  StoredProfileComposioToolkitRecord,
+  StoredProfileRecord,
+  StoredSessionMessageRecord,
+  StoredSessionRecord,
+  StoredSessionSummaryRecord,
+  StoredSharedAgentInstanceRecord,
+  StoredSkillProposal,
+  StoredSkillRecord,
+  StoredSkillSuggestion,
+  StoredSkillUsageRecord,
+  StoredSkillVersion,
+  StoredToolRecord,
+  StoredUserOrganizationRecord,
+  StoredUserRecord,
+  StoredWorkflowRecord,
+  StoredWorkflowRunRecord,
+  StoredWorkflowRunStepRecord,
+  StoredWorkspaceSettingsRecord,
+  UpsertPluginReleaseResult,
+} from "../types";
+
+export interface SqliteDatabase {
+  adapter: DatabaseAdapter;
+  close(): void;
+  /**
+   * Finalizes every prepared statement and releases the file now. `close()`
+   * keeps the file open until those statements are garbage collected, and
+   * Windows cannot rename or delete an open SQLite file.
+   */
+  release(): void;
+  reopen(): Promise<void>;
+}
+
+const INTERRUPTED_RUN_ERROR =
+  "Interrupted: the server process running this exited before it finished.";
+
+interface AutomationRow {
+  created_at: string;
+  definition: string;
+  enabled: number;
+  id: string;
+  name: string;
+  org_id: string | null;
+  profile_id: string;
+  updated_at: string;
+  version: number;
+}
+
+interface AuditEventRow {
+  action: string;
+  actor_user_id: string | null;
+  created_at: string;
+  id: string;
+  metadata: string;
+  org_id: string | null;
+  request_id: string | null;
+  resource_id: string | null;
+  resource_type: string;
+}
+
+interface AutomationRunRow {
+  automation_id: string;
+  completed_at: string | null;
+  delivery_error: string | null;
+  delivery_status: string | null;
+  error: string | null;
+  id: string;
+  output: string | null;
+  progress: string | null;
+  started_at: string;
+  status: string;
+}
+
+interface WorkflowRow {
+  created_at: string;
+  definition: string;
+  enabled: number;
+  id: string;
+  name: string;
+  org_id: string | null;
+  profile_id: string;
+  updated_at: string;
+  version: number;
+}
+
+interface WorkflowRunRow {
+  completed_at: string | null;
+  error: string | null;
+  id: string;
+  input: string | null;
+  output: string | null;
+  started_at: string;
+  status: string;
+  workflow_id: string;
+}
+
+interface WorkflowRunStepRow {
+  completed_at: string | null;
+  error: string | null;
+  id: string;
+  input: string | null;
+  kind: string;
+  output: string | null;
+  position: number;
+  run_id: string;
+  started_at: string;
+  status: string;
+  step_id: string;
+}
+
+interface ProfileRow {
+  acp_agent: string | null;
+  acp_settings: string | null;
+  automations_enabled: number;
+  created_at: string;
+  groups_enabled: number;
+  id: string;
+  is_default: number;
+  is_super: number;
+  model: string | null;
+  name: string;
+  org_id: string | null;
+  owner_user_id: string | null;
+  shared_with_team: number;
+  skills_curator_consolidate_enabled: number | null;
+  skills_post_turn_review: number | null;
+  skills_write_approval: number | null;
+  system_prompt: string;
+  thinking_effort: string | null;
+  thinking_enabled: number | null;
+  updated_at: string;
+}
+
+interface ToolRow {
+  created_at: string;
+  description: string;
+  handler_config: string;
+  handler_type: string;
+  id: string;
+  name: string;
+  org_id?: string | null;
+  plugin_id?: string | null;
+  plugin_key?: string | null;
+  updated_at: string;
+}
+
+interface SessionRow {
+  agent_questionnaire: string | null;
+  agent_todos: string;
+  branch_message_index: number | null;
+  channel: string;
+  created_at: string;
+  id: string;
+  model: string | null;
+  parent_session_id: string | null;
+  pinned: number;
+  profile_id: string;
+  thinking_effort?: string | null;
+  title: string | null;
+  updated_at?: string | null;
+  user_id?: string | null;
+}
+
+interface SessionMessageRow {
+  created_at: string;
+  id: string;
+  payload: string;
+  seq: number;
+  session_id: string;
+}
+
+interface AttachmentRow {
+  channel: string;
+  created_at: string;
+  ephemeral: number;
+  filename: string | null;
+  id: string;
+  kind: string;
+  media_type: string;
+  org_id: string | null;
+  profile_id: string;
+  session_id: string | null;
+  size_bytes: number;
+  storage_path: string;
+}
+
+interface SessionSummaryRow {
+  branch_message_index: number | null;
+  channel: string;
+  created_at: string;
+  first_user_payload: string | null;
+  id: string;
+  message_count: number;
+  parent_session_id: string | null;
+  pinned: number;
+  position: number;
+  profile_id: string;
+  sort_position: number | null;
+  title: string | null;
+  updated_at: string;
+}
+
+interface LlmUsageStatsRow {
+  estimated_cost_usd: number;
+  id: string;
+  input_tokens: number;
+  org_id: string;
+  output_tokens: number;
+  request_count: number;
+  tracked_since: string;
+  updated_at: string;
+}
+
+interface LlmUsageModelStatsRow {
+  estimated_cost_usd: number;
+  input_tokens: number;
+  model_id: string;
+  org_id: string;
+  output_tokens: number;
+  request_count: number;
+  tracked_since: string;
+  updated_at: string;
+}
+
+interface LlmUsageActorStatsRow {
+  estimated_cost_usd: number;
+  input_tokens: number;
+  org_id: string;
+  output_tokens: number;
+  profile_id: string;
+  request_count: number;
+  tracked_since: string;
+  updated_at: string;
+  user_id: string;
+}
+
+interface LlmUsageDailyStatsRow {
+  day: string;
+  estimated_cost_usd: number;
+  input_tokens: number;
+  model_id: string;
+  org_id: string;
+  output_tokens: number;
+  provider: string;
+  request_count: number;
+}
+
+interface WorkspaceSettingsRow {
+  automation_worker_poll_interval_ms: number;
+  coding_agent_harnesses: string;
+  coding_agent_provider_passthrough: number | null;
+  id: string;
+  image_model: string | null;
+  selected_coding_agent_harness: string | null;
+  transcription_model: string | null;
+  updated_at: string;
+  vision_model: string | null;
+}
+
+interface NotificationDestinationRow {
+  channel: StoredNotificationDestinationRecord["channel"];
+  config: string;
+  created_at: string;
+  id: string;
+  name: string;
+  org_id: string;
+  secret_hash: string;
+  updated_at: string;
+}
+
+interface ComposioToolkitRow {
+  cached_tools: string;
+  connected_account_id: string | null;
+  created_at: string;
+  display_name: string;
+  id: string;
+  last_error: string | null;
+  oauth_state_hash: string | null;
+  org_id: string;
+  session_id_enc: string | null;
+  status: string;
+  toolkit_slug: string;
+  updated_at: string;
+}
+
+interface ProfileComposioToolkitRow {
+  allowed_actions: string | null;
+  profile_id: string;
+  toolkit_id: string;
+}
+
+interface ComposioUserConnectionRow {
+  connected_account_id: string | null;
+  created_at: string;
+  id: string;
+  last_error: string | null;
+  oauth_state_hash: string | null;
+  org_id: string;
+  session_id_enc: string | null;
+  status: string;
+  toolkit_id: string;
+  updated_at: string;
+  user_id: string;
+}
+
+interface SkillRow {
+  created_at: string;
+  created_by: string;
+  description: string;
+  disable_model_invocation: number;
+  enabled: number;
+  has_tool: number;
+  id: string;
+  name: string;
+  org_id: string | null;
+  plugin_id?: string | null;
+  plugin_key?: string | null;
+  source_path: string;
+  updated_at: string;
+}
+
+interface SkillUsageRow {
+  created_at: string;
+  last_patched_at: string | null;
+  last_used_at: string | null;
+  last_viewed_at: string | null;
+  org_id: string;
+  patch_count: number;
+  profile_id: string;
+  skill_id: string;
+  updated_at: string;
+  use_count: number;
+  view_count: number;
+}
+
+interface McpServerRow {
+  cached_tools: string;
+  config: string;
+  created_at: string;
+  enabled: number;
+  id: string;
+  last_error: string | null;
+  name: string;
+  status: string;
+  transport: string;
+  updated_at: string;
+}
+
+interface UserRow {
+  created_at: string;
+  disabled_at?: string | null;
+  email: string;
+  id: string;
+  is_platform_admin?: number | null;
+  mfa_enabled?: number | null;
+  mfa_totp_last_step?: number | null;
+  mfa_totp_pending_secret_enc?: string | null;
+  mfa_totp_secret_enc?: string | null;
+  name?: string | null;
+  password_hash: string;
+  phone?: string | null;
+  updated_at: string;
+  user_context?: string | null;
+}
+
+interface PasskeyRow {
+  counter: number;
+  created_at: string;
+  credential_id: string;
+  id: string;
+  name: string;
+  public_key: string;
+  transports: string;
+  user_id: string;
+}
+
+interface BrowserSessionRow {
+  active_org_id?: string | null;
+  created_at: string;
+  csrf_token_hash: string;
+  expires_at: string;
+  id: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  session_token_hash: string;
+  user_id: string;
+}
+
+interface OrganizationRow {
+  allowed_invite_domains: string;
+  archived_at: string | null;
+  created_at: string;
+  id: string;
+  monthly_llm_token_limit: number | null;
+  monthly_llm_turn_limit: number | null;
+  monthly_llm_warning_percent: number;
+  name: string;
+  parent_org_id: string | null;
+  setup_pending: number;
+  skills_curator_archive_after_days: number;
+  skills_curator_consolidate_enabled: number;
+  skills_curator_enabled: number;
+  skills_curator_last_run_at: string | null;
+  skills_curator_stale_after_days: number;
+  skills_post_turn_review: number;
+  skills_write_approval: number;
+  slug: string;
+  updated_at: string;
+}
+
+interface OrgInviteRow {
+  accepted_at: string | null;
+  created_at: string;
+  email: string;
+  expires_at: string;
+  id: string;
+  invited_by_user_id: string;
+  org_id: string;
+  revoked_at: string | null;
+  role: string;
+  token_hash: string;
+}
+
+interface OrgMemoryProposalRow {
+  bullet: string;
+  created_at: string;
+  id: string;
+  org_id: string;
+  pinned: number;
+  profile_id: string | null;
+  proposed_by_user_id: string | null;
+  reviewed_at: string | null;
+  reviewer_user_id: string | null;
+  session_id: string | null;
+  source_document_ids: string | null;
+  status: string;
+}
+
+interface ProfileChangeEventRow {
+  actor_user_id: string | null;
+  after_value: string | null;
+  before_value: string | null;
+  created_at: string;
+  field: string;
+  id: string;
+  org_id: string;
+  profile_id: string;
+  source: string;
+}
+
+interface SkillVersionRow {
+  actor_user_id: string | null;
+  content: string;
+  created_at: string;
+  id: string;
+  kind: string;
+  note: string | null;
+  skill_id: string;
+  source: string | null;
+  version: number;
+}
+
+interface SkillProposalRow {
+  action: string;
+  consolidate_loser_skill_names: string | null;
+  content: string | null;
+  created_at: string;
+  id: string;
+  org_id: string;
+  patch_new_string: string | null;
+  patch_old_string: string | null;
+  profile_id: string;
+  proposed_by_user_id: string | null;
+  relative_path: string | null;
+  reviewed_at: string | null;
+  reviewer_user_id: string | null;
+  session_id: string | null;
+  skill_name: string;
+  status: string;
+  supporting_files: string | null;
+}
+
+interface SkillSuggestionRow {
+  action: string;
+  applied_at: string | null;
+  content: string | null;
+  created_at: string;
+  id: string;
+  org_id: string;
+  patch_new_string: string | null;
+  patch_old_string: string | null;
+  profile_id: string;
+  proposed_by_user_id: string | null;
+  session_id: string | null;
+  skill_name: string;
+  source: string;
+  status: string;
+  warnings: string | null;
+}
+
+interface ArtifactOwnerRow {
+  channel: string | null;
+  created_at: string;
+  filename: string;
+  org_id: string;
+  profile_id: string;
+  session_id: string | null;
+  user_id: string | null;
+  user_name: string | null;
+}
+
+interface ArtifactShareRow {
+  created_at: string;
+  created_by_user_id: string;
+  filename: string;
+  id: string;
+  mime_type: string;
+  org_id: string;
+  profile_id: string;
+  revoked_at: string | null;
+  size_bytes: number;
+  source_path: string;
+  storage_path: string;
+  token_hash: string;
+}
+
+/**
+ * The file holds plaintext MCP credentials and every transcript, so it carries
+ * the same 0600 the rest of ~/.mingzhan already uses. bun:sqlite takes no mode, and
+ * an existing loose file keeps its own, so chmod after open rather than at create.
+ */
+export function openPrivateDatabase(databasePath: string): Database {
+  ensureDatabaseDirectory(databasePath);
+  const db = new Database(databasePath, { create: true });
+
+  if (databasePath !== ":memory:") {
+    chmodSync(databasePath, PRIVATE_FILE_MODE);
+    // WAL lets readers run beside the writer. FULL syncs the log on every commit,
+    // so an acknowledged write still survives power loss; EXTRA only added a
+    // directory sync for the DELETE journal, which WAL never unlinks.
+    db.exec(
+      "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000;"
+    );
+  }
+
+  return db;
+}
+
+/**
+ * Sync sqlite `:memory:` adapter for tests. Prefer `createSqliteDatabase` when you need `close()`.
+ * Foreign keys stay off so existing tests that omit parent rows (org/user/tool) keep working —
+ * same permissiveness as the deleted Map adapter. Production/`createSqliteDatabase` keep FKs on.
+ */
+export function createSqliteMemoryAdapter(): DatabaseAdapter {
+  const db = openPrivateDatabase(":memory:");
+  migrateDatabase(db);
+  db.exec("PRAGMA foreign_keys = OFF");
+
+  return createSqliteDatabaseAdapter(db);
+}
+
+interface TrackedDatabaseHandle {
+  close: () => void;
+  db: Database;
+}
+
+/**
+ * bun on macOS throws "database is locked" from `db.close(true)` while any
+ * prepared statement exists — including never-executed ones — and the throw
+ * leaves the database open, so callers that need a real close (tests, the
+ * restore flow's file moves) fail or silently leak the handle. Finalizing the
+ * statements first makes close() actually close. Statements are tracked by
+ * overriding `prepare` on this instance; every other Database member is
+ * untouched, so migrateDatabase() and the adapter are covered as-is.
+ */
+function openTrackedDatabase(databasePath: string): TrackedDatabaseHandle {
+  const db = openPrivateDatabase(databasePath);
+  const statements = new Set<{ finalize: () => void }>();
+
+  const prepare = db.prepare.bind(db);
+
+  // SAFETY: own-property override shadows the prototype method, and the
+  // wrapped call forwards the exact argument list to the original prepare.
+  db.prepare = ((...args: Parameters<Database["prepare"]>) => {
+    const statement = prepare(...args);
+
+    statements.add(statement);
+
+    return statement;
+  }) as Database["prepare"];
+
+  return {
+    close() {
+      for (const statement of statements) {
+        try {
+          statement.finalize();
+        } catch {
+          // Already finalized or the database is gone; close proceeds.
+        }
+      }
+
+      statements.clear();
+      db.close(true);
+    },
+    db,
+  };
+}
+
+export async function createSqliteDatabase(
+  databaseUrl: string
+): Promise<SqliteDatabase> {
+  const databasePath = resolveDatabasePath(databaseUrl);
+
+  let current = openTrackedDatabase(databasePath);
+  migrateDatabase(current.db);
+  let adapter = createSqliteDatabaseAdapter(current.db);
+
+  // Stable proxy so services keep one adapter reference across reopen().
+  const adapterProxy = new Proxy(adapter, {
+    get(_target, property, receiver) {
+      const value = Object.entries(adapter).find(
+        ([key]) => key === String(property)
+      )?.[1];
+
+      return value instanceof Function ? value.bind(adapter) : value;
+    },
+  });
+
+  return {
+    adapter: adapterProxy,
+    close() {
+      current.close();
+    },
+    release() {
+      current.close();
+    },
+    async reopen() {
+      const next = openTrackedDatabase(databasePath);
+      migrateDatabase(next.db);
+      adapter = createSqliteDatabaseAdapter(next.db);
+      const previous = current;
+      current = next;
+      previous.close();
+    },
+  };
+}
+
+/** How long claim rows block replays before prune (also caps table growth). */
+const NOTIFICATION_WEBHOOK_DELIVERY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
+  const listAutomationsStmt = db.prepare<AutomationRow, SQLQueryBindings[]>(
+    "SELECT * FROM automations"
+  );
+
+  const listAutomationsForOrgStmt = db.prepare<
+    AutomationRow,
+    SQLQueryBindings[]
+  >("SELECT * FROM automations WHERE org_id = ? ORDER BY updated_at DESC");
+
+  const getAutomationStmt = db.prepare<AutomationRow, SQLQueryBindings[]>(
+    "SELECT * FROM automations WHERE id = ?"
+  );
+
+  const upsertAutomationStmt = db.prepare(`
+    INSERT INTO automations (id, name, version, definition, profile_id, org_id, enabled, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      name = excluded.name,
+      version = excluded.version,
+      definition = excluded.definition,
+      profile_id = excluded.profile_id,
+      org_id = excluded.org_id,
+      enabled = excluded.enabled,
+      updated_at = excluded.updated_at
+  `);
+
+  const deleteAutomationStmt = db.prepare(
+    "DELETE FROM automations WHERE id = ?"
+  );
+
+  const listAutomationRunsStmt = db.prepare<
+    AutomationRunRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT * FROM automation_runs
+    WHERE automation_id = ?
+    ORDER BY started_at DESC
+    LIMIT ?
+  `);
+
+  const getActiveAutomationRunStmt = db.prepare<
+    AutomationRunRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT * FROM automation_runs
+    WHERE automation_id = ? AND status = 'running'
+    ORDER BY started_at DESC
+    LIMIT 1
+  `);
+
+  const getAutomationRunStmt = db.prepare<
+    AutomationRunRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT * FROM automation_runs
+    WHERE automation_id = ? AND id = ?
+    LIMIT 1
+  `);
+
+  const insertAutomationRunStmt = db.prepare(`
+    INSERT INTO automation_runs (id, automation_id, status, started_at, completed_at, output, error, delivery_status, delivery_error, progress)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const updateAutomationRunStmt = db.prepare(`
+    UPDATE automation_runs
+    SET status = ?, completed_at = ?, output = ?, error = ?, delivery_status = ?, delivery_error = ?, progress = ?
+    WHERE id = ?
+  `);
+
+  const listWorkflowsForOrgStmt = db.prepare<WorkflowRow, SQLQueryBindings[]>(
+    "SELECT * FROM workflows WHERE org_id = ? ORDER BY updated_at DESC"
+  );
+
+  const getWorkflowStmt = db.prepare<WorkflowRow, SQLQueryBindings[]>(
+    "SELECT * FROM workflows WHERE id = ?"
+  );
+
+  const upsertWorkflowStmt = db.prepare(`
+    INSERT INTO workflows (id, name, version, definition, profile_id, org_id, enabled, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      name = excluded.name,
+      version = excluded.version,
+      definition = excluded.definition,
+      profile_id = excluded.profile_id,
+      org_id = excluded.org_id,
+      enabled = excluded.enabled,
+      updated_at = excluded.updated_at
+  `);
+
+  const deleteWorkflowStmt = db.prepare("DELETE FROM workflows WHERE id = ?");
+
+  const listWorkflowRunsStmt = db.prepare<WorkflowRunRow, SQLQueryBindings[]>(`
+    SELECT * FROM workflow_runs
+    WHERE workflow_id = ?
+    ORDER BY started_at DESC
+    LIMIT ?
+  `);
+
+  const getWorkflowRunStmt = db.prepare<WorkflowRunRow, SQLQueryBindings[]>(`
+    SELECT * FROM workflow_runs
+    WHERE workflow_id = ? AND id = ?
+  `);
+
+  const insertWorkflowRunStmt = db.prepare(`
+    INSERT INTO workflow_runs (id, workflow_id, status, input, started_at, completed_at, output, error)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const updateWorkflowRunStmt = db.prepare(`
+    UPDATE workflow_runs
+    SET status = ?, input = ?, completed_at = ?, output = ?, error = ?
+    WHERE id = ?
+  `);
+
+  const deleteWorkflowRunStmt = db.prepare(`
+    DELETE FROM workflow_runs
+    WHERE workflow_id = ? AND id = ?
+  `);
+
+  const failExhaustedAutomationRunsStmt = db.prepare(`
+    UPDATE automation_runs
+    SET status = 'failed', completed_at = ?, error = ?
+    WHERE status = 'running' AND resume_count >= ?
+  `);
+
+  const resumeInterruptedAutomationRunsStmt = db.prepare<
+    {
+      automation_id: string;
+      id: string;
+    },
+    SQLQueryBindings[]
+  >(`
+    UPDATE automation_runs
+    SET resume_count = resume_count + 1
+    WHERE status = 'running'
+    RETURNING id, automation_id
+  `);
+
+  const insertAutomationRunStepStmt = db.prepare(`
+    INSERT OR IGNORE INTO automation_run_steps (run_id, tool_call_id, tool_group_id, tool_name, args, result, status, started_at, completed_at, position)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const completeAutomationRunStepStmt = db.prepare(`
+    UPDATE automation_run_steps
+    SET status = 'completed', result = ?, completed_at = ?
+    WHERE run_id = ? AND tool_call_id = ?
+  `);
+
+  const listAutomationRunStepsStmt = db.prepare<
+    {
+      args: string;
+      completed_at: string | null;
+      position: number;
+      result: string | null;
+      run_id: string;
+      started_at: string;
+      status: StoredAutomationRunStepRecord["status"];
+      tool_call_id: string;
+      tool_group_id: string | null;
+      tool_name: string;
+    },
+    SQLQueryBindings[]
+  >(`
+    SELECT * FROM automation_run_steps
+    WHERE run_id = ?
+    ORDER BY position ASC
+  `);
+
+  const claimInterruptedAutomationRunsTransaction = db.transaction(
+    (maxResumes: number, completedAt: string) => {
+      failExhaustedAutomationRunsStmt.run(
+        completedAt,
+        INTERRUPTED_RUN_ERROR,
+        maxResumes
+      );
+
+      return resumeInterruptedAutomationRunsStmt.all();
+    }
+  );
+
+  const failInterruptedWorkflowRunsStmt = db.prepare(`
+    UPDATE workflow_runs
+    SET status = 'failed', completed_at = ?, error = ?
+    WHERE status = 'running'
+  `);
+
+  const failInterruptedWorkflowRunStepsStmt = db.prepare(`
+    UPDATE workflow_run_steps
+    SET status = 'failed', completed_at = ?, error = ?
+    WHERE status = 'running'
+  `);
+
+  const listWorkflowRunStepsStmt = db.prepare<
+    WorkflowRunStepRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT * FROM workflow_run_steps
+    WHERE run_id = ?
+    ORDER BY position ASC
+  `);
+
+  const insertWorkflowRunStepStmt = db.prepare(`
+    INSERT INTO workflow_run_steps (id, run_id, step_id, kind, status, input, output, error, started_at, completed_at, position)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const updateWorkflowRunStepStmt = db.prepare(`
+    UPDATE workflow_run_steps
+    SET status = ?, input = ?, output = ?, error = ?, completed_at = ?
+    WHERE id = ?
+  `);
+
+  const getAutomationRunReadThroughStmt = db.prepare<
+    {
+      read_through_at: string;
+    } | null,
+    SQLQueryBindings[]
+  >(`
+    SELECT read_through_at
+    FROM automation_run_read_state
+    WHERE user_id = ? AND org_id = ? AND automation_id = ?
+  `);
+
+  const upsertAutomationRunReadThroughStmt = db.prepare(`
+    INSERT INTO automation_run_read_state (user_id, org_id, automation_id, read_through_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(user_id, org_id, automation_id) DO UPDATE SET
+      read_through_at = excluded.read_through_at
+  `);
+
+  const countUnreadAutomationRunsByOrgStmt = db.prepare<
+    { automation_id: string } & { unread_count: number },
+    SQLQueryBindings[]
+  >(`
+    SELECT ar.automation_id AS automation_id, COUNT(*) AS unread_count
+    FROM automation_runs ar
+    INNER JOIN automations a ON a.id = ar.automation_id
+    LEFT JOIN automation_run_read_state rs
+      ON rs.automation_id = ar.automation_id
+      AND rs.user_id = ?
+      AND rs.org_id = ?
+    WHERE a.org_id = ?
+      AND ar.status IN ('completed', 'failed')
+      AND COALESCE(ar.completed_at, ar.started_at) > COALESCE(rs.read_through_at, '1970-01-01T00:00:00.000Z')
+    GROUP BY ar.automation_id
+  `);
+
+  const listProfilesStmt = db.prepare<ProfileRow, SQLQueryBindings[]>(
+    "SELECT * FROM profiles"
+  );
+
+  const listProfilesForOrgStmt = db.prepare<ProfileRow, SQLQueryBindings[]>(
+    "SELECT * FROM profiles WHERE org_id = ? ORDER BY is_default DESC, name ASC"
+  );
+
+  const getProfileStmt = db.prepare<ProfileRow, SQLQueryBindings[]>(
+    "SELECT * FROM profiles WHERE id = ?"
+  );
+
+  const getProfileForOrgStmt = db.prepare<ProfileRow, SQLQueryBindings[]>(
+    "SELECT * FROM profiles WHERE id = ? AND org_id = ?"
+  );
+
+  const getDefaultProfileForOrgStmt = db.prepare<
+    ProfileRow,
+    SQLQueryBindings[]
+  >("SELECT * FROM profiles WHERE org_id = ? AND is_default = 1 LIMIT 1");
+
+  const clearDefaultProfileForOrgStmt = db.prepare(`
+    UPDATE profiles SET is_default = 0 WHERE org_id = ? AND id != ?
+  `);
+
+  const upsertProfileStmt = db.prepare(`
+    INSERT INTO profiles (
+      id,
+      name,
+      system_prompt,
+      model,
+      thinking_enabled,
+      thinking_effort,
+      is_super,
+      org_id,
+      is_default,
+      automations_enabled,
+      groups_enabled,
+      skills_write_approval,
+      skills_post_turn_review,
+      skills_curator_consolidate_enabled,
+      acp_agent,
+      acp_settings,
+      owner_user_id,
+      shared_with_team,
+      created_at,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      name = excluded.name,
+      system_prompt = excluded.system_prompt,
+      model = excluded.model,
+      thinking_enabled = excluded.thinking_enabled,
+      thinking_effort = excluded.thinking_effort,
+      is_super = excluded.is_super,
+      org_id = excluded.org_id,
+      is_default = excluded.is_default,
+      automations_enabled = excluded.automations_enabled,
+      groups_enabled = excluded.groups_enabled,
+      skills_write_approval = excluded.skills_write_approval,
+      skills_post_turn_review = excluded.skills_post_turn_review,
+      skills_curator_consolidate_enabled = excluded.skills_curator_consolidate_enabled,
+      acp_agent = excluded.acp_agent,
+      acp_settings = excluded.acp_settings,
+      owner_user_id = excluded.owner_user_id,
+      shared_with_team = excluded.shared_with_team,
+      updated_at = excluded.updated_at
+  `);
+
+  const insertProfileIfAbsentStmt = db.prepare(`
+    INSERT INTO profiles (
+      id,
+      name,
+      system_prompt,
+      model,
+      thinking_enabled,
+      thinking_effort,
+      is_super,
+      org_id,
+      is_default,
+      automations_enabled,
+      groups_enabled,
+      skills_write_approval,
+      skills_post_turn_review,
+      skills_curator_consolidate_enabled,
+      acp_agent,
+      acp_settings,
+      owner_user_id,
+      shared_with_team,
+      created_at,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO NOTHING
+  `);
+
+  const profileInsertArgs = (record: StoredProfileRecord) => [
+    record.id,
+    record.name,
+    record.systemPrompt,
+    record.model,
+    record.thinkingEnabled == null ? null : record.thinkingEnabled ? 1 : 0,
+    record.thinkingEffort ?? null,
+    record.isSuper ? 1 : 0,
+    record.orgId ?? null,
+    record.isDefault ? 1 : 0,
+    record.automationsEnabled === false ? 0 : 1,
+    record.groupsEnabled === false ? 0 : 1,
+    record.skillsWriteApproval == null
+      ? null
+      : record.skillsWriteApproval
+        ? 1
+        : 0,
+    record.skillsPostTurnReview == null
+      ? null
+      : record.skillsPostTurnReview
+        ? 1
+        : 0,
+    record.skillsCuratorConsolidateEnabled == null
+      ? null
+      : record.skillsCuratorConsolidateEnabled
+        ? 1
+        : 0,
+    record.acpAgent ? JSON.stringify(record.acpAgent) : null,
+    record.acpSettings ? JSON.stringify(record.acpSettings) : null,
+    record.ownerUserId ?? null,
+    record.sharedWithTeam === false ? 0 : 1,
+    record.createdAt,
+    record.updatedAt ?? record.createdAt,
+  ];
+
+  const runUpsertProfileStmt = (record: StoredProfileRecord) => {
+    upsertProfileStmt.run(...profileInsertArgs(record));
+  };
+
+  const upsertDefaultProfileTransaction = db.transaction(
+    (record: StoredProfileRecord) => {
+      clearDefaultProfileForOrgStmt.run(record.orgId!, record.id);
+      runUpsertProfileStmt(record);
+    }
+  );
+
+  const moveProfileTransaction = db.transaction(
+    (
+      profileId: string,
+      sourceOrgId: string,
+      targetOrgId: string,
+      workspaceFrom: string,
+      workspaceTo: string
+    ) => {
+      const profile = getProfileForOrgStmt.get(profileId, sourceOrgId);
+
+      if (!profile) {
+        throw new MíngZhànApiError("Profile not found.", 404);
+      }
+
+      if (sourceOrgId === targetOrgId) {
+        throw new MíngZhànApiError("Choose another organization.", 400);
+      }
+
+      if (profile.is_super) {
+        throw new MíngZhànApiError("Super MíngZhàn cannot be moved.", 400);
+      }
+
+      const target = db
+        .query(
+          "SELECT id FROM organizations WHERE id = ? AND archived_at IS NULL"
+        )
+        .get(targetOrgId);
+
+      if (!target) {
+        throw new MíngZhànApiError(
+          "Destination organization is unavailable.",
+          404
+        );
+      }
+
+      for (const [runs, owners, foreignKey] of [
+        ["automation_runs", "automations", "automation_id"],
+        ["workflow_runs", "workflows", "workflow_id"],
+      ]) {
+        if (
+          db
+            .query(
+              `SELECT 1 FROM ${runs} r JOIN ${owners} o ON o.id = r.${foreignKey} WHERE o.profile_id = ? AND r.status = 'running' LIMIT 1`
+            )
+            .get(profileId)
+        ) {
+          throw new MíngZhànApiError(
+            "Wait for running automations and workflows to finish.",
+            409
+          );
+        }
+      }
+
+      if (profile.is_default) {
+        const successor = db
+          .query<{ id: string }, SQLQueryBindings[]>(
+            "SELECT id FROM profiles WHERE org_id = ? AND id != ? AND is_super = 0 ORDER BY created_at LIMIT 1"
+          )
+          .get(sourceOrgId, profileId);
+
+        if (!successor) {
+          throw new MíngZhànApiError(
+            "Create another profile before moving the default profile.",
+            409
+          );
+        }
+
+        db.query("UPDATE profiles SET is_default = 1 WHERE id = ?").run(
+          successor.id
+        );
+      }
+
+      const workspacePrefix = `${workspaceFrom}${sep}`;
+
+      if (
+        db
+          .query(
+            "SELECT 1 FROM skills s JOIN profile_skills ps ON ps.skill_id = s.id WHERE substr(s.source_path, 1, length(?)) = ? AND ps.profile_id != ? LIMIT 1"
+          )
+          .get(workspacePrefix, workspacePrefix, profileId)
+      ) {
+        throw new MíngZhànApiError(
+          "Unassign this profile's local skills from other profiles before moving.",
+          409
+        );
+      }
+
+      db.query(
+        "UPDATE skills SET org_id = ?, source_path = ? || substr(source_path, length(?) + 1) WHERE substr(source_path, 1, length(?)) = ?"
+      ).run(
+        targetOrgId,
+        workspaceTo,
+        workspaceFrom,
+        workspacePrefix,
+        workspacePrefix
+      );
+      const now = new Date().toISOString();
+      db.query(
+        "UPDATE profiles SET org_id = ?, is_default = 0, updated_at = ? WHERE id = ?"
+      ).run(targetOrgId, now, profileId);
+
+      for (const table of [
+        "sessions",
+        "attachments",
+        "profile_change_events",
+        "profile_skill_usage",
+        "skill_proposals",
+        "skill_suggestions",
+      ]) {
+        db.query(`UPDATE ${table} SET org_id = ? WHERE profile_id = ?`).run(
+          targetOrgId,
+          profileId
+        );
+      }
+
+      db.query(
+        "UPDATE attachments SET storage_path = ? || substr(storage_path, length(?) + 1) WHERE profile_id = ? AND substr(storage_path, 1, length(?)) = ?"
+      ).run(
+        workspaceTo,
+        workspaceFrom,
+        profileId,
+        workspacePrefix,
+        workspacePrefix
+      );
+
+      for (const table of ["automations", "workflows"]) {
+        db.query(
+          `UPDATE ${table} SET org_id = ?, enabled = 0, updated_at = ? WHERE profile_id = ?`
+        ).run(targetOrgId, now, profileId);
+      }
+
+      db.query(
+        "DELETE FROM automation_run_read_state WHERE automation_id IN (SELECT id FROM automations WHERE profile_id = ?)"
+      ).run(profileId);
+      // Existing public links must not grant access after a transfer.
+      db.query(
+        "UPDATE artifact_shares SET revoked_at = ? WHERE profile_id = ? AND revoked_at IS NULL"
+      ).run(now, profileId);
+      db.query(
+        "DELETE FROM profile_composio_toolkits WHERE profile_id = ?"
+      ).run(profileId);
+
+      for (const [table, resources, key] of [
+        ["profile_tools", "tools", "tool_id"],
+        ["profile_mcp_servers", "mcp_servers", "server_id"],
+        ["profile_skills", "skills", "skill_id"],
+      ]) {
+        db.query(
+          `DELETE FROM ${table} WHERE profile_id = ? AND ${key} IN (SELECT id FROM ${resources} WHERE org_id IS NOT NULL AND org_id != ?)`
+        ).run(profileId, targetOrgId);
+      }
+    }
+  );
+
+  const deleteProfileStmt = db.prepare("DELETE FROM profiles WHERE id = ?");
+
+  const promoteProfileStmt = db.prepare(
+    "UPDATE profiles SET is_default = 1, updated_at = ? WHERE id = ? AND org_id = ?"
+  );
+
+  const deleteProfileAndPromoteDefaultTx = db.transaction(
+    (id: string, orgId: string, successorId?: string) => {
+      if (getProfileForOrgStmt.get(id, orgId)?.is_default && !successorId) {
+        throw new Error("Default profile changed during deletion.");
+      }
+
+      const deleted = deleteProfileForOrgStmt.run(id, orgId).changes > 0;
+
+      if (
+        deleted &&
+        successorId &&
+        !getDefaultProfileForOrgStmt.get(orgId) &&
+        promoteProfileStmt.run(new Date().toISOString(), successorId, orgId)
+          .changes !== 1
+      ) {
+        throw new Error("Successor profile not found.");
+      }
+
+      return deleted;
+    }
+  );
+
+  const deleteProfileForOrgStmt = db.prepare(
+    "DELETE FROM profiles WHERE id = ? AND org_id = ?"
+  );
+
+  const listToolsStmt = db.prepare<ToolRow, SQLQueryBindings[]>(
+    "SELECT * FROM tools"
+  );
+
+  const getToolStmt = db.prepare<ToolRow, SQLQueryBindings[]>(
+    "SELECT * FROM tools WHERE id = ?"
+  );
+
+  const getToolByNameStmt = db.prepare<ToolRow, SQLQueryBindings[]>(
+    "SELECT * FROM tools WHERE name = ?"
+  );
+
+  // The org's own tool wins over a global tool of the same name; tools owned
+  // by another organization are never visible to name lookups.
+  const getToolByNameForOrgStmt = db.prepare<ToolRow, SQLQueryBindings[]>(`
+    SELECT * FROM tools
+    WHERE name = ? AND (org_id IS NULL OR org_id = ?)
+    ORDER BY org_id IS NULL
+    LIMIT 1
+  `);
+
+  const upsertToolStmt = db.prepare(`
+    INSERT INTO tools (
+      id, name, description, handler_type, handler_config, org_id, plugin_id, plugin_key, created_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      name = excluded.name,
+      description = excluded.description,
+      handler_type = excluded.handler_type,
+      handler_config = excluded.handler_config,
+      org_id = excluded.org_id,
+      plugin_id = excluded.plugin_id,
+      plugin_key = excluded.plugin_key,
+      updated_at = excluded.updated_at
+  `);
+
+  const deleteToolStmt = db.prepare("DELETE FROM tools WHERE id = ?");
+
+  const listToolsForProfileStmt = db.prepare<ToolRow, SQLQueryBindings[]>(`
+    SELECT tools.*
+    FROM profile_tools
+    INNER JOIN tools ON profile_tools.tool_id = tools.id
+    WHERE profile_tools.profile_id = ?
+  `);
+
+  const assignToolStmt = db.prepare(`
+    INSERT INTO profile_tools (profile_id, tool_id)
+    VALUES (?, ?)
+    ON CONFLICT DO NOTHING
+  `);
+
+  const unassignToolStmt = db.prepare(`
+    DELETE FROM profile_tools
+    WHERE profile_id = ? AND tool_id = ?
+  `);
+
+  const unassignToolFromAllProfilesStmt = db.prepare(`
+    DELETE FROM profile_tools
+    WHERE tool_id = ?
+  `);
+
+  const deleteToolEverywhereTransaction = db.transaction((toolId: string) => {
+    unassignToolFromAllProfilesStmt.run(toolId);
+
+    return deleteToolStmt.run(toolId);
+  });
+
+  const listSessionsStmt = db.prepare<SessionRow, SQLQueryBindings[]>(
+    "SELECT * FROM sessions WHERE app_user_id IS NULL"
+  );
+
+  const listSessionsForUserStmt = db.prepare<SessionRow, SQLQueryBindings[]>(
+    "SELECT * FROM sessions WHERE user_id = ? AND app_user_id IS NULL ORDER BY created_at ASC"
+  );
+
+  const getSessionStmt = db.prepare<SessionRow, SQLQueryBindings[]>(
+    "SELECT * FROM sessions WHERE id = ? AND app_user_id IS NULL"
+  );
+
+  // org_id follows the profile's org. The profile move path keeps it in sync.
+  const upsertSessionStmt = db.prepare(`
+    INSERT INTO sessions (id, profile_id, channel, created_at, updated_at, app_user_id, user_id, model, org_id, pinned, parent_session_id, branch_message_index, thinking_effort)
+    VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      profile_id = excluded.profile_id,
+      channel = excluded.channel,
+      user_id = COALESCE(excluded.user_id, sessions.user_id),
+      model = excluded.model,
+      org_id = excluded.org_id
+    WHERE sessions.app_user_id IS NULL
+  `);
+
+  const updateSessionUpdatedAtStmt = db.prepare(
+    "UPDATE sessions SET updated_at = ? WHERE id = ? AND app_user_id IS NULL"
+  );
+
+  const deleteSessionStmt = db.prepare(
+    "DELETE FROM sessions WHERE id = ? AND app_user_id IS NULL"
+  );
+
+  const updateSessionModelStmt = db.prepare(
+    "UPDATE sessions SET model = ? WHERE id = ? AND app_user_id IS NULL"
+  );
+
+  const updateSessionThinkingEffortStmt = db.prepare(
+    "UPDATE sessions SET thinking_effort = ? WHERE id = ? AND app_user_id IS NULL"
+  );
+
+  const updateSessionPinnedStmt = db.prepare(
+    "UPDATE sessions SET pinned = ? WHERE id = ? AND app_user_id IS NULL"
+  );
+
+  const updateSessionParentStmt = db.prepare(
+    "UPDATE sessions SET parent_session_id = ? WHERE id = ? AND app_user_id IS NULL"
+  );
+
+  const setSessionOrderStmt = db.prepare(`
+    INSERT INTO session_user_order (session_id, user_id, sort_position)
+    VALUES (?, ?, ?)
+    ON CONFLICT(session_id, user_id) DO UPDATE SET sort_position = excluded.sort_position
+  `);
+
+  const updateSessionTitleStmt = db.prepare(`
+    UPDATE sessions SET title = ? WHERE id = ? AND app_user_id IS NULL AND title IS NULL
+  `);
+
+  const getSessionTodosStmt = db.prepare<
+    {
+      agent_todos: string;
+    },
+    SQLQueryBindings[]
+  >("SELECT agent_todos FROM sessions WHERE id = ? AND app_user_id IS NULL");
+
+  const renameSessionTitleStmt = db.prepare(
+    "UPDATE sessions SET title = ? WHERE id = ? AND app_user_id IS NULL"
+  );
+
+  const updateSessionTodosStmt = db.prepare(
+    "UPDATE sessions SET agent_todos = ? WHERE id = ? AND app_user_id IS NULL"
+  );
+
+  const getSessionQuestionnaireStmt = db.prepare<
+    {
+      agent_questionnaire: string | null;
+    },
+    SQLQueryBindings[]
+  >(
+    "SELECT agent_questionnaire FROM sessions WHERE id = ? AND app_user_id IS NULL"
+  );
+
+  const updateSessionQuestionnaireStmt = db.prepare(
+    "UPDATE sessions SET agent_questionnaire = ? WHERE id = ? AND app_user_id IS NULL"
+  );
+
+  const listMessagesForSessionStmt = db.prepare<
+    SessionMessageRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT * FROM session_messages
+    WHERE session_id = ? AND EXISTS (SELECT 1 FROM sessions WHERE id = session_id AND app_user_id IS NULL)
+    ORDER BY seq ASC
+  `);
+
+  const appendMessageStmt = db.prepare(`
+    INSERT INTO session_messages (id, session_id, seq, payload, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+
+  const requireWritableSession = (sessionId: string): void => {
+    const retired = db
+      .query("SELECT 1 FROM sessions WHERE id = ? AND app_user_id IS NOT NULL")
+      .get(sessionId);
+
+    if (retired) {
+      throw new Error("Session not found.");
+    }
+  };
+
+  const insertMessages = (
+    sessionId: string,
+    messages: StoredSessionMessageRecord[]
+  ): void => {
+    requireWritableSession(sessionId);
+
+    for (const message of messages) {
+      appendMessageStmt.run(
+        message.id,
+        sessionId,
+        message.seq,
+        JSON.stringify(message.payload),
+        message.createdAt
+      );
+    }
+  };
+
+  const appendMessagesTransaction = db.transaction(insertMessages);
+
+  const deleteMessagesForSessionStmt = db.prepare(
+    "DELETE FROM session_messages WHERE session_id = ? AND EXISTS (SELECT 1 FROM sessions WHERE id = session_id AND app_user_id IS NULL)"
+  );
+
+  const replaceMessagesForSessionTransaction = db.transaction(
+    (sessionId: string, messages: StoredSessionMessageRecord[]) => {
+      requireWritableSession(sessionId);
+      deleteMessagesForSessionStmt.run(sessionId);
+      insertMessages(sessionId, messages);
+
+      const updatedAt = messages.reduce(
+        (latest, message) =>
+          message.createdAt > latest ? message.createdAt : latest,
+        new Date().toISOString()
+      );
+
+      updateSessionUpdatedAtStmt.run(updatedAt, sessionId);
+    }
+  );
+
+  const insertAttachmentStmt = db.prepare(`
+    INSERT INTO attachments (
+      id, org_id, profile_id, session_id, channel, kind, filename,
+      media_type, size_bytes, storage_path, created_at, ephemeral
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const getAttachmentStmt = db.prepare<AttachmentRow, SQLQueryBindings[]>(
+    "SELECT * FROM attachments WHERE id = ? AND NOT EXISTS (SELECT 1 FROM sessions WHERE sessions.id = attachments.session_id AND app_user_id IS NOT NULL)"
+  );
+
+  const listAttachmentsForSessionStmt = db.prepare<
+    AttachmentRow,
+    SQLQueryBindings[]
+  >(
+    "SELECT * FROM attachments WHERE session_id = ? AND NOT EXISTS (SELECT 1 FROM sessions WHERE sessions.id = attachments.session_id AND app_user_id IS NOT NULL)"
+  );
+
+  // Gives each attachment of a session to another live session whose messages
+  // still name it, so purging the first one leaves the file in place. The new
+  // owner must be on the attachment's own profile, the only place the file can
+  // be read from, and that profile must belong to the caller's org. A session
+  // elsewhere that names the same id keeps nothing alive. An attachment nobody
+  // else names keeps its owner and is deleted with it.
+  const handOverSharedAttachmentsStmt = db.prepare(`
+    UPDATE attachments
+    SET session_id = COALESCE(
+      (
+        SELECT s.id
+        FROM sessions AS s
+        JOIN profiles AS p ON p.id = s.profile_id
+        JOIN session_messages AS m ON m.session_id = s.id
+        WHERE p.org_id = ?2
+          AND s.profile_id = attachments.profile_id
+          AND s.app_user_id IS NULL
+          AND s.id != ?1
+          AND instr(m.payload, '"attachmentId":"' || attachments.id || '"') > 0
+        LIMIT 1
+      ),
+      session_id
+    )
+    WHERE session_id = ?1 AND org_id = ?2
+  `);
+
+  const listEphemeralAttachmentsStmt = db.prepare<
+    AttachmentRow,
+    SQLQueryBindings[]
+  >(
+    "SELECT * FROM attachments WHERE ephemeral = 1 AND NOT EXISTS (SELECT 1 FROM sessions WHERE sessions.id = attachments.session_id AND app_user_id IS NOT NULL)"
+  );
+
+  const deleteAttachmentStmt = db.prepare(
+    "DELETE FROM attachments WHERE id = ? AND NOT EXISTS (SELECT 1 FROM sessions WHERE sessions.id = attachments.session_id AND app_user_id IS NOT NULL)"
+  );
+
+  // Keyset paging on the sort columns. `position` is each row's place in the
+  // whole list, so the caller can tell when chats crossed a cursor between two
+  // page requests. The preview is read only for the rows of the page, after the
+  // LIMIT, because it parses message JSON.
+  const listSessionSummariesStmt = db.prepare<
+    SessionSummaryRow,
+    SQLQueryBindings[]
+  >(`
+    WITH summaries AS (
+      SELECT
+        s.id,
+        s.profile_id,
+        s.channel,
+        s.created_at,
+        s.title,
+        s.pinned,
+        s.parent_session_id,
+        s.branch_message_index,
+        o.sort_position,
+        COUNT(m.id) AS message_count,
+        max(
+          COALESCE(MAX(m.created_at), s.created_at),
+          COALESCE(s.updated_at, s.created_at)
+        ) AS updated_at
+      FROM sessions s
+      LEFT JOIN session_user_order o ON o.session_id = s.id AND o.user_id = ?12
+      LEFT JOIN session_messages m ON m.session_id = s.id
+      WHERE s.profile_id = ?1
+        AND s.channel IN (SELECT value FROM json_each(?2))
+        AND (?8 IS NULL OR s.id = ?8)
+        AND (
+          ?10 IS NULL
+          OR s.user_id = ?10
+          OR s.channel IN (SELECT value FROM json_each(?11))
+        )
+        AND s.app_user_id IS NULL
+        -- Only message text is searched: content is a string or an array of
+        -- parts, and matching the raw JSON would let "role" hit every chat.
+        -- LIKE ignores case for ASCII letters only, so "école" does not find
+        -- "École": SQLite has no Unicode case folding and bun:sqlite cannot
+        -- register one. That needs a folded copy of the text or an FTS5 index.
+        AND (
+          ?9 IS NULL
+          OR s.title LIKE ?9 ESCAPE '\\'
+          OR EXISTS (
+            SELECT 1
+            FROM session_messages sm
+            WHERE sm.session_id = s.id
+              AND json_extract(sm.payload, '$.role') IN ('user', 'assistant')
+              AND (
+                (
+                  json_type(sm.payload, '$.content') = 'text'
+                  AND json_extract(sm.payload, '$.content') LIKE ?9 ESCAPE '\\'
+                )
+                OR (
+                  json_type(sm.payload, '$.content') = 'array'
+                  AND EXISTS (
+                    SELECT 1
+                    FROM json_each(sm.payload, '$.content') AS part
+                    WHERE json_extract(part.value, '$.type') = 'text'
+                      AND json_extract(part.value, '$.text') LIKE ?9 ESCAPE '\\'
+                  )
+                )
+              )
+          )
+        )
+      GROUP BY s.id
+      HAVING COUNT(m.id) > 0
+    ),
+    ranked AS (
+      SELECT
+        *,
+        row_number() OVER (
+          ORDER BY pinned DESC, updated_at DESC, created_at DESC, id DESC
+        ) AS position
+      FROM summaries
+    ),
+    page AS (
+      SELECT * FROM ranked
+      WHERE ?6 IS NULL
+        OR (pinned, updated_at, created_at, id) < (?3, ?4, ?5, ?6)
+      ORDER BY position
+      LIMIT ?7
+    )
+    SELECT
+      page.*,
+      (
+        SELECT payload
+        FROM session_messages
+        WHERE session_id = page.id
+          AND json_extract(payload, '$.role') = 'user'
+        ORDER BY seq ASC
+        LIMIT 1
+      ) AS first_user_payload
+    FROM page
+    ORDER BY position
+  `);
+
+  const getLlmUsageStatsStmt = db.prepare<LlmUsageStatsRow, SQLQueryBindings[]>(
+    "SELECT * FROM llm_usage_stats WHERE org_id = ? AND id = ?"
+  );
+
+  const listLlmUsageStatsByModelStmt = db.prepare<
+    LlmUsageModelStatsRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT * FROM llm_usage_model_stats
+    WHERE org_id = ?
+    ORDER BY request_count DESC, input_tokens + output_tokens DESC, model_id ASC
+  `);
+
+  const listLlmUsageStatsByActorStmt = db.prepare<
+    LlmUsageActorStatsRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT * FROM llm_usage_actor_stats
+    WHERE org_id = ?
+    ORDER BY request_count DESC, input_tokens + output_tokens DESC
+  `);
+
+  const listLlmUsageDailyStatsStmt = db.prepare<
+    LlmUsageDailyStatsRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT * FROM llm_usage_daily_stats
+    WHERE org_id = ? AND day >= ?
+    ORDER BY day ASC, model_id ASC, provider ASC
+  `);
+
+  const listMcpServersStmt = db.prepare<McpServerRow, SQLQueryBindings[]>(
+    "SELECT * FROM mcp_servers"
+  );
+
+  const getMcpServerStmt = db.prepare<McpServerRow, SQLQueryBindings[]>(
+    "SELECT * FROM mcp_servers WHERE id = ?"
+  );
+
+  const getMcpServerByNameStmt = db.prepare<McpServerRow, SQLQueryBindings[]>(
+    "SELECT * FROM mcp_servers WHERE name = ?"
+  );
+
+  const upsertMcpServerStmt = db.prepare(`
+    INSERT INTO mcp_servers (
+      id, name, transport, config, enabled, status, last_error, cached_tools, created_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      name = excluded.name,
+      transport = excluded.transport,
+      config = excluded.config,
+      enabled = excluded.enabled,
+      status = excluded.status,
+      last_error = excluded.last_error,
+      cached_tools = excluded.cached_tools,
+      updated_at = excluded.updated_at
+  `);
+
+  const deleteMcpServerStmt = db.prepare(
+    "DELETE FROM mcp_servers WHERE id = ?"
+  );
+
+  const unassignMcpServerFromAllProfilesStmt = db.prepare(
+    "DELETE FROM profile_mcp_servers WHERE server_id = ?"
+  );
+
+  const deleteMcpServerEverywhereTransaction = db.transaction(
+    (serverId: string) => {
+      unassignMcpServerFromAllProfilesStmt.run(serverId);
+
+      return deleteMcpServerStmt.run(serverId);
+    }
+  );
+
+  const listMcpServersForProfileStmt = db.prepare<
+    McpServerRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT mcp_servers.*
+    FROM mcp_servers
+    INNER JOIN profile_mcp_servers ON profile_mcp_servers.server_id = mcp_servers.id
+    WHERE profile_mcp_servers.profile_id = ?
+    AND mcp_servers.enabled = 1
+    ORDER BY mcp_servers.name ASC
+  `);
+
+  const assignMcpServerStmt = db.prepare(`
+    INSERT OR IGNORE INTO profile_mcp_servers (profile_id, server_id)
+    VALUES (?, ?)
+  `);
+
+  const unassignMcpServerStmt = db.prepare(`
+    DELETE FROM profile_mcp_servers
+    WHERE profile_id = ? AND server_id = ?
+  `);
+
+  const countProfileMcpAssignmentsStmt = db.prepare<
+    { count: number },
+    SQLQueryBindings[]
+  >(`
+    SELECT COUNT(*) AS count FROM profile_mcp_servers
+  `);
+
+  const listProfilesForMcpServerStmt = db.prepare<
+    ProfileRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT profiles.*
+    FROM profiles
+    INNER JOIN profile_mcp_servers ON profile_mcp_servers.profile_id = profiles.id
+    WHERE profile_mcp_servers.server_id = ?
+    ORDER BY profiles.name ASC
+  `);
+
+  const listMcpServerProfileCountsStmt = db.prepare<
+    {
+      server_id: string;
+      count: number;
+    },
+    SQLQueryBindings[]
+  >(`
+    SELECT server_id, COUNT(*) AS count
+    FROM profile_mcp_servers
+    GROUP BY server_id
+  `);
+
+  const listSkillsStmt = db.prepare<SkillRow, SQLQueryBindings[]>(
+    "SELECT * FROM skills ORDER BY name ASC"
+  );
+
+  const getSkillStmt = db.prepare<SkillRow, SQLQueryBindings[]>(
+    "SELECT * FROM skills WHERE id = ?"
+  );
+
+  // The org's own skill wins over a global skill of the same name.
+  const getSkillByNameStmt = db.prepare<SkillRow, SQLQueryBindings[]>(`
+    SELECT * FROM skills
+    WHERE name = ? AND (org_id IS NULL OR org_id = ?)
+    ORDER BY org_id IS NULL
+    LIMIT 1
+  `);
+
+  const getSkillBySourcePathStmt = db.prepare<SkillRow, SQLQueryBindings[]>(
+    "SELECT * FROM skills WHERE source_path = ?"
+  );
+
+  const upsertSkillStmt = db.prepare(`
+    INSERT INTO skills (
+      id, name, description, source_path, has_tool, disable_model_invocation, enabled, created_by, org_id, plugin_id, plugin_key, created_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      name = excluded.name,
+      description = excluded.description,
+      source_path = excluded.source_path,
+      has_tool = excluded.has_tool,
+      disable_model_invocation = excluded.disable_model_invocation,
+      enabled = excluded.enabled,
+      created_by = excluded.created_by,
+      org_id = excluded.org_id,
+      plugin_id = excluded.plugin_id,
+      plugin_key = excluded.plugin_key,
+      updated_at = excluded.updated_at
+  `);
+
+  const deleteSkillStmt = db.prepare("DELETE FROM skills WHERE id = ?");
+
+  const deleteSkillVersionsStmt = db.prepare(
+    "DELETE FROM skill_versions WHERE skill_id = ?"
+  );
+
+  const createSkillVersionStmt = db.prepare<
+    { version: number },
+    SQLQueryBindings[]
+  >(`
+    INSERT INTO skill_versions (
+      id, skill_id, version, kind, content, note, actor_user_id, source,
+      created_at
+    )
+    SELECT ?, ?, COALESCE(MAX(version), 0) + 1, ?, ?, ?, ?, ?, ?
+    FROM skill_versions WHERE skill_id = ?
+    RETURNING version
+  `);
+
+  const listSkillVersionsStmt = db.prepare<
+    SkillVersionRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, skill_id, version, kind, content, note, actor_user_id, source,
+      created_at
+    FROM skill_versions
+    WHERE skill_id = ?
+    ORDER BY version DESC
+    LIMIT ?
+  `);
+
+  const getSkillVersionStmt = db.prepare<SkillVersionRow, SQLQueryBindings[]>(`
+    SELECT
+      id, skill_id, version, kind, content, note, actor_user_id, source,
+      created_at
+    FROM skill_versions
+    WHERE skill_id = ? AND id = ?
+  `);
+
+  const clearErasedUserSkillVersionsStmt = db.prepare(
+    "UPDATE skill_versions SET actor_user_id = NULL WHERE actor_user_id = ?"
+  );
+
+  const getPluginReleaseStmt = db.prepare<PluginReleaseRow, SQLQueryBindings[]>(
+    "SELECT * FROM plugin_releases WHERE plugin_id = ? AND version = ?"
+  );
+
+  const insertPluginReleaseStmt = db.prepare(`
+    INSERT INTO plugin_releases (plugin_id, version, manifest, digest, created_at, source)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+
+  const fillEmptyPluginReleaseDigestStmt = db.prepare(`
+    UPDATE plugin_releases
+    SET digest = ?, manifest = ?
+    WHERE plugin_id = ? AND version = ? AND (digest IS NULL OR digest = '')
+  `);
+
+  const getOrgPluginStmt = db.prepare<OrgPluginRow, SQLQueryBindings[]>(
+    "SELECT * FROM org_plugins WHERE org_id = ? AND plugin_id = ?"
+  );
+
+  const listOrgPluginsStmt = db.prepare(
+    "SELECT * FROM org_plugins ORDER BY org_id, plugin_id"
+  );
+
+  const listOrgPluginsForOrgStmt = db.prepare(
+    "SELECT * FROM org_plugins WHERE org_id = ? ORDER BY plugin_id"
+  );
+
+  const listPluginReleasesStmt = db.prepare(
+    "SELECT * FROM plugin_releases WHERE plugin_id = ? ORDER BY created_at ASC"
+  );
+
+  const listAllPluginReleasesStmt = db.prepare(
+    "SELECT * FROM plugin_releases ORDER BY plugin_id, created_at ASC"
+  );
+
+  const deleteOrgPluginStmt = db.prepare(
+    "DELETE FROM org_plugins WHERE org_id = ? AND plugin_id = ? AND revision = ?"
+  );
+
+  const deletePluginReleaseStmt = db.prepare(
+    "DELETE FROM plugin_releases WHERE plugin_id = ? AND version = ?"
+  );
+
+  const insertOrgPluginStmt = db.prepare(`
+    INSERT INTO org_plugins (
+      org_id, plugin_id, selected_version, database_generation, lifecycle_state,
+      revision, pending_operation, last_lifecycle_error, created_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+  `);
+
+  const updateOrgPluginCasStmt = db.prepare(`
+    UPDATE org_plugins
+    SET
+      selected_version = ?,
+      database_generation = ?,
+      lifecycle_state = ?,
+      revision = revision + 1,
+      pending_operation = ?,
+      last_lifecycle_error = ?,
+      updated_at = ?
+    WHERE org_id = ? AND plugin_id = ? AND revision = ?
+  `);
+
+  const getOwnedSkillIdStmt = db.prepare<{ id: string }, SQLQueryBindings[]>(`
+    SELECT id FROM skills
+    WHERE org_id = ? AND plugin_id = ? AND plugin_key = ?
+  `);
+
+  const listOwnedSkillIdsStmt = db.prepare<
+    { id: string; plugin_key: string } & {
+      id: string;
+    },
+    SQLQueryBindings[]
+  >(`
+    SELECT id, plugin_key FROM skills
+    WHERE org_id = ? AND plugin_id = ?
+  `);
+
+  const getOwnedToolIdStmt = db.prepare<{ id: string }, SQLQueryBindings[]>(`
+    SELECT id FROM tools
+    WHERE org_id = ? AND plugin_id = ? AND plugin_key = ?
+  `);
+
+  const listOwnedToolIdsStmt = db.prepare<
+    { id: string; plugin_key: string } & {
+      id: string;
+    },
+    SQLQueryBindings[]
+  >(`
+    SELECT id, plugin_key FROM tools
+    WHERE org_id = ? AND plugin_id = ?
+  `);
+
+  const listProfilesWithPluginAssignmentCountStmt = db.prepare<
+    { profile_id: string },
+    SQLQueryBindings[]
+  >(`
+    SELECT profile_id FROM (
+      SELECT profile_tools.profile_id AS profile_id
+      FROM profile_tools
+      INNER JOIN tools ON tools.id = profile_tools.tool_id
+      WHERE tools.org_id = ? AND tools.plugin_id = ?
+      UNION ALL
+      SELECT profile_skills.profile_id AS profile_id
+      FROM profile_skills
+      INNER JOIN skills ON skills.id = profile_skills.skill_id
+      WHERE skills.org_id = ? AND skills.plugin_id = ?
+    )
+    GROUP BY profile_id
+    HAVING COUNT(*) = ?
+  `);
+
+  const findToolNameCollisionStmt = db.prepare(`
+    SELECT id FROM tools
+    WHERE name = ? AND org_id = ?
+      AND NOT (plugin_id IS ? AND plugin_key IS ?)
+    LIMIT 1
+  `);
+
+  const listSkillsForProfileStmt = db.prepare<SkillRow, SQLQueryBindings[]>(`
+    SELECT skills.*
+    FROM skills
+    INNER JOIN profile_skills ON profile_skills.skill_id = skills.id
+    WHERE profile_skills.profile_id = ?
+    ORDER BY skills.name ASC
+  `);
+
+  const assignSkillStmt = db.prepare(`
+    INSERT OR IGNORE INTO profile_skills (profile_id, skill_id)
+    VALUES (?, ?)
+  `);
+
+  const unassignSkillStmt = db.prepare(`
+    DELETE FROM profile_skills
+    WHERE profile_id = ? AND skill_id = ?
+  `);
+
+  const unassignSkillFromAllProfilesStmt = db.prepare(`
+    DELETE FROM profile_skills WHERE skill_id = ?
+  `);
+
+  const listSkillUsageForProfileStmt = db.prepare<
+    SkillUsageRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT * FROM profile_skill_usage WHERE profile_id = ?
+  `);
+
+  const getSkillUsageStmt = db.prepare<SkillUsageRow, SQLQueryBindings[]>(`
+    SELECT * FROM profile_skill_usage WHERE profile_id = ? AND skill_id = ?
+  `);
+
+  const incrementSkillUsageStmt = db.prepare(`
+    INSERT INTO profile_skill_usage (
+      org_id,
+      profile_id,
+      skill_id,
+      view_count,
+      use_count,
+      patch_count,
+      last_viewed_at,
+      last_used_at,
+      last_patched_at,
+      created_at,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(profile_id, skill_id) DO UPDATE SET
+      view_count = profile_skill_usage.view_count + excluded.view_count,
+      use_count = profile_skill_usage.use_count + excluded.use_count,
+      patch_count = profile_skill_usage.patch_count + excluded.patch_count,
+      last_viewed_at = COALESCE(excluded.last_viewed_at, profile_skill_usage.last_viewed_at),
+      last_used_at = COALESCE(excluded.last_used_at, profile_skill_usage.last_used_at),
+      last_patched_at = COALESCE(excluded.last_patched_at, profile_skill_usage.last_patched_at),
+      updated_at = excluded.updated_at
+  `);
+
+  const incrementLlmUsageStatsStmt = db.prepare(`
+    INSERT INTO llm_usage_stats (
+      org_id,
+      id,
+      request_count,
+      input_tokens,
+      output_tokens,
+      estimated_cost_usd,
+      tracked_since,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(org_id, id) DO UPDATE SET
+      request_count = llm_usage_stats.request_count + excluded.request_count,
+      input_tokens = llm_usage_stats.input_tokens + excluded.input_tokens,
+      output_tokens = llm_usage_stats.output_tokens + excluded.output_tokens,
+      estimated_cost_usd = llm_usage_stats.estimated_cost_usd + excluded.estimated_cost_usd,
+      updated_at = excluded.updated_at
+  `);
+
+  const incrementLlmUsageStatsByModelStmt = db.prepare(`
+    INSERT INTO llm_usage_model_stats (
+      org_id,
+      model_id,
+      request_count,
+      input_tokens,
+      output_tokens,
+      estimated_cost_usd,
+      tracked_since,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(org_id, model_id) DO UPDATE SET
+      request_count = llm_usage_model_stats.request_count + excluded.request_count,
+      input_tokens = llm_usage_model_stats.input_tokens + excluded.input_tokens,
+      output_tokens = llm_usage_model_stats.output_tokens + excluded.output_tokens,
+      estimated_cost_usd = llm_usage_model_stats.estimated_cost_usd + excluded.estimated_cost_usd,
+      updated_at = excluded.updated_at
+  `);
+
+  // An empty string stands for "no agent" or "no user": SQLite treats every
+  // NULL in a primary key as distinct, so NULL would split the unattributed group.
+  const incrementLlmUsageStatsByActorStmt = db.prepare(`
+    INSERT INTO llm_usage_actor_stats (
+      org_id,
+      profile_id,
+      user_id,
+      request_count,
+      input_tokens,
+      output_tokens,
+      estimated_cost_usd,
+      tracked_since,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(org_id, profile_id, user_id) DO UPDATE SET
+      request_count = llm_usage_actor_stats.request_count + excluded.request_count,
+      input_tokens = llm_usage_actor_stats.input_tokens + excluded.input_tokens,
+      output_tokens = llm_usage_actor_stats.output_tokens + excluded.output_tokens,
+      estimated_cost_usd = llm_usage_actor_stats.estimated_cost_usd + excluded.estimated_cost_usd,
+      updated_at = excluded.updated_at
+  `);
+
+  const incrementLlmUsageDailyStatsStmt = db.prepare(`
+    INSERT INTO llm_usage_daily_stats (
+      org_id,
+      day,
+      model_id,
+      provider,
+      request_count,
+      input_tokens,
+      output_tokens,
+      estimated_cost_usd,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(org_id, day, model_id, provider) DO UPDATE SET
+      request_count = llm_usage_daily_stats.request_count + excluded.request_count,
+      input_tokens = llm_usage_daily_stats.input_tokens + excluded.input_tokens,
+      output_tokens = llm_usage_daily_stats.output_tokens + excluded.output_tokens,
+      estimated_cost_usd = llm_usage_daily_stats.estimated_cost_usd + excluded.estimated_cost_usd,
+      updated_at = excluded.updated_at
+  `);
+
+  const incrementLlmTurnUsageStmt = db.prepare(`
+    INSERT INTO llm_turn_usage (
+      org_id, bucket, arm, turns, input_tokens, output_tokens, estimated_turns, updated_at
+    )
+    VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+    ON CONFLICT(org_id, bucket, arm) DO UPDATE SET
+      turns = llm_turn_usage.turns + 1,
+      input_tokens = llm_turn_usage.input_tokens + excluded.input_tokens,
+      output_tokens = llm_turn_usage.output_tokens + excluded.output_tokens,
+      estimated_turns = llm_turn_usage.estimated_turns + excluded.estimated_turns,
+      updated_at = excluded.updated_at
+  `);
+
+  const listLlmTurnUsageStmt = db.prepare<
+    {
+      bucket: string;
+      estimated_turns: number;
+      input_tokens: number;
+      org_id: string;
+      output_tokens: number;
+      turns: number;
+    },
+    SQLQueryBindings[]
+  >("SELECT * FROM llm_turn_usage WHERE org_id = ? ORDER BY bucket ASC");
+
+  const getWorkspaceSettingsStmt = db.prepare<
+    WorkspaceSettingsRow,
+    SQLQueryBindings[]
+  >("SELECT * FROM workspace_settings WHERE id = ?");
+
+  const upsertWorkspaceSettingsStmt = db.prepare(`
+    INSERT INTO workspace_settings (
+      id,
+      vision_model,
+      transcription_model,
+      image_model,
+      coding_agent_harnesses,
+      selected_coding_agent_harness,
+      coding_agent_provider_passthrough,
+      automation_worker_poll_interval_ms,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      vision_model = excluded.vision_model,
+      transcription_model = excluded.transcription_model,
+      image_model = excluded.image_model,
+      coding_agent_harnesses = excluded.coding_agent_harnesses,
+      selected_coding_agent_harness = excluded.selected_coding_agent_harness,
+      coding_agent_provider_passthrough = excluded.coding_agent_provider_passthrough,
+      automation_worker_poll_interval_ms = excluded.automation_worker_poll_interval_ms,
+      updated_at = excluded.updated_at
+  `);
+
+  const listNotificationDestinationsForOrgStmt = db.prepare<
+    NotificationDestinationRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT id, name, channel, config, secret_hash, org_id, created_at, updated_at
+    FROM notification_destinations
+    WHERE org_id = ?
+    ORDER BY created_at DESC
+  `);
+
+  const getNotificationDestinationStmt = db.prepare<
+    NotificationDestinationRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT id, name, channel, config, secret_hash, org_id, created_at, updated_at
+    FROM notification_destinations
+    WHERE id = ?
+  `);
+
+  const upsertNotificationDestinationStmt = db.prepare(`
+    INSERT INTO notification_destinations (
+      id,
+      name,
+      channel,
+      config,
+      secret_hash,
+      org_id,
+      created_at,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      name = excluded.name,
+      channel = excluded.channel,
+      config = excluded.config,
+      secret_hash = excluded.secret_hash,
+      org_id = excluded.org_id,
+      created_at = excluded.created_at,
+      updated_at = excluded.updated_at
+  `);
+
+  const deleteNotificationDestinationStmt = db.prepare(`
+    DELETE FROM notification_destinations WHERE id = ?
+  `);
+
+  const claimNotificationWebhookDeliveryStmt = db.prepare(`
+    INSERT OR IGNORE INTO notification_webhook_deliveries (
+      destination_id,
+      event_id,
+      created_at
+    )
+    VALUES (?, ?, ?)
+  `);
+
+  const pruneNotificationWebhookDeliveriesStmt = db.prepare(`
+    DELETE FROM notification_webhook_deliveries
+    WHERE created_at < ?
+  `);
+
+  const listComposioToolkitsForOrgStmt = db.prepare<
+    ComposioToolkitRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id,
+      org_id,
+      toolkit_slug,
+      display_name,
+      status,
+      connected_account_id,
+      session_id_enc,
+      oauth_state_hash,
+      cached_tools,
+      last_error,
+      created_at,
+      updated_at
+    FROM composio_toolkits
+    WHERE org_id = ?
+    ORDER BY display_name ASC
+  `);
+
+  const getComposioToolkitStmt = db.prepare<
+    ComposioToolkitRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id,
+      org_id,
+      toolkit_slug,
+      display_name,
+      status,
+      connected_account_id,
+      session_id_enc,
+      oauth_state_hash,
+      cached_tools,
+      last_error,
+      created_at,
+      updated_at
+    FROM composio_toolkits
+    WHERE id = ?
+  `);
+
+  const getComposioToolkitBySlugStmt = db.prepare<
+    ComposioToolkitRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id,
+      org_id,
+      toolkit_slug,
+      display_name,
+      status,
+      connected_account_id,
+      session_id_enc,
+      oauth_state_hash,
+      cached_tools,
+      last_error,
+      created_at,
+      updated_at
+    FROM composio_toolkits
+    WHERE org_id = ? AND toolkit_slug = ?
+  `);
+
+  const upsertComposioToolkitStmt = db.prepare(`
+    INSERT INTO composio_toolkits (
+      id,
+      org_id,
+      toolkit_slug,
+      display_name,
+      status,
+      connected_account_id,
+      session_id_enc,
+      oauth_state_hash,
+      cached_tools,
+      last_error,
+      created_at,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      org_id = excluded.org_id,
+      toolkit_slug = excluded.toolkit_slug,
+      display_name = excluded.display_name,
+      status = excluded.status,
+      connected_account_id = excluded.connected_account_id,
+      session_id_enc = excluded.session_id_enc,
+      oauth_state_hash = excluded.oauth_state_hash,
+      cached_tools = excluded.cached_tools,
+      last_error = excluded.last_error,
+      created_at = excluded.created_at,
+      updated_at = excluded.updated_at
+  `);
+
+  const deleteComposioToolkitStmt = db.prepare(`
+    DELETE FROM composio_toolkits WHERE id = ?
+  `);
+
+  const listProfileComposioToolkitsStmt = db.prepare<
+    ProfileComposioToolkitRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT profile_id, toolkit_id, allowed_actions
+    FROM profile_composio_toolkits
+    WHERE profile_id = ?
+  `);
+
+  const deleteProfileComposioToolkitsStmt = db.prepare(`
+    DELETE FROM profile_composio_toolkits WHERE profile_id = ?
+  `);
+
+  const insertProfileComposioToolkitStmt = db.prepare(`
+    INSERT INTO profile_composio_toolkits (profile_id, toolkit_id, allowed_actions)
+    VALUES (?, ?, ?)
+  `);
+
+  const replaceProfileComposioToolkitsTransaction = db.transaction(
+    (profileId: string, assignments: StoredProfileComposioToolkitRecord[]) => {
+      deleteProfileComposioToolkitsStmt.run(profileId);
+
+      for (const assignment of assignments) {
+        insertProfileComposioToolkitStmt.run(
+          assignment.profileId,
+          assignment.toolkitId,
+          assignment.allowedActions
+            ? JSON.stringify(assignment.allowedActions)
+            : null
+        );
+      }
+    }
+  );
+
+  const listComposioUserConnectionsForUserStmt = db.prepare<
+    ComposioUserConnectionRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id,
+      org_id,
+      user_id,
+      toolkit_id,
+      status,
+      connected_account_id,
+      session_id_enc,
+      oauth_state_hash,
+      last_error,
+      created_at,
+      updated_at
+    FROM composio_user_connections
+    WHERE org_id = ? AND user_id = ?
+    ORDER BY updated_at DESC
+  `);
+
+  const getComposioUserConnectionStmt = db.prepare<
+    ComposioUserConnectionRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id,
+      org_id,
+      user_id,
+      toolkit_id,
+      status,
+      connected_account_id,
+      session_id_enc,
+      oauth_state_hash,
+      last_error,
+      created_at,
+      updated_at
+    FROM composio_user_connections
+    WHERE user_id = ? AND toolkit_id = ?
+  `);
+
+  const getComposioUserConnectionByIdStmt = db.prepare<
+    ComposioUserConnectionRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id,
+      org_id,
+      user_id,
+      toolkit_id,
+      status,
+      connected_account_id,
+      session_id_enc,
+      oauth_state_hash,
+      last_error,
+      created_at,
+      updated_at
+    FROM composio_user_connections
+    WHERE id = ?
+  `);
+
+  const upsertComposioUserConnectionStmt = db.prepare(`
+    INSERT INTO composio_user_connections (
+      id,
+      org_id,
+      user_id,
+      toolkit_id,
+      status,
+      connected_account_id,
+      session_id_enc,
+      oauth_state_hash,
+      last_error,
+      created_at,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      org_id = excluded.org_id,
+      user_id = excluded.user_id,
+      toolkit_id = excluded.toolkit_id,
+      status = excluded.status,
+      connected_account_id = excluded.connected_account_id,
+      session_id_enc = excluded.session_id_enc,
+      oauth_state_hash = excluded.oauth_state_hash,
+      last_error = excluded.last_error,
+      created_at = excluded.created_at,
+      updated_at = excluded.updated_at
+  `);
+
+  const deleteComposioUserConnectionStmt = db.prepare(`
+    DELETE FROM composio_user_connections WHERE id = ?
+  `);
+
+  const updateUserMfaStmt = db.prepare(`
+    UPDATE users
+    SET mfa_enabled = ?,
+        mfa_totp_secret_enc = ?,
+        mfa_totp_pending_secret_enc = ?,
+        mfa_totp_last_step = ?,
+        updated_at = ?
+    WHERE id = ?
+  `);
+
+  const activateUserMfaStmt = db.prepare(`
+    UPDATE users
+    SET mfa_enabled = 1,
+        mfa_totp_secret_enc = ?,
+        mfa_totp_pending_secret_enc = NULL,
+        mfa_totp_last_step = ?,
+        updated_at = ?
+    WHERE id = ? AND mfa_totp_pending_secret_enc IS NOT NULL
+  `);
+
+  const setPendingMfaSecretStmt = db.prepare(`
+    UPDATE users
+    SET mfa_totp_pending_secret_enc = ?, updated_at = ?
+    WHERE id = ?
+  `);
+
+  const consumeMfaTotpStepStmt = db.prepare(`
+    UPDATE users
+    SET mfa_totp_last_step = ?
+    WHERE id = ?
+      AND mfa_enabled = 1
+      AND (mfa_totp_last_step IS NULL OR mfa_totp_last_step < ?)
+  `);
+
+  const createMfaBackupCodeStmt = db.prepare(`
+    INSERT INTO user_mfa_backup_codes (id, user_id, code_hash, used_at, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+
+  const consumeMfaBackupCodeStmt = db.prepare(`
+    UPDATE user_mfa_backup_codes
+    SET used_at = ?
+    WHERE user_id = ? AND code_hash = ? AND used_at IS NULL
+  `);
+
+  const countUnusedMfaBackupCodesStmt = db.prepare<
+    {
+      count: number;
+    },
+    SQLQueryBindings[]
+  >(`
+    SELECT COUNT(*) AS count
+    FROM user_mfa_backup_codes
+    WHERE user_id = ? AND used_at IS NULL
+  `);
+
+  const deleteMfaBackupCodesStmt = db.prepare(`
+    DELETE FROM user_mfa_backup_codes
+    WHERE user_id = ?
+  `);
+
+  const createPasskeyStmt = db.prepare(`
+    INSERT INTO user_passkeys (
+      id, user_id, credential_id, public_key, counter, transports, name, created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const createPasskeyChallengeStmt = db.prepare(`
+    INSERT INTO user_passkey_challenges (
+      challenge, user_id, type, expires_at, created_at
+    )
+    VALUES (?, ?, ?, ?, ?)
+  `);
+
+  const deleteExpiredPasskeyChallengesStmt = db.prepare(`
+    DELETE FROM user_passkey_challenges
+    WHERE expires_at <= ?
+  `);
+
+  const consumePasskeyChallengeStmt = db.prepare(`
+    DELETE FROM user_passkey_challenges
+    WHERE challenge = ? AND type = ? AND expires_at > ?
+      AND (user_id = ? OR user_id IS NULL)
+  `);
+
+  const deletePasskeysStmt = db.prepare(
+    "DELETE FROM user_passkeys WHERE user_id = ?"
+  );
+
+  const getPasskeyStmt = db.prepare<PasskeyRow, SQLQueryBindings[]>(`
+    SELECT id, user_id, credential_id, public_key, counter, transports, name, created_at
+    FROM user_passkeys
+    WHERE user_id = ? AND credential_id = ?
+  `);
+
+  const getPasskeyByCredentialIdStmt = db.prepare<
+    PasskeyRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT id, user_id, credential_id, public_key, counter, transports, name, created_at
+    FROM user_passkeys
+    WHERE credential_id = ?
+  `);
+
+  const listPasskeysStmt = db.prepare<PasskeyRow, SQLQueryBindings[]>(`
+    SELECT id, user_id, credential_id, public_key, counter, transports, name, created_at
+    FROM user_passkeys
+    WHERE user_id = ?
+    ORDER BY created_at ASC
+  `);
+
+  const updatePasskeyCounterStmt = db.prepare(`
+    UPDATE user_passkeys SET counter = ? WHERE user_id = ? AND credential_id = ?
+  `);
+
+  const getUserByEmailStmt = db.prepare<UserRow, SQLQueryBindings[]>(
+    "SELECT * FROM users WHERE email = ?"
+  );
+
+  const getUserByIdStmt = db.prepare<UserRow, SQLQueryBindings[]>(
+    "SELECT * FROM users WHERE id = ?"
+  );
+
+  const createUserStmt = db.prepare(`
+    INSERT INTO users (
+      id, email, password_hash, name, phone, is_platform_admin,
+      mfa_enabled, mfa_totp_secret_enc, created_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const updateUserProfileStmt = db.prepare(`
+    UPDATE users
+    SET name = ?, phone = ?, email = COALESCE(?, email), updated_at = ?
+    WHERE id = ?
+  `);
+
+  const updateUserPasswordStmt = db.prepare(`
+    UPDATE users
+    SET password_hash = ?, updated_at = ?
+    WHERE id = ?
+  `);
+
+  const disableUserStmt = db.prepare(`
+    UPDATE users
+    SET disabled_at = ?, updated_at = ?
+    WHERE id = ?
+  `);
+
+  const enableUserStmt = db.prepare(`
+    UPDATE users
+    SET disabled_at = NULL, updated_at = ?
+    WHERE id = ?
+  `);
+
+  const clearErasedUserSessionsStmt = db.prepare(
+    "UPDATE sessions SET user_id = NULL WHERE user_id = ?"
+  );
+
+  const clearErasedUserOrgMemoryProposalsStmt = db.prepare(`
+    UPDATE org_memory_proposals
+    SET proposed_by_user_id = CASE WHEN proposed_by_user_id = ? THEN NULL ELSE proposed_by_user_id END,
+        reviewer_user_id = CASE WHEN reviewer_user_id = ? THEN NULL ELSE reviewer_user_id END
+    WHERE proposed_by_user_id = ? OR reviewer_user_id = ?
+  `);
+
+  const clearErasedUserSkillProposalsStmt = db.prepare(`
+    UPDATE skill_proposals
+    SET proposed_by_user_id = CASE WHEN proposed_by_user_id = ? THEN NULL ELSE proposed_by_user_id END,
+        reviewer_user_id = CASE WHEN reviewer_user_id = ? THEN NULL ELSE reviewer_user_id END
+    WHERE proposed_by_user_id = ? OR reviewer_user_id = ?
+  `);
+
+  const clearErasedUserSkillSuggestionsStmt = db.prepare(`
+    UPDATE skill_suggestions SET proposed_by_user_id = NULL
+    WHERE proposed_by_user_id = ?
+  `);
+
+  const clearErasedUserProfileEventsStmt = db.prepare(`
+    UPDATE profile_change_events SET actor_user_id = NULL
+    WHERE actor_user_id = ?
+  `);
+
+  const deleteErasedUserAutomationReadsStmt = db.prepare(
+    "DELETE FROM automation_run_read_state WHERE user_id = ?"
+  );
+
+  const deleteErasedUserMembershipsStmt = db.prepare(
+    "DELETE FROM org_members WHERE user_id = ?"
+  );
+
+  const deleteErasedUserChannelMappingsStmt = db.prepare(
+    "DELETE FROM channel_org_mappings WHERE user_id = ?"
+  );
+
+  const deleteErasedUserBrowserSessionsStmt = db.prepare(
+    "DELETE FROM browser_sessions WHERE user_id = ?"
+  );
+
+  const deleteErasedUserPasswordResetsStmt = db.prepare(
+    "DELETE FROM password_reset_tokens WHERE user_id = ?"
+  );
+
+  const deleteErasedUserComposioConnectionsStmt = db.prepare(
+    "DELETE FROM composio_user_connections WHERE user_id = ?"
+  );
+
+  const anonymizeErasedUserStmt = db.prepare(`
+    UPDATE users
+    SET email = ?, password_hash = ?, name = NULL, phone = NULL,
+        is_platform_admin = 0, disabled_at = ?, user_context = NULL, updated_at = ?
+    WHERE id = ?
+  `);
+
+  const eraseUserTransaction = db.transaction(
+    (input: {
+      id: string;
+      email: string;
+      passwordHash: string;
+      updatedAt: string;
+    }) => {
+      clearErasedUserSessionsStmt.run(input.id);
+      clearErasedUserOrgMemoryProposalsStmt.run(
+        input.id,
+        input.id,
+        input.id,
+        input.id
+      );
+      clearErasedUserSkillProposalsStmt.run(
+        input.id,
+        input.id,
+        input.id,
+        input.id
+      );
+      clearErasedUserSkillSuggestionsStmt.run(input.id);
+      clearErasedUserProfileEventsStmt.run(input.id);
+      clearErasedUserSkillVersionsStmt.run(input.id);
+      deleteErasedUserAutomationReadsStmt.run(input.id);
+      deleteErasedUserMembershipsStmt.run(input.id);
+      deleteErasedUserChannelMappingsStmt.run(input.id);
+      deleteErasedUserBrowserSessionsStmt.run(input.id);
+      deleteErasedUserPasswordResetsStmt.run(input.id);
+      deleteErasedUserComposioConnectionsStmt.run(input.id);
+
+      return anonymizeErasedUserStmt.run(
+        input.email,
+        input.passwordHash,
+        input.updatedAt,
+        input.updatedAt,
+        input.id
+      ).changes;
+    }
+  );
+
+  // Per-org context lives on org_members only. users.user_context is a legacy
+  // column left in place for existing installs; migrateLegacyUserContextToOrgMembers
+  // copies any remaining values once, and this read path must not use it (#550).
+  const getUserContextStmt = db.prepare<
+    {
+      user_context?: string | null;
+    },
+    SQLQueryBindings[]
+  >(`
+    SELECT om.user_context AS user_context
+    FROM org_members om
+    WHERE om.org_id = ? AND om.user_id = ?
+  `);
+
+  const setUserContextStmt = db.prepare(`
+    UPDATE org_members
+    SET user_context = ?
+    WHERE org_id = ? AND user_id = ?
+  `);
+
+  const countUsersStmt = db.prepare<{ count: number }, SQLQueryBindings[]>(
+    "SELECT COUNT(*) as count FROM users"
+  );
+
+  const countHumanUsersStmt = db.prepare<
+    {
+      count: number;
+    },
+    SQLQueryBindings[]
+  >("SELECT COUNT(*) as count FROM users WHERE id != ?");
+
+  const listPlatformAdminUsersStmt = db.prepare<UserRow, SQLQueryBindings[]>(
+    "SELECT * FROM users WHERE is_platform_admin = 1"
+  );
+
+  const createAuditEventStmt = db.prepare(`
+    INSERT INTO audit_events (
+      id, actor_user_id, org_id, action, resource_type, resource_id,
+      metadata, request_id, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const listAuditEventsStmt = db.prepare<AuditEventRow, SQLQueryBindings[]>(`
+    SELECT
+      id, actor_user_id, org_id, action, resource_type, resource_id,
+      metadata, request_id, created_at
+    FROM audit_events
+    WHERE (? IS NULL OR org_id = ?)
+      AND (? IS NULL OR action = ?)
+    ORDER BY created_at DESC, id DESC
+    LIMIT ? OFFSET ?
+  `);
+
+  const createBrowserSessionStmt = db.prepare(`
+    INSERT INTO browser_sessions (
+      id,
+      user_id,
+      session_token_hash,
+      csrf_token_hash,
+      created_at,
+      expires_at,
+      revoked_at,
+      last_used_at,
+      active_org_id
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const getBrowserSessionByTokenHashStmt = db.prepare<
+    BrowserSessionRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT * FROM browser_sessions
+    WHERE session_token_hash = ?
+    LIMIT 1
+  `);
+
+  const revokeBrowserSessionByTokenHashStmt = db.prepare(`
+    UPDATE browser_sessions
+    SET revoked_at = ?
+    WHERE session_token_hash = ? AND revoked_at IS NULL
+  `);
+
+  const listBrowserSessionsForUserStmt = db.prepare<
+    BrowserSessionRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT * FROM browser_sessions
+    WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ?
+    ORDER BY COALESCE(last_used_at, created_at) DESC, id DESC
+  `);
+
+  const revokeBrowserSessionForUserStmt = db.prepare(`
+    UPDATE browser_sessions
+    SET revoked_at = ?
+    WHERE id = ? AND user_id = ? AND revoked_at IS NULL
+  `);
+
+  const revokeBrowserSessionsForUserExceptStmt = db.prepare(`
+    UPDATE browser_sessions
+    SET revoked_at = ?
+    WHERE user_id = ? AND (? IS NULL OR id != ?) AND revoked_at IS NULL
+  `);
+
+  const revokeBrowserSessionsForUserStmt = db.prepare(`
+    UPDATE browser_sessions
+    SET revoked_at = ?
+    WHERE user_id = ? AND revoked_at IS NULL
+  `);
+
+  const updateBrowserSessionLastUsedAtStmt = db.prepare(`
+    UPDATE browser_sessions
+    SET last_used_at = ?
+    WHERE id = ?
+  `);
+
+  const updateBrowserSessionActiveOrgIdStmt = db.prepare(`
+    UPDATE browser_sessions
+    SET active_org_id = ?
+    WHERE id = ?
+  `);
+
+  const createPasswordResetTokenStmt = db.prepare(`
+    INSERT INTO password_reset_tokens (
+      id, user_id, token_hash, expires_at, consumed_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+  `);
+
+  const getUsablePasswordResetTokenStmt = db.prepare<
+    { user_id: string },
+    SQLQueryBindings[]
+  >(`
+    SELECT user_id
+    FROM password_reset_tokens
+    WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ?
+    LIMIT 1
+  `);
+
+  const consumePasswordResetTokensForUserStmt = db.prepare(`
+    UPDATE password_reset_tokens
+    SET consumed_at = ?
+    WHERE user_id = ? AND consumed_at IS NULL
+  `);
+
+  const consumePasswordResetTokenTransaction = db.transaction(
+    (tokenHash: string, passwordHash: string, consumedAt: string) => {
+      const token = getUsablePasswordResetTokenStmt.get(tokenHash, consumedAt);
+
+      if (!token) {
+        return false;
+      }
+
+      consumePasswordResetTokensForUserStmt.run(consumedAt, token.user_id);
+      updateUserPasswordStmt.run(passwordHash, consumedAt, token.user_id);
+      revokeBrowserSessionsForUserStmt.run(consumedAt, token.user_id);
+
+      return true;
+    }
+  );
+
+  const getOrgTeamCreationStmt = db.prepare<
+    StoredOrgTeamCreationRecord,
+    SQLQueryBindings[]
+  >(`
+    SELECT parent_org_id AS parentOrgId, request_id AS requestId,
+      request_hash AS requestHash, creator_user_id AS creatorUserId,
+      admin_user_id AS adminUserId, team_org_id AS teamOrgId,
+      created_at AS createdAt, completed_at AS completedAt
+    FROM org_team_creation_requests WHERE parent_org_id = ? AND request_id = ?
+  `);
+
+  const insertOrgTeamCreationStmt = db.prepare(`
+    INSERT INTO org_team_creation_requests (parent_org_id, request_id, request_hash, creator_user_id, admin_user_id, team_org_id, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const completeOrgTeamCreationStmt = db.prepare(
+    "UPDATE org_team_creation_requests SET completed_at = ? WHERE parent_org_id = ? AND request_id = ? AND team_org_id = ? AND completed_at IS NULL"
+  );
+
+  const deleteOrgTeamCreationStmt = db.prepare(
+    "DELETE FROM org_team_creation_requests WHERE parent_org_id = ? AND request_id = ? AND team_org_id = ? AND completed_at IS NULL"
+  );
+
+  const getSharedAgentInstanceStmt = db.prepare<
+    StoredSharedAgentInstanceRecord,
+    SQLQueryBindings[]
+  >(`
+    SELECT profile_id AS profileId, team_org_id AS teamOrgId,
+      source_org_id AS sourceOrgId, source_profile_id AS sourceProfileId,
+      publication_id AS publicationId, created_at AS createdAt
+    FROM shared_agent_instances WHERE team_org_id = ? AND profile_id = ?
+  `);
+
+  const getSharedAgentInstanceForSourceStmt = db.prepare<
+    StoredSharedAgentInstanceRecord,
+    SQLQueryBindings[]
+  >(`
+    SELECT profile_id AS profileId, team_org_id AS teamOrgId,
+      source_org_id AS sourceOrgId, source_profile_id AS sourceProfileId,
+      publication_id AS publicationId, created_at AS createdAt
+    FROM shared_agent_instances WHERE team_org_id = ? AND source_profile_id = ?
+  `);
+
+  const insertSharedAgentInstanceStmt = db.prepare(`
+    INSERT INTO shared_agent_instances (profile_id, team_org_id, source_org_id, source_profile_id, publication_id, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+
+  const updateSharedAgentInstancePublicationStmt = db.prepare(
+    "UPDATE shared_agent_instances SET publication_id = ? WHERE profile_id = ? AND team_org_id = ?"
+  );
+
+  const listOrgSharedResourcesStmt = db.prepare<
+    StoredOrgSharedResourceRecord,
+    SQLQueryBindings[]
+  >(`
+    SELECT id, org_id AS orgId, resource_kind AS resourceKind,
+      resource_id AS resourceId, created_at AS createdAt, updated_at AS updatedAt
+    FROM org_shared_resources WHERE org_id = ? ORDER BY resource_kind, id
+  `);
+
+  const getOrgSharedResourceStmt = db.prepare<
+    StoredOrgSharedResourceRecord,
+    SQLQueryBindings[]
+  >(`
+    SELECT id, org_id AS orgId, resource_kind AS resourceKind,
+      resource_id AS resourceId, created_at AS createdAt, updated_at AS updatedAt
+    FROM org_shared_resources WHERE org_id = ? AND id = ?
+  `);
+
+  const getOrgSharedResourceBySourceStmt = db.prepare<
+    StoredOrgSharedResourceRecord,
+    SQLQueryBindings[]
+  >(`
+    SELECT id, org_id AS orgId, resource_kind AS resourceKind,
+      resource_id AS resourceId, created_at AS createdAt, updated_at AS updatedAt
+    FROM org_shared_resources WHERE org_id = ? AND resource_kind = ? AND resource_id = ?
+  `);
+
+  const publishOrgSharedResourceStmt = db.prepare(`
+    INSERT INTO org_shared_resources (id, org_id, resource_kind, resource_id, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(org_id, resource_kind, resource_id) DO NOTHING
+  `);
+
+  const deleteOrgSharedResourceStmt = db.prepare(
+    "DELETE FROM org_shared_resources WHERE org_id = ? AND id = ?"
+  );
+
+  const tryMarkOrganizationArchivedStmt = db.prepare(`
+    UPDATE organizations AS target
+    SET archived_at = ?, updated_at = ?
+    WHERE id = ?
+      AND archived_at IS NULL
+      AND (SELECT COUNT(*) FROM organizations WHERE archived_at IS NULL) > 1
+      AND NOT EXISTS (SELECT 1 FROM organizations WHERE parent_org_id = target.id AND archived_at IS NULL)
+  `);
+
+  const deleteOrganizationStmt = db.prepare(
+    "DELETE FROM organizations WHERE id = ?"
+  );
+
+  const organizationExistsStmt = db.prepare(
+    "SELECT 1 FROM organizations WHERE id = ?"
+  );
+
+  const organizationChildrenStmt = db.prepare(
+    "SELECT 1 FROM organizations WHERE parent_org_id = ? LIMIT 1"
+  );
+
+  const deleteOrganizationTransaction = db.transaction(
+    (
+      orgId: string,
+      pendingRequest?: { parentOrgId: string; requestId: string }
+    ) => {
+      if (pendingRequest) {
+        const request = getOrgTeamCreationStmt.get(
+          pendingRequest.parentOrgId,
+          pendingRequest.requestId
+        );
+
+        if (!request || request.teamOrgId !== orgId || request.completedAt) {
+          return false;
+        }
+      }
+
+      if (
+        !organizationExistsStmt.get(orgId) ||
+        organizationChildrenStmt.get(orgId)
+      ) {
+        return false;
+      }
+
+      db.query(
+        "UPDATE browser_sessions SET active_org_id = NULL WHERE active_org_id = ?"
+      ).run(orgId);
+
+      // These tables gained org_id through migrations rather than FK-backed
+      // schema definitions, so the organization cascade cannot remove them.
+      for (const table of [
+        "llm_turn_usage",
+        "llm_usage_actor_stats",
+        "llm_usage_daily_stats",
+        "llm_usage_stats",
+        "llm_usage_model_stats",
+        "mcp_servers",
+        "skills",
+        "tools",
+        "workspace_settings",
+      ]) {
+        db.query(`DELETE FROM ${table} WHERE org_id = ?`).run(orgId);
+      }
+
+      const deleted = deleteOrganizationStmt.run(orgId).changes > 0;
+
+      if (deleted && pendingRequest) {
+        deleteOrgTeamCreationStmt.run(
+          pendingRequest.parentOrgId,
+          pendingRequest.requestId,
+          orgId
+        );
+      }
+
+      return deleted;
+    }
+  );
+
+  const deleteOrganizationWithForeignKeys = (
+    id: string,
+    pendingRequest?: { parentOrgId: string; requestId: string }
+  ) => {
+    const foreignKeys = db
+      .query<{ foreign_keys: number }, SQLQueryBindings[]>(
+        "PRAGMA foreign_keys"
+      )
+      .get();
+
+    const restoreForeignKeys = foreignKeys?.foreign_keys === 0;
+
+    if (restoreForeignKeys) {
+      db.exec("PRAGMA foreign_keys = ON");
+    }
+
+    try {
+      return deleteOrganizationTransaction.immediate(id, pendingRequest);
+    } finally {
+      if (restoreForeignKeys) {
+        db.exec("PRAGMA foreign_keys = OFF");
+      }
+    }
+  };
+
+  const upsertOrganizationStmt = db.prepare(`
+    INSERT INTO organizations (id, parent_org_id, name, slug, allowed_invite_domains, monthly_llm_token_limit, monthly_llm_turn_limit, monthly_llm_warning_percent, skills_write_approval, skills_post_turn_review, skills_curator_enabled, skills_curator_stale_after_days, skills_curator_archive_after_days, skills_curator_consolidate_enabled, skills_curator_last_run_at, archived_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      name = excluded.name,
+      slug = excluded.slug,
+      allowed_invite_domains = excluded.allowed_invite_domains,
+      monthly_llm_token_limit = excluded.monthly_llm_token_limit,
+      monthly_llm_turn_limit = excluded.monthly_llm_turn_limit,
+      monthly_llm_warning_percent = excluded.monthly_llm_warning_percent,
+      skills_write_approval = excluded.skills_write_approval,
+      skills_post_turn_review = excluded.skills_post_turn_review,
+      skills_curator_enabled = excluded.skills_curator_enabled,
+      skills_curator_stale_after_days = excluded.skills_curator_stale_after_days,
+      skills_curator_archive_after_days = excluded.skills_curator_archive_after_days,
+      skills_curator_consolidate_enabled = excluded.skills_curator_consolidate_enabled,
+      skills_curator_last_run_at = excluded.skills_curator_last_run_at,
+      archived_at = excluded.archived_at,
+      updated_at = excluded.updated_at
+  `);
+
+  // One row per LLM call in flight. Usage already spent comes from the ledger
+  // (?5, ?6), so a hold only has to cover calls that have not reported yet.
+  // ponytail: a hold older than an hour belongs to a call that died without
+  // releasing (crash, hung provider) and is ignored; nothing sweeps those rows.
+  const tryReserveMonthlyLlmQuotaStmt = db.prepare(`
+    WITH held AS (
+      SELECT COUNT(*) AS turns, COALESCE(SUM(reserved_tokens), 0) AS tokens
+      FROM org_llm_quota_reservations
+      WHERE org_id = ?1
+        AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ', ?4, '-1 hour')
+    )
+    INSERT INTO org_llm_quota_reservations (
+      id, org_id, reserved_tokens, created_at
+    )
+    SELECT ?2, o.id, ?3, ?4
+    FROM organizations AS o, held
+    WHERE o.id = ?1
+      AND o.archived_at IS NULL
+      AND (o.monthly_llm_turn_limit IS NULL OR o.monthly_llm_turn_limit <= 0 OR ?5 + held.turns + 1 <= o.monthly_llm_turn_limit)
+      AND (o.monthly_llm_token_limit IS NULL OR o.monthly_llm_token_limit <= 0 OR ?6 + held.tokens + ?3 <= o.monthly_llm_token_limit)
+  `);
+
+  // Deleting the row is the release, so a second call for the same id frees
+  // nothing and the held total cannot go below zero.
+  const releaseMonthlyLlmQuotaStmt = db.prepare(
+    "DELETE FROM org_llm_quota_reservations WHERE id = ? AND org_id = ?"
+  );
+
+  const listOrganizationsStmt = db.prepare<
+    OrganizationRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT id, parent_org_id, name, slug, EXISTS (SELECT 1 FROM org_team_creation_requests WHERE team_org_id = organizations.id AND completed_at IS NULL) AS setup_pending, allowed_invite_domains, monthly_llm_token_limit, monthly_llm_turn_limit, monthly_llm_warning_percent, skills_write_approval, skills_post_turn_review, skills_curator_enabled, skills_curator_stale_after_days, skills_curator_archive_after_days, skills_curator_consolidate_enabled, skills_curator_last_run_at, archived_at, created_at, updated_at
+    FROM organizations
+    ORDER BY name ASC
+  `);
+
+  const getOrganizationResourceCountsStmt = db.prepare<
+    { agents: number; members: number; skills: number; tools: number },
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      (SELECT COUNT(*) FROM profiles p WHERE p.org_id = o.id
+        AND p.is_default = 0 AND p.is_super = 0
+        AND NOT EXISTS (SELECT 1 FROM shared_agent_instances s WHERE s.profile_id = p.id)) AS agents,
+      (SELECT COUNT(*) FROM org_members m JOIN users u ON u.id = m.user_id
+        WHERE m.org_id = o.id AND m.user_id != ?) AS members,
+      (SELECT COUNT(*) FROM skills s WHERE s.org_id = o.id) AS skills,
+      (SELECT COUNT(*) FROM tools t WHERE t.org_id = o.id) AS tools
+    FROM organizations o WHERE o.id = ?
+  `);
+
+  const getOrganizationBySlugStmt = db.prepare<
+    OrganizationRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT id, parent_org_id, name, slug, EXISTS (SELECT 1 FROM org_team_creation_requests WHERE team_org_id = organizations.id AND completed_at IS NULL) AS setup_pending, allowed_invite_domains, monthly_llm_token_limit, monthly_llm_turn_limit, monthly_llm_warning_percent, skills_write_approval, skills_post_turn_review, skills_curator_enabled, skills_curator_stale_after_days, skills_curator_archive_after_days, skills_curator_consolidate_enabled, skills_curator_last_run_at, archived_at, created_at, updated_at
+    FROM organizations
+    WHERE slug = ?
+    LIMIT 1
+  `);
+
+  const getOrganizationByIdStmt = db.prepare<
+    OrganizationRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT id, parent_org_id, name, slug, EXISTS (SELECT 1 FROM org_team_creation_requests WHERE team_org_id = organizations.id AND completed_at IS NULL) AS setup_pending, allowed_invite_domains, monthly_llm_token_limit, monthly_llm_turn_limit, monthly_llm_warning_percent, skills_write_approval, skills_post_turn_review, skills_curator_enabled, skills_curator_stale_after_days, skills_curator_archive_after_days, skills_curator_consolidate_enabled, skills_curator_last_run_at, archived_at, created_at, updated_at
+    FROM organizations
+    WHERE id = ?
+    LIMIT 1
+  `);
+
+  const createOrgInviteStmt = db.prepare(`
+    INSERT INTO org_invites (
+      id, org_id, email, role, token_hash, invited_by_user_id,
+      expires_at, accepted_at, revoked_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const getOrgInviteByTokenHashStmt = db.prepare<
+    OrgInviteRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, email, role, token_hash, invited_by_user_id,
+      expires_at, accepted_at, revoked_at, created_at
+    FROM org_invites
+    WHERE token_hash = ?
+    LIMIT 1
+  `);
+
+  const getPendingOrgInviteStmt = db.prepare<OrgInviteRow, SQLQueryBindings[]>(`
+    SELECT
+      id, org_id, email, role, token_hash, invited_by_user_id,
+      expires_at, accepted_at, revoked_at, created_at
+    FROM org_invites
+    WHERE org_id = ? AND email = ? AND accepted_at IS NULL AND revoked_at IS NULL
+    LIMIT 1
+  `);
+
+  const markOrgInviteAcceptedStmt = db.prepare(`
+    UPDATE org_invites
+    SET accepted_at = ?
+    WHERE id = ?
+  `);
+
+  const createOrgMemoryProposalStmt = db.prepare(`
+    INSERT INTO org_memory_proposals (
+      id, org_id, profile_id, session_id, proposed_by_user_id,
+      bullet, source_document_ids, status, pinned, reviewer_user_id, reviewed_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const createProfileChangeEventStmt = db.prepare(`
+    INSERT INTO profile_change_events (
+      id, org_id, profile_id, actor_user_id, source, field,
+      before_value, after_value, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const listProfileChangeEventsStmt = db.prepare<
+    ProfileChangeEventRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, profile_id, actor_user_id, source, field,
+      before_value, after_value, created_at
+    FROM profile_change_events
+    WHERE org_id = ? AND profile_id = ?
+    ORDER BY created_at DESC, id DESC
+    LIMIT ? OFFSET ?
+  `);
+
+  const listOrgMemoryProposalsStmt = db.prepare(`
+    SELECT
+      id, org_id, profile_id, session_id, proposed_by_user_id,
+      bullet, source_document_ids, status, pinned, reviewer_user_id, reviewed_at, created_at
+    FROM org_memory_proposals
+    WHERE org_id = ? AND status = ?
+    ORDER BY created_at DESC
+  `);
+
+  const listAllOrgMemoryProposalsStmt = db.prepare(`
+    SELECT
+      id, org_id, profile_id, session_id, proposed_by_user_id,
+      bullet, source_document_ids, status, pinned, reviewer_user_id, reviewed_at, created_at
+    FROM org_memory_proposals
+    WHERE org_id = ?
+    ORDER BY created_at DESC
+  `);
+
+  const getOrgMemoryProposalStmt = db.prepare<
+    OrgMemoryProposalRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, profile_id, session_id, proposed_by_user_id,
+      bullet, source_document_ids, status, pinned, reviewer_user_id, reviewed_at, created_at
+    FROM org_memory_proposals
+    WHERE org_id = ? AND id = ?
+    LIMIT 1
+  `);
+
+  const getPendingOrgMemoryProposalByBulletStmt = db.prepare<
+    OrgMemoryProposalRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, profile_id, session_id, proposed_by_user_id,
+      bullet, source_document_ids, status, pinned, reviewer_user_id, reviewed_at, created_at
+    FROM org_memory_proposals
+    WHERE org_id = ? AND bullet = ? AND status = 'pending'
+    LIMIT 1
+  `);
+
+  const updateOrgMemoryProposalStatusStmt = db.prepare(`
+    UPDATE org_memory_proposals
+    SET status = ?, reviewer_user_id = ?, reviewed_at = ?, pinned = ?
+    WHERE org_id = ? AND id = ?
+  `);
+
+  const countOrgMemoryProposalsStmt = db.prepare<
+    {
+      count: number;
+    },
+    SQLQueryBindings[]
+  >(`
+    SELECT COUNT(*) AS count
+    FROM org_memory_proposals
+    WHERE org_id = ? AND status = ?
+  `);
+
+  const createSkillProposalStmt = db.prepare(`
+    INSERT INTO skill_proposals (
+      id, org_id, profile_id, session_id, proposed_by_user_id,
+      action, skill_name, content, patch_old_string, patch_new_string, relative_path,
+      consolidate_loser_skill_names, supporting_files,
+      status, reviewer_user_id, reviewed_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const listSkillProposalsByStatusStmt = db.prepare<
+    SkillProposalRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, profile_id, session_id, proposed_by_user_id,
+      action, skill_name, content, patch_old_string, patch_new_string, relative_path,
+      consolidate_loser_skill_names, supporting_files,
+      status, reviewer_user_id, reviewed_at, created_at
+    FROM skill_proposals
+    WHERE org_id = ? AND status = ?
+    ORDER BY created_at DESC
+  `);
+
+  const listSkillProposalsByStatusAndProfileStmt = db.prepare<
+    SkillProposalRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, profile_id, session_id, proposed_by_user_id,
+      action, skill_name, content, patch_old_string, patch_new_string, relative_path,
+      consolidate_loser_skill_names, supporting_files,
+      status, reviewer_user_id, reviewed_at, created_at
+    FROM skill_proposals
+    WHERE org_id = ? AND status = ? AND profile_id = ?
+    ORDER BY created_at DESC
+  `);
+
+  const listAllSkillProposalsStmt = db.prepare<
+    SkillProposalRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, profile_id, session_id, proposed_by_user_id,
+      action, skill_name, content, patch_old_string, patch_new_string, relative_path,
+      consolidate_loser_skill_names, supporting_files,
+      status, reviewer_user_id, reviewed_at, created_at
+    FROM skill_proposals
+    WHERE org_id = ?
+    ORDER BY created_at DESC
+  `);
+
+  const listAllSkillProposalsForProfileStmt = db.prepare<
+    SkillProposalRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, profile_id, session_id, proposed_by_user_id,
+      action, skill_name, content, patch_old_string, patch_new_string, relative_path,
+      consolidate_loser_skill_names, supporting_files,
+      status, reviewer_user_id, reviewed_at, created_at
+    FROM skill_proposals
+    WHERE org_id = ? AND profile_id = ?
+    ORDER BY created_at DESC
+  `);
+
+  const getSkillProposalStmt = db.prepare<
+    SkillProposalRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, profile_id, session_id, proposed_by_user_id,
+      action, skill_name, content, patch_old_string, patch_new_string, relative_path,
+      consolidate_loser_skill_names, supporting_files,
+      status, reviewer_user_id, reviewed_at, created_at
+    FROM skill_proposals
+    WHERE org_id = ? AND id = ?
+    LIMIT 1
+  `);
+
+  const getPendingSkillProposalForCreateStmt = db.prepare<
+    SkillProposalRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, profile_id, session_id, proposed_by_user_id,
+      action, skill_name, content, patch_old_string, patch_new_string, relative_path,
+      consolidate_loser_skill_names, supporting_files,
+      status, reviewer_user_id, reviewed_at, created_at
+    FROM skill_proposals
+    WHERE org_id = ? AND profile_id = ? AND skill_name = ? AND action = 'create' AND status = 'pending'
+    LIMIT 1
+  `);
+
+  const getPendingSkillProposalForSkillStmt = db.prepare<
+    SkillProposalRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, profile_id, session_id, proposed_by_user_id,
+      action, skill_name, content, patch_old_string, patch_new_string, relative_path,
+      consolidate_loser_skill_names, supporting_files,
+      status, reviewer_user_id, reviewed_at, created_at
+    FROM skill_proposals
+    WHERE org_id = ? AND profile_id = ? AND skill_name = ? AND status = 'pending'
+    LIMIT 1
+  `);
+
+  const getPendingSkillProposalForPatchStmt = db.prepare<
+    SkillProposalRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, profile_id, session_id, proposed_by_user_id,
+      action, skill_name, content, patch_old_string, patch_new_string, relative_path,
+      consolidate_loser_skill_names, supporting_files,
+      status, reviewer_user_id, reviewed_at, created_at
+    FROM skill_proposals
+    WHERE org_id = ? AND profile_id = ? AND skill_name = ? AND action = 'patch'
+      AND patch_old_string = ? AND patch_new_string = ? AND status = 'pending'
+    LIMIT 1
+  `);
+
+  const updateSkillProposalStatusStmt = db.prepare(`
+    UPDATE skill_proposals
+    SET status = ?, reviewer_user_id = ?, reviewed_at = ?
+    WHERE org_id = ? AND id = ?
+  `);
+
+  const countPendingSkillProposalsStmt = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM skill_proposals
+    WHERE org_id = ? AND status = 'pending'
+  `);
+
+  const countPendingSkillProposalsForProfileStmt = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM skill_proposals
+    WHERE org_id = ? AND profile_id = ? AND status = 'pending'
+  `);
+
+  const createSkillSuggestionStmt = db.prepare(`
+    INSERT INTO skill_suggestions (
+      id, org_id, profile_id, session_id, proposed_by_user_id,
+      action, skill_name, content, patch_old_string, patch_new_string,
+      status, source, warnings, created_at, applied_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const getSkillSuggestionStmt = db.prepare<
+    SkillSuggestionRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, profile_id, session_id, proposed_by_user_id,
+      action, skill_name, content, patch_old_string, patch_new_string,
+      status, source, warnings, created_at, applied_at
+    FROM skill_suggestions
+    WHERE org_id = ? AND id = ?
+    LIMIT 1
+  `);
+
+  const markSkillSuggestionAppliedStmt = db.prepare(`
+    UPDATE skill_suggestions
+    SET status = 'applied', applied_at = ?
+    WHERE org_id = ? AND id = ?
+  `);
+
+  const listSkillSuggestionsStmt = db.prepare<
+    SkillSuggestionRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, profile_id, session_id, proposed_by_user_id,
+      action, skill_name, content, patch_old_string, patch_new_string,
+      status, source, warnings, created_at, applied_at
+    FROM skill_suggestions
+    WHERE org_id = ?
+      AND (? IS NULL OR session_id = ?)
+      AND (? IS NULL OR status = ?)
+      AND (? IS NULL OR profile_id = ?)
+    ORDER BY created_at DESC
+  `);
+
+  const upsertArtifactRecordStmt = db.prepare(`
+    INSERT INTO artifacts (
+      org_id, profile_id, filename, session_id, user_id, channel, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT (org_id, profile_id, filename) DO UPDATE SET
+      session_id = excluded.session_id,
+      user_id = excluded.user_id,
+      channel = excluded.channel,
+      created_at = excluded.created_at
+  `);
+
+  const listArtifactRecordsStmt = db.prepare<
+    ArtifactOwnerRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      a.org_id, a.profile_id, a.filename, a.session_id, a.user_id,
+      a.channel, a.created_at,
+      COALESCE(NULLIF(u.name, ''), u.email) AS user_name
+    FROM artifacts a
+    LEFT JOIN users u ON u.id = a.user_id
+    WHERE a.org_id = ? AND a.profile_id = ?
+  `);
+
+  const deleteArtifactRecordStmt = db.prepare(`
+    DELETE FROM artifacts WHERE org_id = ? AND profile_id = ? AND filename = ?
+  `);
+
+  const createArtifactShareStmt = db.prepare(`
+    INSERT INTO artifact_shares (
+      id, org_id, profile_id, source_path, filename, mime_type, size_bytes,
+      token_hash, storage_path, created_by_user_id, created_at, revoked_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const updateArtifactShareSnapshotStmt = db.prepare(`
+    UPDATE artifact_shares
+    SET filename = ?, mime_type = ?, size_bytes = ?, storage_path = ?
+    WHERE id = ?
+  `);
+
+  const getArtifactShareByTokenHashStmt = db.prepare<
+    ArtifactShareRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, profile_id, source_path, filename, mime_type, size_bytes,
+      token_hash, storage_path, created_by_user_id, created_at, revoked_at
+    FROM artifact_shares
+    WHERE token_hash = ? AND revoked_at IS NULL
+    LIMIT 1
+  `);
+
+  const getActiveArtifactShareByPathStmt = db.prepare<
+    ArtifactShareRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, profile_id, source_path, filename, mime_type, size_bytes,
+      token_hash, storage_path, created_by_user_id, created_at, revoked_at
+    FROM artifact_shares
+    WHERE org_id = ? AND profile_id = ? AND source_path = ? AND revoked_at IS NULL
+    LIMIT 1
+  `);
+
+  const getArtifactShareByIdStmt = db.prepare<
+    ArtifactShareRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, profile_id, source_path, filename, mime_type, size_bytes,
+      token_hash, storage_path, created_by_user_id, created_at, revoked_at
+    FROM artifact_shares
+    WHERE org_id = ? AND profile_id = ? AND id = ?
+    LIMIT 1
+  `);
+
+  const listArtifactSharesForProfileStmt = db.prepare<
+    ArtifactShareRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, profile_id, source_path, filename, mime_type, size_bytes,
+      token_hash, storage_path, created_by_user_id, created_at, revoked_at
+    FROM artifact_shares
+    WHERE org_id = ? AND profile_id = ?
+  `);
+
+  const revokeArtifactShareStmt = db.prepare(`
+    UPDATE artifact_shares
+    SET revoked_at = ?
+    WHERE id = ? AND revoked_at IS NULL
+  `);
+
+  const getOrgMemberStmt = db.prepare<
+    {
+      org_id: string;
+      user_id: string;
+      role: string;
+      user_context?: string | null;
+      created_at: string;
+    },
+    SQLQueryBindings[]
+  >(`
+    SELECT org_id, user_id, role, user_context, created_at
+    FROM org_members
+    WHERE org_id = ? AND user_id = ?
+    LIMIT 1
+  `);
+
+  const upsertOrgMemberStmt = db.prepare(`
+    INSERT INTO org_members (org_id, user_id, role, user_context, created_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(org_id, user_id) DO UPDATE SET
+      role = excluded.role
+  `);
+
+  const runCreateUserStmt = (record: StoredUserRecord) => {
+    createUserStmt.run(
+      record.id,
+      record.email,
+      record.passwordHash,
+      record.name ?? null,
+      record.phone ?? null,
+      record.isPlatformAdmin ? 1 : 0,
+      record.mfaEnabled ? 1 : 0,
+      record.mfaTotpSecretEnc ?? null,
+      record.createdAt,
+      record.updatedAt
+    );
+  };
+
+  const runUpsertOrganizationStmt = db.transaction(
+    (record: StoredOrganizationRecord) => {
+      const existing = getOrganizationByIdStmt.get(record.id);
+
+      if (
+        existing &&
+        record.parentOrgId !== undefined &&
+        record.parentOrgId !== existing.parent_org_id
+      ) {
+        throw new Error("Organization parent cannot change");
+      }
+
+      const parentOrgId = record.parentOrgId ?? existing?.parent_org_id ?? null;
+
+      if (parentOrgId && !(existing && record.archivedAt)) {
+        const parent = getOrganizationByIdStmt.get(parentOrgId);
+
+        if (!parent || parent.parent_org_id || parent.archived_at) {
+          throw new Error("Team requires an active root organization");
+        }
+      }
+
+      if (
+        record.archivedAt &&
+        db
+          .query(
+            "SELECT 1 FROM organizations WHERE parent_org_id = ? AND archived_at IS NULL LIMIT 1"
+          )
+          .get(record.id)
+      ) {
+        throw new Error("Organization has active teams");
+      }
+
+      upsertOrganizationStmt.run(
+        record.id,
+        parentOrgId,
+        record.name,
+        record.slug,
+        JSON.stringify(record.allowedInviteDomains ?? []),
+        record.monthlyLlmTokenLimit ?? null,
+        record.monthlyLlmTurnLimit ?? 0,
+        record.monthlyLlmWarningPercent ?? 80,
+        record.skillsWriteApproval ? 1 : 0,
+        record.skillsPostTurnReview ? 1 : 0,
+        record.skillsCuratorEnabled ? 1 : 0,
+        record.skillsCuratorStaleAfterDays ?? 30,
+        record.skillsCuratorArchiveAfterDays ?? 90,
+        record.skillsCuratorConsolidateEnabled ? 1 : 0,
+        record.skillsCuratorLastRunAt ?? null,
+        record.archivedAt ?? null,
+        record.createdAt,
+        record.updatedAt
+      );
+    }
+  );
+
+  const publishOrgSharedResourceTransaction = db.transaction(
+    (record: StoredOrgSharedResourceRecord) => {
+      const parent = getOrganizationByIdStmt.get(record.orgId);
+
+      if (!parent || parent.parent_org_id || parent.archived_at) {
+        throw new Error("Publication requires an active root organization");
+      }
+
+      if (record.resourceKind === "agent") {
+        const profile = getProfileStmt.get(record.resourceId);
+
+        if (
+          !profile ||
+          profile.org_id !== record.orgId ||
+          profile.is_super ||
+          profile.is_default
+        ) {
+          throw new Error("Agent source cannot be published");
+        }
+      }
+
+      if (record.resourceKind === "skill") {
+        const skill = getSkillStmt.get(record.resourceId);
+
+        if (!skill || skill.org_id !== record.orgId || !skill.enabled) {
+          throw new Error("Skill source cannot be published");
+        }
+      }
+
+      if (record.resourceKind === "tool") {
+        const tool = getToolStmt.get(record.resourceId);
+
+        if (!tool || (tool.org_id && tool.org_id !== record.orgId)) {
+          throw new Error("Tool source cannot be published");
+        }
+      }
+
+      // Filesystem knowledge and configured models are validated by OrgService.
+      publishOrgSharedResourceStmt.run(
+        record.id,
+        record.orgId,
+        record.resourceKind,
+        record.resourceId,
+        record.createdAt,
+        record.updatedAt
+      );
+
+      const published = getOrgSharedResourceBySourceStmt.get(
+        record.orgId,
+        record.resourceKind,
+        record.resourceId
+      );
+
+      if (!published) {
+        throw new Error("Publication was not saved");
+      }
+
+      return published;
+    }
+  );
+
+  const createSharedAgentInstanceTransaction = db.transaction(
+    (
+      teamOrgId: string,
+      publicationId: string,
+      profileId: string,
+      createdAt: string
+    ) => {
+      const team = getOrganizationByIdStmt.get(teamOrgId);
+
+      const parent = team?.parent_org_id
+        ? getOrganizationByIdStmt.get(team.parent_org_id)
+        : null;
+
+      if (
+        !team ||
+        team.archived_at ||
+        team.setup_pending ||
+        !parent ||
+        parent.archived_at ||
+        parent.setup_pending ||
+        parent.parent_org_id
+      ) {
+        throw new Error("Shared agent requires an active team and parent");
+      }
+
+      const publication = getOrgSharedResourceStmt.get(
+        parent.id,
+        publicationId
+      );
+
+      const source =
+        publication?.resourceKind === "agent"
+          ? getProfileStmt.get(publication.resourceId)
+          : null;
+
+      if (
+        !(publication && source) ||
+        source.org_id !== parent.id ||
+        source.is_super ||
+        source.is_default ||
+        source.acp_agent ||
+        source.acp_settings
+      ) {
+        throw new Error("Shared agent source is unavailable");
+      }
+
+      const existing = getSharedAgentInstanceForSourceStmt.get(
+        teamOrgId,
+        source.id
+      );
+
+      if (existing) {
+        const profile = getProfileStmt.get(existing.profileId);
+
+        if (
+          !profile ||
+          profile.org_id !== teamOrgId ||
+          existing.sourceOrgId !== parent.id
+        ) {
+          throw new Error("Shared agent instance has invalid ownership");
+        }
+
+        updateSharedAgentInstancePublicationStmt.run(
+          publicationId,
+          profile.id,
+          teamOrgId
+        );
+
+        return toProfileRecord(profile);
+      }
+
+      if (getProfileStmt.get(profileId)) {
+        throw new Error("Shared agent profile ID already exists");
+      }
+
+      const profile: StoredProfileRecord = {
+        ...toProfileRecord(source),
+        automationsEnabled: true,
+        createdAt,
+        id: profileId,
+        isDefault: false,
+        isSuper: false,
+        orgId: teamOrgId,
+        skillsCuratorConsolidateEnabled: null,
+        skillsPostTurnReview: null,
+        skillsWriteApproval: null,
+        updatedAt: createdAt,
+      };
+
+      runUpsertProfileStmt(profile);
+      insertSharedAgentInstanceStmt.run(
+        profileId,
+        teamOrgId,
+        parent.id,
+        source.id,
+        publicationId,
+        createdAt
+      );
+
+      return profile;
+    }
+  );
+
+  const runUpsertOrgMemberStmt = (record: StoredOrgMemberRecord) => {
+    upsertOrgMemberStmt.run(
+      record.orgId,
+      record.userId,
+      record.role,
+      record.userContext ?? null,
+      record.createdAt
+    );
+  };
+
+  const beginOrgTeamCreationTransaction = db.transaction(
+    (input: BeginOrgTeamCreationInput) => {
+      const parentOrgId = input.organization.parentOrgId;
+      const parent = getOrganizationByIdStmt.get(parentOrgId);
+      const creator = getUserByIdStmt.get(input.creatorUserId);
+      const member = getOrgMemberStmt.get(parentOrgId, input.creatorUserId);
+
+      if (
+        !parent ||
+        parent.parent_org_id ||
+        parent.archived_at ||
+        !creator ||
+        creator.disabled_at ||
+        (!creator.is_platform_admin && member?.role !== "admin")
+      ) {
+        throw new Error("Team creation requires an active parent admin");
+      }
+
+      const existing = getOrgTeamCreationStmt.get(parentOrgId, input.requestId);
+
+      if (existing) {
+        if (
+          existing.creatorUserId !== input.creatorUserId ||
+          existing.requestHash !== input.requestHash
+        ) {
+          throw new Error(
+            "Team creation request conflicts with its previous use"
+          );
+        }
+
+        return existing;
+      }
+
+      const admin = getUserByIdStmt.get(input.adminUserId);
+
+      if (
+        !admin ||
+        admin.disabled_at ||
+        input.organization.archivedAt ||
+        getOrganizationByIdStmt.get(input.organization.id)
+      ) {
+        throw new Error(
+          "Team creation requires a new active team and an active admin"
+        );
+      }
+
+      runUpsertOrganizationStmt(input.organization);
+      runUpsertOrgMemberStmt({
+        createdAt: input.organization.createdAt,
+        orgId: input.organization.id,
+        role: "admin",
+        userId: input.adminUserId,
+      });
+      insertOrgTeamCreationStmt.run(
+        parentOrgId,
+        input.requestId,
+        input.requestHash,
+        input.creatorUserId,
+        input.adminUserId,
+        input.organization.id,
+        input.organization.createdAt
+      );
+      const request = getOrgTeamCreationStmt.get(parentOrgId, input.requestId);
+
+      if (!request) {
+        throw new Error("Team creation request was not saved");
+      }
+
+      return request;
+    }
+  );
+
+  const completeOrgTeamCreationTransaction = db.transaction(
+    (
+      parentOrgId: string,
+      requestId: string,
+      teamOrgId: string,
+      completedAt: string
+    ) => {
+      const request = getOrgTeamCreationStmt.get(parentOrgId, requestId);
+
+      if (!request || request.teamOrgId !== teamOrgId) {
+        return false;
+      }
+
+      if (request.completedAt) {
+        return true;
+      }
+
+      const team = getOrganizationByIdStmt.get(teamOrgId);
+      const parent = getOrganizationByIdStmt.get(parentOrgId);
+      const admin = getUserByIdStmt.get(request.adminUserId);
+      const member = getOrgMemberStmt.get(teamOrgId, request.adminUserId);
+
+      if (
+        !team ||
+        team.parent_org_id !== parentOrgId ||
+        team.archived_at ||
+        !parent ||
+        parent.archived_at ||
+        !admin ||
+        admin.disabled_at ||
+        member?.role !== "admin" ||
+        !getDefaultProfileForOrgStmt.get(teamOrgId) ||
+        !listProfilesForOrgStmt
+          .all(teamOrgId)
+          .some((profile) => profile.is_super)
+      ) {
+        return false;
+      }
+
+      return (
+        completeOrgTeamCreationStmt.run(
+          completedAt,
+          parentOrgId,
+          requestId,
+          teamOrgId
+        ).changes > 0
+      );
+    }
+  );
+
+  const bootstrapInitialSetupTransaction = db.transaction(
+    (input: {
+      member: StoredOrgMemberRecord;
+      organization: StoredOrganizationRecord;
+      user: StoredUserRecord;
+    }) => {
+      const row = countHumanUsersStmt.get(LOCAL_CLIENT_USER_ID);
+
+      if ((row?.count ?? 0) > 0) {
+        return false;
+      }
+
+      runUpsertOrganizationStmt(input.organization);
+      runCreateUserStmt(input.user);
+      runUpsertOrgMemberStmt(input.member);
+
+      return true;
+    }
+  );
+
+  const listOrgMembersStmt = db.prepare<
+    {
+      org_id: string;
+      user_id: string;
+      role: string;
+      user_context?: string | null;
+      created_at: string;
+    },
+    SQLQueryBindings[]
+  >(`
+    SELECT org_id, user_id, role, user_context, created_at
+    FROM org_members
+    WHERE org_id = ?
+    ORDER BY created_at ASC
+  `);
+
+  const listUserOrganizationsStmt = db.prepare(`
+    SELECT
+      o.id,
+      o.parent_org_id,
+      o.name,
+      o.slug,
+      o.allowed_invite_domains,
+      o.skills_write_approval,
+      o.skills_post_turn_review,
+      o.skills_curator_enabled,
+      o.skills_curator_consolidate_enabled,
+      o.skills_curator_last_run_at,
+      o.archived_at,
+      o.created_at,
+      o.updated_at,
+      om.role,
+      om.created_at AS joined_at
+    FROM org_members om
+    INNER JOIN organizations o ON o.id = om.org_id
+    WHERE om.user_id = ?
+      AND NOT EXISTS (SELECT 1 FROM org_team_creation_requests WHERE team_org_id = o.id AND completed_at IS NULL)
+      AND o.archived_at IS NULL
+    ORDER BY o.name ASC
+  `);
+
+  // The last-admin guard lives in the statement so two concurrent removals
+  // cannot both pass a read-then-write check and leave the org with no admin.
+  const deleteOrgMemberStmt = db.prepare(`
+    DELETE FROM org_members
+    WHERE org_id = ? AND user_id = ?
+      AND (role != 'admin'
+        OR (SELECT COUNT(*) FROM org_members
+            WHERE org_id = ? AND role = 'admin') > 1)
+  `);
+
+  const updateOrgMemberRoleStmt = db.prepare(`
+    UPDATE org_members SET role = ?
+    WHERE org_id = ? AND user_id = ?
+      AND (? = 'admin' OR role != 'admin'
+        OR (SELECT COUNT(*) FROM org_members
+            WHERE org_id = ? AND role = 'admin') > 1)
+  `);
+
+  const upsertPluginReleaseTx = db.transaction(
+    (record: StoredPluginReleaseRecord): UpsertPluginReleaseResult => {
+      const existing = getPluginReleaseStmt.get(
+        record.pluginId,
+        record.version
+      );
+
+      if (existing) {
+        const existingDigest = existing.digest ?? "";
+
+        if (existingDigest && existingDigest !== record.digest) {
+          return { ok: false, reason: "digest_conflict" };
+        }
+
+        if (!existingDigest) {
+          fillEmptyPluginReleaseDigestStmt.run(
+            record.digest,
+            JSON.stringify(record.manifest),
+            record.pluginId,
+            record.version
+          );
+        }
+
+        return { ok: true };
+      }
+
+      insertPluginReleaseStmt.run(
+        record.pluginId,
+        record.version,
+        JSON.stringify(record.manifest),
+        record.digest,
+        record.createdAt,
+        record.source ?? "legacy"
+      );
+
+      return { ok: true };
+    }
+  );
+
+  const publishOrgPluginReleaseTx = db.transaction(
+    (input: PublishOrgPluginReleaseInput): PluginPublishResult => {
+      const seenToolNames = new Set<string>();
+
+      for (const tool of input.contributions.tools) {
+        const pluginKey = tool.pluginKey ?? "";
+        const derived = derivePluginToolName(input.pluginId, pluginKey);
+
+        if (!derived || derived !== tool.name) {
+          return { ok: false, reason: "tool_name_invalid" };
+        }
+
+        if (seenToolNames.has(tool.name)) {
+          return { ok: false, reason: "tool_name_collision" };
+        }
+
+        seenToolNames.add(tool.name);
+
+        const collision = findToolNameCollisionStmt.get(
+          tool.name,
+          input.orgId,
+          input.pluginId,
+          pluginKey
+        );
+
+        if (collision) {
+          return { ok: false, reason: "tool_name_collision" };
+        }
+      }
+
+      const existing = getOrgPluginStmt.get(input.orgId, input.pluginId);
+
+      if (existing) {
+        if (existing.revision !== input.expectedRevision) {
+          return { ok: false, reason: "stale_revision" };
+        }
+
+        const updated = updateOrgPluginCasStmt.run(
+          input.selectedVersion,
+          input.databaseGeneration,
+          input.lifecycleState,
+          input.pendingOperation ?? null,
+          input.lastLifecycleError ?? null,
+          input.now,
+          input.orgId,
+          input.pluginId,
+          input.expectedRevision
+        );
+
+        if (updated.changes === 0) {
+          return { ok: false, reason: "stale_revision" };
+        }
+      } else {
+        if (input.expectedRevision !== 0) {
+          return { ok: false, reason: "stale_revision" };
+        }
+
+        insertOrgPluginStmt.run(
+          input.orgId,
+          input.pluginId,
+          input.selectedVersion,
+          input.databaseGeneration,
+          input.lifecycleState,
+          input.pendingOperation ?? null,
+          input.lastLifecycleError ?? null,
+          input.now,
+          input.now
+        );
+      }
+
+      const ownedSkills = listOwnedSkillIdsStmt.all(
+        input.orgId,
+        input.pluginId
+      );
+
+      const ownedTools = listOwnedToolIdsStmt.all(input.orgId, input.pluginId);
+      const ownedCount = ownedSkills.length + ownedTools.length;
+
+      // Profiles that held every tool and skill of the previous release keep
+      // full access when the new release adds tools or skills.
+      const fullAccessProfileIds =
+        ownedCount === 0
+          ? []
+          : listProfilesWithPluginAssignmentCountStmt
+              .all(
+                input.orgId,
+                input.pluginId,
+                input.orgId,
+                input.pluginId,
+                ownedCount
+              )
+              .map((row) => row.profile_id);
+
+      const incomingSkillKeys = new Set(
+        input.contributions.skills.map((skill) => skill.pluginKey)
+      );
+
+      for (const row of ownedSkills) {
+        if (!incomingSkillKeys.has(row.plugin_key)) {
+          unassignSkillFromAllProfilesStmt.run(row.id);
+          deleteSkillStmt.run(row.id);
+        }
+      }
+
+      for (const skill of input.contributions.skills) {
+        const owned = getOwnedSkillIdStmt.get(
+          input.orgId,
+          input.pluginId,
+          skill.pluginKey ?? null
+        );
+
+        const id = owned?.id ?? skill.id;
+        upsertSkillStmt.run(
+          id,
+          skill.name,
+          skill.description,
+          skill.sourcePath,
+          skill.hasTool ? 1 : 0,
+          skill.disableModelInvocation ? 1 : 0,
+          skill.enabled ? 1 : 0,
+          skill.createdBy,
+          input.orgId,
+          input.pluginId,
+          skill.pluginKey ?? null,
+          skill.createdAt,
+          skill.updatedAt
+        );
+
+        if (!owned) {
+          for (const profileId of fullAccessProfileIds) {
+            assignSkillStmt.run(profileId, id);
+          }
+        }
+      }
+
+      const incomingToolKeys = new Set(
+        input.contributions.tools.map((tool) => tool.pluginKey)
+      );
+
+      for (const row of ownedTools) {
+        if (!incomingToolKeys.has(row.plugin_key)) {
+          unassignToolFromAllProfilesStmt.run(row.id);
+          deleteToolStmt.run(row.id);
+        }
+      }
+
+      for (const tool of input.contributions.tools) {
+        const owned = getOwnedToolIdStmt.get(
+          input.orgId,
+          input.pluginId,
+          tool.pluginKey ?? null
+        );
+
+        const id = owned?.id ?? tool.id;
+        upsertToolStmt.run(
+          id,
+          tool.name,
+          tool.description,
+          tool.handlerType,
+          JSON.stringify(tool.handlerConfig ?? {}),
+          input.orgId,
+          input.pluginId,
+          tool.pluginKey ?? null,
+          tool.createdAt,
+          tool.updatedAt
+        );
+
+        if (!owned) {
+          for (const profileId of fullAccessProfileIds) {
+            assignToolStmt.run(profileId, id);
+          }
+        }
+      }
+
+      const published = getOrgPluginStmt.get(input.orgId, input.pluginId);
+
+      if (!published) {
+        throw new Error("Published plugin state is missing.");
+      }
+
+      return { ok: true, revision: published.revision };
+    }
+  );
+
+  const compareAndSetOrgPluginStateTx = db.transaction(
+    (input: CompareAndSetOrgPluginStateInput): PluginPublishResult => {
+      const existing = getOrgPluginStmt.get(input.orgId, input.pluginId);
+
+      if (existing) {
+        if (existing.revision !== input.expectedRevision) {
+          return { ok: false, reason: "stale_revision" };
+        }
+
+        const updated = updateOrgPluginCasStmt.run(
+          input.selectedVersion,
+          input.databaseGeneration,
+          input.lifecycleState,
+          input.pendingOperation ?? null,
+          input.lastLifecycleError ?? null,
+          input.now,
+          input.orgId,
+          input.pluginId,
+          input.expectedRevision
+        );
+
+        if (updated.changes === 0) {
+          return { ok: false, reason: "stale_revision" };
+        }
+      } else {
+        if (input.expectedRevision !== 0) {
+          return { ok: false, reason: "stale_revision" };
+        }
+
+        insertOrgPluginStmt.run(
+          input.orgId,
+          input.pluginId,
+          input.selectedVersion,
+          input.databaseGeneration,
+          input.lifecycleState,
+          input.pendingOperation ?? null,
+          input.lastLifecycleError ?? null,
+          input.now,
+          input.now
+        );
+      }
+
+      const saved = getOrgPluginStmt.get(input.orgId, input.pluginId);
+
+      if (!saved) {
+        throw new Error("Saved plugin state is missing.");
+      }
+
+      return { ok: true, revision: saved.revision };
+    }
+  );
+
+  const deleteOrgPluginTx = db.transaction(
+    (orgId: string, pluginId: string, expectedRevision: number): boolean => {
+      const existing = getOrgPluginStmt.get(orgId, pluginId);
+
+      if (!existing || existing.revision !== expectedRevision) {
+        return false;
+      }
+
+      for (const row of listOwnedSkillIdsStmt.all(orgId, pluginId)) {
+        unassignSkillFromAllProfilesStmt.run(row.id);
+        deleteSkillStmt.run(row.id);
+      }
+
+      for (const row of listOwnedToolIdsStmt.all(orgId, pluginId)) {
+        unassignToolFromAllProfilesStmt.run(row.id);
+        deleteToolStmt.run(row.id);
+      }
+
+      const deleted = deleteOrgPluginStmt.run(
+        orgId,
+        pluginId,
+        expectedRevision
+      );
+
+      return deleted.changes > 0;
+    }
+  );
+
+  return {
+    async abortOrgTeamCreation(parentOrgId, requestId, teamOrgId) {
+      return deleteOrganizationWithForeignKeys(teamOrgId, {
+        parentOrgId,
+        requestId,
+      });
+    },
+    async activateUserMfa(id, totpSecretEnc, lastStep, updatedAt) {
+      const result = activateUserMfaStmt.run(
+        totpSecretEnc,
+        lastStep,
+        updatedAt,
+        id
+      );
+
+      return result.changes > 0;
+    },
+    async appendMessagesForSession(sessionId, messages) {
+      appendMessagesTransaction(sessionId, messages);
+    },
+
+    async assignMcpServerToProfile(profileId, serverId) {
+      assignMcpServerStmt.run(profileId, serverId);
+    },
+
+    async assignSkillToProfile(profileId, skillId) {
+      assignSkillStmt.run(profileId, skillId);
+    },
+
+    async assignToolToProfile(profileId, toolId) {
+      assignToolStmt.run(profileId, toolId);
+    },
+
+    async beginOrgTeamCreation(input) {
+      return beginOrgTeamCreationTransaction.immediate(input);
+    },
+
+    async bootstrapInitialSetup(input) {
+      return bootstrapInitialSetupTransaction.immediate(input);
+    },
+
+    async checkHealth() {
+      // Prepare afresh: cached statements can outlive SQLite's closed handle.
+      using statement = db.prepare("SELECT 1 FROM users LIMIT 1");
+      statement.get();
+    },
+
+    async claimInterruptedAutomationRuns(maxResumes) {
+      return claimInterruptedAutomationRunsTransaction
+        .immediate(maxResumes, new Date().toISOString())
+        .map((row) => ({ automationId: row.automation_id, id: row.id }));
+    },
+
+    async claimNotificationWebhookDelivery(destinationId, eventId, createdAt) {
+      // Bound ledger growth: drop rows outside the replay window before claim.
+      const createdAtMs = Date.parse(createdAt);
+
+      if (Number.isFinite(createdAtMs)) {
+        pruneNotificationWebhookDeliveriesStmt.run(
+          new Date(
+            createdAtMs - NOTIFICATION_WEBHOOK_DELIVERY_RETENTION_MS
+          ).toISOString()
+        );
+      }
+
+      return (
+        claimNotificationWebhookDeliveryStmt.run(
+          destinationId,
+          eventId,
+          createdAt
+        ).changes > 0
+      );
+    },
+
+    async compareAndSetOrgPluginState(input) {
+      return compareAndSetOrgPluginStateTx(input);
+    },
+
+    async completeAutomationRunStep(runId, toolCallId, result, completedAt) {
+      completeAutomationRunStepStmt.run(result, completedAt, runId, toolCallId);
+    },
+
+    async completeOrgTeamCreation(
+      parentOrgId,
+      requestId,
+      teamOrgId,
+      completedAt
+    ) {
+      return completeOrgTeamCreationTransaction.immediate(
+        parentOrgId,
+        requestId,
+        teamOrgId,
+        completedAt
+      );
+    },
+    async consumeMfaBackupCode(userId, codeHash, usedAt) {
+      return consumeMfaBackupCodeStmt.run(usedAt, userId, codeHash).changes > 0;
+    },
+    async consumeMfaTotpStep(userId, step) {
+      return consumeMfaTotpStepStmt.run(step, userId, step).changes > 0;
+    },
+    async consumePasskeyChallenge(challenge, userId, type, consumedAt) {
+      return (
+        consumePasskeyChallengeStmt.run(challenge, type, consumedAt, userId)
+          .changes > 0
+      );
+    },
+
+    async consumePasswordResetToken(tokenHash, passwordHash, consumedAt) {
+      return consumePasswordResetTokenTransaction.immediate(
+        tokenHash,
+        passwordHash,
+        consumedAt
+      );
+    },
+
+    async countHumanUsers() {
+      const row = countHumanUsersStmt.get(LOCAL_CLIENT_USER_ID);
+
+      return row?.count ?? 0;
+    },
+
+    async countOrgMemoryProposals(orgId, status) {
+      const row = countOrgMemoryProposalsStmt.get(orgId, status);
+
+      return row?.count ?? 0;
+    },
+
+    async countPendingSkillProposals(orgId, profileId) {
+      // SAFETY: The adapter writes this row value through its typed contract.
+      const row = (
+        profileId
+          ? countPendingSkillProposalsForProfileStmt.get(orgId, profileId)
+          : countPendingSkillProposalsStmt.get(orgId)
+      ) as { count: number };
+
+      return row?.count ?? 0;
+    },
+
+    async countProfileMcpAssignments() {
+      const row = countProfileMcpAssignmentsStmt.get();
+
+      return row?.count ?? 0;
+    },
+
+    async countUnreadAutomationRunsByOrg(userId, orgId) {
+      return countUnreadAutomationRunsByOrgStmt
+        .all(userId, orgId, orgId)
+        .map((row) => ({
+          automationId: row.automation_id,
+          unreadCount: Number(row.unread_count),
+        }));
+    },
+    async countUnusedMfaBackupCodes(userId) {
+      const row = countUnusedMfaBackupCodesStmt.get(userId);
+
+      return Number(row?.count ?? 0);
+    },
+
+    async countUsers() {
+      const row = countUsersStmt.get();
+
+      return row?.count ?? 0;
+    },
+    async createArtifactShare(record) {
+      createArtifactShareStmt.run(
+        record.id,
+        record.orgId,
+        record.profileId,
+        record.sourcePath,
+        record.filename,
+        record.mimeType,
+        record.sizeBytes,
+        record.tokenHash,
+        record.storagePath,
+        record.createdByUserId,
+        record.createdAt,
+        record.revokedAt
+      );
+    },
+    async createAuditEvent(record) {
+      createAuditEventStmt.run(
+        record.id,
+        record.actorUserId,
+        record.orgId,
+        record.action,
+        record.resourceType,
+        record.resourceId,
+        JSON.stringify(record.metadata),
+        record.requestId,
+        record.createdAt
+      );
+    },
+
+    async createBrowserSession(record) {
+      createBrowserSessionStmt.run(
+        record.id,
+        record.userId,
+        record.sessionTokenHash,
+        record.csrfTokenHash,
+        record.createdAt,
+        record.expiresAt,
+        record.revokedAt,
+        record.lastUsedAt,
+        record.activeOrgId ?? null
+      );
+    },
+    async createMfaBackupCode(record) {
+      createMfaBackupCodeStmt.run(
+        record.id,
+        record.userId,
+        record.codeHash,
+        record.usedAt,
+        record.createdAt
+      );
+    },
+
+    async createOrgInvite(record) {
+      createOrgInviteStmt.run(
+        record.id,
+        record.orgId,
+        record.email,
+        record.role,
+        record.tokenHash,
+        record.invitedByUserId,
+        record.expiresAt,
+        record.acceptedAt,
+        record.revokedAt,
+        record.createdAt
+      );
+    },
+
+    async createOrgMemoryProposal(record) {
+      createOrgMemoryProposalStmt.run(
+        record.id,
+        record.orgId,
+        record.profileId,
+        record.sessionId,
+        record.proposedByUserId,
+        record.bullet,
+        record.sourceDocumentIds.length > 0
+          ? JSON.stringify(record.sourceDocumentIds)
+          : null,
+        record.status,
+        record.pinned ? 1 : 0,
+        record.reviewerUserId,
+        record.reviewedAt,
+        record.createdAt
+      );
+    },
+    async createPasskey(record) {
+      createPasskeyStmt.run(
+        record.id,
+        record.userId,
+        record.credentialId,
+        record.publicKey,
+        record.counter,
+        JSON.stringify(record.transports),
+        record.name,
+        record.createdAt
+      );
+    },
+    async createPasskeyChallenge(record) {
+      deleteExpiredPasskeyChallengesStmt.run(record.createdAt);
+      createPasskeyChallengeStmt.run(
+        record.challenge,
+        record.userId,
+        record.type,
+        record.expiresAt,
+        record.createdAt
+      );
+    },
+
+    async createPasswordResetToken(record) {
+      createPasswordResetTokenStmt.run(
+        record.id,
+        record.userId,
+        record.tokenHash,
+        record.expiresAt,
+        record.consumedAt,
+        record.createdAt
+      );
+    },
+
+    async createProfileChangeEvent(record) {
+      createProfileChangeEventStmt.run(
+        record.id,
+        record.orgId,
+        record.profileId,
+        record.actorUserId,
+        record.source,
+        record.field,
+        record.beforeValue,
+        record.afterValue,
+        record.createdAt
+      );
+    },
+
+    async createProfileIfAbsent(record) {
+      const result = insertProfileIfAbsentStmt.run(
+        ...profileInsertArgs(record)
+      );
+
+      return result.changes > 0;
+    },
+
+    async createSharedAgentInstance(
+      teamOrgId,
+      publicationId,
+      profileId,
+      createdAt
+    ) {
+      return createSharedAgentInstanceTransaction.immediate(
+        teamOrgId,
+        publicationId,
+        profileId,
+        createdAt
+      );
+    },
+
+    async createSkillProposal(record) {
+      createSkillProposalStmt.run(
+        record.id,
+        record.orgId,
+        record.profileId,
+        record.sessionId,
+        record.proposedByUserId,
+        record.action,
+        record.skillName,
+        record.content,
+        record.patchOldString,
+        record.patchNewString,
+        record.relativePath,
+        record.consolidateLoserSkillNames
+          ? JSON.stringify(record.consolidateLoserSkillNames)
+          : null,
+        record.supportingFiles ? JSON.stringify(record.supportingFiles) : null,
+        record.status,
+        record.reviewerUserId,
+        record.reviewedAt,
+        record.createdAt
+      );
+    },
+
+    async createSkillSuggestion(record) {
+      createSkillSuggestionStmt.run(
+        record.id,
+        record.orgId,
+        record.profileId,
+        record.sessionId,
+        record.proposedByUserId,
+        record.action,
+        record.skillName,
+        record.content,
+        record.patchOldString,
+        record.patchNewString,
+        record.status,
+        record.source,
+        record.warnings ? JSON.stringify(record.warnings) : null,
+        record.createdAt,
+        record.appliedAt
+      );
+    },
+
+    async createSkillVersion(record) {
+      const row = createSkillVersionStmt.get(
+        record.id,
+        record.skillId,
+        record.kind,
+        record.content,
+        record.note,
+        record.actorUserId,
+        record.source,
+        record.createdAt,
+        record.skillId
+      );
+
+      if (!row) {
+        throw new Error("Created skill version is missing.");
+      }
+
+      return { ...record, version: row.version };
+    },
+
+    async createUser(record) {
+      runCreateUserStmt(record);
+    },
+    async deleteArtifactRecord(orgId, profileId, filename) {
+      deleteArtifactRecordStmt.run(orgId, profileId, filename);
+    },
+
+    async deleteAttachment(id) {
+      const result = deleteAttachmentStmt.run(id);
+
+      return result.changes > 0;
+    },
+
+    async deleteAutomation(id) {
+      const result = deleteAutomationStmt.run(id);
+
+      return result.changes > 0;
+    },
+
+    async deleteComposioToolkit(id) {
+      const result = deleteComposioToolkitStmt.run(id);
+
+      return result.changes > 0;
+    },
+    async deleteComposioUserConnection(id) {
+      const result = deleteComposioUserConnectionStmt.run(id);
+
+      return result.changes > 0;
+    },
+
+    async deleteMcpServer(id) {
+      const result = deleteMcpServerEverywhereTransaction(id);
+
+      return result.changes > 0;
+    },
+
+    async deleteMessagesForSession(sessionId) {
+      deleteMessagesForSessionStmt.run(sessionId);
+    },
+    async deleteMfaBackupCodes(userId) {
+      deleteMfaBackupCodesStmt.run(userId);
+    },
+
+    async deleteNotificationDestination(id) {
+      const result = deleteNotificationDestinationStmt.run(id);
+
+      return result.changes > 0;
+    },
+
+    async deleteOrganization(id) {
+      return deleteOrganizationWithForeignKeys(id);
+    },
+
+    async deleteOrgMember(orgId, userId) {
+      const result = deleteOrgMemberStmt.run(orgId, userId, orgId);
+
+      return result.changes > 0;
+    },
+
+    async deleteOrgPlugin(orgId, pluginId, expectedRevision) {
+      return deleteOrgPluginTx(orgId, pluginId, expectedRevision);
+    },
+
+    async deleteOrgSharedResource(orgId, id) {
+      return deleteOrgSharedResourceStmt.run(orgId, id).changes > 0;
+    },
+
+    async deletePasskeys(userId) {
+      deletePasskeysStmt.run(userId);
+    },
+
+    async deletePluginRelease(pluginId, version) {
+      const result = deletePluginReleaseStmt.run(pluginId, version);
+
+      return result.changes > 0;
+    },
+
+    async deleteProfile(id) {
+      const result = deleteProfileStmt.run(id);
+
+      return result.changes > 0;
+    },
+
+    async deleteProfileAndPromoteDefault(id, orgId, successorId) {
+      return deleteProfileAndPromoteDefaultTx.immediate(id, orgId, successorId);
+    },
+
+    async deleteProfileForOrg(id, orgId) {
+      const result = deleteProfileForOrgStmt.run(id, orgId);
+
+      return result.changes > 0;
+    },
+
+    async deleteSession(id) {
+      return db.transaction(() => {
+        db.prepare(
+          "UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?"
+        ).run(id);
+        db.prepare("DELETE FROM session_user_order WHERE session_id = ?").run(
+          id
+        );
+
+        return deleteSessionStmt.run(id).changes > 0;
+      })();
+    },
+
+    async deleteSkill(id) {
+      // FK cascade is off (PRAGMA foreign_keys = OFF), so versions go too.
+      deleteSkillVersionsStmt.run(id);
+      const result = deleteSkillStmt.run(id);
+
+      return result.changes > 0;
+    },
+
+    async deleteTool(id) {
+      // FK cascade is off (PRAGMA foreign_keys = OFF), so unassign + delete
+      // must be one transaction or seed/admin delete can leave partial state.
+      const result = deleteToolEverywhereTransaction(id);
+
+      return result.changes > 0;
+    },
+
+    async deleteWorkflow(id) {
+      const result = deleteWorkflowStmt.run(id);
+
+      return result.changes > 0;
+    },
+
+    async deleteWorkflowRun(workflowId, runId) {
+      const result = deleteWorkflowRunStmt.run(workflowId, runId);
+
+      return result.changes > 0;
+    },
+
+    async disableUser(id, disabledAt) {
+      disableUserStmt.run(disabledAt, disabledAt, id);
+    },
+
+    async enableUser(id) {
+      enableUserStmt.run(new Date().toISOString(), id);
+    },
+
+    async eraseUser(input) {
+      return eraseUserTransaction.immediate(input) > 0;
+    },
+
+    async failInterruptedRuns() {
+      const completedAt = new Date().toISOString();
+
+      const workflows = failInterruptedWorkflowRunsStmt.run(
+        completedAt,
+        INTERRUPTED_RUN_ERROR
+      );
+
+      // Steps follow their run: a failed run whose steps still read `running`
+      // renders as work in progress under a finished run.
+      failInterruptedWorkflowRunStepsStmt.run(
+        completedAt,
+        INTERRUPTED_RUN_ERROR
+      );
+
+      return workflows.changes;
+    },
+
+    async getActiveArtifactShareByPath(orgId, profileId, sourcePath) {
+      const row = getActiveArtifactShareByPathStmt.get(
+        orgId,
+        profileId,
+        sourcePath
+      );
+
+      return row ? toArtifactShareRecord(row) : null;
+    },
+
+    async getActiveAutomationRun(automationId) {
+      const row = getActiveAutomationRunStmt.get(automationId);
+
+      return row ? toAutomationRunRecord(row) : null;
+    },
+
+    async getArtifactShareById(orgId, profileId, shareId) {
+      const row = getArtifactShareByIdStmt.get(orgId, profileId, shareId);
+
+      return row ? toArtifactShareRecord(row) : null;
+    },
+
+    async getArtifactShareByTokenHash(tokenHash) {
+      const row = getArtifactShareByTokenHashStmt.get(tokenHash);
+
+      return row ? toArtifactShareRecord(row) : null;
+    },
+
+    async getAttachment(id) {
+      const row = getAttachmentStmt.get(id);
+
+      return row ? toAttachmentRecord(row) : null;
+    },
+
+    async getAutomation(id) {
+      const row = getAutomationStmt.get(id);
+
+      return row ? toAutomationRecord(row) : null;
+    },
+
+    async getAutomationRun(automationId, runId) {
+      const row = getAutomationRunStmt.get(automationId, runId);
+
+      return row ? toAutomationRunRecord(row) : null;
+    },
+
+    async getAutomationRunReadThrough(userId, orgId, automationId) {
+      const row = getAutomationRunReadThroughStmt.get(
+        userId,
+        orgId,
+        automationId
+      );
+
+      return row?.read_through_at ?? null;
+    },
+
+    async getBrowserSessionBySessionTokenHash(sessionTokenHash) {
+      const row = getBrowserSessionByTokenHashStmt.get(sessionTokenHash);
+
+      return row ? toBrowserSessionRecord(row) : null;
+    },
+
+    async getComposioToolkit(id) {
+      const row = getComposioToolkitStmt.get(id);
+
+      return row ? toComposioToolkitRecord(row) : null;
+    },
+
+    async getComposioToolkitBySlug(orgId, toolkitSlug) {
+      const row = getComposioToolkitBySlugStmt.get(orgId, toolkitSlug);
+
+      return row ? toComposioToolkitRecord(row) : null;
+    },
+
+    async getComposioUserConnection(userId, toolkitId) {
+      const row = getComposioUserConnectionStmt.get(userId, toolkitId);
+
+      return row ? toComposioUserConnectionRecord(row) : null;
+    },
+
+    async getComposioUserConnectionById(id) {
+      const row = getComposioUserConnectionByIdStmt.get(id);
+
+      return row ? toComposioUserConnectionRecord(row) : null;
+    },
+
+    async getDefaultProfileForOrg(orgId) {
+      const row = getDefaultProfileForOrgStmt.get(orgId);
+
+      return row ? toProfileRecord(row) : null;
+    },
+
+    async getLlmUsageStats(orgId) {
+      const row = getLlmUsageStatsStmt.get(orgId, LLM_USAGE_STATS_ID);
+
+      return row ? toLlmUsageStatsRecord(row) : null;
+    },
+
+    async getMcpServer(id) {
+      const row = getMcpServerStmt.get(id);
+
+      return row ? await toMcpServerRecord(row) : null;
+    },
+
+    async getMcpServerByName(name) {
+      const row = getMcpServerByNameStmt.get(name);
+
+      return row ? await toMcpServerRecord(row) : null;
+    },
+
+    async getNotificationDestination(id) {
+      const row = getNotificationDestinationStmt.get(id);
+
+      return row ? toNotificationDestinationRecord(row) : null;
+    },
+
+    async getOrganizationById(id) {
+      const row = getOrganizationByIdStmt.get(id);
+
+      return row ? toOrganizationRecord(row) : null;
+    },
+
+    async getOrganizationBySlug(slug) {
+      const row = getOrganizationBySlugStmt.get(slug);
+
+      return row ? toOrganizationRecord(row) : null;
+    },
+
+    async getOrganizationResourceCounts(orgId) {
+      return getOrganizationResourceCountsStmt.get(LOCAL_CLIENT_USER_ID, orgId);
+    },
+
+    async getOrgInviteByTokenHash(tokenHash) {
+      const row = getOrgInviteByTokenHashStmt.get(tokenHash);
+
+      return row ? toOrgInviteRecord(row) : null;
+    },
+
+    async getOrgMember(orgId, userId) {
+      const row = getOrgMemberStmt.get(orgId, userId);
+
+      if (!row) {
+        return null;
+      }
+
+      return {
+        createdAt: row.created_at,
+        orgId: row.org_id,
+        // SAFETY: The adapter writes this row value through its typed contract.
+        role: row.role as StoredOrgMemberRecord["role"],
+        userContext: row.user_context ?? null,
+        userId: row.user_id,
+      };
+    },
+
+    async getOrgMemoryProposal(orgId, id) {
+      const row = getOrgMemoryProposalStmt.get(orgId, id);
+
+      return row ? toOrgMemoryProposalRecord(row) : null;
+    },
+
+    async getOrgPlugin(orgId, pluginId) {
+      const row = getOrgPluginStmt.get(orgId, pluginId);
+
+      return row ? toOrgPluginRecord(row) : null;
+    },
+
+    async getOrgSharedResource(orgId, id) {
+      return getOrgSharedResourceStmt.get(orgId, id) ?? null;
+    },
+
+    async getOrgTeamCreation(parentOrgId, requestId) {
+      return getOrgTeamCreationStmt.get(parentOrgId, requestId) ?? null;
+    },
+    async getPasskey(userId, credentialId) {
+      const row = getPasskeyStmt.get(userId, credentialId);
+
+      return row ? toPasskeyRecord(row) : null;
+    },
+    async getPasskeyByCredentialId(credentialId) {
+      const row = getPasskeyByCredentialIdStmt.get(credentialId);
+
+      return row ? toPasskeyRecord(row) : null;
+    },
+
+    async getPendingOrgInvite(orgId, email) {
+      const row = getPendingOrgInviteStmt.get(
+        orgId,
+        email.trim().toLowerCase()
+      );
+
+      return row ? toOrgInviteRecord(row) : null;
+    },
+
+    async getPendingOrgMemoryProposalByBullet(orgId, bullet) {
+      const row = getPendingOrgMemoryProposalByBulletStmt.get(orgId, bullet);
+
+      return row ? toOrgMemoryProposalRecord(row) : null;
+    },
+
+    async getPendingSkillProposalForCreate(orgId, profileId, skillName) {
+      const row = getPendingSkillProposalForCreateStmt.get(
+        orgId,
+        profileId,
+        skillName
+      );
+
+      return row ? toSkillProposalRecord(row) : null;
+    },
+
+    async getPendingSkillProposalForPatch(
+      orgId,
+      profileId,
+      skillName,
+      patchOldString,
+      patchNewString
+    ) {
+      const row = getPendingSkillProposalForPatchStmt.get(
+        orgId,
+        profileId,
+        skillName,
+        patchOldString,
+        patchNewString
+      );
+
+      return row ? toSkillProposalRecord(row) : null;
+    },
+
+    async getPendingSkillProposalForSkill(orgId, profileId, skillName) {
+      const row = getPendingSkillProposalForSkillStmt.get(
+        orgId,
+        profileId,
+        skillName
+      );
+
+      return row ? toSkillProposalRecord(row) : null;
+    },
+
+    async getPluginRelease(pluginId, version) {
+      const row = getPluginReleaseStmt.get(pluginId, version);
+
+      return row ? toPluginReleaseRecord(row) : null;
+    },
+
+    async getProfile(id) {
+      const row = getProfileStmt.get(id);
+
+      return row ? toProfileRecord(row) : null;
+    },
+
+    async getProfileForOrg(id, orgId) {
+      const row = getProfileForOrgStmt.get(id, orgId);
+
+      return row ? toProfileRecord(row) : null;
+    },
+
+    async getSession(id) {
+      const row = getSessionStmt.get(id);
+
+      return row ? toSessionRecord(row) : null;
+    },
+
+    async getSessionQuestionnaire(sessionId) {
+      const row = getSessionQuestionnaireStmt.get(sessionId);
+
+      return row ? parseAgentQuestionnaire(row.agent_questionnaire) : null;
+    },
+
+    async getSessionTodos(sessionId) {
+      const row = getSessionTodosStmt.get(sessionId);
+
+      return row ? parseAgentTodos(row.agent_todos) : [];
+    },
+
+    async getSharedAgentInstance(teamOrgId, profileId) {
+      return getSharedAgentInstanceStmt.get(teamOrgId, profileId) ?? null;
+    },
+
+    async getSkill(id) {
+      const row = getSkillStmt.get(id);
+
+      return row ? toSkillRecord(row) : null;
+    },
+
+    async getSkillByName(name, orgId) {
+      const row = getSkillByNameStmt.get(name, orgId ?? null);
+
+      return row ? toSkillRecord(row) : null;
+    },
+
+    async getSkillBySourcePath(sourcePath) {
+      const row = getSkillBySourcePathStmt.get(sourcePath);
+
+      return row ? toSkillRecord(row) : null;
+    },
+
+    async getSkillProposal(orgId, id) {
+      const row = getSkillProposalStmt.get(orgId, id);
+
+      return row ? toSkillProposalRecord(row) : null;
+    },
+
+    async getSkillSuggestion(orgId, id) {
+      const row = getSkillSuggestionStmt.get(orgId, id);
+
+      return row ? toSkillSuggestionRecord(row) : null;
+    },
+
+    async getSkillUsage(profileId, skillId) {
+      const row = getSkillUsageStmt.get(profileId, skillId);
+
+      return row ? toSkillUsageRecord(row) : null;
+    },
+
+    async getSkillVersion(skillId, versionId) {
+      const row = getSkillVersionStmt.get(skillId, versionId);
+
+      return row ? toSkillVersionRecord(row) : null;
+    },
+
+    async getTool(id) {
+      const row = getToolStmt.get(id);
+
+      return row ? toToolRecord(row) : null;
+    },
+
+    async getToolByName(name) {
+      const row = getToolByNameStmt.get(name);
+
+      return row ? toToolRecord(row) : null;
+    },
+
+    async getToolByNameForOrg(orgId, name) {
+      const row = getToolByNameForOrgStmt.get(name, orgId);
+
+      return row ? toToolRecord(row) : null;
+    },
+    async getUserByEmail(email) {
+      const row = getUserByEmailStmt.get(email);
+
+      return row ? toUserRecord(row) : null;
+    },
+
+    async getUserById(id) {
+      const row = getUserByIdStmt.get(id);
+
+      return row ? toUserRecord(row) : null;
+    },
+
+    async getUserContext(orgId, userId) {
+      const row = getUserContextStmt.get(orgId, userId);
+
+      return row?.user_context ?? null;
+    },
+
+    async getWorkflow(id) {
+      const row = getWorkflowStmt.get(id);
+
+      return row ? toWorkflowRecord(row) : null;
+    },
+
+    async getWorkflowRun(workflowId, runId) {
+      const row = getWorkflowRunStmt.get(workflowId, runId);
+
+      return row ? toWorkflowRunRecord(row) : null;
+    },
+
+    async getWorkspaceSettings() {
+      const row = getWorkspaceSettingsStmt.get(WORKSPACE_SETTINGS_ID);
+
+      return row ? toWorkspaceSettingsRecord(row) : null;
+    },
+
+    async handOverSharedAttachments(sessionId, orgId) {
+      handOverSharedAttachmentsStmt.run(sessionId, orgId);
+    },
+
+    async importSharedAgentReference(record) {
+      db.transaction(() => {
+        const profile = getProfileForOrgStmt.get(
+          record.profileId,
+          record.teamOrgId
+        );
+
+        if (
+          !profile ||
+          profile.is_default ||
+          profile.is_super ||
+          getSharedAgentInstanceStmt.get(record.teamOrgId, record.profileId)
+        ) {
+          throw new Error("Invalid imported shared agent profile");
+        }
+
+        insertSharedAgentInstanceStmt.run(
+          record.profileId,
+          record.teamOrgId,
+          record.sourceOrgId,
+          record.sourceProfileId,
+          record.publicationId,
+          record.createdAt
+        );
+      }).immediate();
+    },
+
+    async incrementLlmTurnUsage(orgId, delta) {
+      const updatedAt = new Date().toISOString();
+      incrementLlmTurnUsageStmt.run(
+        orgId,
+        updatedAt.slice(0, 10),
+        // Legacy arm column, see migrateLlmTurnUsageTable.
+        "none",
+        delta.inputTokens,
+        delta.outputTokens,
+        delta.estimated ? 1 : 0,
+        updatedAt
+      );
+    },
+
+    async incrementLlmUsageDailyStats(orgId, key, delta) {
+      incrementLlmUsageDailyStatsStmt.run(
+        orgId,
+        key.day,
+        key.modelId,
+        key.provider,
+        delta.requestCount,
+        delta.inputTokens,
+        delta.outputTokens,
+        delta.estimatedCostUsd,
+        new Date().toISOString()
+      );
+    },
+
+    async incrementLlmUsageStats(orgId, delta, trackedSince) {
+      const updatedAt = new Date().toISOString();
+      incrementLlmUsageStatsStmt.run(
+        orgId,
+        LLM_USAGE_STATS_ID,
+        delta.requestCount,
+        delta.inputTokens,
+        delta.outputTokens,
+        delta.estimatedCostUsd,
+        trackedSince,
+        updatedAt
+      );
+    },
+
+    async incrementLlmUsageStatsByActor(orgId, actor, delta, trackedSince) {
+      const updatedAt = new Date().toISOString();
+      incrementLlmUsageStatsByActorStmt.run(
+        orgId,
+        actor.profileId?.trim() ?? "",
+        actor.userId?.trim() ?? "",
+        delta.requestCount,
+        delta.inputTokens,
+        delta.outputTokens,
+        delta.estimatedCostUsd,
+        trackedSince,
+        updatedAt
+      );
+    },
+
+    async incrementLlmUsageStatsByModel(orgId, modelId, delta, trackedSince) {
+      const updatedAt = new Date().toISOString();
+      incrementLlmUsageStatsByModelStmt.run(
+        orgId,
+        modelId,
+        delta.requestCount,
+        delta.inputTokens,
+        delta.outputTokens,
+        delta.estimatedCostUsd,
+        trackedSince,
+        updatedAt
+      );
+    },
+
+    async incrementSkillUsage(input) {
+      const now = new Date().toISOString();
+      incrementSkillUsageStmt.run(
+        input.orgId,
+        input.profileId,
+        input.skillId,
+        input.viewDelta ?? 0,
+        input.useDelta ?? 0,
+        input.patchDelta ?? 0,
+        input.viewedAt ?? null,
+        input.usedAt ?? null,
+        input.patchedAt ?? null,
+        now,
+        now
+      );
+    },
+
+    async insertAttachment(record) {
+      if (record.sessionId) {
+        requireWritableSession(record.sessionId);
+      }
+
+      insertAttachmentStmt.run(
+        record.id,
+        record.orgId,
+        record.profileId,
+        record.sessionId,
+        record.channel,
+        record.kind,
+        record.filename,
+        record.mediaType,
+        record.sizeBytes,
+        record.storagePath,
+        record.createdAt,
+        record.ephemeral ? 1 : 0
+      );
+    },
+
+    async insertAutomationRun(record) {
+      insertAutomationRunStmt.run(
+        record.id,
+        record.automationId,
+        record.status,
+        record.startedAt,
+        record.completedAt,
+        record.output,
+        record.error,
+        record.deliveryStatus ?? null,
+        record.deliveryError ?? null,
+        record.progress ? JSON.stringify(record.progress) : null
+      );
+    },
+
+    async insertAutomationRunStep(step) {
+      insertAutomationRunStepStmt.run(
+        step.runId,
+        step.toolCallId,
+        step.toolGroupId,
+        step.toolName,
+        step.args,
+        step.result,
+        step.status,
+        step.startedAt,
+        step.completedAt,
+        step.position
+      );
+    },
+
+    async insertWorkflowRun(record) {
+      insertWorkflowRunStmt.run(
+        record.id,
+        record.workflowId,
+        record.status,
+        record.input,
+        record.startedAt,
+        record.completedAt,
+        record.output,
+        record.error
+      );
+    },
+
+    async insertWorkflowRunStep(record) {
+      insertWorkflowRunStepStmt.run(
+        record.id,
+        record.runId,
+        record.stepId,
+        record.kind,
+        record.status,
+        record.input,
+        record.output,
+        record.error,
+        record.startedAt,
+        record.completedAt,
+        record.position
+      );
+    },
+    async listArtifactRecords(orgId, profileId) {
+      return listArtifactRecordsStmt
+        .all(orgId, profileId)
+        .map((row) => toArtifactOwnerRecord(row));
+    },
+
+    async listArtifactSharesForProfile(orgId, profileId) {
+      return listArtifactSharesForProfileStmt
+        .all(orgId, profileId)
+        .map((row) => toArtifactShareRecord(row));
+    },
+
+    async listAttachmentsForSession(sessionId) {
+      return listAttachmentsForSessionStmt
+        .all(sessionId)
+        .map((row) => toAttachmentRecord(row));
+    },
+
+    async listAuditEvents(options = {}) {
+      const action = options.action ?? null;
+      const orgId = options.orgId ?? null;
+
+      const rows = listAuditEventsStmt.all(
+        orgId,
+        orgId,
+        action,
+        action,
+        options.limit ?? 100,
+        options.offset ?? 0
+      );
+
+      return rows.map(toAuditEventRecord);
+    },
+
+    async listAutomationRunSteps(runId) {
+      return listAutomationRunStepsStmt.all(runId).map((row) => ({
+        args: row.args,
+        completedAt: row.completed_at,
+        position: row.position,
+        result: row.result,
+        runId: row.run_id,
+        startedAt: row.started_at,
+        status: row.status,
+        toolCallId: row.tool_call_id,
+        toolGroupId: row.tool_group_id,
+        toolName: row.tool_name,
+      }));
+    },
+
+    async listAutomationRuns(automationId, limit = 20) {
+      return listAutomationRunsStmt
+        .all(automationId, limit)
+        .map((row) => toAutomationRunRecord(row));
+    },
+
+    async listAutomations() {
+      return listAutomationsStmt.all().map((row) => toAutomationRecord(row));
+    },
+
+    async listAutomationsForOrg(orgId) {
+      return listAutomationsForOrgStmt
+        .all(orgId)
+        .map((row) => toAutomationRecord(row));
+    },
+
+    async listBrowserSessionsForUser(userId, now) {
+      const rows = listBrowserSessionsForUserStmt.all(userId, now);
+
+      return rows.map(toBrowserSessionRecord);
+    },
+
+    async listComposioToolkitsForOrg(orgId) {
+      return listComposioToolkitsForOrgStmt
+        .all(orgId)
+        .map((row) => toComposioToolkitRecord(row));
+    },
+
+    async listComposioUserConnectionsForUser(orgId, userId) {
+      return listComposioUserConnectionsForUserStmt
+        .all(orgId, userId)
+        .map((row) => toComposioUserConnectionRecord(row));
+    },
+
+    async listEphemeralAttachments() {
+      return listEphemeralAttachmentsStmt
+        .all()
+        .map((row) => toAttachmentRecord(row));
+    },
+
+    async listFilePins(orgId, userId, profileId) {
+      return db
+        .query<{ path: string }, SQLQueryBindings[]>(
+          "SELECT path FROM file_pins WHERE org_id = ? AND user_id = ? AND profile_id = ? ORDER BY path"
+        )
+        .all(orgId, userId, profileId)
+        .map((row) => row.path);
+    },
+
+    async listLlmTurnUsage(orgId) {
+      return listLlmTurnUsageStmt.all(orgId).map((row) => ({
+        bucket: row.bucket,
+        estimatedTurns: row.estimated_turns,
+        inputTokens: row.input_tokens,
+        orgId: row.org_id,
+        outputTokens: row.output_tokens,
+        turns: row.turns,
+      }));
+    },
+
+    async listLlmUsageDailyStats(orgId, sinceDay) {
+      return listLlmUsageDailyStatsStmt
+        .all(orgId, sinceDay)
+        .map((row) => toLlmUsageDailyStatsRecord(row));
+    },
+
+    async listLlmUsageStatsByActor(orgId) {
+      return listLlmUsageStatsByActorStmt
+        .all(orgId)
+        .map((row) => toLlmUsageActorStatsRecord(row));
+    },
+
+    async listLlmUsageStatsByModel(orgId) {
+      return listLlmUsageStatsByModelStmt
+        .all(orgId)
+        .map((row) => toLlmUsageModelStatsRecord(row));
+    },
+
+    async listMcpServerProfileCounts() {
+      const counts: Record<string, number> = {};
+
+      for (const row of listMcpServerProfileCountsStmt.all()) {
+        counts[row.server_id] = row.count;
+      }
+
+      return counts;
+    },
+
+    async listMcpServers() {
+      return Promise.all(
+        listMcpServersStmt.all().map((row) => toMcpServerRecord(row))
+      );
+    },
+
+    async listMcpServersForProfile(profileId) {
+      return Promise.all(
+        listMcpServersForProfileStmt
+          .all(profileId)
+          .map((row) => toMcpServerRecord(row))
+      );
+    },
+
+    async listMessagesForSession(sessionId) {
+      return listMessagesForSessionStmt
+        .all(sessionId)
+        .map((row) => toSessionMessageRecord(row));
+    },
+
+    async listNotificationDestinationsForOrg(orgId) {
+      return listNotificationDestinationsForOrgStmt
+        .all(orgId)
+        .map((row) => toNotificationDestinationRecord(row));
+    },
+
+    async listOrganizations() {
+      return listOrganizationsStmt
+        .all()
+        .map((row) => toOrganizationRecord(row));
+    },
+
+    async listOrgMembers(orgId) {
+      return listOrgMembersStmt.all(orgId).map((row) => {
+        const member = row;
+
+        return {
+          createdAt: member.created_at,
+          orgId: member.org_id,
+          // SAFETY: The adapter writes this row value through its typed contract.
+          role: member.role as StoredOrgMemberRecord["role"],
+          userContext: member.user_context ?? null,
+          userId: member.user_id,
+        };
+      });
+    },
+
+    async listOrgMemoryProposals(orgId, status) {
+      // SAFETY: The adapter writes this row value through its typed contract.
+      const rows = (
+        status
+          ? listOrgMemoryProposalsStmt.all(orgId, status)
+          : listAllOrgMemoryProposalsStmt.all(orgId)
+      ) as OrgMemoryProposalRow[];
+
+      return rows.map(toOrgMemoryProposalRecord);
+    },
+
+    async listOrgPlugins(orgId) {
+      const rows =
+        orgId === undefined
+          ? listOrgPluginsStmt.all()
+          : listOrgPluginsForOrgStmt.all(orgId);
+
+      // SAFETY: The adapter writes this row value through its typed contract.
+      return rows.map((row) => toOrgPluginRecord(row as OrgPluginRow));
+    },
+
+    async listOrgSharedResources(orgId) {
+      return listOrgSharedResourcesStmt.all(orgId);
+    },
+    async listPasskeys(userId) {
+      return listPasskeysStmt.all(userId).map((row) => toPasskeyRecord(row));
+    },
+
+    async listPlatformAdminUsers() {
+      const rows = listPlatformAdminUsersStmt.all();
+
+      return rows.map(toUserRecord);
+    },
+
+    async listPluginReleases(pluginId) {
+      const rows = pluginId
+        ? listPluginReleasesStmt.all(pluginId)
+        : listAllPluginReleasesStmt.all();
+
+      // SAFETY: The adapter writes this row value through its typed contract.
+      return rows.map((row) => toPluginReleaseRecord(row as PluginReleaseRow));
+    },
+
+    async listProfileChangeEvents(orgId, profileId, options = {}) {
+      const limit = options.limit ?? 100;
+      const offset = options.offset ?? 0;
+
+      const rows = listProfileChangeEventsStmt.all(
+        orgId,
+        profileId,
+        limit,
+        offset
+      );
+
+      return rows.map(toProfileChangeEventRecord);
+    },
+
+    async listProfileComposioToolkits(profileId) {
+      return listProfileComposioToolkitsStmt
+        .all(profileId)
+        .map((row) => toProfileComposioToolkitRecord(row));
+    },
+
+    async listProfiles() {
+      return listProfilesStmt.all().map((row) => toProfileRecord(row));
+    },
+
+    async listProfilesForMcpServer(serverId) {
+      return listProfilesForMcpServerStmt
+        .all(serverId)
+        .map((row) => toProfileRecord(row));
+    },
+
+    async listProfilesForOrg(orgId) {
+      return listProfilesForOrgStmt
+        .all(orgId)
+        .map((row) => toProfileRecord(row));
+    },
+
+    async listSessionSummaries(profileId, channels, options = {}) {
+      const { after, limit, query, sessionId, sharedChannels, userId } =
+        options;
+
+      return listSessionSummariesStmt
+        .all(
+          profileId,
+          JSON.stringify(channels),
+          after ? Number(after.pinned) : null,
+          after?.updatedAt ?? null,
+          after?.createdAt ?? null,
+          after?.id ?? null,
+          // SQLite reads a negative LIMIT as no limit.
+          limit ?? -1,
+          sessionId ?? null,
+          query ? likeContains(query) : null,
+          userId ?? null,
+          JSON.stringify(sharedChannels ?? []),
+          userId ?? null
+        )
+        .map((row) => toSessionSummaryRecord(row));
+    },
+
+    async listSessions() {
+      return listSessionsStmt.all().map((row) => toSessionRecord(row));
+    },
+
+    async listSessionsForUser(userId) {
+      return listSessionsForUserStmt
+        .all(userId)
+        .map((row) => toSessionRecord(row));
+    },
+
+    async listSkillProposals(orgId, options = {}) {
+      const { status, profileId, sessionId } = options;
+      let rows: SkillProposalRow[];
+
+      if (status && profileId) {
+        rows = listSkillProposalsByStatusAndProfileStmt.all(
+          orgId,
+          status,
+          profileId
+        );
+      } else if (status) {
+        rows = listSkillProposalsByStatusStmt.all(orgId, status);
+      } else if (profileId) {
+        rows = listAllSkillProposalsForProfileStmt.all(orgId, profileId);
+      } else {
+        rows = listAllSkillProposalsStmt.all(orgId);
+      }
+
+      const records = rows.map(toSkillProposalRecord);
+
+      if (!sessionId) {
+        return records;
+      }
+
+      return records.filter((proposal) => proposal.sessionId === sessionId);
+    },
+
+    async listSkillSuggestions(orgId, options = {}) {
+      const { sessionId, status, profileId } = options;
+      const sessionFilter = sessionId ?? null;
+      const statusFilter = status ?? null;
+      const profileFilter = profileId ?? null;
+
+      const rows = listSkillSuggestionsStmt.all(
+        orgId,
+        sessionFilter,
+        sessionFilter,
+        statusFilter,
+        statusFilter,
+        profileFilter,
+        profileFilter
+      );
+
+      return rows.map(toSkillSuggestionRecord);
+    },
+
+    async listSkills() {
+      return listSkillsStmt.all().map((row) => toSkillRecord(row));
+    },
+
+    async listSkillsForProfile(profileId) {
+      return listSkillsForProfileStmt
+        .all(profileId)
+        .map((row) => toSkillRecord(row));
+    },
+
+    async listSkillUsageForProfile(profileId) {
+      return listSkillUsageForProfileStmt
+        .all(profileId)
+        .map((row) => toSkillUsageRecord(row));
+    },
+
+    async listSkillVersions(skillId, options = {}) {
+      const rows = listSkillVersionsStmt.all(skillId, options.limit ?? 50);
+
+      return rows.map(toSkillVersionRecord);
+    },
+
+    async listTools() {
+      return listToolsStmt.all().map((row) => toToolRecord(row));
+    },
+
+    async listToolsForProfile(profileId) {
+      return listToolsForProfileStmt
+        .all(profileId)
+        .map((row) => toToolRecord(row));
+    },
+
+    async listUserOrganizations(userId) {
+      return listUserOrganizationsStmt.all(userId).map((row) => {
+        // SAFETY: The adapter writes this row value through its typed contract.
+        const record = row as OrganizationRow & {
+          joined_at: string;
+          role: string;
+        };
+
+        return {
+          joinedAt: record.joined_at,
+          organization: toOrganizationRecord(record),
+          // SAFETY: The adapter writes this row value through its typed contract.
+          role: record.role as StoredUserOrganizationRecord["role"],
+        };
+      });
+    },
+
+    async listWorkflowRunSteps(runId) {
+      return listWorkflowRunStepsStmt
+        .all(runId)
+        .map((row) => toWorkflowRunStepRecord(row));
+    },
+
+    async listWorkflowRuns(workflowId, limit = 20) {
+      return listWorkflowRunsStmt
+        .all(workflowId, limit)
+        .map((row) => toWorkflowRunRecord(row));
+    },
+
+    async listWorkflowsForOrg(orgId) {
+      return listWorkflowsForOrgStmt
+        .all(orgId)
+        .map((row) => toWorkflowRecord(row));
+    },
+
+    async markOrgInviteAccepted(id, acceptedAt) {
+      markOrgInviteAcceptedStmt.run(acceptedAt, id);
+    },
+
+    async markSkillSuggestionApplied(orgId, id, appliedAt) {
+      const result = markSkillSuggestionAppliedStmt.run(appliedAt, orgId, id);
+
+      return result.changes > 0;
+    },
+
+    async moveProfile(
+      profileId,
+      sourceOrgId,
+      targetOrgId,
+      workspaceFrom,
+      workspaceTo
+    ) {
+      moveProfileTransaction.immediate(
+        profileId,
+        sourceOrgId,
+        targetOrgId,
+        workspaceFrom,
+        workspaceTo
+      );
+    },
+
+    async publishOrgPluginRelease(input) {
+      return publishOrgPluginReleaseTx(input);
+    },
+
+    async publishOrgSharedResource(record) {
+      return publishOrgSharedResourceTransaction(record);
+    },
+
+    async releaseMonthlyLlmQuota(orgId, reservationId) {
+      releaseMonthlyLlmQuotaStmt.run(reservationId, orgId);
+    },
+
+    async renameFilePins(orgId, profileId, oldPath, newPath) {
+      if (oldPath === newPath) {
+        return;
+      }
+
+      db.transaction(() => {
+        db.query(`INSERT OR IGNORE INTO file_pins (org_id, user_id, profile_id, path)
+          SELECT org_id, user_id, profile_id, ? || substr(path, length(?) + 1)
+          FROM file_pins WHERE org_id = ? AND profile_id = ?
+          AND (path = ? OR substr(path, 1, length(?) + 1) = ? || '/')`).run(
+          newPath,
+          oldPath,
+          orgId,
+          profileId,
+          oldPath,
+          oldPath,
+          oldPath
+        );
+        db.query(`DELETE FROM file_pins WHERE org_id = ? AND profile_id = ?
+          AND (path = ? OR substr(path, 1, length(?) + 1) = ? || '/')`).run(
+          orgId,
+          profileId,
+          oldPath,
+          oldPath,
+          oldPath
+        );
+      })();
+    },
+    async renameSessionTitle(sessionId, title) {
+      const result = renameSessionTitleStmt.run(title, sessionId);
+
+      return result.changes > 0;
+    },
+
+    async replaceMessagesForSession(sessionId, messages) {
+      replaceMessagesForSessionTransaction(sessionId, messages);
+    },
+
+    async replaceProfileComposioToolkits(profileId, assignments) {
+      replaceProfileComposioToolkitsTransaction(profileId, assignments);
+    },
+
+    async revokeArtifactShare(id, revokedAt) {
+      const result = revokeArtifactShareStmt.run(revokedAt, id);
+
+      return result.changes > 0;
+    },
+
+    async revokeBrowserSessionBySessionTokenHash(sessionTokenHash, revokedAt) {
+      const result = revokeBrowserSessionByTokenHashStmt.run(
+        revokedAt,
+        sessionTokenHash
+      );
+
+      return result.changes > 0;
+    },
+
+    async revokeBrowserSessionForUser(id, userId, revokedAt) {
+      const result = revokeBrowserSessionForUserStmt.run(revokedAt, id, userId);
+
+      return result.changes > 0;
+    },
+
+    async revokeBrowserSessionsForUser(userId, revokedAt) {
+      const result = revokeBrowserSessionsForUserStmt.run(revokedAt, userId);
+
+      return result.changes;
+    },
+
+    async revokeBrowserSessionsForUserExcept(userId, sessionId, revokedAt) {
+      const result = revokeBrowserSessionsForUserExceptStmt.run(
+        revokedAt,
+        userId,
+        sessionId,
+        sessionId
+      );
+
+      return result.changes;
+    },
+    async setFilePinned(orgId, userId, profileId, path, pinned) {
+      if (pinned) {
+        db.query(
+          "INSERT OR IGNORE INTO file_pins (org_id, user_id, profile_id, path) VALUES (?, ?, ?, ?)"
+        ).run(orgId, userId, profileId, path);
+      } else {
+        db.query(
+          "DELETE FROM file_pins WHERE org_id = ? AND user_id = ? AND profile_id = ? AND path = ?"
+        ).run(orgId, userId, profileId, path);
+      }
+    },
+    async setPendingMfaSecret(id, pendingTotpSecretEnc, updatedAt) {
+      setPendingMfaSecretStmt.run(pendingTotpSecretEnc, updatedAt, id);
+    },
+    async setSessionOrder(userId, sessionIds) {
+      db.transaction(() => {
+        for (const [index, sessionId] of sessionIds.entries()) {
+          setSessionOrderStmt.run(sessionId, userId, index);
+        }
+      })();
+    },
+
+    async setUserContext(orgId, userId, content, _updatedAt) {
+      setUserContextStmt.run(content, orgId, userId);
+    },
+
+    async tryMarkOrganizationArchived(orgId, archivedAt) {
+      const now = new Date().toISOString();
+
+      const result = tryMarkOrganizationArchivedStmt.run(
+        archivedAt,
+        now,
+        orgId
+      );
+
+      return result.changes > 0;
+    },
+
+    async tryReserveMonthlyLlmQuota(input) {
+      const result = tryReserveMonthlyLlmQuotaStmt.run(
+        input.orgId,
+        input.reservationId,
+        input.reservedTokens,
+        input.createdAt,
+        input.existingTurns,
+        input.existingTokens
+      );
+
+      return result.changes === 1;
+    },
+
+    async unassignMcpServerFromProfile(profileId, serverId) {
+      const result = unassignMcpServerStmt.run(profileId, serverId);
+
+      return result.changes > 0;
+    },
+
+    async unassignSkillFromProfile(profileId, skillId) {
+      const result = unassignSkillStmt.run(profileId, skillId);
+
+      return result.changes > 0;
+    },
+
+    async unassignToolFromProfile(profileId, toolId) {
+      const result = unassignToolStmt.run(profileId, toolId);
+
+      return result.changes > 0;
+    },
+
+    async updateArtifactShareSnapshot(id, snapshot) {
+      updateArtifactShareSnapshotStmt.run(
+        snapshot.filename,
+        snapshot.mimeType,
+        snapshot.sizeBytes,
+        snapshot.storagePath,
+        id
+      );
+    },
+
+    async updateAutomationRun(record) {
+      updateAutomationRunStmt.run(
+        record.status,
+        record.completedAt,
+        record.output,
+        record.error,
+        record.deliveryStatus ?? null,
+        record.deliveryError ?? null,
+        record.progress ? JSON.stringify(record.progress) : null,
+        record.id
+      );
+    },
+
+    async updateBrowserSessionActiveOrgId(id, activeOrgId) {
+      updateBrowserSessionActiveOrgIdStmt.run(activeOrgId, id);
+    },
+
+    async updateBrowserSessionLastUsedAt(id, lastUsedAt) {
+      updateBrowserSessionLastUsedAtStmt.run(lastUsedAt, id);
+    },
+
+    async updateOrgMemberRole(orgId, userId, role) {
+      const result = updateOrgMemberRoleStmt.run(
+        role,
+        orgId,
+        userId,
+        role,
+        orgId
+      );
+
+      return result.changes > 0;
+    },
+
+    async updateOrgMemoryProposalStatus(orgId, id, update) {
+      const result = updateOrgMemoryProposalStatusStmt.run(
+        update.status,
+        update.reviewerUserId,
+        update.reviewedAt,
+        update.pinned ? 1 : 0,
+        orgId,
+        id
+      );
+
+      return result.changes > 0;
+    },
+    async updatePasskeyCounter(userId, credentialId, counter) {
+      updatePasskeyCounterStmt.run(counter, userId, credentialId);
+    },
+
+    async updateSessionModel(sessionId, model) {
+      const result = updateSessionModelStmt.run(model, sessionId);
+
+      return result.changes > 0;
+    },
+    async updateSessionParent(sessionId, parentSessionId) {
+      return (
+        updateSessionParentStmt.run(parentSessionId, sessionId).changes > 0
+      );
+    },
+    async updateSessionPinned(sessionId, pinned) {
+      const result = updateSessionPinnedStmt.run(pinned ? 1 : 0, sessionId);
+
+      return result.changes > 0;
+    },
+
+    async updateSessionQuestionnaire(sessionId, questionnaire) {
+      updateSessionQuestionnaireStmt.run(
+        questionnaire ? JSON.stringify(questionnaire) : null,
+        sessionId
+      );
+    },
+    async updateSessionThinkingEffort(sessionId, effort) {
+      const result = updateSessionThinkingEffortStmt.run(effort, sessionId);
+
+      return result.changes > 0;
+    },
+
+    async updateSessionTitle(sessionId, title) {
+      const result = updateSessionTitleStmt.run(title, sessionId);
+
+      return result.changes > 0;
+    },
+
+    async updateSessionTodos(sessionId, todos) {
+      updateSessionTodosStmt.run(JSON.stringify(todos), sessionId);
+    },
+
+    async updateSkillProposalStatus(orgId, id, update) {
+      const result = updateSkillProposalStatusStmt.run(
+        update.status,
+        update.reviewerUserId,
+        update.reviewedAt,
+        orgId,
+        id
+      );
+
+      return result.changes > 0;
+    },
+    async updateUserMfa(id, mfa, updatedAt) {
+      updateUserMfaStmt.run(
+        mfa.enabled ? 1 : 0,
+        mfa.totpSecretEnc,
+        mfa.pendingTotpSecretEnc,
+        mfa.mfaTotpLastStep,
+        updatedAt,
+        id
+      );
+    },
+
+    async updateUserPassword(id, passwordHash, updatedAt) {
+      updateUserPasswordStmt.run(passwordHash, updatedAt, id);
+    },
+
+    async updateUserProfile(id, profile, updatedAt) {
+      updateUserProfileStmt.run(
+        profile.name,
+        profile.phone,
+        profile.email ?? null,
+        updatedAt,
+        id
+      );
+    },
+
+    async updateWorkflowRun(record) {
+      updateWorkflowRunStmt.run(
+        record.status,
+        record.input,
+        record.completedAt,
+        record.output,
+        record.error,
+        record.id
+      );
+    },
+
+    async updateWorkflowRunStep(record) {
+      updateWorkflowRunStepStmt.run(
+        record.status,
+        record.input,
+        record.output,
+        record.error,
+        record.completedAt,
+        record.id
+      );
+    },
+    async upsertArtifactRecord(record) {
+      upsertArtifactRecordStmt.run(
+        record.orgId,
+        record.profileId,
+        record.filename,
+        record.sessionId,
+        record.userId,
+        record.channel,
+        record.createdAt
+      );
+    },
+
+    async upsertAutomation(record) {
+      const existing = await this.getAutomation(record.id);
+
+      upsertAutomationStmt.run(
+        record.id,
+        record.name,
+        record.version,
+        JSON.stringify(record.definition),
+        record.profileId,
+        record.orgId ?? null,
+        record.enabled ? 1 : 0,
+        existing?.createdAt ?? record.createdAt,
+        record.updatedAt
+      );
+    },
+
+    async upsertAutomationRunReadThrough(
+      userId,
+      orgId,
+      automationId,
+      readThroughAt
+    ) {
+      upsertAutomationRunReadThroughStmt.run(
+        userId,
+        orgId,
+        automationId,
+        readThroughAt
+      );
+    },
+
+    async upsertComposioToolkit(record) {
+      upsertComposioToolkitStmt.run(
+        record.id,
+        record.orgId,
+        record.toolkitSlug,
+        record.displayName,
+        record.status,
+        null,
+        null,
+        null,
+        JSON.stringify(record.cachedTools),
+        record.lastError,
+        record.createdAt,
+        record.updatedAt
+      );
+    },
+
+    async upsertComposioUserConnection(record) {
+      upsertComposioUserConnectionStmt.run(
+        record.id,
+        record.orgId,
+        record.userId,
+        record.toolkitId,
+        record.status,
+        record.connectedAccountId,
+        record.sessionIdEnc,
+        record.oauthStateHash,
+        record.lastError,
+        record.createdAt,
+        record.updatedAt
+      );
+    },
+
+    async upsertMcpServer(record) {
+      upsertMcpServerStmt.run(
+        record.id,
+        record.name,
+        record.transport,
+        await encryptMcpConfig(record.id, record.config),
+        record.enabled ? 1 : 0,
+        record.status,
+        record.lastError,
+        JSON.stringify(record.cachedTools ?? []),
+        record.createdAt,
+        record.updatedAt
+      );
+    },
+
+    async upsertNotificationDestination(record) {
+      upsertNotificationDestinationStmt.run(
+        record.id,
+        record.name,
+        record.channel,
+        JSON.stringify(record.config),
+        record.secretHash,
+        record.orgId,
+        record.createdAt,
+        record.updatedAt
+      );
+    },
+
+    async upsertOrganization(record) {
+      runUpsertOrganizationStmt(record);
+    },
+
+    async upsertOrgMember(record) {
+      runUpsertOrgMemberStmt(record);
+    },
+
+    async upsertPluginRelease(record) {
+      return upsertPluginReleaseTx(record);
+    },
+
+    async upsertProfile(record) {
+      if (record.isDefault && record.orgId) {
+        upsertDefaultProfileTransaction.immediate(record);
+
+        return;
+      }
+
+      runUpsertProfileStmt(record);
+    },
+    async upsertSession(record) {
+      requireWritableSession(record.id);
+
+      // org_id comes from the session's current profile on every upsert;
+      // callers do not pass one, so it cannot drift from that profile.
+      const orgId = getProfileStmt.get(record.profileId)?.org_id ?? null;
+
+      upsertSessionStmt.run(
+        record.id,
+        record.profileId,
+        record.channel,
+        record.createdAt,
+        record.createdAt,
+        record.userId ?? null,
+        record.model,
+        orgId,
+        record.pinned ? 1 : 0,
+        record.parentSessionId ?? null,
+        record.branchMessageIndex ?? null,
+        record.thinkingEffort ?? null
+      );
+    },
+    async upsertSkill(record) {
+      upsertSkillStmt.run(
+        record.id,
+        record.name,
+        record.description,
+        record.sourcePath,
+        record.hasTool ? 1 : 0,
+        record.disableModelInvocation ? 1 : 0,
+        record.enabled ? 1 : 0,
+        record.createdBy,
+        record.orgId ?? null,
+        record.pluginId ?? null,
+        record.pluginKey ?? null,
+        record.createdAt,
+        record.updatedAt
+      );
+    },
+
+    async upsertTool(record) {
+      upsertToolStmt.run(
+        record.id,
+        record.name,
+        record.description,
+        record.handlerType,
+        JSON.stringify(record.handlerConfig ?? {}),
+        record.orgId ?? null,
+        record.pluginId ?? null,
+        record.pluginKey ?? null,
+        record.createdAt,
+        record.updatedAt
+      );
+    },
+
+    async upsertWorkflow(record) {
+      const existing = await this.getWorkflow(record.id);
+
+      upsertWorkflowStmt.run(
+        record.id,
+        record.name,
+        record.version,
+        JSON.stringify(record.definition),
+        record.profileId,
+        record.orgId ?? null,
+        record.enabled ? 1 : 0,
+        existing?.createdAt ?? record.createdAt,
+        record.updatedAt
+      );
+    },
+
+    async upsertWorkspaceSettings(record) {
+      upsertWorkspaceSettingsStmt.run(
+        WORKSPACE_SETTINGS_ID,
+        record.visionModel,
+        record.transcriptionModel,
+        record.imageModel,
+        JSON.stringify(record.codingAgentHarnesses),
+        record.selectedCodingAgentHarness,
+        record.codingAgentProviderPassthrough === false ? 0 : 1,
+        record.automationWorkerPollIntervalMs ?? 5 * 60 * 1000,
+        record.updatedAt
+      );
+    },
+  };
+}
+
+function toAutomationRecord(row: AutomationRow): StoredAutomationRecord {
+  return {
+    createdAt: row.created_at,
+    definition: parseJson(row.definition),
+    enabled: row.enabled !== 0,
+    id: row.id,
+    name: row.name,
+    orgId: row.org_id ?? null,
+    profileId: row.profile_id,
+    updatedAt: row.updated_at,
+    version: row.version,
+  };
+}
+
+function toAutomationRunRecord(
+  row: AutomationRunRow
+): StoredAutomationRunRecord {
+  return {
+    automationId: row.automation_id,
+    completedAt: row.completed_at,
+    deliveryError: row.delivery_error,
+    deliveryStatus: row.delivery_status,
+    error: row.error,
+    id: row.id,
+    output: row.output,
+    // SAFETY: The adapter writes this row value through its typed contract.
+    progress: row.progress
+      ? (parseJson(row.progress) as StoredAutomationRunRecord["progress"])
+      : undefined,
+    startedAt: row.started_at,
+    // SAFETY: The adapter writes this row value through its typed contract.
+    status: row.status as StoredAutomationRunRecord["status"],
+  };
+}
+
+function toWorkflowRecord(row: WorkflowRow): StoredWorkflowRecord {
+  return {
+    createdAt: row.created_at,
+    definition: parseJson(row.definition),
+    enabled: row.enabled !== 0,
+    id: row.id,
+    name: row.name,
+    orgId: row.org_id ?? null,
+    profileId: row.profile_id,
+    updatedAt: row.updated_at,
+    version: row.version,
+  };
+}
+
+function toWorkflowRunRecord(row: WorkflowRunRow): StoredWorkflowRunRecord {
+  return {
+    completedAt: row.completed_at,
+    error: row.error,
+    id: row.id,
+    input: row.input,
+    output: row.output,
+    startedAt: row.started_at,
+    // SAFETY: The adapter writes this row value through its typed contract.
+    status: row.status as StoredWorkflowRunRecord["status"],
+    workflowId: row.workflow_id,
+  };
+}
+
+function toWorkflowRunStepRecord(
+  row: WorkflowRunStepRow
+): StoredWorkflowRunStepRecord {
+  return {
+    completedAt: row.completed_at,
+    error: row.error,
+    id: row.id,
+    input: row.input,
+    kind: row.kind,
+    output: row.output,
+    position: row.position,
+    runId: row.run_id,
+    startedAt: row.started_at,
+    status: row.status,
+    stepId: row.step_id,
+  };
+}
+
+function toProfileRecord(row: ProfileRow): StoredProfileRecord {
+  return {
+    acpAgent:
+      // SAFETY: The adapter writes this column only through JSON.stringify(AcpAgentConfig).
+      row.acp_agent == null
+        ? null
+        : (JSON.parse(row.acp_agent) as AcpAgentConfig),
+    acpSettings:
+      // SAFETY: The adapter writes this column only through JSON.stringify(Record<string, string>).
+      row.acp_settings == null
+        ? null
+        : (JSON.parse(row.acp_settings) as Record<string, string>),
+    automationsEnabled: row.automations_enabled !== 0,
+    createdAt: row.created_at,
+    groupsEnabled: row.groups_enabled !== 0,
+    id: row.id,
+    isDefault: row.is_default !== 0,
+    isSuper: row.is_super !== 0,
+    model: row.model,
+    name: row.name,
+    orgId: row.org_id ?? null,
+    ownerUserId: row.owner_user_id ?? null,
+    sharedWithTeam: row.shared_with_team !== 0,
+    skillsCuratorConsolidateEnabled:
+      row.skills_curator_consolidate_enabled == null
+        ? null
+        : row.skills_curator_consolidate_enabled !== 0,
+    skillsPostTurnReview:
+      row.skills_post_turn_review == null
+        ? null
+        : row.skills_post_turn_review !== 0,
+    skillsWriteApproval:
+      row.skills_write_approval == null
+        ? null
+        : row.skills_write_approval !== 0,
+    systemPrompt: row.system_prompt,
+    thinkingEffort:
+      // SAFETY: The adapter writes this row value through its typed contract.
+      row.thinking_effort as StoredProfileRecord["thinkingEffort"],
+    thinkingEnabled:
+      row.thinking_enabled == null ? null : row.thinking_enabled !== 0,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toSkillRecord(row: SkillRow): StoredSkillRecord {
+  return {
+    createdAt: row.created_at,
+    createdBy: normalizeSkillCreatedBy(row.created_by),
+    description: row.description,
+    disableModelInvocation: row.disable_model_invocation !== 0,
+    enabled: row.enabled !== 0,
+    hasTool: row.has_tool !== 0,
+    id: row.id,
+    name: row.name,
+    orgId: row.org_id ?? null,
+    pluginId: row.plugin_id ?? null,
+    pluginKey: row.plugin_key ?? null,
+    sourcePath: row.source_path,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toSkillUsageRecord(row: SkillUsageRow): StoredSkillUsageRecord {
+  return {
+    createdAt: row.created_at,
+    lastPatchedAt: row.last_patched_at,
+    lastUsedAt: row.last_used_at,
+    lastViewedAt: row.last_viewed_at,
+    orgId: row.org_id,
+    patchCount: row.patch_count,
+    profileId: row.profile_id,
+    skillId: row.skill_id,
+    updatedAt: row.updated_at,
+    useCount: row.use_count,
+    viewCount: row.view_count,
+  };
+}
+
+function normalizeSkillCreatedBy(
+  value: string
+): StoredSkillRecord["createdBy"] {
+  if (value === "agent" || value === "human") {
+    return value;
+  }
+
+  return "bundled";
+}
+
+/**
+ * MCP config holds headers, env and OAuth tokens, so it is stored encrypted.
+ * Rows saved before encryption stay readable until the next save.
+ */
+const ENCRYPTED_MCP_CONFIG_PREFIX = "enc:";
+
+function mcpConfigScope(serverId: string): string {
+  return `mcp-server:${serverId}`;
+}
+
+async function encryptMcpConfig(
+  serverId: string,
+  config: StoredMcpServerRecord["config"]
+): Promise<string> {
+  return `${ENCRYPTED_MCP_CONFIG_PREFIX}${await encryptCredential(
+    mcpConfigScope(serverId),
+    JSON.stringify(config ?? {})
+  )}`;
+}
+
+async function decryptMcpConfig(row: McpServerRow): Promise<JsonValue> {
+  if (!row.config.startsWith(ENCRYPTED_MCP_CONFIG_PREFIX)) {
+    return parseJson(row.config);
+  }
+
+  return parseJson(
+    await decryptCredential(
+      mcpConfigScope(row.id),
+      row.config.slice(ENCRYPTED_MCP_CONFIG_PREFIX.length)
+    )
+  );
+}
+
+async function toMcpServerRecord(
+  row: McpServerRow
+): Promise<StoredMcpServerRecord> {
+  return {
+    // SAFETY: The adapter writes this row value through its typed contract.
+    cachedTools: JSON.parse(
+      row.cached_tools
+    ) as StoredMcpServerRecord["cachedTools"],
+    config: await decryptMcpConfig(row),
+    createdAt: row.created_at,
+    enabled: row.enabled !== 0,
+    id: row.id,
+    lastError: row.last_error,
+    name: row.name,
+    // SAFETY: The adapter writes this row value through its typed contract.
+    status: row.status as StoredMcpServerRecord["status"],
+    // SAFETY: The adapter writes this row value through its typed contract.
+    transport: row.transport as StoredMcpServerRecord["transport"],
+    updatedAt: row.updated_at,
+  };
+}
+
+function toToolRecord(row: ToolRow): StoredToolRecord {
+  return {
+    createdAt: row.created_at,
+    description: row.description,
+    handlerConfig: parseJson(row.handler_config),
+    handlerType: row.handler_type,
+    id: row.id,
+    name: row.name,
+    orgId: row.org_id ?? null,
+    pluginId: row.plugin_id ?? null,
+    pluginKey: row.plugin_key ?? null,
+    updatedAt: row.updated_at,
+  };
+}
+
+interface PluginReleaseRow {
+  created_at: string;
+  digest: string | null;
+  manifest: string;
+  plugin_id: string;
+  source: NonNullable<StoredPluginReleaseRecord["source"]>;
+  version: string;
+}
+
+interface OrgPluginRow {
+  created_at: string;
+  database_generation: string | null;
+  last_lifecycle_error: string | null;
+  lifecycle_state: string;
+  org_id: string;
+  pending_operation: string | null;
+  plugin_id: string;
+  revision: number;
+  selected_version: string | null;
+  updated_at: string;
+}
+
+function toPluginReleaseRecord(
+  row: PluginReleaseRow
+): StoredPluginReleaseRecord {
+  return {
+    createdAt: row.created_at,
+    digest: row.digest ?? "",
+    // SAFETY: The adapter writes this row value through its typed contract.
+    manifest: JSON.parse(row.manifest) as StoredPluginReleaseRecord["manifest"],
+    pluginId: row.plugin_id,
+    source: row.source ?? "legacy",
+    version: row.version,
+  };
+}
+
+function toOrgPluginRecord(row: OrgPluginRow): StoredOrgPluginRecord {
+  return {
+    createdAt: row.created_at,
+    databaseGeneration: row.database_generation,
+    lastLifecycleError: row.last_lifecycle_error,
+    lifecycleState:
+      // SAFETY: The adapter writes this row value through its typed contract.
+      row.lifecycle_state as StoredOrgPluginRecord["lifecycleState"],
+    orgId: row.org_id,
+    pendingOperation: row.pending_operation,
+    pluginId: row.plugin_id,
+    revision: row.revision,
+    selectedVersion: row.selected_version,
+    updatedAt: row.updated_at,
+  };
+}
+
+type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
+type JsonRecord = Record<string, JsonValue>;
+
+function isJsonRecord<Value>(value: Value): value is Value & JsonRecord {
+  return value instanceof Object && !Array.isArray(value);
+}
+
+function isJsonString(value: unknown): value is string {
+  return Object.prototype.toString.call(value) === "[object String]";
+}
+
+function isAgentTodo(
+  value: unknown
+): value is StoredSessionRecord["agentTodos"][number] {
+  if (!isJsonRecord(value)) {
+    return false;
+  }
+
+  return (
+    "id" in value &&
+    isJsonString(value.id) &&
+    "content" in value &&
+    isJsonString(value.content) &&
+    "status" in value &&
+    (value.status === "pending" ||
+      value.status === "in_progress" ||
+      value.status === "completed" ||
+      value.status === "cancelled")
+  );
+}
+
+function isAgentQuestionChoice(
+  value: unknown
+): value is AgentQuestionnaire["questions"][number]["choices"][number] {
+  return (
+    isJsonRecord(value) &&
+    "id" in value &&
+    isJsonString(value.id) &&
+    "label" in value &&
+    isJsonString(value.label)
+  );
+}
+
+function isAgentQuestion(
+  value: unknown
+): value is AgentQuestionnaire["questions"][number] {
+  return (
+    isJsonRecord(value) &&
+    "id" in value &&
+    isJsonString(value.id) &&
+    "prompt" in value &&
+    isJsonString(value.prompt) &&
+    "allowCustomAnswer" in value &&
+    (value.allowCustomAnswer === true || value.allowCustomAnswer === false) &&
+    "choices" in value &&
+    Array.isArray(value.choices) &&
+    value.choices.every(isAgentQuestionChoice) &&
+    (!("placeholder" in value) ||
+      value.placeholder === undefined ||
+      isJsonString(value.placeholder))
+  );
+}
+
+function parseAgentTodos(
+  raw: string | null | undefined
+): StoredSessionRecord["agentTodos"] {
+  if (!raw || raw.trim() === "") {
+    return [];
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(raw);
+
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed.filter(isAgentTodo);
+  } catch {
+    return [];
+  }
+}
+
+function parseAgentQuestionnaire(
+  raw: string | null | undefined
+): AgentQuestionnaire | null {
+  if (!raw || raw.trim() === "") {
+    return null;
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(raw);
+
+    if (!isJsonRecord(parsed)) {
+      return null;
+    }
+
+    const questions = parsed.questions;
+
+    if (
+      !(
+        isJsonString(parsed.id) &&
+        isJsonString(parsed.title) &&
+        Array.isArray(questions)
+      )
+    ) {
+      return null;
+    }
+
+    const validQuestions = questions.filter((question) =>
+      isAgentQuestion(question)
+    );
+
+    if (validQuestions.length !== questions.length) {
+      return null;
+    }
+
+    return {
+      id: parsed.id,
+      questions: validQuestions,
+      title: parsed.title,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseThinkingEffort(value: string | null | undefined) {
+  return value === "low" || value === "medium" || value === "high"
+    ? value
+    : null;
+}
+
+function toSessionRecord(row: SessionRow): StoredSessionRecord {
+  return {
+    agentQuestionnaire: parseAgentQuestionnaire(row.agent_questionnaire),
+    agentTodos: parseAgentTodos(row.agent_todos),
+    branchMessageIndex: row.branch_message_index,
+    channel: row.channel,
+    createdAt: row.created_at,
+    id: row.id,
+    model: row.model ?? null,
+    parentSessionId: row.parent_session_id,
+    pinned: row.pinned === 1,
+    profileId: row.profile_id,
+    thinkingEffort: parseThinkingEffort(row.thinking_effort),
+    title: row.title ?? null,
+    userId: row.user_id ?? null,
+  };
+}
+
+function toSessionMessageRecord(
+  row: SessionMessageRow
+): StoredSessionMessageRecord {
+  return {
+    createdAt: row.created_at,
+    id: row.id,
+    payload: parseJson(row.payload),
+    seq: row.seq,
+    sessionId: row.session_id,
+  };
+}
+
+function toAttachmentRecord(row: AttachmentRow): StoredAttachmentRecord {
+  return {
+    channel: row.channel,
+    createdAt: row.created_at,
+    ephemeral: row.ephemeral === 1,
+    filename: row.filename,
+    id: row.id,
+    // SAFETY: The adapter writes this row value through its typed contract.
+    kind: row.kind as StoredAttachmentRecord["kind"],
+    mediaType: row.media_type,
+    orgId: row.org_id,
+    profileId: row.profile_id,
+    sessionId: row.session_id,
+    sizeBytes: row.size_bytes,
+    storagePath: row.storage_path,
+  };
+}
+
+/** A LIKE pattern that matches `text` anywhere, with its wildcards taken literally. */
+function likeContains(text: string): string {
+  return `%${text.replace(/[\\%_]/g, (char) => `\\${char}`)}%`;
+}
+
+function previewFromFirstUserPayload(
+  payloadJson: string | null
+): string | null {
+  if (!payloadJson) {
+    return null;
+  }
+
+  try {
+    // SAFETY: The adapter writes this row value through its typed contract.
+    const message = parseJson(payloadJson) as ChatMessage;
+
+    if (message.role !== "user") {
+      return null;
+    }
+
+    const text = getUserMessageText(message.content).trim();
+
+    return text || (Array.isArray(message.content) ? "[image]" : null);
+  } catch {
+    return null;
+  }
+}
+
+function toSessionSummaryRecord(
+  row: SessionSummaryRow
+): StoredSessionSummaryRecord {
+  return {
+    branchMessageIndex: row.branch_message_index,
+    channel: row.channel,
+    createdAt: row.created_at,
+    id: row.id,
+    messageCount: row.message_count,
+    parentSessionId: row.parent_session_id,
+    pinned: row.pinned === 1,
+    position: row.position,
+    preview: previewFromFirstUserPayload(row.first_user_payload),
+    profileId: row.profile_id,
+    sortPosition: row.sort_position,
+    title: row.title ?? null,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toLlmUsageStatsRecord(
+  row: LlmUsageStatsRow
+): StoredLlmUsageStatsRecord {
+  return {
+    estimatedCostUsd: row.estimated_cost_usd,
+    id: row.id,
+    inputTokens: row.input_tokens,
+    orgId: row.org_id,
+    outputTokens: row.output_tokens,
+    requestCount: row.request_count,
+    trackedSince: row.tracked_since,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toLlmUsageActorStatsRecord(
+  row: LlmUsageActorStatsRow
+): StoredLlmUsageActorStatsRecord {
+  return {
+    estimatedCostUsd: row.estimated_cost_usd,
+    inputTokens: row.input_tokens,
+    orgId: row.org_id,
+    outputTokens: row.output_tokens,
+    profileId: row.profile_id || null,
+    requestCount: row.request_count,
+    trackedSince: row.tracked_since,
+    updatedAt: row.updated_at,
+    userId: row.user_id || null,
+  };
+}
+
+function toLlmUsageDailyStatsRecord(
+  row: LlmUsageDailyStatsRow
+): StoredLlmUsageDailyStatsRecord {
+  return {
+    day: row.day,
+    estimatedCostUsd: row.estimated_cost_usd,
+    inputTokens: row.input_tokens,
+    modelId: row.model_id,
+    orgId: row.org_id,
+    outputTokens: row.output_tokens,
+    provider: row.provider,
+    requestCount: row.request_count,
+  };
+}
+
+function toLlmUsageModelStatsRecord(
+  row: LlmUsageModelStatsRow
+): StoredLlmUsageModelStatsRecord {
+  return {
+    estimatedCostUsd: row.estimated_cost_usd,
+    inputTokens: row.input_tokens,
+    modelId: row.model_id,
+    orgId: row.org_id,
+    outputTokens: row.output_tokens,
+    requestCount: row.request_count,
+    trackedSince: row.tracked_since,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toWorkspaceSettingsRecord(
+  row: WorkspaceSettingsRow
+): StoredWorkspaceSettingsRecord {
+  return {
+    automationWorkerPollIntervalMs: row.automation_worker_poll_interval_ms,
+    codingAgentHarnesses: parseCodingAgentHarnesses(row.coding_agent_harnesses),
+    codingAgentProviderPassthrough: row.coding_agent_provider_passthrough !== 0,
+    id: row.id,
+    imageModel: row.image_model?.trim() || null,
+    selectedCodingAgentHarness:
+      row.selected_coding_agent_harness?.trim() || null,
+    transcriptionModel: row.transcription_model?.trim() || null,
+    updatedAt: row.updated_at,
+    visionModel: row.vision_model?.trim() || null,
+  };
+}
+
+function parseCodingAgentHarnessProbeCache(
+  raw: JsonValue | undefined
+): StoredWorkspaceSettingsRecord["codingAgentHarnesses"][number]["probeCache"] {
+  if (!isJsonRecord(raw)) {
+    return null;
+  }
+
+  const checkedAt = isJsonString(raw.checkedAt) ? raw.checkedAt.trim() : "";
+
+  const nextStep = raw.nextStep;
+
+  if (!checkedAt) {
+    return null;
+  }
+
+  if (
+    nextStep !== null &&
+    nextStep !== "install" &&
+    nextStep !== "login" &&
+    nextStep !== "retry"
+  ) {
+    return null;
+  }
+
+  const normalizedNextStep = nextStep === "login" ? "retry" : nextStep;
+
+  return {
+    authenticated:
+      raw.authenticated === true || raw.authenticated === false
+        ? raw.authenticated
+        : null,
+    checkedAt,
+    nextStep: normalizedNextStep,
+    ready: raw.ready === true,
+    statusMessage: isJsonString(raw.statusMessage) ? raw.statusMessage : null,
+  };
+}
+
+function parseCodingAgentHarnesses(
+  raw: string | null | undefined
+): StoredWorkspaceSettingsRecord["codingAgentHarnesses"] {
+  if (!raw?.trim()) {
+    return [];
+  }
+
+  try {
+    const parsed: JsonValue = JSON.parse(raw);
+
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed.flatMap((item) => {
+      if (!isJsonRecord(item)) {
+        return [];
+      }
+
+      const id = isJsonString(item.id) ? item.id.trim() : "";
+      const kind = isJsonString(item.kind) ? item.kind.trim() : "";
+      const name = isJsonString(item.name) ? item.name.trim() : "";
+
+      const command = isJsonString(item.command) ? item.command.trim() : "";
+
+      const args = Array.isArray(item.args)
+        ? item.args.filter(isJsonString)
+        : [];
+
+      if (!(id && name && command)) {
+        return [];
+      }
+
+      if (
+        kind !== "codex" &&
+        kind !== "claude_code" &&
+        kind !== "opencode" &&
+        kind !== "pi" &&
+        kind !== "cursor_agent"
+      ) {
+        return [];
+      }
+
+      const probeCache = parseCodingAgentHarnessProbeCache(item.probeCache);
+
+      const harness: StoredWorkspaceSettingsRecord["codingAgentHarnesses"][number] =
+        {
+          args,
+          command,
+          enabled: item.enabled !== false,
+          id,
+          kind,
+          name,
+        };
+
+      if (probeCache) {
+        harness.probeCache = probeCache;
+      }
+
+      return [harness];
+    });
+  } catch {
+    return [];
+  }
+}
+
+function toPasskeyRecord(row: PasskeyRow): StoredPasskeyRecord {
+  let transports: string[] = [];
+
+  try {
+    // SAFETY: The adapter writes this row value through its typed contract.
+    transports = JSON.parse(row.transports) as string[];
+  } catch {
+    transports = [];
+  }
+
+  return {
+    counter: row.counter,
+    createdAt: row.created_at,
+    credentialId: row.credential_id,
+    id: row.id,
+    name: row.name,
+    publicKey: row.public_key,
+    transports,
+    userId: row.user_id,
+  };
+}
+
+function toNotificationDestinationRecord(
+  row: NotificationDestinationRow
+): StoredNotificationDestinationRecord {
+  const common = {
+    createdAt: row.created_at,
+    id: row.id,
+    name: row.name,
+    orgId: row.org_id,
+    secretHash: row.secret_hash,
+    updatedAt: row.updated_at,
+  };
+
+  switch (row.channel) {
+    case "telegram":
+      return {
+        ...common,
+        channel: row.channel,
+        // SAFETY: The adapter writes this row value through its typed contract.
+        config: JSON.parse(row.config) as Extract<
+          StoredNotificationDestinationRecord,
+          { channel: "telegram" }
+        >["config"],
+      };
+    case "discord":
+      return {
+        ...common,
+        channel: row.channel,
+        // SAFETY: The adapter writes this row value through its typed contract.
+        config: JSON.parse(row.config) as Extract<
+          StoredNotificationDestinationRecord,
+          { channel: "discord" }
+        >["config"],
+      };
+    case "whatsapp":
+      return {
+        ...common,
+        channel: row.channel,
+        // SAFETY: The adapter writes this row value through its typed contract.
+        config: JSON.parse(row.config) as Extract<
+          StoredNotificationDestinationRecord,
+          { channel: "whatsapp" }
+        >["config"],
+      };
+    default:
+      throw new Error("Unsupported notification destination channel.");
+  }
+}
+
+function normalizeOrgComposioToolkitStatus(
+  status: string
+): StoredComposioToolkitRecord["status"] {
+  return status === "disabled" ? "disabled" : "enabled";
+}
+
+function toComposioToolkitRecord(
+  row: ComposioToolkitRow
+): StoredComposioToolkitRecord {
+  return {
+    // SAFETY: The adapter writes this row value through its typed contract.
+    cachedTools: JSON.parse(
+      row.cached_tools
+    ) as StoredComposioToolkitRecord["cachedTools"],
+    createdAt: row.created_at,
+    displayName: row.display_name,
+    id: row.id,
+    lastError: row.last_error,
+    orgId: row.org_id,
+    status: normalizeOrgComposioToolkitStatus(row.status),
+    toolkitSlug: row.toolkit_slug,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toComposioUserConnectionRecord(
+  row: ComposioUserConnectionRow
+): StoredComposioUserConnectionRecord {
+  return {
+    connectedAccountId: row.connected_account_id,
+    createdAt: row.created_at,
+    id: row.id,
+    lastError: row.last_error,
+    oauthStateHash: row.oauth_state_hash,
+    orgId: row.org_id,
+    sessionIdEnc: row.session_id_enc,
+    // SAFETY: The adapter writes this row value through its typed contract.
+    status: row.status as StoredComposioUserConnectionRecord["status"],
+    toolkitId: row.toolkit_id,
+    updatedAt: row.updated_at,
+    userId: row.user_id,
+  };
+}
+
+function toProfileComposioToolkitRecord(
+  row: ProfileComposioToolkitRow
+): StoredProfileComposioToolkitRecord {
+  return {
+    // SAFETY: The adapter writes this row value through its typed contract.
+    allowedActions: row.allowed_actions
+      ? (JSON.parse(
+          row.allowed_actions
+        ) as StoredProfileComposioToolkitRecord["allowedActions"])
+      : null,
+    profileId: row.profile_id,
+    toolkitId: row.toolkit_id,
+  };
+}
+
+function toUserRecord(row: UserRow): StoredUserRecord {
+  return {
+    createdAt: row.created_at,
+    disabledAt: row.disabled_at ?? null,
+    email: row.email,
+    id: row.id,
+    isPlatformAdmin: Boolean(row.is_platform_admin),
+    mfaEnabled: Boolean(row.mfa_enabled),
+    mfaTotpLastStep: row.mfa_totp_last_step ?? null,
+    mfaTotpPendingSecretEnc: row.mfa_totp_pending_secret_enc ?? null,
+    mfaTotpSecretEnc: row.mfa_totp_secret_enc ?? null,
+    name: row.name ?? null,
+    passwordHash: row.password_hash,
+    phone: row.phone ?? null,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toOrganizationRecord(row: OrganizationRow): StoredOrganizationRecord {
+  return {
+    // SAFETY: The adapter writes this row value through its typed contract.
+    allowedInviteDomains: JSON.parse(row.allowed_invite_domains) as string[],
+    archivedAt: row.archived_at,
+    createdAt: row.created_at,
+    id: row.id,
+    monthlyLlmTokenLimit: row.monthly_llm_token_limit ?? undefined,
+    monthlyLlmTurnLimit: row.monthly_llm_turn_limit ?? 0,
+    monthlyLlmWarningPercent: row.monthly_llm_warning_percent ?? 80,
+    name: row.name,
+    parentOrgId: row.parent_org_id,
+    setupPending: row.setup_pending === 1,
+    skillsCuratorArchiveAfterDays: row.skills_curator_archive_after_days,
+    skillsCuratorConsolidateEnabled:
+      row.skills_curator_consolidate_enabled !== 0,
+    skillsCuratorEnabled: row.skills_curator_enabled !== 0,
+    skillsCuratorLastRunAt: row.skills_curator_last_run_at,
+    skillsCuratorStaleAfterDays: row.skills_curator_stale_after_days,
+    skillsPostTurnReview: row.skills_post_turn_review !== 0,
+    skillsWriteApproval: row.skills_write_approval !== 0,
+    slug: row.slug,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toAuditEventRecord(row: AuditEventRow): StoredAuditEvent {
+  let metadata: StoredAuditEvent["metadata"] = {};
+
+  try {
+    // SAFETY: The adapter writes this row value through its typed contract.
+    metadata = JSON.parse(row.metadata) as StoredAuditEvent["metadata"];
+  } catch {
+    metadata = {};
+  }
+
+  return {
+    action: row.action,
+    actorUserId: row.actor_user_id,
+    createdAt: row.created_at,
+    id: row.id,
+    metadata,
+    orgId: row.org_id,
+    requestId: row.request_id,
+    resourceId: row.resource_id,
+    resourceType: row.resource_type,
+  };
+}
+
+function toOrgInviteRecord(row: OrgInviteRow): StoredOrgInviteRecord {
+  return {
+    acceptedAt: row.accepted_at,
+    createdAt: row.created_at,
+    email: row.email,
+    expiresAt: row.expires_at,
+    id: row.id,
+    invitedByUserId: row.invited_by_user_id,
+    orgId: row.org_id,
+    revokedAt: row.revoked_at,
+    // SAFETY: The adapter writes this row value through its typed contract.
+    role: row.role as StoredOrgInviteRecord["role"],
+    tokenHash: row.token_hash,
+  };
+}
+
+function parseOrgMemorySourceDocumentIds(raw: string | null): string[] {
+  if (!raw) {
+    return [];
+  }
+
+  try {
+    const parsed: JsonValue = JSON.parse(raw);
+
+    if (Array.isArray(parsed) && parsed.every(isJsonString)) {
+      return parsed;
+    }
+  } catch {
+    return [];
+  }
+
+  return [];
+}
+
+function toOrgMemoryProposalRecord(
+  row: OrgMemoryProposalRow
+): StoredOrgMemoryProposal {
+  return {
+    bullet: row.bullet,
+    createdAt: row.created_at,
+    id: row.id,
+    orgId: row.org_id,
+    pinned: Boolean(row.pinned),
+    profileId: row.profile_id,
+    proposedByUserId: row.proposed_by_user_id,
+    reviewedAt: row.reviewed_at,
+    reviewerUserId: row.reviewer_user_id,
+    sessionId: row.session_id,
+    sourceDocumentIds: parseOrgMemorySourceDocumentIds(row.source_document_ids),
+    // SAFETY: The adapter writes this row value through its typed contract.
+    status: row.status as OrgMemoryProposalStatus,
+  };
+}
+
+function toProfileChangeEventRecord(
+  row: ProfileChangeEventRow
+): StoredProfileChangeEvent {
+  return {
+    actorUserId: row.actor_user_id,
+    afterValue: row.after_value,
+    beforeValue: row.before_value,
+    createdAt: row.created_at,
+    // SAFETY: The adapter writes this row value through its typed contract.
+    field: row.field as StoredProfileChangeEvent["field"],
+    id: row.id,
+    orgId: row.org_id,
+    profileId: row.profile_id,
+    // SAFETY: The adapter writes this row value through its typed contract.
+    source: row.source as StoredProfileChangeEvent["source"],
+  };
+}
+
+function toSkillVersionRecord(row: SkillVersionRow): StoredSkillVersion {
+  return {
+    actorUserId: row.actor_user_id,
+    content: row.content,
+    createdAt: row.created_at,
+    id: row.id,
+    // SAFETY: The adapter writes this row value through its typed contract.
+    kind: row.kind as StoredSkillVersion["kind"],
+    note: row.note,
+    skillId: row.skill_id,
+    // SAFETY: The adapter writes this row value through its typed contract.
+    source: row.source as StoredSkillVersion["source"],
+    version: row.version,
+  };
+}
+
+function toSkillProposalRecord(row: SkillProposalRow): StoredSkillProposal {
+  let consolidateLoserSkillNames: string[] | null = null;
+
+  if (row.consolidate_loser_skill_names) {
+    try {
+      const parsed: JsonValue = JSON.parse(row.consolidate_loser_skill_names);
+
+      if (Array.isArray(parsed) && parsed.every(isJsonString)) {
+        consolidateLoserSkillNames = parsed;
+      }
+    } catch {
+      consolidateLoserSkillNames = null;
+    }
+  }
+
+  return {
+    // SAFETY: The adapter writes this row value through its typed contract.
+    action: row.action as StoredSkillProposal["action"],
+    consolidateLoserSkillNames,
+    content: row.content,
+    createdAt: row.created_at,
+    id: row.id,
+    orgId: row.org_id,
+    patchNewString: row.patch_new_string,
+    patchOldString: row.patch_old_string,
+    profileId: row.profile_id,
+    proposedByUserId: row.proposed_by_user_id,
+    relativePath: row.relative_path,
+    reviewedAt: row.reviewed_at,
+    reviewerUserId: row.reviewer_user_id,
+    sessionId: row.session_id,
+    skillName: row.skill_name,
+    // SAFETY: The adapter writes this row value through its typed contract.
+    status: row.status as StoredSkillProposal["status"],
+    supportingFiles: row.supporting_files
+      ? JSON.parse(row.supporting_files)
+      : null,
+  };
+}
+
+function toSkillSuggestionRecord(
+  row: SkillSuggestionRow
+): StoredSkillSuggestion {
+  return {
+    // SAFETY: The adapter writes this row value through its typed contract.
+    action: row.action as StoredSkillSuggestion["action"],
+    appliedAt: row.applied_at,
+    content: row.content,
+    createdAt: row.created_at,
+    id: row.id,
+    orgId: row.org_id,
+    patchNewString: row.patch_new_string,
+    patchOldString: row.patch_old_string,
+    profileId: row.profile_id,
+    proposedByUserId: row.proposed_by_user_id,
+    sessionId: row.session_id,
+    skillName: row.skill_name,
+    // SAFETY: The adapter writes this row value through its typed contract.
+    source: row.source as StoredSkillSuggestion["source"],
+    // SAFETY: The adapter writes this row value through its typed contract.
+    status: row.status as StoredSkillSuggestion["status"],
+    // SAFETY: The adapter writes this row value through its typed contract.
+    warnings: row.warnings ? (JSON.parse(row.warnings) as string[]) : null,
+  };
+}
+
+function toArtifactOwnerRecord(
+  row: ArtifactOwnerRow
+): StoredArtifactOwnerRecord {
+  return {
+    channel: row.channel,
+    createdAt: row.created_at,
+    filename: row.filename,
+    orgId: row.org_id,
+    profileId: row.profile_id,
+    sessionId: row.session_id,
+    userId: row.user_id,
+    userName: row.user_name,
+  };
+}
+
+function toArtifactShareRecord(
+  row: ArtifactShareRow
+): StoredArtifactShareRecord {
+  return {
+    createdAt: row.created_at,
+    createdByUserId: row.created_by_user_id,
+    filename: row.filename,
+    id: row.id,
+    mimeType: row.mime_type,
+    orgId: row.org_id,
+    profileId: row.profile_id,
+    revokedAt: row.revoked_at,
+    sizeBytes: row.size_bytes,
+    sourcePath: row.source_path,
+    storagePath: row.storage_path,
+    tokenHash: row.token_hash,
+  };
+}
+
+function toBrowserSessionRecord(
+  row: BrowserSessionRow
+): StoredBrowserSessionRecord {
+  return {
+    activeOrgId: row.active_org_id ?? null,
+    createdAt: row.created_at,
+    csrfTokenHash: row.csrf_token_hash,
+    expiresAt: row.expires_at,
+    id: row.id,
+    lastUsedAt: row.last_used_at,
+    revokedAt: row.revoked_at,
+    sessionTokenHash: row.session_token_hash,
+    userId: row.user_id,
+  };
+}
+
+function parseJson(value: string): JsonValue {
+  return JSON.parse(value);
+}

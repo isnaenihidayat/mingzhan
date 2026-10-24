@@ -1,0 +1,565 @@
+import type {
+  AutomationDeliveryStatus,
+  AutomationRunRecord,
+  AutomationTrigger,
+  AutomationUnreadSummary,
+  CreateAutomationRequest,
+  StoredAutomation,
+  UpdateAutomationRequest,
+} from "@mingzhan/core";
+import {
+  computeAutomationNextRunAt,
+  createId,
+  DEFAULT_TIMEZONE,
+  isAutomationRunUnread,
+  isWorkerSchedulable,
+  MíngZhànApiError,
+  normalizeAutomationDelivery,
+  resolveScheduleTimezone,
+  summarizeAutomationUnreadCounts,
+  validateAutomationDelivery,
+  validateAutomationInput,
+} from "@mingzhan/core";
+import { canAccessSuperMingzhanProfile } from "@mingzhan/core/profiles";
+import { type DatabaseAdapter, DatabaseAutomationStore } from "@mingzhan/db";
+import { z } from "zod";
+
+const DeliveryStatusSchema = z.enum(["sent", "failed", "skipped"]).nullish();
+
+/** Caller role context used to gate access to admin-only profiles (e.g. Super MíngZhàn). */
+export type ProfileAccess = Parameters<typeof canAccessSuperMingzhanProfile>[0];
+
+export interface AutomationServiceOptions {
+  canSendEmail?: (profileId: string, orgId: string) => Promise<boolean>;
+  getUserTimezone: () => Promise<string>;
+  onChange?: () => void | Promise<void>;
+}
+
+export class AutomationService {
+  private readonly runProgress = new Map<
+    string,
+    Pick<AutomationRunRecord, "output" | "progress">
+  >();
+  private readonly store: DatabaseAutomationStore;
+  private readonly db: DatabaseAdapter;
+  private readonly getUserTimezone: () => Promise<string>;
+  private readonly canSendEmail?: (
+    profileId: string,
+    orgId: string
+  ) => Promise<boolean>;
+  private onChange?: () => void | Promise<void>;
+
+  constructor(db: DatabaseAdapter, options: AutomationServiceOptions) {
+    this.db = db;
+    this.store = new DatabaseAutomationStore(db);
+    this.getUserTimezone = options.getUserTimezone;
+    this.canSendEmail = options.canSendEmail;
+    this.onChange = options.onChange;
+  }
+
+  setOnChange(onChange: () => void | Promise<void>): void {
+    this.onChange = onChange;
+  }
+
+  /** All automations — used by the scheduler across orgs. */
+  async listAll(): Promise<StoredAutomation[]> {
+    const automations = await this.store.list();
+
+    const enabled = await Promise.all(
+      automations.map(async (automation) =>
+        (await this.isProfileAutomationEnabled(automation.profileId))
+          ? automation
+          : null
+      )
+    );
+
+    return Promise.all(
+      enabled
+        .filter(
+          (automation): automation is StoredAutomation => automation !== null
+        )
+        .map((automation) => this.enrichAutomation(automation))
+    );
+  }
+
+  async listForOrg(
+    orgId: string,
+    userId?: string
+  ): Promise<{
+    automations: StoredAutomation[];
+    unread?: AutomationUnreadSummary;
+  }> {
+    const automations = await this.store.listForOrg(orgId);
+
+    const enriched = await Promise.all(
+      automations.map((automation) => this.enrichAutomation(automation))
+    );
+
+    const unread = userId
+      ? await this.getUnreadSummary(orgId, userId)
+      : undefined;
+
+    return { automations: enriched, unread };
+  }
+
+  async get(id: string, orgId?: string): Promise<StoredAutomation | null> {
+    const automation = await this.store.get(id);
+
+    if (!automation || (orgId && !automationBelongsToOrg(automation, orgId))) {
+      return null;
+    }
+
+    return this.enrichAutomation(automation);
+  }
+
+  async create(
+    orgId: string,
+    input: CreateAutomationRequest,
+    profileIdOverride?: string,
+    access?: ProfileAccess
+  ): Promise<StoredAutomation> {
+    const userTimezone = await this.getUserTimezone();
+    const trigger = resolveScheduleTimezone(input.trigger, userTimezone);
+
+    validateAutomationInput({
+      name: input.name,
+      prompt: input.prompt,
+      trigger,
+    });
+
+    const profileId = await this.resolveProfileId(
+      orgId,
+      profileIdOverride ?? input.profileId,
+      access
+    );
+
+    const delivery = normalizeAutomationDelivery(input.delivery);
+    await validateAutomationDelivery(delivery, {
+      access: {
+        isPlatformAdmin: access?.isPlatformAdmin,
+        orgRole: access?.orgRole,
+      },
+      isEmailConfigured: this.canSendEmail
+        ? () => this.canSendEmail!(profileId, orgId)
+        : undefined,
+      orgId,
+      profileId,
+    });
+
+    const now = new Date().toISOString();
+
+    const automation: StoredAutomation = {
+      createdAt: now,
+      description: input.description?.trim() || input.prompt.trim(),
+      enabled: input.enabled ?? true,
+      id: createId("automation"),
+      name: input.name.trim(),
+      orgId,
+      profileId,
+      prompt: input.prompt.trim(),
+      steps: [],
+      trigger,
+      updatedAt: now,
+      version: 1,
+    };
+
+    if (delivery) {
+      automation.delivery = delivery;
+    }
+
+    const profile = await this.db.getProfile(profileId);
+
+    const isFirstAutomation = !(
+      await this.db.listAutomationsForOrg(orgId)
+    ).some((existing) => existing.profileId === profileId);
+
+    await this.store.save(automation);
+
+    // The first automation is the user's consent to run automations.
+    if (profile && profile.automationsEnabled === false && isFirstAutomation) {
+      await this.db.upsertProfile({
+        ...profile,
+        automationsEnabled: true,
+        updatedAt: now,
+      });
+    }
+
+    await this.notifyChange();
+
+    return this.enrichAutomation(automation);
+  }
+
+  async update(
+    id: string,
+    orgId: string,
+    input: UpdateAutomationRequest,
+    access?: ProfileAccess
+  ): Promise<StoredAutomation> {
+    const existing = await this.get(id, orgId);
+
+    if (!existing) {
+      throw new Error("Automation not found.");
+    }
+
+    const userTimezone = await this.getUserTimezone();
+
+    const trigger = input.trigger
+      ? resolveScheduleTimezone(input.trigger, userTimezone)
+      : existing.trigger;
+
+    validateAutomationInput({
+      name: input.name?.trim() || existing.name,
+      prompt: input.prompt?.trim() || existing.prompt,
+      trigger,
+    });
+
+    let profileId = existing.profileId;
+
+    if (input.profileId !== undefined) {
+      if (!input.profileId.trim()) {
+        throw new Error("Profile id is required.");
+      }
+
+      profileId = await this.resolveProfileId(orgId, input.profileId, access);
+    }
+
+    let delivery = existing.delivery;
+
+    if (input.delivery === null) {
+      delivery = undefined;
+    } else if (input.delivery !== undefined) {
+      delivery = normalizeAutomationDelivery(input.delivery);
+    }
+
+    await validateAutomationDelivery(delivery, {
+      access: {
+        isPlatformAdmin: access?.isPlatformAdmin,
+        orgRole: access?.orgRole,
+      },
+      isEmailConfigured: this.canSendEmail
+        ? () => this.canSendEmail!(profileId, orgId)
+        : undefined,
+      orgId,
+      previousDelivery: existing.delivery,
+      profileId,
+    });
+
+    const updated: StoredAutomation = {
+      ...existing,
+      delivery,
+      description: input.description?.trim() ?? existing.description,
+      enabled: input.enabled ?? existing.enabled,
+      name: input.name?.trim() || existing.name,
+      profileId,
+      prompt: input.prompt?.trim() || existing.prompt,
+      trigger,
+      updatedAt: new Date().toISOString(),
+      version: existing.version + 1,
+    };
+
+    await this.store.save(updated);
+    await this.notifyChange();
+
+    return this.enrichAutomation(updated);
+  }
+
+  async delete(id: string, orgId: string): Promise<boolean> {
+    const existing = await this.get(id, orgId);
+
+    if (!existing) {
+      return false;
+    }
+
+    const deleted = await this.store.delete(id);
+
+    if (deleted) {
+      await this.notifyChange();
+    }
+
+    return deleted;
+  }
+
+  async listRuns(
+    automationId: string,
+    orgId?: string,
+    limit = 20,
+    userId?: string
+  ): Promise<AutomationRunRecord[]> {
+    const automation = orgId
+      ? await this.get(automationId, orgId)
+      : await this.store.get(automationId);
+
+    if (!automation) {
+      throw new Error("Automation not found.");
+    }
+
+    const runs = await this.db.listAutomationRuns(automationId, limit);
+
+    const readThroughAt =
+      userId && orgId
+        ? await this.db.getAutomationRunReadThrough(userId, orgId, automationId)
+        : null;
+
+    return runs.map((run) => {
+      const record = toRunRecord(run, readThroughAt);
+
+      const progress =
+        run.status === "running" ? this.runProgress.get(run.id) : undefined;
+
+      if (progress) {
+        Object.assign(record, progress);
+      }
+
+      return record;
+    });
+  }
+
+  setRunProgress(
+    runId: string,
+    progress?: Pick<AutomationRunRecord, "output" | "progress">
+  ): void {
+    if (progress === undefined) {
+      this.runProgress.delete(runId);
+    } else {
+      this.runProgress.set(runId, progress);
+    }
+  }
+
+  async markRunsRead(
+    automationId: string,
+    orgId: string,
+    userId: string
+  ): Promise<{ readThroughAt: string }> {
+    const automation = await this.get(automationId, orgId);
+
+    if (!automation) {
+      throw new Error("Automation not found.");
+    }
+
+    const readThroughAt = new Date().toISOString();
+    await this.db.upsertAutomationRunReadThrough(
+      userId,
+      orgId,
+      automationId,
+      readThroughAt
+    );
+
+    return { readThroughAt };
+  }
+
+  async getUnreadSummary(
+    orgId: string,
+    userId: string
+  ): Promise<AutomationUnreadSummary> {
+    const counts = await this.db.countUnreadAutomationRunsByOrg(userId, orgId);
+
+    return summarizeAutomationUnreadCounts(counts);
+  }
+
+  async getActiveRun(
+    automationId: string
+  ): Promise<AutomationRunRecord | null> {
+    const run = await this.db.getActiveAutomationRun(automationId);
+
+    return run ? toRunRecord(run) : null;
+  }
+
+  async createRun(automationId: string): Promise<AutomationRunRecord> {
+    const run = {
+      automationId,
+      completedAt: null,
+      error: null,
+      id: createId("run"),
+      output: null,
+      startedAt: new Date().toISOString(),
+      status: "running" as const,
+    };
+
+    await this.db.insertAutomationRun(run);
+
+    return toRunRecord(run);
+  }
+
+  async completeRun(
+    runId: string,
+    automationId: string,
+    result: { output?: string; error?: string }
+  ): Promise<AutomationRunRecord> {
+    const run = await this.db.getAutomationRun(automationId, runId);
+
+    if (!run || run.status !== "running") {
+      throw new Error("Automation run not found.");
+    }
+
+    const completedAt = new Date().toISOString();
+
+    const progress = this.runProgress.get(runId)?.progress?.map((message) =>
+      message.role === "tool" && !message.toolCompletedAt
+        ? {
+            ...message,
+            content: JSON.stringify({
+              error: "Run ended before this tool completed.",
+            }),
+            toolCompletedAt: Date.parse(completedAt),
+          }
+        : { ...message }
+    );
+
+    if (progress && result.output && !result.error) {
+      const last = progress.at(-1);
+
+      if (last?.role === "assistant" && !last.toolCalls) {
+        last.content = result.output;
+      } else {
+        progress.push({ content: result.output, role: "assistant" });
+      }
+    }
+
+    const updated = {
+      ...run,
+      completedAt,
+      error: result.error ?? null,
+      output: result.output ?? null,
+      progress,
+      status: result.error ? ("failed" as const) : ("completed" as const),
+    };
+
+    await this.db.updateAutomationRun(updated);
+
+    return toRunRecord(updated);
+  }
+
+  async updateRunDelivery(
+    runId: string,
+    automationId: string,
+    result: {
+      deliveryStatus: AutomationDeliveryStatus;
+      deliveryError: string | null;
+    }
+  ): Promise<AutomationRunRecord> {
+    const runs = await this.db.listAutomationRuns(automationId, 100);
+    const run = runs.find((entry) => entry.id === runId);
+
+    if (!run) {
+      throw new Error("Automation run not found.");
+    }
+
+    const updated = {
+      ...run,
+      deliveryError: result.deliveryError,
+      deliveryStatus: result.deliveryStatus,
+    };
+
+    await this.db.updateAutomationRun(updated);
+
+    return toRunRecord(updated);
+  }
+
+  computeNextRunAt(
+    trigger: AutomationTrigger,
+    userTimezone = DEFAULT_TIMEZONE
+  ): string | null {
+    return computeAutomationNextRunAt(trigger, userTimezone);
+  }
+
+  private async resolveProfileId(
+    orgId: string,
+    profileId?: string,
+    access?: ProfileAccess
+  ): Promise<string> {
+    const trimmed = profileId?.trim();
+
+    if (trimmed) {
+      const profile = await this.db.getProfileForOrg(trimmed, orgId);
+
+      if (profile) {
+        if (profile.isSuper && !canAccessSuperMingzhanProfile(access ?? {})) {
+          throw new MíngZhànApiError(
+            "Super MíngZhàn is only available to org admins.",
+            403
+          );
+        }
+
+        return profile.id;
+      }
+
+      throw new Error("Profile not found.");
+    }
+
+    const defaultProfile = await this.db.getDefaultProfileForOrg(orgId);
+
+    if (!defaultProfile) {
+      throw new Error("No default profile exists for this organization.");
+    }
+
+    return defaultProfile.id;
+  }
+
+  private async enrichAutomation(
+    automation: StoredAutomation
+  ): Promise<StoredAutomation> {
+    const userTimezone = await this.getUserTimezone();
+    const runs = await this.db.listAutomationRuns(automation.id, 1);
+
+    return {
+      ...automation,
+      lastRunAt: runs[0]?.startedAt ?? null,
+      lastRunStatus: runs[0]?.status ?? null,
+      nextRunAt: isWorkerSchedulable(automation)
+        ? this.computeNextRunAt(automation.trigger, userTimezone)
+        : null,
+    };
+  }
+
+  async isProfileAutomationEnabled(profileId: string): Promise<boolean> {
+    const profile = await this.db.getProfile(profileId);
+
+    return profile?.automationsEnabled !== false;
+  }
+
+  private async notifyChange(): Promise<void> {
+    await this.onChange?.();
+  }
+}
+
+function automationBelongsToOrg(
+  automation: StoredAutomation,
+  orgId: string
+): boolean {
+  return automation.orgId === orgId;
+}
+
+function toRunRecord(
+  run: {
+    id: string;
+    automationId: string;
+    status: AutomationRunRecord["status"];
+    startedAt: string;
+    completedAt: string | null;
+    output: string | null;
+    progress?: AutomationRunRecord["progress"];
+    error: string | null;
+    deliveryStatus?: string | null;
+    deliveryError?: string | null;
+  },
+  readThroughAt?: string | null
+): AutomationRunRecord {
+  const record: AutomationRunRecord = {
+    automationId: run.automationId,
+    completedAt: run.completedAt,
+    deliveryError: run.deliveryError ?? null,
+    deliveryStatus: DeliveryStatusSchema.parse(run.deliveryStatus) ?? null,
+    error: run.error,
+    id: run.id,
+    output: run.output,
+    progress: run.progress,
+    startedAt: run.startedAt,
+    status: run.status,
+  };
+
+  if (readThroughAt !== undefined) {
+    record.read = !isAutomationRunUnread(record, readThroughAt);
+  }
+
+  return record;
+}

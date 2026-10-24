@@ -1,0 +1,20 @@
+<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="mzGold" x1="0" y1="0" x2="48" y2="48" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FBBF24" />
+      <stop offset="100%" stop-color="#F59E0B" />
+    </linearGradient>
+    <linearGradient id="mzCrimson" x1="0" y1="0" x2="48" y2="48" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#EF4444" />
+      <stop offset="100%" stop-color="#DC2626" />
+    </linearGradient>
+  </defs>
+  <!-- Armor Shield Base -->
+  <path d="M24 4L40 10.5V23.5C40 33.8 24 43.5 24 43.5C24 43.5 8 33.8 8 23.5V10.5L24 4Z" fill="#1C1917" stroke="url(#mzGold)" stroke-width="2.2" stroke-linejoin="round"/>
+  <!-- Frontline Vanguard Chevron (Top - Crimson) -->
+  <path d="M14 17L24 23.5L34 17L30 14L24 18L18 14L14 17Z" fill="url(#mzCrimson)"/>
+  <!-- Central Victory Core (Gold) -->
+  <path d="M24 16L32 21.5L24 27L16 21.5L24 16Z" fill="url(#mzGold)"/>
+  <!-- Lower Vanguard Cut (Crimson) -->
+  <path d="M24 29L32 23.5V28L24 35L16 28V23.5L24 29Z" fill="url(#mzCrimson)"/>
+</svg>

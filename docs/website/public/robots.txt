@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://ahmadrosid.github.io/mingzhan/sitemap.xml
+LLMS: https://ahmadrosid.github.io/mingzhan/llms.txt

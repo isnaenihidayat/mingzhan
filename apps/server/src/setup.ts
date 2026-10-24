@@ -1,0 +1,82 @@
+import {
+  apiKeyEnvVarForProvider,
+  createProviderInstanceId,
+  defaultProviderLabel,
+  ensureUserConfigDir,
+  isProviderConfigured,
+  loadUserConfig,
+  type ProviderClient,
+  readEnvValue,
+  resolveProvider,
+  saveUserConfig,
+  type UserConfig,
+} from "@mingzhan/core";
+import {
+  NETRA_AGENT_MODEL_ID,
+  resolveNetraModelId,
+} from "@mingzhan/core/discovery-providers";
+import { createProviderFromActiveConfig } from "./providers";
+
+export interface ProviderBootstrap {
+  provider: ProviderClient | null;
+  userConfig: UserConfig | null;
+}
+
+async function bootstrapProviderFromEnv(
+  env: Record<string, string | undefined>
+): Promise<UserConfig | null> {
+  const providerType = resolveProvider({ env });
+
+  if (!providerType || providerType === "openai_compatible") {
+    return null;
+  }
+
+  const envVar = apiKeyEnvVarForProvider(providerType);
+  const apiKey = envVar ? readEnvValue(env, envVar) : undefined;
+
+  if (!apiKey) {
+    return null;
+  }
+
+  const netraModel =
+    providerType === "netra"
+      ? resolveNetraModelId(
+          readEnvValue(env, "NETRA_MODEL") ?? NETRA_AGENT_MODEL_ID
+        )
+      : null;
+
+  if (providerType === "netra" && netraModel !== NETRA_AGENT_MODEL_ID) {
+    return null;
+  }
+
+  const instance = {
+    apiKey: "",
+    createdAt: new Date().toISOString(),
+    customModels: netraModel ? [{ default: true, id: netraModel }] : undefined,
+    id: createProviderInstanceId(),
+    label: defaultProviderLabel(providerType, []),
+    type: providerType,
+  };
+
+  const config: UserConfig = {
+    defaultProviderId: instance.id,
+    providers: [instance],
+  };
+
+  await saveUserConfig(config);
+
+  return config;
+}
+
+export async function ensureProviderConfigured(): Promise<ProviderBootstrap> {
+  await ensureUserConfigDir();
+  let userConfig = await loadUserConfig();
+
+  if (!isProviderConfigured(userConfig, process.env)) {
+    userConfig = (await bootstrapProviderFromEnv(process.env)) ?? userConfig;
+  }
+
+  const provider = createProviderFromActiveConfig(userConfig, process.env);
+
+  return { provider, userConfig };
+}

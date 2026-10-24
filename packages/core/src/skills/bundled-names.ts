@@ -1,0 +1,41 @@
+export const DEFAULT_BUNDLED_SKILL_NAMES = [
+  "create-automation",
+  "manage-skills",
+  "skill-installer",
+  "update-profile-memory",
+  "archive-profile-memory",
+  "artifact-design",
+  "composio-integrations",
+  "mingzhan-guide",
+] as const;
+
+export const SUPER_MINGZHAN_BUNDLED_SKILL_NAMES = [
+  "create-plugin",
+  "create-profile",
+  "create-skill",
+  "coding-agent",
+] as const;
+
+export const RUNTIME_ONLY_BUNDLED_SKILL_NAMES = [
+  "coding-backend-codex",
+  "coding-backend-claude-code",
+  "coding-backend-opencode",
+  "coding-backend-pi",
+  "coding-backend-cursor",
+] as const;
+
+/** Bundled skills that install/sync but are never auto-assigned (manual opt-in). */
+export const OPT_IN_BUNDLED_SKILL_NAMES = [
+  "agent-browser",
+  "google-meet",
+  "knowledge-base-wiki",
+] as const;
+
+export const BUNDLED_SKILL_NAMES = [
+  ...DEFAULT_BUNDLED_SKILL_NAMES,
+  ...SUPER_MINGZHAN_BUNDLED_SKILL_NAMES,
+  ...RUNTIME_ONLY_BUNDLED_SKILL_NAMES,
+  ...OPT_IN_BUNDLED_SKILL_NAMES,
+] as const;
+
+export type BundledSkillName = (typeof BUNDLED_SKILL_NAMES)[number];

@@ -1,0 +1,23 @@
+{
+  "name": "@mingzhan/plugin-supermemory",
+  "version": "0.1.0",
+  "type": "module",
+  "files": [
+    "mingzhan.plugin.json",
+    "actions",
+    "migrations",
+    "ui",
+    "skills",
+    "workers"
+  ],
+  "scripts": {
+    "build": "bun build ./src/actions.ts --outdir actions --target bun && bun build ./src/ui.tsx --outfile ui/app.js --target browser && bun build ./src/worker.ts --outfile workers/server.js --target bun",
+    "test": "bun test src"
+  },
+  "devDependencies": {
+    "@mingzhan/core": "workspace:*",
+    "@mingzhan/ui": "workspace:*",
+    "@types/react": "^19.3.0",
+    "react": "^19.3.0"
+  }
+}

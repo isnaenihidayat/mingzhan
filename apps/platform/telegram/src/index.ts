@@ -1,0 +1,245 @@
+import { join } from "node:path";
+import { MíngZhànClient } from "@mingzhan/client";
+import {
+  installErrorHandlers,
+  installErrorTrackingSink,
+  log,
+} from "@mingzhan/core";
+import { hasActiveStreams } from "@mingzhan/core/channel-active-stream";
+import { ChannelOrgStore } from "@mingzhan/core/channel-org";
+import { ChannelSessionStore } from "@mingzhan/core/channel-session-store";
+import {
+  ensureServerRunning,
+  stopSpawnedServer,
+} from "@mingzhan/core/ensure-server";
+import { loadLocalAuthToken } from "@mingzhan/core/local-auth";
+import { resolveWebPublicUrl } from "@mingzhan/core/runtime";
+import { getTelegramConfigDir } from "@mingzhan/core/telegram-config";
+import {
+  createTelegramWorkerHeartbeat,
+  isHeartbeatAlive,
+} from "@mingzhan/core/telegram-worker";
+import { TelegramAuthStore } from "./auth-store";
+import { createBot } from "./bot";
+import { loadTelegramIdentities, type TelegramBridgeConfig } from "./config";
+
+installErrorHandlers("worker:telegram");
+
+void installErrorTrackingSink();
+
+type StartedIdentity = {
+  clearHeartbeat: () => Promise<void>;
+  stop: () => void;
+  writeHeartbeat: () => Promise<void>;
+};
+
+let spawnedChild: Bun.Subprocess | null = null;
+
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+const started: StartedIdentity[] = [];
+
+registerCleanupHandlers(async () => {
+  await stopAll();
+
+  if (hasActiveStreams()) {
+    console.warn(
+      "Leaving the spawned MíngZhàn server running so in-flight agent turns can finish; the next worker start will reuse it."
+    );
+  } else {
+    stopSpawnedServer(spawnedChild);
+  }
+});
+
+try {
+  const identities = await loadTelegramIdentities();
+
+  const { serverUrl, spawnedChild: child } = await ensureServerRunning({
+    spawn: false,
+  });
+
+  spawnedChild = child;
+
+  const authToken =
+    (await loadLocalAuthToken("telegram@mingzhan.internal")) ?? undefined;
+
+  const probe = new MíngZhànClient({
+    authToken,
+    baseUrl: serverUrl,
+    clientOrigin: resolveWebPublicUrl(),
+  });
+
+  const health = await probe.health();
+
+  try {
+    await probe.listUserOrgs();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(
+      `MíngZhàn API authentication failed: ${message}\n` +
+        "Restart the server so it can provision the local client user:\n" +
+        "  bun run dev:server"
+    );
+    process.exit(1);
+  }
+
+  if (!health.providerConfigured) {
+    console.warn(
+      "Server has no provider configured. Chat runs in offline mode until an API key is set."
+    );
+  }
+
+  const running: Promise<void>[] = [];
+
+  for (const config of identities) {
+    const bot = await startIdentity(config, serverUrl, authToken);
+
+    if (bot) {
+      running.push(bot.running);
+    }
+  }
+
+  if (running.length === 0) {
+    console.error(
+      "Every configured Telegram bot is already claimed by a running bridge."
+    );
+    process.exit(1);
+  }
+
+  log("info", "worker.started", {
+    count: running.length,
+    worker: "telegram",
+  });
+  console.log(`Server: ${serverUrl}`);
+
+  heartbeatTimer = setInterval(() => {
+    for (const identity of started) {
+      void identity.writeHeartbeat();
+    }
+  }, 15_000);
+
+  await Promise.all(running);
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(message);
+  // Await before exit: void + process.exit can leave a stale heartbeat file.
+  await stopAll();
+  stopSpawnedServer(spawnedChild);
+  process.exit(1);
+} finally {
+  stopSpawnedServer(spawnedChild);
+}
+
+/**
+ * Starts one bot for one config scope, or returns null when another process
+ * already holds that identity. Telegram drops updates for whichever poller is
+ * not last, so a second claim has to be refused rather than raced.
+ */
+async function startIdentity(
+  config: TelegramBridgeConfig,
+  serverUrl: string,
+  authToken: string | undefined
+): Promise<{ running: Promise<void> } | null> {
+  const label = config.orgId ? `org ${config.orgId}` : "install-wide config";
+
+  const heartbeat = createTelegramWorkerHeartbeat(
+    config.owner ?? config.orgId ?? null
+  );
+
+  const existing = await heartbeat.read();
+
+  if (existing && existing.pid !== process.pid && isHeartbeatAlive(existing)) {
+    console.error(
+      `Another MíngZhàn Telegram bridge already runs the ${label} bot (pid ${existing.pid}). Skipping it.`
+    );
+
+    return null;
+  }
+
+  await heartbeat.acquire();
+  const configDir = getTelegramConfigDir(config.owner ?? config.orgId ?? null);
+
+  const client = new MíngZhànClient({
+    authToken,
+    baseUrl: serverUrl,
+    clientOrigin: resolveWebPublicUrl(),
+    orgId: config.orgId,
+  });
+
+  const sessionStore = new ChannelSessionStore(
+    join(configDir, "chat-sessions.json")
+  );
+
+  await sessionStore.load();
+
+  const orgStore = new ChannelOrgStore(join(configDir, "org-selection.json"));
+  await orgStore.load();
+
+  const authStore = new TelegramAuthStore(config.owner ?? config.orgId ?? null);
+  await authStore.reload();
+
+  const bot = await createBot(config, {
+    authStore,
+    client,
+    orgStore,
+    sessionStore,
+  });
+
+  const writeHeartbeat = () =>
+    heartbeat.write({ pid: process.pid, updatedAt: new Date().toISOString() });
+
+  started.push({
+    clearHeartbeat: heartbeat.clear,
+    stop: () => bot.stop(),
+    writeHeartbeat,
+  });
+
+  await writeHeartbeat();
+
+  const authConfig = authStore.getConfig();
+  console.log(
+    `${label}: profile ${config.profileId} · paired ${authConfig?.pairedUserIds.length ?? 0} · pending handshake ${authConfig?.handshakeCode ? "yes" : "no"}`
+  );
+
+  return {
+    running: bot.start({
+      onStart: (info) => {
+        console.log(`Bot @${info.username} is listening for ${label}.`);
+      },
+    }),
+  };
+}
+
+async function stopAll(): Promise<void> {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+
+  await Promise.all(
+    started.map((identity) => {
+      identity.stop();
+
+      return identity.clearHeartbeat();
+    })
+  );
+}
+
+function registerCleanupHandlers(cleanup: () => void | Promise<void>): void {
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    process.on(signal, async () => {
+      await cleanup();
+      process.exit(0);
+    });
+  }
+
+  // pm2 stops Windows workers with a "shutdown" message instead of a signal.
+  if (process.platform === "win32") {
+    process.on("message", async (message) => {
+      if (message === "shutdown") {
+        await cleanup();
+        process.exit(0);
+      }
+    });
+  }
+}

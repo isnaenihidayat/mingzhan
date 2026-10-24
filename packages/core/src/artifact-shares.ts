@@ -1,0 +1,102 @@
+import crypto from "node:crypto";
+import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { z } from "zod";
+import { assertHtmlArtifactSize } from "./artifact-mime";
+import { pathExists } from "./fs";
+import { assertConfigPathSegment, getArtifactSharesDir } from "./soul/resolve";
+
+export function generateArtifactShareToken(): string {
+  // No underscores: plain-text markdown strippers treat `_word_` as italic and can
+  // corrupt share URLs in channel footers (Telegram sendPlain path).
+  return `nkshare${crypto.randomUUID().replace(/-/g, "")}${crypto.randomUUID().replace(/-/g, "")}`;
+}
+
+export function buildArtifactSharePath(token: string): string {
+  return `/s/${assertConfigPathSegment(token, "shareToken")}`;
+}
+
+export async function writeArtifactShareSnapshot(input: {
+  orgId: string;
+  shareId: string;
+  filename: string;
+  bytes: Buffer;
+  mimeType?: string;
+}): Promise<string> {
+  assertHtmlArtifactSize(
+    input.filename,
+    input.bytes.byteLength,
+    input.mimeType
+  );
+  const sharesDir = getArtifactSharesDir(input.orgId);
+
+  const shareDir = path.join(
+    sharesDir,
+    assertConfigPathSegment(input.shareId, "shareId")
+  );
+
+  await mkdir(shareDir, { recursive: true });
+
+  const safeName =
+    path.basename(input.filename).replace(/[^\w.\-()+ ]+/g, "_") || "artifact";
+
+  const storagePath = path.join(shareDir, safeName);
+  await writeFile(storagePath, input.bytes);
+
+  return storagePath;
+}
+
+export function assertArtifactShareStoragePath(
+  orgId: string,
+  storagePath: string
+): void {
+  if (!path.isAbsolute(storagePath)) {
+    throw new Error(
+      "Artifact share storage path must be absolute; relative paths resolve against process.cwd()."
+    );
+  }
+
+  const root = path.resolve(getArtifactSharesDir(orgId));
+  const resolved = path.resolve(storagePath);
+
+  if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) {
+    throw new Error(
+      "Artifact share storage path escapes the org artifact-shares directory."
+    );
+  }
+}
+
+export async function readArtifactShareSnapshot(
+  orgId: string,
+  storagePath: string,
+  mimeType = ""
+): Promise<Buffer> {
+  assertArtifactShareStoragePath(orgId, storagePath);
+
+  if (!(await pathExists(storagePath))) {
+    throw new Error(`Artifact share snapshot not found: ${storagePath}`);
+  }
+
+  assertHtmlArtifactSize(storagePath, (await stat(storagePath)).size, mimeType);
+  const bytes = await readFile(storagePath);
+  assertHtmlArtifactSize(storagePath, bytes.byteLength, mimeType);
+
+  return bytes;
+}
+
+export async function deleteArtifactShareSnapshot(
+  orgId: string,
+  storagePath: string
+): Promise<void> {
+  assertArtifactShareStoragePath(orgId, storagePath);
+
+  try {
+    await unlink(storagePath);
+  } catch (error) {
+    const details = z.object({ code: z.string().optional() }).safeParse(error);
+
+    if (!details.success || details.data.code !== "ENOENT") {
+      throw error;
+    }
+  }
+}

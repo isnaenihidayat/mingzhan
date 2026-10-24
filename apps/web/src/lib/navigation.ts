@@ -1,0 +1,640 @@
+import {
+  BrainIcon,
+  Bug01Icon,
+  Building03Icon,
+  CodeIcon,
+  Coins01Icon,
+  DashboardSquare01Icon,
+  Folder01Icon,
+  LayoutGridIcon,
+  Notification01Icon,
+  PackageIcon,
+  Plug01Icon,
+  PlusSignSquareIcon,
+  PuzzleIcon,
+  Settings01Icon,
+  SharedWifiIcon,
+  SlidersHorizontalIcon,
+  UserGroupIcon,
+  UserSquareIcon,
+  WorkflowSquare01Icon,
+} from "hugeicons-react";
+
+type NavIcon = typeof SharedWifiIcon;
+
+export type PageId =
+  | "google-meet"
+  | "groups"
+  | "chat"
+  | "composio"
+  | "customize"
+  | "usage"
+  | "files"
+  | "profiles"
+  | "soul"
+  | "tools"
+  | "skills"
+  | "mcp"
+  | "automations"
+  | "organization"
+  | "settings"
+  | "providers"
+  | "notifications"
+  | "workers"
+  | "plugins"
+  | "plugin-management";
+
+export interface NavItem {
+  description: string;
+  icon: NavIcon;
+  id: PageId;
+  label: string;
+}
+
+export interface NavGroup {
+  /** When true, sidebar renders a collapsible tree under `label`. */
+  collapsible?: boolean;
+  id: string;
+  items: NavItem[];
+  label: string;
+}
+
+const navItem = (
+  id: PageId,
+  label: string,
+  description: string,
+  icon: NavIcon
+): NavItem => ({
+  description,
+  icon,
+  id,
+  label,
+});
+
+const NAV_GROUPS: NavGroup[] = [
+  {
+    id: "chat",
+    items: [
+      navItem(
+        "chat",
+        "New chat",
+        "Start a new conversation",
+        PlusSignSquareIcon
+      ),
+      navItem(
+        "profiles",
+        "Agent",
+        "Manage bot configs and tool allowlists",
+        UserSquareIcon
+      ),
+      navItem(
+        "groups",
+        "Groups",
+        "Group chats where agents talk to each other",
+        UserGroupIcon
+      ),
+      navItem(
+        "google-meet",
+        "Google Meet",
+        "Capture and read meeting transcripts",
+        SharedWifiIcon
+      ),
+      navItem("plugin-management", "Plugins", "Manage plugins", PackageIcon),
+      navItem(
+        "composio",
+        "Connections",
+        "Connect apps and manage plugins",
+        PuzzleIcon
+      ),
+    ],
+    label: "Chat",
+  },
+  {
+    id: "agent",
+    items: [
+      navItem(
+        "automations",
+        "Automations",
+        "Manage scheduled automations",
+        SharedWifiIcon
+      ),
+      navItem(
+        "customize",
+        "Control center",
+        "Manage MíngZhàn settings, tools, and integrations",
+        SlidersHorizontalIcon
+      ),
+    ],
+    label: "Agent",
+  },
+  {
+    id: "organization",
+    items: [
+      navItem(
+        "organization",
+        "Organization",
+        "Members, memory, and org settings",
+        Building03Icon
+      ),
+    ],
+    label: "Organization",
+  },
+  {
+    collapsible: true,
+    id: "system",
+    items: [
+      navItem("usage", "Usage", "View token usage and costs", Coins01Icon),
+      navItem(
+        "files",
+        "Browse Files",
+        "Manage profile artifacts",
+        Folder01Icon
+      ),
+      navItem(
+        "workers",
+        "Workers",
+        "Automation and channel workers",
+        DashboardSquare01Icon
+      ),
+      navItem("tools", "Tools", "Manage agent tools", LayoutGridIcon),
+      navItem("skills", "Skills", "Browse organization skills", BrainIcon),
+      navItem("mcp", "MCP", "Manage MCP servers", Plug01Icon),
+      navItem(
+        "providers",
+        "AI Providers",
+        "Manage provider API keys and models",
+        BrainIcon
+      ),
+      navItem(
+        "settings",
+        "Settings",
+        "Appearance and preferences",
+        Settings01Icon
+      ),
+    ],
+    label: "System",
+  },
+];
+
+const NAV_ITEMS: NavItem[] = NAV_GROUPS.flatMap((group) => group.items);
+
+export const SIDEBAR_PAGE_IDS: readonly PageId[] = [
+  "chat",
+  "profiles",
+  "groups",
+  "composio",
+  "automations",
+  "customize",
+];
+
+/** Plugins is a tab of Connections, so it lights up the Connections item. */
+export function sidebarPageId(page: PageId): PageId {
+  return page === "plugin-management" ? "composio" : page;
+}
+
+export const STANDALONE_PAGES: Partial<Record<PageId, NavItem>> = {
+  notifications: navItem(
+    "notifications",
+    "Notifications",
+    "Automation runs and org memory proposals",
+    Notification01Icon
+  ),
+};
+
+export const SETUP_PATH = "/setup";
+
+const PLATFORM_ADMIN_PAGE_IDS: ReadonlySet<PageId> = new Set([
+  "soul",
+  "mcp",
+  "providers",
+  "skills",
+]);
+
+export function canAccessSystemPage(
+  isPlatformAdmin: boolean,
+  orgRole: string | undefined
+): boolean {
+  return isPlatformAdmin || orgRole === "admin";
+}
+
+export function canAccessIntegrationsPage(
+  orgRole: string | undefined
+): boolean {
+  return orgRole === "admin" || orgRole === "member";
+}
+
+export function canAccessOrganizationPage(
+  isPlatformAdmin: boolean,
+  orgRole: string | undefined
+): boolean {
+  return isPlatformAdmin || orgRole === "admin" || orgRole === "member";
+}
+
+export function canManagePluginReleases(isPlatformAdmin: boolean): boolean {
+  return isPlatformAdmin;
+}
+
+export const canUseToolPlayground = canAccessSystemPage;
+
+interface PageAccess {
+  isPlatformAdmin: boolean;
+  orgRole: string | undefined;
+}
+
+/** Whether this user can open the page, so it is not redirected away. */
+export function canOpenPage(pageId: PageId, access: PageAccess): boolean {
+  if (pageId === "google-meet" || pageId === "groups") {
+    return canAccessIntegrationsPage(access.orgRole);
+  }
+
+  if (pageId === "composio") {
+    return access.isPlatformAdmin || canAccessIntegrationsPage(access.orgRole);
+  }
+
+  if (pageId === "organization" || pageId === "files") {
+    return canAccessOrganizationPage(access.isPlatformAdmin, access.orgRole);
+  }
+
+  if (
+    pageId === "usage" ||
+    pageId === "plugin-management" ||
+    pageId === "tools" ||
+    pageId === "soul" ||
+    pageId === "workers"
+  ) {
+    return canAccessSystemPage(access.isPlatformAdmin, access.orgRole);
+  }
+
+  return !PLATFORM_ADMIN_PAGE_IDS.has(pageId) || access.isPlatformAdmin;
+}
+
+/**
+ * Nav groups this user can actually reach, empty groups dropped. The sidebar and
+ * the command palette both read this, so the palette cannot offer a destination
+ * the sidebar hides.
+ */
+export function visibleNavGroups(access: PageAccess): NavGroup[] {
+  const groups: NavGroup[] = [];
+
+  for (const group of NAV_GROUPS) {
+    const items = group.items.filter((item) => canOpenPage(item.id, access));
+
+    if (items.length > 0) {
+      groups.push({ ...group, items });
+    }
+  }
+
+  return groups;
+}
+
+const queryPath = (path: string, params: Record<string, string>): string =>
+  `${path}?${new URLSearchParams(params)}`;
+
+const toolsTabPath = (): string => PAGE_PATHS.tools;
+
+export const pluginManagementPath = (): string =>
+  PAGE_PATHS["plugin-management"];
+
+const PLUGIN_PAGE_PREFIX = "/plugins";
+
+export function pluginPagePath(pluginId: string): string {
+  return `${PLUGIN_PAGE_PREFIX}/${encodeURIComponent(pluginId)}`;
+}
+
+export function pluginIdFromPath(pathname: string): string | null {
+  if (
+    pathname === PLUGIN_PAGE_PREFIX ||
+    pathname === `${PLUGIN_PAGE_PREFIX}/`
+  ) {
+    return null;
+  }
+
+  if (!pathname.startsWith(`${PLUGIN_PAGE_PREFIX}/`)) {
+    return null;
+  }
+
+  const rest = pathname.slice(PLUGIN_PAGE_PREFIX.length + 1);
+
+  if (!rest || rest.includes("/")) {
+    return null;
+  }
+
+  try {
+    return decodeURIComponent(rest);
+  } catch {
+    return rest;
+  }
+}
+
+export function pluginIcon(pluginId: string): NavIcon {
+  switch (pluginId) {
+    case "workflows":
+      return WorkflowSquare01Icon;
+    case "supermemory":
+      return BrainIcon;
+    default:
+      return PackageIcon;
+  }
+}
+
+export interface PluginNavEntry {
+  href: string;
+  label: string;
+  pluginId: string;
+}
+
+export function enabledPluginNavEntries(
+  plugins: ReadonlyArray<{
+    lifecycleState: string;
+    pluginId: string;
+    ui: { pageLabel: string } | null;
+  }>
+): PluginNavEntry[] {
+  return plugins
+    .filter(
+      (plugin) => plugin.lifecycleState === "enabled" && plugin.ui !== null
+    )
+    .toSorted((left, right) => {
+      const leftLabel = left.ui?.pageLabel ?? left.pluginId;
+      const rightLabel = right.ui?.pageLabel ?? right.pluginId;
+      const byLabel = leftLabel.localeCompare(rightLabel);
+
+      if (byLabel !== 0) {
+        return byLabel;
+      }
+
+      return left.pluginId.localeCompare(right.pluginId);
+    })
+    .map((plugin) => ({
+      href: pluginPagePath(plugin.pluginId),
+      label: plugin.ui?.pageLabel ?? plugin.pluginId,
+      pluginId: plugin.pluginId,
+    }));
+}
+
+export function profilePath(
+  profileId: string,
+  options?: { section?: "mcp" }
+): string {
+  return queryPath(
+    PAGE_PATHS.profiles,
+    options?.section
+      ? { profile: profileId, section: options.section }
+      : { profile: profileId }
+  );
+}
+
+export function skillDetailPath(
+  skillId: string,
+  options?: { profileId?: string }
+): string {
+  const path = `${PAGE_PATHS.profiles}/skills/${encodeURIComponent(skillId)}`;
+
+  return options?.profileId
+    ? queryPath(path, { profile: options.profileId })
+    : path;
+}
+
+const backTarget = (
+  profileId: string | null,
+  fallback: { href: string; label: string }
+): { href: string; label: string } =>
+  profileId ? { href: profilePath(profileId), label: "Profile" } : fallback;
+
+/** Resolve skill detail back-navigation from search params set by skillDetailPath. */
+export const skillDetailBackTarget = (
+  searchParams: URLSearchParams
+): {
+  href: string;
+  label: string;
+} =>
+  backTarget(searchParams.get("profile"), {
+    href:
+      searchParams.get("from") === "skills"
+        ? PAGE_PATHS.skills
+        : PAGE_PATHS.profiles,
+    label: searchParams.get("from") === "skills" ? "Skills" : "Profiles",
+  });
+
+export function toolPlaygroundPath(
+  toolId: string,
+  options?: { fromProfileId?: string }
+): string {
+  const path = `${PAGE_PATHS.soul}/playground/${encodeURIComponent(toolId)}`;
+
+  return options?.fromProfileId
+    ? queryPath(path, { from: "profiles", profile: options.fromProfileId })
+    : path;
+}
+
+/** Resolve playground back-navigation from search params set by toolPlaygroundPath. */
+export const toolPlaygroundBackTarget = (
+  searchParams: URLSearchParams
+): {
+  href: string;
+  label: string;
+} =>
+  backTarget(
+    searchParams.get("from") === "profiles"
+      ? searchParams.get("profile")
+      : null,
+    { href: toolsTabPath(), label: "Tools" }
+  );
+
+export function orgSkillProposalsPath(profileId?: string): string {
+  const params = new URLSearchParams({
+    skillProposals: "proposals",
+  });
+
+  if (profileId) {
+    params.set("profileId", profileId);
+  }
+
+  return `${PAGE_PATHS.organization}?${params.toString()}`;
+}
+
+export function teamDetailPath(teamId: string): string {
+  return `${PAGE_PATHS.organization}/teams/${encodeURIComponent(teamId)}`;
+}
+
+/** A group's new chat, or one of its sessions. */
+export function groupPath(groupId: string, sessionId?: string): string {
+  const base = `${PAGE_PATHS.groups}/${encodeURIComponent(groupId)}`;
+
+  return sessionId ? `${base}/${encodeURIComponent(sessionId)}` : base;
+}
+
+/** The group (and session) a `/groups/...` path points at, if any. */
+export function groupRouteFromPath(
+  pathname: string
+): { groupId: string; sessionId: string | null } | null {
+  const [groupId, sessionId] = pathname
+    .slice(`${PAGE_PATHS.groups}/`.length)
+    .split("/");
+
+  if (!(pathname.startsWith(`${PAGE_PATHS.groups}/`) && groupId)) {
+    return null;
+  }
+
+  try {
+    return {
+      groupId: decodeURIComponent(groupId),
+      sessionId: sessionId ? decodeURIComponent(sessionId) : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export const PAGE_PATHS: Record<PageId, string> = {
+  automations: "/automations",
+  chat: "/chat",
+  composio: "/connectors",
+  customize: "/customize",
+  files: "/files",
+  "google-meet": "/google-meet",
+  groups: "/groups",
+  mcp: "/customize/mcp",
+  notifications: "/notifications",
+  organization: "/organization",
+  "plugin-management": "/customize/plugins",
+  plugins: PLUGIN_PAGE_PREFIX,
+  profiles: "/profiles",
+  providers: "/customize/providers",
+  settings: "/settings",
+  skills: "/customize/skills",
+  soul: "/system",
+  tools: "/customize/tools",
+  usage: "/customize/usage",
+  workers: "/workers",
+};
+
+const PREFIX_PAGE_IDS: readonly [string, PageId][] = [
+  [PAGE_PATHS.composio, "composio"],
+  ["/customize/connections", "customize"],
+  [PAGE_PATHS["plugin-management"], "plugin-management"],
+  [PAGE_PATHS.chat, "chat"],
+  [PAGE_PATHS.groups, "groups"],
+  [PAGE_PATHS.organization, "organization"],
+  [PAGE_PATHS.soul, "soul"],
+  [PAGE_PATHS.profiles, "profiles"],
+  [PAGE_PATHS.files, "files"],
+  [PAGE_PATHS.plugins, "plugins"],
+];
+
+export function pathForPage(pageId: PageId): string {
+  return PAGE_PATHS[pageId];
+}
+
+export function navHrefForPage(
+  pageId: PageId,
+  chatProfileId?: string | null
+): string {
+  if (pageId === "chat") {
+    const params = new URLSearchParams({ new: "1" });
+
+    if (chatProfileId) {
+      params.set("profile", chatProfileId);
+    }
+
+    return `${PAGE_PATHS.chat}?${params.toString()}`;
+  }
+
+  return pathForPage(pageId);
+}
+
+export function findNavItem(pageId: PageId): NavItem | undefined {
+  return (
+    NAV_ITEMS.find((item) => item.id === pageId) ?? STANDALONE_PAGES[pageId]
+  );
+}
+
+export function pageIdFromPath(pathname: string): PageId | null {
+  if (pathname === "/tasks") {
+    return "automations";
+  }
+
+  const prefixPage = PREFIX_PAGE_IDS.find(
+    ([prefix]) => pathname === prefix || pathname.startsWith(`${prefix}/`)
+  );
+
+  if (prefixPage) {
+    return prefixPage[1];
+  }
+
+  return (
+    // SAFETY: The enclosing parser checks the value before this conversion.
+    (Object.entries(PAGE_PATHS) as [PageId, string][]).find(
+      ([, path]) => pathname === path
+    )?.[0] ?? null
+  );
+}
+
+/** App path for a same-origin link to a known page, or null for other links. */
+export function inAppLinkPath(href: string, origin: string): string | null {
+  if (href.startsWith("//")) {
+    return null;
+  }
+
+  let url: URL;
+
+  try {
+    url = new URL(href, origin);
+  } catch {
+    return null;
+  }
+
+  if (url.origin !== origin || !pageIdFromPath(url.pathname)) {
+    return null;
+  }
+
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
+const INTEGRATION_SECTIONS = [
+  {
+    icon: Notification01Icon,
+    id: "notifications",
+    label: "Notifications",
+  },
+  {
+    icon: Plug01Icon,
+    id: "composio",
+    label: "Composio",
+  },
+  {
+    icon: CodeIcon,
+    id: "coding-agents",
+    label: "Coding agents",
+  },
+  {
+    icon: Bug01Icon,
+    id: "error-tracking",
+    label: "Error tracking",
+  },
+] as const;
+
+export type IntegrationSectionId = (typeof INTEGRATION_SECTIONS)[number]["id"];
+
+export function integrationSectionPath(id: IntegrationSectionId): string {
+  return id === "composio"
+    ? PAGE_PATHS.composio
+    : `/customize/connections/${id}`;
+}
+
+export function visibleIntegrationSections(
+  isPlatformAdmin: boolean,
+  orgRole: string | undefined
+) {
+  return INTEGRATION_SECTIONS.filter((item) => {
+    if (item.id === "composio") {
+      return isPlatformAdmin || orgRole === "admin" || orgRole === "member";
+    }
+
+    if (item.id === "error-tracking") {
+      return isPlatformAdmin;
+    }
+
+    return isPlatformAdmin || orgRole === "admin";
+  });
+}

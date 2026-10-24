@@ -1,0 +1,131 @@
+import { expect, test } from "bun:test";
+import {
+  buildUserContextStatus,
+  normalizeUserContextContent,
+  parseUserContext,
+  renderUserContext,
+  USER_CONTEXT_FIELDS,
+} from "./user-context";
+
+test("normalizeUserContextContent returns undefined when empty", () => {
+  expect(normalizeUserContextContent(undefined)).toBeUndefined();
+  expect(normalizeUserContextContent(null)).toBeUndefined();
+  expect(normalizeUserContextContent("   \n")).toBeUndefined();
+});
+
+test("normalizeUserContextContent returns trimmed content", () => {
+  expect(normalizeUserContextContent("  # About Me\n\nHello\n  ")).toBe(
+    "# About Me\n\nHello"
+  );
+});
+
+test("buildUserContextStatus omits content by default", () => {
+  expect(buildUserContextStatus("# About Me", false)).toEqual({
+    active: true,
+  });
+});
+
+test("renderUserContext returns nothing when every answer is blank", () => {
+  expect(renderUserContext({})).toBe("");
+  expect(renderUserContext({ name: "", role: "   " })).toBe("");
+});
+
+test("parseUserContext keeps unknown lines as extra", () => {
+  const parsed = parseUserContext(`# About Me
+
+- What you do: Backend engineer
+
+## Notes
+
+Ships on Fridays.
+`);
+
+  expect(parsed.answers.role).toBe("Backend engineer");
+  expect(parsed.extra).toBe("## Notes\n\nShips on Fridays.");
+});
+
+test("parse and render round-trip hand-written extra content", () => {
+  const original = `# About Me
+
+- Name / nickname: Alex
+- Tech stack: Go, Postgres
+
+## Notes
+
+Ships on Fridays.
+`;
+
+  const parsed = parseUserContext(original);
+  expect(renderUserContext(parsed.answers, parsed.extra)).toBe(original);
+});
+
+test("parse and render preserve every field and extra notes", () => {
+  const answers = Object.fromEntries(
+    USER_CONTEXT_FIELDS.map((field) => [field.key, field.key])
+  );
+
+  const rendered = renderUserContext(answers, "On call every other week.");
+  expect(parseUserContext(rendered)).toEqual({
+    answers,
+    extra: "On call every other week.",
+  });
+  expect(renderUserContext({}, "Just notes.")).toContain("Just notes.");
+});
+
+test("parse and render round-trip a trailing space in an answer", () => {
+  const parsed = parseUserContext("# About Me\n\n- Name / nickname: Alex \n");
+  expect(parsed.answers.name).toBe("Alex ");
+  expect(renderUserContext(parsed.answers, parsed.extra)).toBe(
+    "# About Me\n\n- Name / nickname: Alex \n"
+  );
+});
+
+test("parseUserContext keeps a repeated bullet instead of overwriting it", () => {
+  const parsed = parseUserContext(`# About Me
+
+- Always: Answer in English
+- Always: Use metric units
+`);
+
+  expect(parsed.answers.always).toBe("Answer in English");
+  expect(parsed.extra).toBe("- Always: Use metric units");
+
+  const rendered = renderUserContext(parsed.answers, parsed.extra);
+  expect(rendered).toBe(`# About Me
+
+- Always: Answer in English
+
+- Always: Use metric units
+`);
+
+  // The moved line stays put from here on, so saving twice loses nothing.
+  const reparsed = parseUserContext(rendered);
+  expect(renderUserContext(reparsed.answers, reparsed.extra)).toBe(rendered);
+});
+
+test("parseUserContext tolerates missing content", () => {
+  expect(parseUserContext(null)).toEqual({ answers: {}, extra: "" });
+  expect(parseUserContext(undefined)).toEqual({ answers: {}, extra: "" });
+});
+
+test("saving optional help preserves existing preferences and an introduction", () => {
+  const original = renderUserContext(
+    { name: "Rosid", never: "Use emojis", role: "Software engineer" },
+    "I build my own product.\nI work with a small team."
+  );
+
+  const { answers, extra } = parseUserContext(original);
+
+  const saved = renderUserContext(
+    { ...answers, help: "Writing code, Product decisions" },
+    extra
+  );
+
+  expect(parseUserContext(saved)).toEqual({
+    answers: { ...answers, help: "Writing code, Product decisions" },
+    extra,
+  });
+  expect(
+    renderUserContext({ ...parseUserContext(saved).answers, help: "" }, extra)
+  ).toBe(original);
+});

@@ -1,0 +1,758 @@
+import {
+  type AgentChannel,
+  fetchGitHubSkillBundle,
+  type GitHubSkillBundle,
+  parseRawProfileSkillContent,
+  type ToolContext,
+  type ToolDefinition,
+} from "@mingzhan/core";
+import type { SkillProposalAction } from "@mingzhan/db";
+import { z } from "zod";
+import type { SkillProposalService } from "../services/skill-proposal-service";
+import type { SkillsService } from "../services/skills-service";
+
+export interface SkillManageToolDeps {
+  skillProposalService?: SkillProposalService | null;
+  skillsService: SkillsService;
+}
+
+type SkillManageAction = SkillProposalAction;
+
+interface SkillManageResult {
+  action: SkillManageAction;
+  assigned: boolean;
+  created?: boolean;
+  description?: string;
+  matchHint: string;
+  name: string;
+  path?: string;
+}
+
+interface StagedSkillManageResult {
+  action: SkillManageAction;
+  matchHint: string;
+  message: string;
+  name: string;
+  outcome: "created" | "already_pending";
+  path?: string;
+  proposalId?: string;
+  staged: true;
+}
+
+const SkillManageInputSchema = z.object({
+  action: z.string().optional().catch(undefined),
+  content: z.string().optional().catch(undefined),
+  name: z.string().optional().catch(undefined),
+  new_string: z.string().optional().catch(undefined),
+  old_string: z.string().optional().catch(undefined),
+  path: z.string().optional().catch(undefined),
+  url: z.string().optional().catch(undefined),
+});
+
+type SkillManageInput = z.infer<typeof SkillManageInputSchema>;
+
+function requireOrgId(context: ToolContext): string {
+  const orgId = context.orgId?.trim();
+
+  if (!orgId) {
+    throw new Error("Organization context is required.");
+  }
+
+  return orgId;
+}
+
+function requireProfileId(context: ToolContext): string {
+  const profileId = context.profileId?.trim();
+
+  if (!profileId) {
+    throw new Error("Profile context is required.");
+  }
+
+  return profileId;
+}
+
+/**
+ * Which channels get the skill-management surface. Total over `AgentChannel`,
+ * so a new channel fails the typecheck here instead of inheriting `false` in
+ * silence. `agent-service` reads the same table when it decides whether to
+ * attach the tools, so the offer and this gate cannot drift apart.
+ */
+export const SKILL_MANAGE_CHANNELS = {
+  automation: false,
+  cli: true,
+  discord: false,
+  slack: false,
+  subagent: false,
+  task: false,
+  telegram: false,
+  web: true,
+  whatsapp: false,
+} as const satisfies Record<AgentChannel, boolean>;
+
+/**
+ * Deny-by-default membership gate for skill_manage.
+ */
+function requireSkillManageAccess(context: ToolContext) {
+  if (context.automationId?.trim()) {
+    throw new Error("skill_manage is not available during automation runs.");
+  }
+
+  const channel = context.channel;
+
+  if (channel !== undefined && !SKILL_MANAGE_CHANNELS[channel]) {
+    throw new Error(
+      "skill_manage is only available in interactive web or CLI chat."
+    );
+  }
+
+  const orgId = requireOrgId(context);
+  const profileId = requireProfileId(context);
+  const role = context.orgRole;
+
+  if (role === undefined || role === null) {
+    throw new Error("skill_manage requires an organization role.");
+  }
+
+  if (role !== "admin" && role !== "member") {
+    throw new Error("Organization membership required.");
+  }
+
+  return { orgId, profileId };
+}
+
+function readRawString(
+  input: SkillManageInput,
+  key: keyof SkillManageInput
+): string | null {
+  return input[key] ?? null;
+}
+
+function readString(
+  input: SkillManageInput,
+  key: keyof SkillManageInput
+): string | null {
+  const value = input[key];
+
+  return value?.trim() || null;
+}
+
+function readAction(input: SkillManageInput): SkillManageAction {
+  if (!input.action) {
+    throw new Error(
+      "action is required (create | patch | edit | delete | write_file | remove_file | approve_code)."
+    );
+  }
+
+  const value = input.action;
+
+  if (
+    value === "create" ||
+    value === "patch" ||
+    value === "edit" ||
+    value === "delete" ||
+    value === "write_file" ||
+    value === "remove_file" ||
+    value === "approve_code"
+  ) {
+    return value;
+  }
+
+  throw new Error(
+    "action must be create, patch, edit, delete, write_file, remove_file, or approve_code."
+  );
+}
+
+function skillManageResult(options: {
+  action: SkillManageAction;
+  name: string;
+  assigned: boolean;
+  context: ToolContext;
+  description?: string;
+  created?: boolean;
+  path?: string;
+}): SkillManageResult {
+  options.context.onSkillCatalogChange?.();
+
+  const matchHint =
+    options.action === "delete"
+      ? "The skill was removed from this profile (disk, assignment, and DB row). Keyword match and /skill will no longer find it."
+      : options.action === "write_file" || options.action === "remove_file"
+        ? "Supporting file change applied under the profile skill directory."
+        : "The skill is assigned for this profile. Keyword match and /skill work on later turns; the session skills catalog refreshes before the next turn.";
+
+  const result: SkillManageResult = {
+    action: options.action,
+    assigned: options.assigned,
+    matchHint,
+    name: options.name,
+  };
+
+  if (options.description !== undefined) {
+    result.description = options.description;
+  }
+
+  if (options.created !== undefined) {
+    result.created = options.created;
+  }
+
+  if (options.path !== undefined) {
+    result.path = options.path;
+  }
+
+  return result;
+}
+
+function stagedSkillManageResult(options: {
+  action: SkillManageAction;
+  name: string;
+  proposalId?: string;
+  outcome: "created" | "already_pending";
+  message: string;
+  path?: string;
+}): StagedSkillManageResult {
+  const result: StagedSkillManageResult = {
+    action: options.action,
+    matchHint:
+      "The skill change is pending admin approval and is not live yet. It will not match until an org admin approves the proposal.",
+    message: options.message,
+    name: options.name,
+    outcome: options.outcome,
+    proposalId: options.proposalId,
+    staged: true as const,
+  };
+
+  if (options.path !== undefined) {
+    result.path = options.path;
+  }
+
+  return result;
+}
+
+export function createSkillManageTools(
+  deps: SkillManageToolDeps
+): ToolDefinition[] {
+  const { skillsService: service, skillProposalService = null } = deps;
+
+  return [
+    {
+      description:
+        "Create, patch, edit, or delete reusable profile skills (SKILL.md under the profile skills directory), or write/remove supporting files under a skill directory, with auto-assign for skill mutations. When write approval is enabled for this org/profile, changes are staged for admin review instead of applying immediately. Prefer patch with unique old_string/new_string over edit for small fixes. Crystallize a skill after complex multi-step success (about 5+ tool calls), error recovery, or when the user corrects your approach — do not dump procedures into MEMORY.md.",
+      name: "skill_manage",
+      parallelSafe: false,
+      parameters: {
+        additionalProperties: false,
+        properties: {
+          action: {
+            description:
+              "install = fetch a public GitHub skill directory including supporting files and create/adopt it; create = new/adopt skill; patch = targeted edit; edit = full SKILL.md replace; delete = remove profile-owned skill; write_file/remove_file = supporting files; approve_code = request admin review of an existing code file.",
+            enum: [
+              "install",
+              "create",
+              "patch",
+              "edit",
+              "delete",
+              "write_file",
+              "remove_file",
+              "approve_code",
+            ],
+            type: "string",
+          },
+          content: {
+            description:
+              "Full SKILL.md markdown including YAML frontmatter (create/edit), or supporting file body (write_file).",
+            type: "string",
+          },
+          name: {
+            description:
+              "Skill name (kebab-case). Required for patch, edit, delete, write_file, remove_file, and approve_code.",
+            type: "string",
+          },
+          new_string: {
+            description:
+              "Replacement text for old_string. Required for patch (may be empty).",
+            type: "string",
+          },
+          old_string: {
+            description:
+              "Exact unique substring to replace in SKILL.md. Required for patch.",
+            type: "string",
+          },
+          path: {
+            description:
+              "Relative path under the skill directory. Required for write_file, remove_file, and approve_code. approve_code may name tool.py/tool.ts/tool.js.",
+            type: "string",
+          },
+          url: {
+            description:
+              "Public GitHub skill directory or SKILL.md URL. Required for install. Downloads SKILL.md and supporting files; never overwrites existing files with different content.",
+            type: "string",
+          },
+        },
+        required: ["action"],
+        type: "object",
+      },
+      async run(rawInput, context: ToolContext) {
+        const parsedInput = SkillManageInputSchema.safeParse(rawInput);
+
+        let input: SkillManageInput = parsedInput.success
+          ? parsedInput.data
+          : {};
+
+        const { orgId, profileId } = requireSkillManageAccess(context);
+        let bundle: GitHubSkillBundle | undefined;
+
+        // Installation is a create proposal so it uses the same approval,
+        // collision protection, assignment, and catalog refresh path.
+        if (readString(input, "action") === "install") {
+          const url = readString(input, "url");
+
+          if (!url) {
+            throw new Error("url is required for install.");
+          }
+
+          bundle = await fetchGitHubSkillBundle(url);
+          input = {
+            action: "create",
+            content: bundle.content,
+          };
+        }
+
+        const action = readAction(input);
+
+        if (
+          skillProposalService !== null &&
+          (await skillProposalService.isWriteApprovalRequired(orgId, profileId))
+        ) {
+          if (action === "create") {
+            const content = readRawString(input, "content");
+
+            if (!content?.trim()) {
+              throw new Error(
+                "content is required for create (full SKILL.md markdown)."
+              );
+            }
+
+            const staged = await skillProposalService.stageProposal({
+              action: "create",
+              content,
+              orgId,
+              profileId,
+              proposedByUserId: context.userId ?? null,
+              sessionId: context.sessionId ?? null,
+              supportingFiles: bundle?.files.map((file) => ({
+                contentBase64: Buffer.from(file.content).toString("base64"),
+                path: file.path,
+              })),
+            });
+
+            const { name } = parseRawProfileSkillContent(
+              content,
+              orgId,
+              profileId
+            );
+
+            return stagedSkillManageResult({
+              action: "create",
+              message: staged.message,
+              name,
+              outcome: staged.outcome,
+              proposalId: staged.proposalId,
+            });
+          }
+
+          if (action === "patch") {
+            const name = readString(input, "name");
+            const oldString = readRawString(input, "old_string");
+            const newString = readRawString(input, "new_string");
+
+            if (!name) {
+              throw new Error("name is required for patch.");
+            }
+
+            if (oldString === null || oldString === "") {
+              throw new Error("old_string is required for patch.");
+            }
+
+            if (newString === null) {
+              throw new Error("new_string is required for patch.");
+            }
+
+            const staged = await skillProposalService.stageProposal({
+              action: "patch",
+              newString,
+              oldString,
+              orgId,
+              profileId,
+              proposedByUserId: context.userId ?? null,
+              sessionId: context.sessionId ?? null,
+              skillName: name,
+            });
+
+            return stagedSkillManageResult({
+              action: "patch",
+              message: staged.message,
+              name,
+              outcome: staged.outcome,
+              proposalId: staged.proposalId,
+            });
+          }
+
+          if (action === "edit") {
+            const name = readString(input, "name");
+            const content = readRawString(input, "content");
+
+            if (!name) {
+              throw new Error("name is required for edit.");
+            }
+
+            if (!content?.trim()) {
+              throw new Error(
+                "content is required for edit (full SKILL.md markdown)."
+              );
+            }
+
+            const staged = await skillProposalService.stageProposal({
+              action: "edit",
+              content,
+              orgId,
+              profileId,
+              proposedByUserId: context.userId ?? null,
+              sessionId: context.sessionId ?? null,
+              skillName: name,
+            });
+
+            return stagedSkillManageResult({
+              action: "edit",
+              message: staged.message,
+              name,
+              outcome: staged.outcome,
+              proposalId: staged.proposalId,
+            });
+          }
+
+          if (action === "write_file") {
+            const name = readString(input, "name");
+            const relativePath = readString(input, "path");
+            const content = readRawString(input, "content");
+
+            if (!name) {
+              throw new Error("name is required for write_file.");
+            }
+
+            if (!relativePath) {
+              throw new Error("path is required for write_file.");
+            }
+
+            if (content === null) {
+              throw new Error("content is required for write_file.");
+            }
+
+            const staged = await skillProposalService.stageProposal({
+              action: "write_file",
+              content,
+              orgId,
+              profileId,
+              proposedByUserId: context.userId ?? null,
+              relativePath,
+              sessionId: context.sessionId ?? null,
+              skillName: name,
+            });
+
+            const resultPath =
+              staged.relativePath || staged.outcome === "created"
+                ? (staged.relativePath ?? relativePath)
+                : undefined;
+
+            return stagedSkillManageResult({
+              action: "write_file",
+              message: staged.message,
+              name,
+              outcome: staged.outcome,
+              path: resultPath,
+              proposalId: staged.proposalId,
+            });
+          }
+
+          if (action === "remove_file") {
+            const name = readString(input, "name");
+            const relativePath = readString(input, "path");
+
+            if (!name) {
+              throw new Error("name is required for remove_file.");
+            }
+
+            if (!relativePath) {
+              throw new Error("path is required for remove_file.");
+            }
+
+            const staged = await skillProposalService.stageProposal({
+              action: "remove_file",
+              orgId,
+              profileId,
+              proposedByUserId: context.userId ?? null,
+              relativePath,
+              sessionId: context.sessionId ?? null,
+              skillName: name,
+            });
+
+            const resultPath =
+              staged.relativePath || staged.outcome === "created"
+                ? (staged.relativePath ?? relativePath)
+                : undefined;
+
+            return stagedSkillManageResult({
+              action: "remove_file",
+              message: staged.message,
+              name,
+              outcome: staged.outcome,
+              path: resultPath,
+              proposalId: staged.proposalId,
+            });
+          }
+
+          if (action === "approve_code") {
+            const name = readString(input, "name");
+            const relativePath = readString(input, "path");
+
+            if (!(name && relativePath)) {
+              throw new Error("name and path are required for approve_code.");
+            }
+
+            const staged = await skillProposalService.stageProposal({
+              action: "approve_code",
+              orgId,
+              profileId,
+              proposedByUserId: context.userId ?? null,
+              relativePath,
+              sessionId: context.sessionId ?? null,
+              skillName: name,
+            });
+
+            return stagedSkillManageResult({
+              action: "approve_code",
+              message: staged.message,
+              name,
+              outcome: staged.outcome,
+              path: staged.relativePath ?? relativePath,
+              proposalId: staged.proposalId,
+            });
+          }
+
+          const name = readString(input, "name");
+
+          if (!name) {
+            throw new Error("name is required for delete.");
+          }
+
+          const staged = await skillProposalService.stageProposal({
+            action: "delete",
+            orgId,
+            profileId,
+            proposedByUserId: context.userId ?? null,
+            sessionId: context.sessionId ?? null,
+            skillName: name,
+          });
+
+          return stagedSkillManageResult({
+            action: "delete",
+            message: staged.message,
+            name,
+            outcome: staged.outcome,
+            proposalId: staged.proposalId,
+          });
+        }
+
+        if (action === "approve_code") {
+          throw new Error(
+            "Enable skill write approval before requesting code review."
+          );
+        }
+
+        if (action === "create") {
+          const content = readRawString(input, "content");
+
+          if (!content?.trim()) {
+            throw new Error(
+              "content is required for create (full SKILL.md markdown)."
+            );
+          }
+
+          const response = await service.createAndAssignRawSkillToProfile(
+            orgId,
+            profileId,
+            content,
+            {
+              changeMeta: {
+                actorUserId: context.userId ?? null,
+                source: "skill_manage",
+              },
+              supportingFiles: bundle?.files,
+            }
+          );
+
+          return skillManageResult({
+            action: "create",
+            assigned: true,
+            context,
+            created: response.created,
+            description: response.skill.description,
+            name: response.skill.name,
+          });
+        }
+
+        if (action === "patch") {
+          const name = readString(input, "name");
+          const oldString = readRawString(input, "old_string");
+          const newString = readRawString(input, "new_string");
+
+          if (!name) {
+            throw new Error("name is required for patch.");
+          }
+
+          if (oldString === null || oldString === "") {
+            throw new Error("old_string is required for patch.");
+          }
+
+          if (newString === null) {
+            throw new Error("new_string is required for patch.");
+          }
+
+          const response = await service.patchAssignedProfileSkill(
+            orgId,
+            profileId,
+            name,
+            oldString,
+            newString,
+            {
+              actorUserId: context.userId ?? null,
+              source: "skill_manage",
+            }
+          );
+
+          return skillManageResult({
+            action: "patch",
+            assigned: true,
+            context,
+            description: response.skill.description,
+            name: response.skill.name,
+          });
+        }
+
+        if (action === "edit") {
+          const name = readString(input, "name");
+          const content = readRawString(input, "content");
+
+          if (!name) {
+            throw new Error("name is required for edit.");
+          }
+
+          if (!content?.trim()) {
+            throw new Error(
+              "content is required for edit (full SKILL.md markdown)."
+            );
+          }
+
+          const response = await service.editAssignedProfileSkill(
+            orgId,
+            profileId,
+            name,
+            content,
+            {
+              actorUserId: context.userId ?? null,
+              source: "skill_manage",
+            }
+          );
+
+          return skillManageResult({
+            action: "edit",
+            assigned: true,
+            context,
+            description: response.skill.description,
+            name: response.skill.name,
+          });
+        }
+
+        if (action === "write_file") {
+          const name = readString(input, "name");
+          const relativePath = readString(input, "path");
+          const content = readRawString(input, "content");
+
+          if (!name) {
+            throw new Error("name is required for write_file.");
+          }
+
+          if (!relativePath) {
+            throw new Error("path is required for write_file.");
+          }
+
+          if (content === null) {
+            throw new Error("content is required for write_file.");
+          }
+
+          const written = await service.writeAssignedProfileSkillSupportingFile(
+            orgId,
+            profileId,
+            name,
+            relativePath,
+            content
+          );
+
+          return skillManageResult({
+            action: "write_file",
+            assigned: true,
+            context,
+            name: written.skillName,
+            path: written.relativePath,
+          });
+        }
+
+        if (action === "remove_file") {
+          const name = readString(input, "name");
+          const relativePath = readString(input, "path");
+
+          if (!name) {
+            throw new Error("name is required for remove_file.");
+          }
+
+          if (!relativePath) {
+            throw new Error("path is required for remove_file.");
+          }
+
+          const removed =
+            await service.removeAssignedProfileSkillSupportingFile(
+              orgId,
+              profileId,
+              name,
+              relativePath
+            );
+
+          return skillManageResult({
+            action: "remove_file",
+            assigned: true,
+            context,
+            name: removed.skillName,
+            path: removed.relativePath,
+          });
+        }
+
+        const name = readString(input, "name");
+
+        if (!name) {
+          throw new Error("name is required for delete.");
+        }
+
+        await service.deleteAssignedProfileSkill(orgId, profileId, name, {
+          actorUserId: context.userId ?? null,
+          source: "skill_manage",
+        });
+
+        return skillManageResult({
+          action: "delete",
+          assigned: false,
+          context,
+          name,
+        });
+      },
+    },
+  ];
+}

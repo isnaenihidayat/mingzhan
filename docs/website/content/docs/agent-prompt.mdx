@@ -1,0 +1,112 @@
+---
+title: "How Agent Prompts Work"
+description: "Understand how MíngZhàn builds the final system prompt from soul files, tools, bundled system skills, and runtime context."
+---
+
+When a user starts chatting with a profile, MíngZhàn builds one system prompt from several sources.
+
+The short version:
+
+```text
+Profile soul/system prompt
++ skills catalog
++ knowledge base catalog
++ org memory summary
++ super mingzhan rules, when enabled
++ USER.md context
++ timezone
++ tool instructions
++ channel instructions
++ per-turn todo and matched skill context
++ current date
+```
+
+## Main profile prompt
+
+MíngZhàn first resolves the profile's main prompt.
+
+If the profile has soul files, MíngZhàn uses them:
+
+| File | Injected as |
+|------|-------------|
+| `SOUL.md` | Identity |
+| `STYLE.md` | Voice and style |
+| `INSTRUCTIONS.md` | Operating instructions |
+| `MEMORY.md` | Continuity |
+
+If there are no soul files, MíngZhàn uses the profile's stored `systemPrompt`.
+
+If both exist and they are different, the stored `systemPrompt` is appended as extra profile instructions.
+
+## Extra profile context
+
+After the main profile prompt, MíngZhàn may append:
+
+- Assigned skills catalog
+- Knowledge base catalog
+- Org memory summary for organization members — pinned bullets under `## Org Memory`, capped at **2048 bytes** with an overflow hint to use `org_memory_search` when truncated (see [Org memory](/org-memory))
+- Super MíngZhàn tool-authoring rules, only for super profiles
+
+## Chat wrapper
+
+The chat runtime then wraps the profile prompt with general chat instructions:
+
+- User context from `USER.md`, when available (filled in at setup step 4 or from **Control center → Workspace → Settings**). Setup answers and `USER.md` are stored per authenticated user within the active organization, not shared organization-wide.
+- The user's timezone
+- Tool-use guidance for assigned tools
+- Memory and skill rules when `read_file` and `edit_file` are available (bundled `update-profile-memory` and `archive-profile-memory` skills)
+- Artifact save rules when `save_artifact` or `write_file` is available (the bundled `artifact-design` skill adds layout and styling)
+- Word-document guidance when `write_docx` is available (use Markdown input; never target `.docx` paths with `write_file`)
+- Coding-agent harness context when `coding-agent` matches ([Coding agent](/coding-agent))
+- Telegram or WhatsApp behavior when the message comes from those channels
+- Discord behavior when the message comes from a server channel (public replies)
+- Slack behavior when the message comes from a Slack DM or channel thread, including the channel audience and Slack Markdown rules
+
+An API-key session with an `appUserId` is separate from the authenticated
+organization user's session. It does not load that user's `USER.md`; its private
+workspace and artifacts are scoped to the stable app-user id, so keep each app
+user's session and files separate.
+When soul is active, MíngZhàn tells the agent to use tools while staying in character.
+
+## Per-turn context
+
+On each user message, MíngZhàn can add fresh context for that turn:
+
+- Active todo/task state
+- Skills matched to the current user message
+
+This context is not permanent. It is attached only when relevant for the current turn.
+
+## Current date
+
+Right before sending the request to the LLM, MíngZhàn appends the current date:
+
+```text
+Today is <current date>.
+```
+
+## Bundled system skills
+
+Profiles do not use dedicated memory or artifact builtins. The chat wrapper nudges the agent toward bundled skills when the right file tools are assigned:
+
+| Skill | When nudged | Purpose |
+|-------|-------------|---------|
+| `update-profile-memory` | `read_file` + `edit_file` | Append facts and preferences to active `MEMORY.md` |
+| `archive-profile-memory` | `read_file` + `edit_file` | Move bullets from `MEMORY.md` into `memory-archive/` without deleting them |
+| `artifact-design` | `save_artifact` or `write_file` | Design rules for HTML pages, dashboards, and slide decks the agent saves under `artifacts/`; on web chat, saved files show as message attachment chips with in-chat preview |
+
+The skills catalog is always visible. When a user message matches a skill description, MíngZhàn can attach the full skill body for that turn (`include-body-on-match: true`).
+
+Active `MEMORY.md` is also composed into the soul stack. Archived content under `memory-archive/` is not loaded automatically. The agent uses `search_files` or `read_file` to retrieve it. Artifact files under `artifacts/` are not loaded into the agent prompt. Users browse them from **Browse Files → Artifacts**, download via the API, or open them from web chat attachment chips on assistant messages (HTML, Markdown, Word, code, and text previews are rendered by content type).
+
+See [Skills](/skills) for the bundled skill list and [Profiles](/profiles) for where memory and artifact files live on disk.
+
+## Where this lives in code
+
+| Step | File |
+|------|------|
+| Build profile prompt | `apps/server/src/services/agent-service.ts` |
+| Compose soul files | `packages/core/src/soul/compose.ts` |
+| Build chat wrapper | `packages/agent/src/chat-prompt.ts` |
+| Add per-turn context | `packages/agent/src/chat.ts` |
+| Send final prompt to provider | `packages/agent/src/chat.ts` |

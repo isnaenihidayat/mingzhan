@@ -1,0 +1,1616 @@
+import type {
+  AcpAgentConfig,
+  AgentQuestionnaire,
+  AgentTodo,
+  ChatMessage,
+  JsonSchema,
+  OrgPluginLifecycleState,
+  OrgPluginSummary,
+  OrgRole,
+  PluginReleaseSummary,
+  ThinkingEffort,
+} from "@mingzhan/core";
+
+export type { OrgRole } from "@mingzhan/core";
+
+export type ChannelType = "telegram" | "whatsapp";
+
+export type AutomationRunStatus = "running" | "completed" | "failed";
+
+export interface StoredAutomationRecord {
+  createdAt: string;
+  definition: unknown;
+  enabled: boolean;
+  id: string;
+  name: string;
+  orgId?: string | null;
+  profileId: string;
+  updatedAt: string;
+  version: number;
+}
+
+export interface StoredAutomationRunRecord {
+  automationId: string;
+  completedAt: string | null;
+  deliveryError?: string | null;
+  deliveryStatus?: string | null;
+  error: string | null;
+  id: string;
+  output: string | null;
+  progress?: ChatMessage[];
+  startedAt: string;
+  status: AutomationRunStatus;
+}
+
+export interface AutomationUnreadCountRecord {
+  automationId: string;
+  unreadCount: number;
+}
+
+export interface StoredWorkflowRecord {
+  createdAt: string;
+  definition: unknown;
+  enabled: boolean;
+  id: string;
+  name: string;
+  orgId?: string | null;
+  profileId: string;
+  updatedAt: string;
+  version: number;
+}
+
+export interface StoredWorkflowRunRecord {
+  completedAt: string | null;
+  error: string | null;
+  id: string;
+  input: string | null;
+  output: string | null;
+  startedAt: string;
+  status: AutomationRunStatus;
+  workflowId: string;
+}
+
+export interface StoredAutomationRunStepRecord {
+  args: string;
+  completedAt: string | null;
+  position: number;
+  result: string | null;
+  runId: string;
+  startedAt: string;
+  status: "running" | "completed";
+  toolCallId: string;
+  toolGroupId: string | null;
+  toolName: string;
+}
+
+export interface StoredWorkflowRunStepRecord {
+  completedAt: string | null;
+  error: string | null;
+  id: string;
+  input: string | null;
+  kind: string;
+  output: string | null;
+  position: number;
+  runId: string;
+  startedAt: string;
+  status: string;
+  stepId: string;
+}
+
+export interface StoredProfileRecord {
+  /** Set when chat turns run through an ACP agent instead of the built-in loop. */
+  acpAgent?: AcpAgentConfig | null;
+  /** The agent settings new chats start with, keyed by config id (for example model or effort). */
+  acpSettings?: Record<string, string> | null;
+  /** Defaults to enabled when absent for legacy in-memory records. */
+  automationsEnabled?: boolean;
+  createdAt: string;
+  /** Whether a super agent may create agent groups. Defaults to enabled. */
+  groupsEnabled?: boolean;
+  id: string;
+  isDefault?: boolean;
+  isSuper: boolean;
+  model: string | null;
+  name: string;
+  orgId?: string | null;
+  /** Member who created the agent. null for agents created by platform admins. */
+  ownerUserId?: string | null;
+  /** Private agents (false) are visible only to their owner and admins. Defaults to shared. */
+  sharedWithTeam?: boolean;
+  /** null = inherit org default; true/false = force consolidate on/off for this profile */
+  skillsCuratorConsolidateEnabled?: boolean | null;
+  /** null = inherit org default; true/false = force post-turn review on/off for this profile */
+  skillsPostTurnReview?: boolean | null;
+  /** null = inherit org default; true/false = force gate on/off for this profile */
+  skillsWriteApproval?: boolean | null;
+  systemPrompt: string;
+  thinkingEffort?: ThinkingEffort | null;
+  thinkingEnabled?: boolean | null;
+  updatedAt: string;
+}
+
+export interface StoredToolRecord {
+  createdAt: string;
+  description: string;
+  handlerConfig: unknown;
+  handlerType: string;
+  id: string;
+  name: string;
+  orgId?: string | null;
+  pluginId?: string | null;
+  pluginKey?: string | null;
+  updatedAt: string;
+}
+
+export interface StoredSessionRecord {
+  agentQuestionnaire: AgentQuestionnaire | null;
+  agentTodos: AgentTodo[];
+  branchMessageIndex?: number | null;
+  channel: string;
+  createdAt: string;
+  id: string;
+  model: string | null;
+  orgId?: string | null;
+  parentSessionId?: string | null;
+  pinned?: boolean;
+  profileId: string;
+  /** Null uses the install thinking effort. */
+  thinkingEffort?: ThinkingEffort | null;
+  title: string | null;
+  userId?: string | null;
+}
+
+export interface StoredSessionMessageRecord {
+  createdAt: string;
+  id: string;
+  payload: unknown;
+  seq: number;
+  sessionId: string;
+}
+
+export type AttachmentKind = "image" | "document";
+
+export interface StoredAttachmentRecord {
+  channel: string;
+  createdAt: string;
+  /**
+   * True for attachments made in a cognito session. They carry a null
+   * sessionId (there is no `sessions` row to reference), so this is what a
+   * startup sweep has to find the ones a hard restart left behind.
+   */
+  ephemeral: boolean;
+  filename: string | null;
+  id: string;
+  kind: AttachmentKind;
+  mediaType: string;
+  orgId: string | null;
+  profileId: string;
+  sessionId: string | null;
+  sizeBytes: number;
+  storagePath: string;
+}
+
+export interface StoredSessionSummaryRecord {
+  branchMessageIndex: number | null;
+  channel: string;
+  createdAt: string;
+  id: string;
+  messageCount: number;
+  orgId?: string | null;
+  parentSessionId: string | null;
+  pinned: boolean;
+  /** 1-based place in the list the query returned the row from. */
+  position: number;
+  preview: string | null;
+  profileId: string;
+  sortPosition: number | null;
+  title: string | null;
+  updatedAt: string;
+}
+
+export interface StoredLlmUsageStatsRecord {
+  estimatedCostUsd: number;
+  id: string;
+  inputTokens: number;
+  orgId: string;
+  outputTokens: number;
+  requestCount: number;
+  trackedSince: string;
+  updatedAt: string;
+}
+
+export interface StoredLlmUsageModelStatsRecord {
+  estimatedCostUsd: number;
+  inputTokens: number;
+  modelId: string;
+  orgId: string;
+  outputTokens: number;
+  requestCount: number;
+  trackedSince: string;
+  updatedAt: string;
+}
+
+/** One org's ledger for one agent and user pair. Null means the call had no such context. */
+export interface StoredLlmUsageActorStatsRecord {
+  estimatedCostUsd: number;
+  inputTokens: number;
+  orgId: string;
+  outputTokens: number;
+  profileId: string | null;
+  requestCount: number;
+  trackedSince: string;
+  updatedAt: string;
+  userId: string | null;
+}
+
+/** One org's ledger for one UTC day, model, and provider. */
+export interface StoredLlmUsageDailyStatsRecord {
+  /** `YYYY-MM-DD`, UTC. */
+  day: string;
+  estimatedCostUsd: number;
+  inputTokens: number;
+  modelId: string;
+  orgId: string;
+  outputTokens: number;
+  /** Empty when the call had no provider context. */
+  provider: string;
+  requestCount: number;
+}
+
+export interface StoredWorkspaceSettingsRecord {
+  /** Workspace-global interval for refreshing automation schedules and curator work. */
+  automationWorkerPollIntervalMs: number;
+  codingAgentHarnesses: StoredCodingAgentHarnessRecord[];
+  /**
+   * When true (default), coding CLIs get MíngZhàn provider credentials at spawn.
+   * When false, harness-native vendor login on the host is used instead.
+   */
+  codingAgentProviderPassthrough: boolean;
+  id: string;
+  imageModel: string | null;
+  selectedCodingAgentHarness: string | null;
+  transcriptionModel: string | null;
+  updatedAt: string;
+  visionModel: string | null;
+}
+
+export type StoredCodingAgentHarnessKind =
+  | "codex"
+  | "claude_code"
+  | "opencode"
+  | "pi"
+  | "cursor_agent";
+
+export interface StoredCodingAgentHarnessProbeCache {
+  authenticated: boolean | null;
+  checkedAt: string;
+  nextStep: "install" | "retry" | null;
+  ready: boolean;
+  statusMessage: string | null;
+}
+
+export interface StoredCodingAgentHarnessRecord {
+  args: string[];
+  command: string;
+  enabled: boolean;
+  id: string;
+  kind: StoredCodingAgentHarnessKind;
+  name: string;
+  probeCache?: StoredCodingAgentHarnessProbeCache | null;
+}
+
+export type StoredNotificationDestinationRecord = {
+  createdAt: string;
+  id: string;
+  name: string;
+  orgId: string;
+  secretHash: string;
+  updatedAt: string;
+} & (
+  | {
+      channel: "telegram";
+      config: { profileId?: string; chatId: number; topicId?: number | null };
+    }
+  | { channel: "discord"; config: { profileId: string; channelId: string } }
+  | { channel: "whatsapp"; config: { profileId: string } }
+);
+
+export type StoredOrgComposioToolkitStatus = "disabled" | "enabled";
+
+export interface StoredComposioToolkitRecord {
+  cachedTools: Array<{
+    slug: string;
+    name: string;
+    description: string;
+    inputSchema: JsonSchema;
+  }>;
+  createdAt: string;
+  displayName: string;
+  id: string;
+  lastError: string | null;
+  orgId: string;
+  status: StoredOrgComposioToolkitStatus;
+  toolkitSlug: string;
+  updatedAt: string;
+}
+
+export type StoredComposioUserConnectionStatus =
+  | "oauth_in_progress"
+  | "connected"
+  | "error";
+
+export interface StoredComposioUserConnectionRecord {
+  connectedAccountId: string | null;
+  createdAt: string;
+  id: string;
+  lastError: string | null;
+  oauthStateHash: string | null;
+  orgId: string;
+  sessionIdEnc: string | null;
+  status: StoredComposioUserConnectionStatus;
+  toolkitId: string;
+  updatedAt: string;
+  userId: string;
+}
+
+export interface StoredProfileComposioToolkitRecord {
+  allowedActions: string[] | null;
+  profileId: string;
+  toolkitId: string;
+}
+
+/** Who caused an LLM call. A missing ID puts the call in the unattributed group. */
+export interface LlmUsageActor {
+  profileId?: string | null;
+  userId?: string | null;
+}
+
+export interface LlmUsageStatsDelta {
+  estimatedCostUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  requestCount: number;
+}
+
+/** One request's provider tokens. */
+export interface LlmTurnUsageDelta {
+  estimated: boolean;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+export interface StoredLlmTurnUsageRecord {
+  bucket: string;
+  estimatedTurns: number;
+  inputTokens: number;
+  orgId: string;
+  outputTokens: number;
+  turns: number;
+}
+
+export type McpServerStatus =
+  | "connected"
+  | "disconnected"
+  | "error"
+  | "needs_auth";
+
+export type McpTransport = "http" | "stdio";
+
+export interface CachedMcpTool {
+  description: string;
+  inputSchema?: unknown;
+  name: string;
+}
+
+export interface StoredSkillRecord {
+  createdAt: string;
+  createdBy: SkillCreatedBy;
+  description: string;
+  disableModelInvocation: boolean;
+  enabled: boolean;
+  hasTool: boolean;
+  id: string;
+  name: string;
+  orgId?: string | null;
+  pluginId?: string | null;
+  pluginKey?: string | null;
+  sourcePath: string;
+  updatedAt: string;
+}
+
+export type SkillCreatedBy = "agent" | "human" | "bundled";
+
+export interface StoredSkillUsageRecord {
+  createdAt: string;
+  lastPatchedAt: string | null;
+  lastUsedAt: string | null;
+  lastViewedAt: string | null;
+  orgId: string;
+  patchCount: number;
+  profileId: string;
+  skillId: string;
+  updatedAt: string;
+  useCount: number;
+  viewCount: number;
+}
+
+export interface StoredMcpServerRecord {
+  cachedTools: CachedMcpTool[];
+  config: unknown;
+  createdAt: string;
+  enabled: boolean;
+  id: string;
+  lastError: string | null;
+  name: string;
+  orgId?: string | null;
+  status: McpServerStatus;
+  transport: McpTransport;
+  updatedAt: string;
+}
+
+export interface StoredUserRecord {
+  createdAt: string;
+  disabledAt?: string | null;
+  email: string;
+  id: string;
+  isPlatformAdmin?: boolean;
+  mfaEnabled?: boolean;
+  mfaTotpLastStep?: number | null;
+  mfaTotpPendingSecretEnc?: string | null;
+  mfaTotpSecretEnc?: string | null;
+  name?: string | null;
+  passwordHash: string;
+  phone?: string | null;
+  updatedAt: string;
+}
+
+export interface StoredMfaBackupCode {
+  codeHash: string;
+  createdAt: string;
+  id: string;
+  usedAt: string | null;
+  userId: string;
+}
+
+export interface StoredPasskeyRecord {
+  counter: number;
+  createdAt: string;
+  credentialId: string;
+  id: string;
+  name: string;
+  publicKey: string;
+  transports: string[];
+  userId: string;
+}
+
+export type PasskeyChallengeType = "authentication" | "registration";
+
+export interface StoredPasskeyChallenge {
+  challenge: string;
+  createdAt: string;
+  expiresAt: string;
+  type: PasskeyChallengeType;
+  userId: string | null;
+}
+
+export type StoredPluginReleaseRecord = PluginReleaseSummary;
+
+export interface StoredOrgPluginRecord extends OrgPluginSummary {
+  createdAt: string;
+  orgId: string;
+}
+
+export type UpsertPluginReleaseResult =
+  | { ok: true }
+  | { ok: false; reason: "digest_conflict" };
+
+export type PluginPublishFailureReason =
+  | "stale_revision"
+  | "tool_name_collision"
+  | "tool_name_invalid";
+
+export type PluginPublishResult =
+  | { ok: true; revision: number }
+  | { ok: false; reason: PluginPublishFailureReason };
+
+export interface CompareAndSetOrgPluginStateInput {
+  databaseGeneration: string | null;
+  expectedRevision: number;
+  lastLifecycleError?: string | null;
+  lifecycleState: OrgPluginLifecycleState;
+  now: string;
+  orgId: string;
+  pendingOperation?: string | null;
+  pluginId: string;
+  selectedVersion: string | null;
+}
+
+export interface PublishOrgPluginReleaseInput {
+  contributions: {
+    skills: StoredSkillRecord[];
+    tools: StoredToolRecord[];
+  };
+  databaseGeneration: string | null;
+  expectedRevision: number;
+  lastLifecycleError?: string | null;
+  lifecycleState: OrgPluginLifecycleState;
+  now: string;
+  orgId: string;
+  pendingOperation?: string | null;
+  pluginId: string;
+  selectedVersion: string;
+}
+
+export interface StoredOrgTeamCreationRecord {
+  adminUserId: string;
+  completedAt: string | null;
+  createdAt: string;
+  creatorUserId: string;
+  parentOrgId: string;
+  requestHash: string;
+  requestId: string;
+  teamOrgId: string;
+}
+
+export interface BeginOrgTeamCreationInput {
+  adminUserId: string;
+  creatorUserId: string;
+  organization: StoredOrganizationRecord & { parentOrgId: string };
+  requestHash: string;
+  requestId: string;
+}
+
+export interface StoredSharedAgentInstanceRecord {
+  createdAt: string;
+  profileId: string;
+  publicationId: string;
+  sourceOrgId: string;
+  sourceProfileId: string;
+  teamOrgId: string;
+}
+
+export interface StoredOrgSharedResourceRecord {
+  createdAt: string;
+  id: string;
+  orgId: string;
+  resourceId: string;
+  resourceKind: "knowledge" | "skill" | "agent" | "tool" | "model";
+  updatedAt: string;
+}
+
+export interface StoredOrganizationRecord {
+  allowedInviteDomains?: string[];
+  archivedAt?: string | null;
+  createdAt: string;
+  id: string;
+  monthlyLlmTokenLimit?: number;
+  monthlyLlmTurnLimit?: number;
+  monthlyLlmWarningPercent?: number;
+  name: string;
+  parentOrgId?: string | null;
+  setupPending?: boolean;
+  skillsCuratorArchiveAfterDays?: number;
+  skillsCuratorConsolidateEnabled?: boolean;
+  skillsCuratorEnabled?: boolean;
+  skillsCuratorLastRunAt?: string | null;
+  skillsCuratorStaleAfterDays?: number;
+  skillsPostTurnReview?: boolean;
+  skillsWriteApproval?: boolean;
+  slug: string;
+  updatedAt: string;
+}
+
+export interface StoredOrgMemberRecord {
+  createdAt: string;
+  orgId: string;
+  role: OrgRole;
+  userContext?: string | null;
+  userId: string;
+}
+
+export interface StoredUserOrganizationRecord {
+  joinedAt: string;
+  organization: StoredOrganizationRecord;
+  role: OrgRole;
+}
+
+export interface StoredOrgInviteRecord {
+  acceptedAt: string | null;
+  createdAt: string;
+  email: string;
+  expiresAt: string;
+  id: string;
+  invitedByUserId: string;
+  orgId: string;
+  revokedAt: string | null;
+  role: OrgRole;
+  tokenHash: string;
+}
+
+export interface StoredPasswordResetTokenRecord {
+  consumedAt: string | null;
+  createdAt: string;
+  expiresAt: string;
+  id: string;
+  tokenHash: string;
+  userId: string;
+}
+
+export type OrgMemoryProposalStatus = "pending" | "approved" | "rejected";
+
+export type ProfileChangeSource =
+  | "dashboard"
+  | "super_mingzhan"
+  | "skill_manage"
+  | "pack_import";
+
+export type ProfileChangeField =
+  | "system_prompt"
+  | "soul.soul"
+  | "soul.style"
+  | "soul.instructions"
+  | "soul.memory"
+  | "tools"
+  | "skills"
+  | "mcp"
+  | "pack_import";
+
+export interface StoredProfileChangeEvent {
+  actorUserId: string | null;
+  afterValue: string | null;
+  beforeValue: string | null;
+  createdAt: string;
+  field: ProfileChangeField;
+  id: string;
+  orgId: string;
+  profileId: string;
+  source: ProfileChangeSource;
+}
+
+export type SkillVersionKind = "created" | "original" | "restored" | "updated";
+
+export interface StoredSkillVersion {
+  actorUserId: string | null;
+  content: string;
+  createdAt: string;
+  id: string;
+  kind: SkillVersionKind;
+  note: string | null;
+  skillId: string;
+  source: ProfileChangeSource | null;
+  version: number;
+}
+
+export interface StoredOrgMemoryProposal {
+  bullet: string;
+  createdAt: string;
+  id: string;
+  orgId: string;
+  pinned: boolean;
+  profileId: string | null;
+  proposedByUserId: string | null;
+  reviewedAt: string | null;
+  reviewerUserId: string | null;
+  sessionId: string | null;
+  /** Knowledge-base document ids the bullet was derived from (optional). */
+  sourceDocumentIds: string[];
+  status: OrgMemoryProposalStatus;
+}
+
+export type SkillProposalStatus = "pending" | "approved" | "rejected";
+
+export type SkillProposalAction =
+  | "create"
+  | "patch"
+  | "delete"
+  | "edit"
+  | "write_file"
+  | "remove_file"
+  | "approve_code";
+
+export interface StoredSkillProposal {
+  action: SkillProposalAction;
+  consolidateLoserSkillNames?: string[] | null;
+  content: string | null;
+  createdAt: string;
+  id: string;
+  orgId: string;
+  patchNewString: string | null;
+  patchOldString: string | null;
+  profileId: string;
+  proposedByUserId: string | null;
+  relativePath: string | null;
+  reviewedAt: string | null;
+  reviewerUserId: string | null;
+  sessionId: string | null;
+  skillName: string;
+  status: SkillProposalStatus;
+  supportingFiles?: { path: string; contentBase64: string }[] | null;
+}
+
+export type SkillSuggestionStatus = "pending" | "applied";
+
+export type SkillSuggestionAction = "create" | "patch";
+
+export interface StoredSkillSuggestion {
+  action: SkillSuggestionAction;
+  appliedAt: string | null;
+  content: string | null;
+  createdAt: string;
+  id: string;
+  orgId: string;
+  patchNewString: string | null;
+  patchOldString: string | null;
+  profileId: string;
+  proposedByUserId: string | null;
+  sessionId: string | null;
+  skillName: string;
+  source: "post_turn_review";
+  status: SkillSuggestionStatus;
+  warnings: string[] | null;
+}
+
+/** Owner of a file under a profile's artifacts/ folder. */
+export interface StoredArtifactRecord {
+  channel: string | null;
+  createdAt: string;
+  /** Relative to the profile's artifacts/ folder, with `/` separators. */
+  filename: string;
+  orgId: string;
+  profileId: string;
+  sessionId: string | null;
+  userId: string | null;
+}
+
+export interface StoredArtifactOwnerRecord extends StoredArtifactRecord {
+  /** The owner's name, or email when the name is empty. Null for channel users. */
+  userName: string | null;
+}
+
+export interface StoredArtifactShareRecord {
+  createdAt: string;
+  createdByUserId: string;
+  filename: string;
+  id: string;
+  mimeType: string;
+  orgId: string;
+  profileId: string;
+  revokedAt: string | null;
+  sizeBytes: number;
+  sourcePath: string;
+  storagePath: string;
+  tokenHash: string;
+}
+
+export interface StoredBrowserSessionRecord {
+  activeOrgId?: string | null;
+  createdAt: string;
+  csrfTokenHash: string;
+  expiresAt: string;
+  id: string;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+  sessionTokenHash: string;
+  userId: string;
+}
+
+export interface StoredAuditEvent {
+  action: string;
+  actorUserId: string | null;
+  createdAt: string;
+  id: string;
+  metadata: Record<string, boolean | null | number | string>;
+  orgId: string | null;
+  requestId: string | null;
+  resourceId: string | null;
+  resourceType: string;
+}
+
+export interface DatabaseAdapter {
+  abortOrgTeamCreation(
+    parentOrgId: string,
+    requestId: string,
+    teamOrgId: string
+  ): Promise<boolean>;
+
+  activateUserMfa(
+    id: string,
+    totpSecretEnc: string,
+    lastStep: number,
+    updatedAt: string
+  ): Promise<boolean>;
+  appendMessagesForSession(
+    sessionId: string,
+    messages: StoredSessionMessageRecord[]
+  ): Promise<void>;
+  assignMcpServerToProfile(profileId: string, serverId: string): Promise<void>;
+  assignSkillToProfile(profileId: string, skillId: string): Promise<void>;
+  assignToolToProfile(profileId: string, toolId: string): Promise<void>;
+  beginOrgTeamCreation(
+    input: BeginOrgTeamCreationInput
+  ): Promise<StoredOrgTeamCreationRecord>;
+  /**
+   * First-admin claim. Writes the org, the admin and the membership in one
+   * transaction, and returns false without writing anything when a human user
+   * already exists, so two concurrent setups cannot leave a memberless org.
+   */
+  bootstrapInitialSetup(input: {
+    member: StoredOrgMemberRecord;
+    organization: StoredOrganizationRecord;
+    user: StoredUserRecord;
+  }): Promise<boolean>;
+  /** Verify the live connection can read the migrated schema. */
+  checkHealth(): Promise<void>;
+  /**
+   * Automation runs left `running` by a dead process: those already resumed
+   * `maxResumes` times are failed, the rest have their resume count raised and
+   * are returned for the caller to continue.
+   */
+  claimInterruptedAutomationRuns(
+    maxResumes: number
+  ): Promise<Array<{ automationId: string; id: string }>>;
+  /**
+   * Atomically claims an idempotency key for a notification webhook delivery.
+   * Prunes rows older than the replay window, then returns true on first claim
+   * and false on replay within that window.
+   */
+  claimNotificationWebhookDelivery(
+    destinationId: string,
+    eventId: string,
+    createdAt: string
+  ): Promise<boolean>;
+  compareAndSetOrgPluginState(
+    input: CompareAndSetOrgPluginStateInput
+  ): Promise<PluginPublishResult>;
+  completeAutomationRunStep(
+    runId: string,
+    toolCallId: string,
+    result: string,
+    completedAt: string
+  ): Promise<void>;
+  completeOrgTeamCreation(
+    parentOrgId: string,
+    requestId: string,
+    teamOrgId: string,
+    completedAt: string
+  ): Promise<boolean>;
+  consumeMfaBackupCode(
+    userId: string,
+    codeHash: string,
+    usedAt: string
+  ): Promise<boolean>;
+  consumeMfaTotpStep(userId: string, step: number): Promise<boolean>;
+  consumePasskeyChallenge(
+    challenge: string,
+    userId: string | null,
+    type: PasskeyChallengeType,
+    consumedAt: string
+  ): Promise<boolean>;
+  consumePasswordResetToken(
+    tokenHash: string,
+    passwordHash: string,
+    consumedAt: string
+  ): Promise<boolean>;
+  /** Users excluding the auto-created CLI bearer-auth identity. */
+  countHumanUsers(): Promise<number>;
+  countOrgMemoryProposals(
+    orgId: string,
+    status: OrgMemoryProposalStatus
+  ): Promise<number>;
+  countPendingSkillProposals(
+    orgId: string,
+    profileId?: string
+  ): Promise<number>;
+  countProfileMcpAssignments(): Promise<number>;
+  countUnreadAutomationRunsByOrg(
+    userId: string,
+    orgId: string
+  ): Promise<AutomationUnreadCountRecord[]>;
+  countUnusedMfaBackupCodes(userId: string): Promise<number>;
+  countUsers(): Promise<number>;
+
+  createArtifactShare(record: StoredArtifactShareRecord): Promise<void>;
+  /** Append-only insert. Adapters must not expose update/delete for this table. */
+  createAuditEvent(record: StoredAuditEvent): Promise<void>;
+
+  createBrowserSession(record: StoredBrowserSessionRecord): Promise<void>;
+  createMfaBackupCode(record: StoredMfaBackupCode): Promise<void>;
+
+  createOrgInvite(record: StoredOrgInviteRecord): Promise<void>;
+
+  createOrgMemoryProposal(record: StoredOrgMemoryProposal): Promise<void>;
+  createPasskey(record: StoredPasskeyRecord): Promise<void>;
+  createPasskeyChallenge(record: StoredPasskeyChallenge): Promise<void>;
+
+  createPasswordResetToken(
+    record: StoredPasswordResetTokenRecord
+  ): Promise<void>;
+
+  /** Append-only insert. Adapters must not expose update/delete for this table. */
+  createProfileChangeEvent(record: StoredProfileChangeEvent): Promise<void>;
+
+  /**
+   * Inserts a profile only when its id is still free. Resolves to `false`,
+   * leaving the existing row untouched, when the id is already taken, so
+   * allocation and insertion stay atomic for concurrent callers.
+   */
+  createProfileIfAbsent(record: StoredProfileRecord): Promise<boolean>;
+  createSharedAgentInstance(
+    teamOrgId: string,
+    publicationId: string,
+    profileId: string,
+    createdAt: string
+  ): Promise<StoredProfileRecord>;
+
+  createSkillProposal(record: StoredSkillProposal): Promise<void>;
+
+  createSkillSuggestion(record: StoredSkillSuggestion): Promise<void>;
+
+  /** Appends a snapshot; the adapter assigns the next version number. */
+  createSkillVersion(
+    record: Omit<StoredSkillVersion, "version">
+  ): Promise<StoredSkillVersion>;
+  createUser(record: StoredUserRecord): Promise<void>;
+  deleteArtifactRecord(
+    orgId: string,
+    profileId: string,
+    filename: string
+  ): Promise<void>;
+  deleteAttachment(id: string): Promise<boolean>;
+  deleteAutomation(id: string): Promise<boolean>;
+  deleteComposioToolkit(id: string): Promise<boolean>;
+  deleteComposioUserConnection(id: string): Promise<boolean>;
+  deleteMcpServer(id: string): Promise<boolean>;
+  deleteMessagesForSession(sessionId: string): Promise<void>;
+  deleteMfaBackupCodes(userId: string): Promise<void>;
+  deleteNotificationDestination(id: string): Promise<boolean>;
+  deleteOrganization(id: string): Promise<boolean>;
+  deleteOrgMember(orgId: string, userId: string): Promise<boolean>;
+  deleteOrgPlugin(
+    orgId: string,
+    pluginId: string,
+    expectedRevision: number
+  ): Promise<boolean>;
+  deleteOrgSharedResource(orgId: string, id: string): Promise<boolean>;
+  deletePasskeys(userId: string): Promise<void>;
+  deletePluginRelease(pluginId: string, version: string): Promise<boolean>;
+  deleteProfile(id: string): Promise<boolean>;
+  deleteProfileAndPromoteDefault(
+    id: string,
+    orgId: string,
+    successorId?: string
+  ): Promise<boolean>;
+  /** Org-scoped delete: resolves to `false` when the profile belongs elsewhere. */
+  deleteProfileForOrg(id: string, orgId: string): Promise<boolean>;
+  deleteSession(id: string): Promise<boolean>;
+  deleteSkill(id: string): Promise<boolean>;
+  deleteTool(id: string): Promise<boolean>;
+  deleteWorkflow(id: string): Promise<boolean>;
+  deleteWorkflowRun(workflowId: string, runId: string): Promise<boolean>;
+  disableUser(id: string, disabledAt: string): Promise<void>;
+  enableUser(id: string): Promise<void>;
+  eraseUser(input: {
+    id: string;
+    email: string;
+    passwordHash: string;
+    updatedAt: string;
+  }): Promise<boolean>;
+  /**
+   * Settles runs left `running` by a process that exited mid-run. Only a
+   * `finally` in the owning process completes a run, so a kill leaves the row
+   * claiming work nothing is doing. Call once at boot, before serving.
+   *
+   * Returns the number of automation and workflow runs settled.
+   */
+  /** Settles workflow runs a dead process left `running`. Automation runs are handled by `claimInterruptedAutomationRuns`. */
+  failInterruptedRuns(): Promise<number>;
+  getActiveArtifactShareByPath(
+    orgId: string,
+    profileId: string,
+    sourcePath: string
+  ): Promise<StoredArtifactShareRecord | null>;
+  getActiveAutomationRun(
+    automationId: string
+  ): Promise<StoredAutomationRunRecord | null>;
+  getArtifactShareById(
+    orgId: string,
+    profileId: string,
+    shareId: string
+  ): Promise<StoredArtifactShareRecord | null>;
+  getArtifactShareByTokenHash(
+    tokenHash: string
+  ): Promise<StoredArtifactShareRecord | null>;
+  getAttachment(id: string): Promise<StoredAttachmentRecord | null>;
+  getAutomation(id: string): Promise<StoredAutomationRecord | null>;
+  getAutomationRun(
+    automationId: string,
+    runId: string
+  ): Promise<StoredAutomationRunRecord | null>;
+
+  getAutomationRunReadThrough(
+    userId: string,
+    orgId: string,
+    automationId: string
+  ): Promise<string | null>;
+  getBrowserSessionBySessionTokenHash(
+    sessionTokenHash: string
+  ): Promise<StoredBrowserSessionRecord | null>;
+  getComposioToolkit(id: string): Promise<StoredComposioToolkitRecord | null>;
+  getComposioToolkitBySlug(
+    orgId: string,
+    toolkitSlug: string
+  ): Promise<StoredComposioToolkitRecord | null>;
+  getComposioUserConnection(
+    userId: string,
+    toolkitId: string
+  ): Promise<StoredComposioUserConnectionRecord | null>;
+  getComposioUserConnectionById(
+    id: string
+  ): Promise<StoredComposioUserConnectionRecord | null>;
+  getDefaultProfileForOrg(orgId: string): Promise<StoredProfileRecord | null>;
+
+  getLlmUsageStats(orgId: string): Promise<StoredLlmUsageStatsRecord | null>;
+  getMcpServer(id: string): Promise<StoredMcpServerRecord | null>;
+  getMcpServerByName(name: string): Promise<StoredMcpServerRecord | null>;
+  getNotificationDestination(
+    id: string
+  ): Promise<StoredNotificationDestinationRecord | null>;
+  getOrganizationById(id: string): Promise<StoredOrganizationRecord | null>;
+  getOrganizationBySlug(slug: string): Promise<StoredOrganizationRecord | null>;
+  getOrganizationResourceCounts(orgId: string): Promise<{
+    agents: number;
+    members: number;
+    skills: number;
+    tools: number;
+  } | null>;
+  getOrgInviteByTokenHash(
+    tokenHash: string
+  ): Promise<StoredOrgInviteRecord | null>;
+  getOrgMember(
+    orgId: string,
+    userId: string
+  ): Promise<StoredOrgMemberRecord | null>;
+  getOrgMemoryProposal(
+    orgId: string,
+    id: string
+  ): Promise<StoredOrgMemoryProposal | null>;
+  getOrgPlugin(
+    orgId: string,
+    pluginId: string
+  ): Promise<StoredOrgPluginRecord | null>;
+  getOrgSharedResource(
+    orgId: string,
+    id: string
+  ): Promise<StoredOrgSharedResourceRecord | null>;
+  getOrgTeamCreation(
+    parentOrgId: string,
+    requestId: string
+  ): Promise<StoredOrgTeamCreationRecord | null>;
+  getPasskey(
+    userId: string,
+    credentialId: string
+  ): Promise<StoredPasskeyRecord | null>;
+  getPasskeyByCredentialId(
+    credentialId: string
+  ): Promise<StoredPasskeyRecord | null>;
+  getPendingOrgInvite(
+    orgId: string,
+    email: string
+  ): Promise<StoredOrgInviteRecord | null>;
+  getPendingOrgMemoryProposalByBullet(
+    orgId: string,
+    bullet: string
+  ): Promise<StoredOrgMemoryProposal | null>;
+  getPendingSkillProposalForCreate(
+    orgId: string,
+    profileId: string,
+    skillName: string
+  ): Promise<StoredSkillProposal | null>;
+  getPendingSkillProposalForPatch(
+    orgId: string,
+    profileId: string,
+    skillName: string,
+    patchOldString: string,
+    patchNewString: string
+  ): Promise<StoredSkillProposal | null>;
+  getPendingSkillProposalForSkill(
+    orgId: string,
+    profileId: string,
+    skillName: string
+  ): Promise<StoredSkillProposal | null>;
+  getPluginRelease(
+    pluginId: string,
+    version: string
+  ): Promise<StoredPluginReleaseRecord | null>;
+  getProfile(id: string): Promise<StoredProfileRecord | null>;
+  getProfileForOrg(
+    id: string,
+    orgId: string
+  ): Promise<StoredProfileRecord | null>;
+  getSession(id: string): Promise<StoredSessionRecord | null>;
+  getSessionQuestionnaire(
+    sessionId: string
+  ): Promise<AgentQuestionnaire | null>;
+  getSessionTodos(sessionId: string): Promise<AgentTodo[]>;
+  getSharedAgentInstance(
+    teamOrgId: string,
+    profileId: string
+  ): Promise<StoredSharedAgentInstanceRecord | null>;
+  getSkill(id: string): Promise<StoredSkillRecord | null>;
+  /**
+   * Resolve a skill by name within `orgId`, falling back to a global (bundled)
+   * skill of that name. Omit `orgId` to look up global skills only.
+   */
+  getSkillByName(
+    name: string,
+    orgId?: string | null
+  ): Promise<StoredSkillRecord | null>;
+  getSkillBySourcePath(sourcePath: string): Promise<StoredSkillRecord | null>;
+  getSkillProposal(
+    orgId: string,
+    id: string
+  ): Promise<StoredSkillProposal | null>;
+  getSkillSuggestion(
+    orgId: string,
+    id: string
+  ): Promise<StoredSkillSuggestion | null>;
+  getSkillUsage(
+    profileId: string,
+    skillId: string
+  ): Promise<StoredSkillUsageRecord | null>;
+  getSkillVersion(
+    skillId: string,
+    versionId: string
+  ): Promise<StoredSkillVersion | null>;
+  getTool(id: string): Promise<StoredToolRecord | null>;
+  getToolByName(name: string): Promise<StoredToolRecord | null>;
+  getToolByNameForOrg(
+    orgId: string,
+    name: string
+  ): Promise<StoredToolRecord | null>;
+  getUserByEmail(email: string): Promise<StoredUserRecord | null>;
+  getUserById(id: string): Promise<StoredUserRecord | null>;
+  getUserContext(orgId: string, userId: string): Promise<string | null>;
+  getWorkflow(id: string): Promise<StoredWorkflowRecord | null>;
+  getWorkflowRun(
+    workflowId: string,
+    runId: string
+  ): Promise<StoredWorkflowRunRecord | null>;
+
+  getWorkspaceSettings(): Promise<StoredWorkspaceSettingsRecord | null>;
+  /**
+   * Moves each attachment of this session that another session in the org
+   * still names over to that session. Call it before deleting a session's
+   * attachments, or a branch loses the files it copied references to.
+   */
+  handOverSharedAttachments(sessionId: string, orgId: string): Promise<void>;
+
+  importSharedAgentReference(
+    record: StoredSharedAgentInstanceRecord
+  ): Promise<void>;
+  incrementLlmTurnUsage(orgId: string, delta: LlmTurnUsageDelta): Promise<void>;
+  incrementLlmUsageDailyStats(
+    orgId: string,
+    key: { day: string; modelId: string; provider: string },
+    delta: LlmUsageStatsDelta
+  ): Promise<void>;
+  incrementLlmUsageStats(
+    orgId: string,
+    delta: LlmUsageStatsDelta,
+    trackedSince: string
+  ): Promise<void>;
+  incrementLlmUsageStatsByActor(
+    orgId: string,
+    actor: LlmUsageActor,
+    delta: LlmUsageStatsDelta,
+    trackedSince: string
+  ): Promise<void>;
+  incrementLlmUsageStatsByModel(
+    orgId: string,
+    modelId: string,
+    delta: LlmUsageStatsDelta,
+    trackedSince: string
+  ): Promise<void>;
+  incrementSkillUsage(input: {
+    orgId: string;
+    profileId: string;
+    skillId: string;
+    viewDelta?: number;
+    useDelta?: number;
+    patchDelta?: number;
+    viewedAt?: string;
+    usedAt?: string;
+    patchedAt?: string;
+  }): Promise<void>;
+  insertAttachment(record: StoredAttachmentRecord): Promise<void>;
+  insertAutomationRun(record: StoredAutomationRunRecord): Promise<void>;
+  insertAutomationRunStep(step: StoredAutomationRunStepRecord): Promise<void>;
+  insertWorkflowRun(record: StoredWorkflowRunRecord): Promise<void>;
+  insertWorkflowRunStep(record: StoredWorkflowRunStepRecord): Promise<void>;
+
+  listArtifactRecords(
+    orgId: string,
+    profileId: string
+  ): Promise<StoredArtifactOwnerRecord[]>;
+  listArtifactSharesForProfile(
+    orgId: string,
+    profileId: string
+  ): Promise<StoredArtifactShareRecord[]>;
+
+  listAttachmentsForSession(
+    sessionId: string
+  ): Promise<StoredAttachmentRecord[]>;
+
+  listAuditEvents(options?: {
+    action?: string;
+    limit?: number;
+    offset?: number;
+    orgId?: string;
+  }): Promise<StoredAuditEvent[]>;
+  listAutomationRunSteps(
+    runId: string
+  ): Promise<StoredAutomationRunStepRecord[]>;
+
+  listAutomationRuns(
+    automationId: string,
+    limit?: number
+  ): Promise<StoredAutomationRunRecord[]>;
+
+  listAutomations(): Promise<StoredAutomationRecord[]>;
+  listAutomationsForOrg(orgId: string): Promise<StoredAutomationRecord[]>;
+  /** Live sessions for one user, newest first. Revoked and expired rows are left out. */
+  listBrowserSessionsForUser(
+    userId: string,
+    now: string
+  ): Promise<StoredBrowserSessionRecord[]>;
+
+  listComposioToolkitsForOrg(
+    orgId: string
+  ): Promise<StoredComposioToolkitRecord[]>;
+
+  listComposioUserConnectionsForUser(
+    orgId: string,
+    userId: string
+  ): Promise<StoredComposioUserConnectionRecord[]>;
+  listEphemeralAttachments(): Promise<StoredAttachmentRecord[]>;
+  listFilePins(
+    orgId: string,
+    userId: string,
+    profileId: string
+  ): Promise<string[]>;
+  listLlmTurnUsage(orgId: string): Promise<StoredLlmTurnUsageRecord[]>;
+  /** Rows from `sinceDay` (inclusive, `YYYY-MM-DD`) onward. */
+  listLlmUsageDailyStats(
+    orgId: string,
+    sinceDay: string
+  ): Promise<StoredLlmUsageDailyStatsRecord[]>;
+  listLlmUsageStatsByActor(
+    orgId: string
+  ): Promise<StoredLlmUsageActorStatsRecord[]>;
+  listLlmUsageStatsByModel(
+    orgId: string
+  ): Promise<StoredLlmUsageModelStatsRecord[]>;
+  listMcpServerProfileCounts(): Promise<Record<string, number>>;
+
+  listMcpServers(): Promise<StoredMcpServerRecord[]>;
+
+  listMcpServersForProfile(profileId: string): Promise<StoredMcpServerRecord[]>;
+
+  listMessagesForSession(
+    sessionId: string
+  ): Promise<StoredSessionMessageRecord[]>;
+
+  listNotificationDestinationsForOrg(
+    orgId: string
+  ): Promise<StoredNotificationDestinationRecord[]>;
+  listOrganizations(): Promise<StoredOrganizationRecord[]>;
+  listOrgMembers(orgId: string): Promise<StoredOrgMemberRecord[]>;
+  listOrgMemoryProposals(
+    orgId: string,
+    status?: OrgMemoryProposalStatus
+  ): Promise<StoredOrgMemoryProposal[]>;
+  listOrgPlugins(orgId?: string): Promise<StoredOrgPluginRecord[]>;
+  listOrgSharedResources(
+    orgId: string
+  ): Promise<StoredOrgSharedResourceRecord[]>;
+  listPasskeys(userId: string): Promise<StoredPasskeyRecord[]>;
+
+  listPlatformAdminUsers(): Promise<StoredUserRecord[]>;
+
+  listPluginReleases(pluginId?: string): Promise<StoredPluginReleaseRecord[]>;
+
+  listProfileChangeEvents(
+    orgId: string,
+    profileId: string,
+    options?: { limit?: number; offset?: number }
+  ): Promise<StoredProfileChangeEvent[]>;
+
+  listProfileComposioToolkits(
+    profileId: string
+  ): Promise<StoredProfileComposioToolkitRecord[]>;
+  listProfiles(): Promise<StoredProfileRecord[]>;
+  listProfilesForMcpServer(serverId: string): Promise<StoredProfileRecord[]>;
+  listProfilesForOrg(orgId: string): Promise<StoredProfileRecord[]>;
+  /**
+   * Newest first, pinned ahead. `after` is the last row of the previous page;
+   * `sessionId` narrows the list to that one session. `userId` keeps the
+   * sessions that user owns, plus every session on a `sharedChannels` channel.
+   */
+  listSessionSummaries(
+    profileId: string,
+    channels: readonly string[],
+    options?: {
+      after?: Pick<
+        StoredSessionSummaryRecord,
+        "createdAt" | "id" | "pinned" | "updatedAt"
+      >;
+      limit?: number;
+      /** Keeps the sessions whose title or user/assistant text contains it. */
+      query?: string;
+      sessionId?: string;
+      sharedChannels?: readonly string[];
+      userId?: string;
+    }
+  ): Promise<StoredSessionSummaryRecord[]>;
+
+  listSessions(): Promise<StoredSessionRecord[]>;
+  listSessionsForUser(userId: string): Promise<StoredSessionRecord[]>;
+
+  listSkillProposals(
+    orgId: string,
+    options?: {
+      status?: SkillProposalStatus;
+      profileId?: string;
+      sessionId?: string;
+    }
+  ): Promise<StoredSkillProposal[]>;
+  listSkillSuggestions(
+    orgId: string,
+    options?: {
+      sessionId?: string;
+      status?: SkillSuggestionStatus;
+      profileId?: string;
+    }
+  ): Promise<StoredSkillSuggestion[]>;
+
+  listSkills(): Promise<StoredSkillRecord[]>;
+
+  listSkillsForProfile(profileId: string): Promise<StoredSkillRecord[]>;
+
+  listSkillUsageForProfile(
+    profileId: string
+  ): Promise<StoredSkillUsageRecord[]>;
+
+  /** Newest first. */
+  listSkillVersions(
+    skillId: string,
+    options?: { limit?: number }
+  ): Promise<StoredSkillVersion[]>;
+
+  listTools(): Promise<StoredToolRecord[]>;
+
+  listToolsForProfile(profileId: string): Promise<StoredToolRecord[]>;
+  listUserOrganizations(
+    userId: string
+  ): Promise<StoredUserOrganizationRecord[]>;
+  listWorkflowRunSteps(runId: string): Promise<StoredWorkflowRunStepRecord[]>;
+  listWorkflowRuns(
+    workflowId: string,
+    limit?: number
+  ): Promise<StoredWorkflowRunRecord[]>;
+  listWorkflowsForOrg(orgId: string): Promise<StoredWorkflowRecord[]>;
+  markOrgInviteAccepted(id: string, acceptedAt: string): Promise<void>;
+  markSkillSuggestionApplied(
+    orgId: string,
+    id: string,
+    appliedAt: string
+  ): Promise<boolean>;
+  moveProfile(
+    profileId: string,
+    sourceOrgId: string,
+    targetOrgId: string,
+    workspaceFrom: string,
+    workspaceTo: string
+  ): Promise<void>;
+  publishOrgPluginRelease(
+    input: PublishOrgPluginReleaseInput
+  ): Promise<PluginPublishResult>;
+  publishOrgSharedResource(
+    record: StoredOrgSharedResourceRecord
+  ): Promise<StoredOrgSharedResourceRecord>;
+  /** Gives back one hold taken by tryReserveMonthlyLlmQuota, at most once. */
+  releaseMonthlyLlmQuota(orgId: string, reservationId: string): Promise<void>;
+  renameFilePins(
+    orgId: string,
+    profileId: string,
+    oldPath: string,
+    newPath: string
+  ): Promise<void>;
+  renameSessionTitle(sessionId: string, title: string): Promise<boolean>;
+  replaceMessagesForSession(
+    sessionId: string,
+    messages: StoredSessionMessageRecord[]
+  ): Promise<void>;
+  replaceProfileComposioToolkits(
+    profileId: string,
+    assignments: StoredProfileComposioToolkitRecord[]
+  ): Promise<void>;
+  revokeArtifactShare(id: string, revokedAt: string): Promise<boolean>;
+  revokeBrowserSessionBySessionTokenHash(
+    sessionTokenHash: string,
+    revokedAt: string
+  ): Promise<boolean>;
+  /**
+   * One session, and only if it belongs to this user. The owner check is in the
+   * statement rather than the caller, so an id from another account cannot be
+   * revoked by any route that reaches this.
+   */
+  revokeBrowserSessionForUser(
+    id: string,
+    userId: string,
+    revokedAt: string
+  ): Promise<boolean>;
+  revokeBrowserSessionsForUser(
+    userId: string,
+    revokedAt: string
+  ): Promise<number>;
+  /**
+   * Every active browser session except the caller's current session. A null
+   * session id revokes all of them for non-browser authentication modes.
+   */
+  revokeBrowserSessionsForUserExcept(
+    userId: string,
+    sessionId: string | null,
+    revokedAt: string
+  ): Promise<number>;
+  setFilePinned(
+    orgId: string,
+    userId: string,
+    profileId: string,
+    path: string,
+    pinned: boolean
+  ): Promise<void>;
+  setPendingMfaSecret(
+    id: string,
+    pendingTotpSecretEnc: string,
+    updatedAt: string
+  ): Promise<void>;
+  setSessionOrder(userId: string, sessionIds: string[]): Promise<void>;
+  setUserContext(
+    orgId: string,
+    userId: string,
+    content: string,
+    updatedAt: string
+  ): Promise<void>;
+
+  tryMarkOrganizationArchived(
+    orgId: string,
+    archivedAt: string
+  ): Promise<boolean>;
+  tryReserveMonthlyLlmQuota(input: {
+    createdAt: string;
+    existingTokens: number;
+    existingTurns: number;
+    orgId: string;
+    reservationId: string;
+    reservedTokens: number;
+  }): Promise<boolean>;
+  unassignMcpServerFromProfile(
+    profileId: string,
+    serverId: string
+  ): Promise<boolean>;
+  unassignSkillFromProfile(
+    profileId: string,
+    skillId: string
+  ): Promise<boolean>;
+  unassignToolFromProfile(profileId: string, toolId: string): Promise<boolean>;
+  updateArtifactShareSnapshot(
+    id: string,
+    snapshot: Pick<
+      StoredArtifactShareRecord,
+      "filename" | "mimeType" | "sizeBytes" | "storagePath"
+    >
+  ): Promise<void>;
+  updateAutomationRun(record: StoredAutomationRunRecord): Promise<void>;
+  updateBrowserSessionActiveOrgId(
+    id: string,
+    activeOrgId: string | null
+  ): Promise<void>;
+  updateBrowserSessionLastUsedAt(id: string, lastUsedAt: string): Promise<void>;
+  /** False when the change would leave the org without an admin. */
+  updateOrgMemberRole(
+    orgId: string,
+    userId: string,
+    role: OrgRole
+  ): Promise<boolean>;
+  updateOrgMemoryProposalStatus(
+    orgId: string,
+    id: string,
+    update: {
+      status: OrgMemoryProposalStatus;
+      reviewerUserId: string;
+      reviewedAt: string;
+      pinned?: boolean;
+    }
+  ): Promise<boolean>;
+  updatePasskeyCounter(
+    userId: string,
+    credentialId: string,
+    counter: number
+  ): Promise<void>;
+  updateSessionModel(sessionId: string, model: string | null): Promise<boolean>;
+  updateSessionParent(
+    sessionId: string,
+    parentSessionId: string | null
+  ): Promise<boolean>;
+  updateSessionPinned(sessionId: string, pinned: boolean): Promise<boolean>;
+  updateSessionQuestionnaire(
+    sessionId: string,
+    questionnaire: AgentQuestionnaire | null
+  ): Promise<void>;
+  updateSessionThinkingEffort(
+    sessionId: string,
+    effort: ThinkingEffort | null
+  ): Promise<boolean>;
+  updateSessionTitle(sessionId: string, title: string): Promise<boolean>;
+  updateSessionTodos(sessionId: string, todos: AgentTodo[]): Promise<void>;
+  updateSkillProposalStatus(
+    orgId: string,
+    id: string,
+    update: {
+      status: SkillProposalStatus;
+      reviewerUserId: string;
+      reviewedAt: string;
+    }
+  ): Promise<boolean>;
+  updateUserMfa(
+    id: string,
+    mfa: {
+      enabled: boolean;
+      mfaTotpLastStep: number | null;
+      pendingTotpSecretEnc: string | null;
+      totpSecretEnc: string | null;
+    },
+    updatedAt: string
+  ): Promise<void>;
+  updateUserPassword(
+    id: string,
+    passwordHash: string,
+    updatedAt: string
+  ): Promise<void>;
+  updateUserProfile(
+    id: string,
+    profile: { name: string | null; phone: string | null; email?: string },
+    updatedAt: string
+  ): Promise<void>;
+  updateWorkflowRun(record: StoredWorkflowRunRecord): Promise<void>;
+  updateWorkflowRunStep(record: StoredWorkflowRunStepRecord): Promise<void>;
+  /** A new file at a path whose old row survived (e.g. removed by a shell) replaces that row. */
+  upsertArtifactRecord(record: StoredArtifactRecord): Promise<void>;
+  upsertAutomation(record: StoredAutomationRecord): Promise<void>;
+  upsertAutomationRunReadThrough(
+    userId: string,
+    orgId: string,
+    automationId: string,
+    readThroughAt: string
+  ): Promise<void>;
+  upsertComposioToolkit(record: StoredComposioToolkitRecord): Promise<void>;
+  upsertComposioUserConnection(
+    record: StoredComposioUserConnectionRecord
+  ): Promise<void>;
+  upsertMcpServer(record: StoredMcpServerRecord): Promise<void>;
+  upsertNotificationDestination(
+    record: StoredNotificationDestinationRecord
+  ): Promise<void>;
+  upsertOrganization(record: StoredOrganizationRecord): Promise<void>;
+  upsertOrgMember(record: StoredOrgMemberRecord): Promise<void>;
+  upsertPluginRelease(
+    record: StoredPluginReleaseRecord
+  ): Promise<UpsertPluginReleaseResult>;
+  upsertProfile(record: StoredProfileRecord): Promise<void>;
+  upsertSession(record: StoredSessionRecord): Promise<void>;
+  upsertSkill(record: StoredSkillRecord): Promise<void>;
+  upsertTool(record: StoredToolRecord): Promise<void>;
+  upsertWorkflow(record: StoredWorkflowRecord): Promise<void>;
+  upsertWorkspaceSettings(record: StoredWorkspaceSettingsRecord): Promise<void>;
+}

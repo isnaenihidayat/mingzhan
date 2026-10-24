@@ -1,0 +1,158 @@
+import {
+  Client,
+  Events,
+  GatewayIntentBits,
+  type Message,
+  MessageFlags,
+  Partials,
+} from "discord.js";
+import {
+  formatDiscordInboundMessageLog,
+  isChannelDebugEnabled,
+} from "./channel-log";
+import { type ChatHandlerDeps, createChatHandler } from "./chat-handler";
+import type { DiscordBridgeConfig } from "./config";
+import {
+  deferSlashInteraction,
+  discordErrorSchema,
+  getDiscordErrorCode,
+  isIgnorableInteractionError,
+} from "./interaction-errors";
+import { registerSlashCommands } from "./slash-commands";
+
+export async function createBot(
+  config: DiscordBridgeConfig,
+  deps: Omit<ChatHandlerDeps, "config" | "getBotInfo">
+): Promise<Client<true>> {
+  const client = new Client<true>({
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.DirectMessages,
+      GatewayIntentBits.MessageContent,
+    ],
+    partials: [Partials.Channel, Partials.Message],
+  });
+
+  const handler = createChatHandler({
+    ...deps,
+    config,
+    getBotInfo: () =>
+      client.user
+        ? { id: client.user.id, username: client.user.username ?? undefined }
+        : undefined,
+  });
+
+  client.once(Events.ClientReady, async (readyClient) => {
+    try {
+      await registerSlashCommands(readyClient);
+    } catch (error) {
+      console.error("Failed to register slash commands:", error);
+    }
+  });
+
+  client.on(Events.MessageCreate, async (message: Message) => {
+    if (isChannelDebugEnabled()) {
+      console.log(formatDiscordInboundMessageLog(message));
+    }
+
+    try {
+      await handler.handleMessage(message);
+    } catch (error) {
+      console.error("Message handler error:", error);
+    }
+  });
+
+  // Integrity: interactions arrive over the gateway WebSocket (discord.js +
+  // intents above), authenticated by the bot token — not via Discord's HTTP
+  // Interactions Endpoint. Ed25519 signature verification (X-Signature-Ed25519 /
+  // X-Signature-Timestamp) does not apply on this path. If we ever expose an
+  // HTTP interaction endpoint, verify signatures with the app public key before
+  // handling the body; do not copy this gateway-only handler as-is.
+  client.on(Events.InteractionCreate, async (interaction) => {
+    if (
+      (interaction.isStringSelectMenu() || interaction.isButton()) &&
+      /^mingzhan:(org|profile|sessions):/.test(interaction.customId)
+    ) {
+      try {
+        // Private pickers can update in place; copied/foreign controls cannot mutate state.
+        if (interaction.customId.split(":")[2] !== interaction.user.id) {
+          await interaction.reply({
+            content: "Open your own /org, /profile or /sessions picker.",
+            flags: MessageFlags.Ephemeral,
+          });
+
+          return;
+        }
+
+        await interaction.deferUpdate();
+        await handler.handleSelectionInteraction(interaction);
+      } catch (error) {
+        const discordError =
+          error instanceof Error
+            ? error
+            : (discordErrorSchema.safeParse(error).data ?? null);
+
+        if (!isIgnorableInteractionError(discordError)) {
+          console.error("Selection interaction error:", error);
+          await interaction
+            .editReply({
+              components: [],
+              content: "Something went wrong. Open the picker again.",
+            })
+            .catch(() => {});
+        }
+      }
+
+      return;
+    }
+
+    if (!interaction.isChatInputCommand()) {
+      return;
+    }
+
+    if (isChannelDebugEnabled()) {
+      console.log(
+        "[discord] slash",
+        interaction.commandName,
+        interaction.user.id
+      );
+    }
+
+    // Acknowledge immediately — Discord expires interactions after ~3s.
+    // Any work (locks, API calls) must happen after this.
+    if (!(await deferSlashInteraction(interaction))) {
+      return;
+    }
+
+    try {
+      await handler.handleSlashCommand(interaction);
+    } catch (error) {
+      const discordError =
+        error instanceof Error
+          ? error
+          : (discordErrorSchema.safeParse(error).data ?? null);
+
+      if (isIgnorableInteractionError(discordError)) {
+        console.warn(
+          `Slash command /${interaction.commandName} interaction expired (${getDiscordErrorCode(discordError)}).`
+        );
+
+        return;
+      }
+
+      console.error("Slash command error:", error);
+      await interaction
+        .editReply({ content: "Something went wrong." })
+        .catch(() => {});
+    }
+  });
+
+  await client.login(config.botToken);
+
+  if (!client.user) {
+    throw new Error("Discord client failed to initialize user.");
+  }
+
+  return client;
+}

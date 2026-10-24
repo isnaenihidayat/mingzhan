@@ -1,0 +1,254 @@
+---
+title: "Docker"
+description: "Run MíngZhàn in a single Docker container with persistent data volumes."
+---
+
+## Requirements
+
+One container, one process tree. Measured on `ghcr.io/mingpromotion/mingzhan:latest`
+(v0.4.20) with no LLM provider and no channel workers:
+
+| | |
+| --- | --- |
+| Image on disk | 734 MB |
+| Memory, idle | ~200 MB |
+| Memory, serving chat | ~240 MB |
+| Memory, automation worker also running | ~247 MB |
+| Boot to `/health` | 3 to 5 seconds |
+| Data directory on first boot | 1.2 MB |
+
+It starts and serves on **1 vCPU and 1 GB**. It also starts under a 512 MB cap,
+using 221 MB, but that leaves nothing for the rest of the box.
+
+Two things raise the figure and are not in the table:
+
+- **Channel workers.** Telegram, WhatsApp, and Discord each run as their own
+  process next to the server. WhatsApp carries Baileys and libsignal and is the
+  heaviest of the three. Size for them separately if you enable them.
+- **A configured provider.** The numbers above come from offline mode, so no
+  model traffic passed through the container.
+
+## Quick run
+
+Pull the prebuilt image and start MíngZhàn:
+
+```bash
+docker pull ghcr.io/mingpromotion/mingzhan:latest
+docker run -d -p 4310:4310 -v mingzhan-data:/mingzhan/data --name mingzhan ghcr.io/mingpromotion/mingzhan:latest
+```
+
+Open `http://localhost:4310`. The container serves the API, web dashboard, and platform workers together.
+
+Data is stored at `/mingzhan/data` inside the container. The `-v mingzhan-data:/mingzhan/data` volume persists orgs, profiles, sessions, provider settings, and the local SQLite database across restarts.
+
+## Build from source
+
+From the repository root:
+
+```bash
+./scripts/docker-build-run.sh
+```
+
+The script uses `docker buildx` (default `linux/amd64`), then starts the container.
+
+The build helper reads these optional environment variables:
+
+- `MINGZHAN_CONTAINER_NAME` sets the container name. The default is `mingzhan`.
+- `MINGZHAN_IMAGE_NAME` sets the local image name. The default is `mingzhan`.
+- `MINGZHAN_HOST_PORT` sets the published host port. The default is `4310`.
+- `MINGZHAN_DATA_VOLUME` sets the Docker volume name. The default is
+  `mingzhan-data`.
+
+For example, this builds and starts an isolated local install on port 4311:
+
+```bash
+MINGZHAN_CONTAINER_NAME=mingzhan-dev \
+MINGZHAN_IMAGE_NAME=mingzhan-dev \
+MINGZHAN_HOST_PORT=4311 \
+MINGZHAN_DATA_VOLUME=mingzhan-dev-data \
+./scripts/docker-build-run.sh
+```
+
+## Configuration
+
+The data root follows `MINGZHAN_CONFIG_DIR` when set. If you set it, use an
+absolute path. MíngZhàn rejects relative paths because they depend on the process
+working directory and can break profile isolation. The default inside the
+container is `/mingzhan/data`, which maps to the `mingzhan-data` volume. The build
+helper always mounts its data volume at `/mingzhan/data`.
+
+On first run, complete the setup wizard in the browser and add your LLM provider. See [Providers](/providers) and [First-time setup](/first-time-setup).
+
+### Logs and monitoring
+
+Use readiness checks to keep traffic away from an unavailable database, and request IDs to connect an HTTP response with its logs.
+
+- Set `MINGZHAN_LOG_FORMAT=json` for JSON lines on standard output. `MINGZHAN_LOG_LEVEL` accepts `debug`, `info` (default), `warn`, `error`, or `silent`. These settings cover HTTP request logging and the initial worker lifecycle events; other existing logs remain unchanged.
+- HTTP responses include `X-Request-Id`. MíngZhàn honors incoming IDs up to 255 characters or generates one. Response logs include this ID, method, status, and duration; `debug` also logs request start. URLs, request bodies, and credentials are not included in these HTTP logs. Streaming durations measure response setup, not the whole stream.
+- Use `/healthz` for liveness and `/readyz` for readiness on port 4310. Readiness returns 200 when the active connection can read the migrated database, or 503 when unavailable. It does not track restore progress and can remain ready while the old connection is still usable. Neither probe needs login or checks external providers or worker connectivity. The existing `/health` behavior is unchanged.
+- Set `MINGZHAN_METRICS=true` to enable `/metrics`; otherwise it returns 404. It serves Prometheus-format HTTP response and server-error counters, which reset on process restart. MíngZhàn sends nothing to an external collector. The endpoint needs no login and uses the same listener as the dashboard: restrict access through your network or reverse proxy before enabling it.
+
+### HTTPS and session cookies
+
+On HTTPS, the session and CSRF cookies are issued as `__Host-mingzhan_session` and `__Host-mingzhan_csrf`. Browsers bind those to the exact host, so a sibling host under the same parent domain cannot plant or overwrite a session.
+
+- A proxy that terminates TLS must send `X-Forwarded-Proto: https`, otherwise MíngZhàn treats the request as plain HTTP, issues the unprefixed `mingzhan_session` and `mingzhan_csrf` cookies, and loses the host binding.
+- Unprefixed cookies are ignored on HTTPS, so the first sign-in after upgrading happens once more. Signing in again reissues the host-bound pair and clears the old cookies.
+- Plain HTTP deployments keep the unprefixed cookies, because browsers discard `Secure` cookies on `http://` origins.
+
+### First-boot seed (optional)
+
+To skip the setup wizard on a fresh data volume, set all three admin seed variables before the first boot. MíngZhàn creates the admin account and a `Personal` org (override with `MINGZHAN_SEED_ORG_NAME`). No provider is created: after the first login, open `/setup` to add one. Self-hosted installs without these variables behave as today.
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `MINGZHAN_SEED_ADMIN_EMAIL` | Yes (with the other two) | Platform admin email |
+| `MINGZHAN_SEED_ADMIN_NAME` | Yes (with the other two) | Platform admin display name |
+| `MINGZHAN_SEED_ADMIN_PASSWORD` | Yes (with the other two) | Platform admin password (min 8 characters) |
+| `MINGZHAN_SEED_ORG_NAME` | No | Organization name (default `Personal`) |
+
+Partial seed config fails boot with a clear error. Restarting a seeded instance is a no-op (idempotent).
+
+```bash
+docker run -d -p 4310:4310 -v mingzhan-data:/mingzhan/data \
+  -e MINGZHAN_SEED_ADMIN_EMAIL=admin@example.com \
+  -e MINGZHAN_SEED_ADMIN_NAME=Admin \
+  -e MINGZHAN_SEED_ADMIN_PASSWORD=seedpass123 \
+  --name mingzhan ghcr.io/mingpromotion/mingzhan:latest
+```
+
+## Reset a local Docker install
+
+To remove the default local resources and start fresh:
+
+```bash
+./scripts/docker-destroy.sh
+./scripts/docker-build-run.sh
+```
+
+The reset script removes the container named `mingzhan`, every container that
+publishes port `4310` (including unrelated containers), the `mingzhan-data` and
+`mingzhan-config` volumes, and the local image named `mingzhan`. Stop any unrelated
+containers before running it if you still need them.
+
+The script does not remove the cached
+`ghcr.io/mingpromotion/mingzhan:latest` image. It also uses the default names, so
+custom names set through the build helper can remain unless you remove them
+yourself.
+
+## Claude and Codex agents
+
+The Claude and Codex [ACP agents](/acp-agents) need the Claude Code and Codex binaries. They add about 670 MB, so the default image does not include them.
+
+| Tag | Claude and Codex agents | Size (amd64) |
+| --- | --- | --- |
+| `latest`, `X.Y.Z` | Bring your own binary | ~620 MB |
+| `latest-full`, `X.Y.Z-full` | Included | ~1.3 GB |
+
+If you use these agents, run the full image:
+
+```bash
+docker run -d -p 4310:4310 -v mingzhan-data:/mingzhan/data --name mingzhan ghcr.io/mingpromotion/mingzhan:latest-full
+```
+
+To build it from source, pass the build arg:
+
+```bash
+./scripts/docker-build-run.sh --build-arg INSTALL_CODING_AGENTS=true
+```
+
+To keep the default image, give the agents a binary through the data volume. Install the CLI once inside the container, then restart it with the path set:
+
+```bash
+docker exec mingzhan bun add -g @openai/codex @anthropic-ai/claude-code
+docker rm -f mingzhan
+docker run -d -p 4310:4310 -v mingzhan-data:/mingzhan/data \
+  -e CODEX_PATH=/mingzhan/data/.bun/bin/codex \
+  -e CLAUDE_CODE_EXECUTABLE=/mingzhan/data/.bun/bin/claude \
+  --name mingzhan ghcr.io/mingpromotion/mingzhan:latest
+```
+
+## Optional: CloakBrowser with agent-browser
+
+The image does not include [CloakBrowser](https://github.com/CloakHQ/CloakBrowser). Stock Chrome from `agent-browser install` still works inside the container when you use the dashboard **Install** path.
+
+To use Cloak as the Chromium behind agent-browser, bind-mount the Cloak binary and pass the same host env MíngZhàn's `bash` tool already inherits:
+
+```bash
+docker run -d -p 4310:4310 -v mingzhan-data:/mingzhan/data \
+  -v /path/to/cloak-chromium:/cloak/chromium:ro \
+  -e AGENT_BROWSER_EXECUTABLE_PATH=/cloak/chromium \
+  -e AGENT_BROWSER_ARGS="<copy from Cloak's agent-browser example>" \
+  --name mingzhan ghcr.io/mingpromotion/mingzhan:latest
+```
+
+See [Agent browser](/agent-browser#3-optional-cloakbrowser-for-antibot-sites).
+
+## Bash in Docker
+
+In Docker, Bash runs inside the MíngZhàn container with the server process's OS permissions. It can access mounted data outside the active profile workspace, including other profiles' files when permissions allow. The shared container does not isolate profiles from each other. Assign Bash only to trusted profiles.
+
+### Remote bash backend
+
+Use this when org admins are not the operator but profiles still need a shell, or when the host cannot run a sandbox itself. Bash then runs in a sandbox service you operate, not in the MíngZhàn container, so bash commands cannot reach `config.ini`, other profiles' files, or the server network. Python skill tools written by members still run on the MíngZhàn server.
+
+```bash
+MINGZHAN_BASH_BACKEND=remote
+MINGZHAN_BASH_REMOTE_URL=https://sandbox.internal/v1/exec
+MINGZHAN_BASH_REMOTE_TOKEN=<shared secret>
+# Optional. Default is off.
+MINGZHAN_BASH_SANDBOX_NETWORK=public
+```
+
+What changes for profiles:
+
+- `/workspace` in the sandbox starts empty. It does not share files with `read_file`, `write_file`, or `edit_file`, which still use the profile workspace on the MíngZhàn server.
+- `codingAgent` runs are refused. Use `MINGZHAN_BASH_BACKEND=host` for the [coding agent](/coding-agent).
+- `MINGZHAN_TENANT_BASH=0` still turns bash off for both backends.
+- Skills that run through `bash` run in the sandbox. Install their CLIs there (for example `agent-browser`). Skill scripts in the profile workspace are not in `/workspace`, and files a skill writes there (such as `screenshot artifacts/<file>.png`) stay in the sandbox, so `save_artifact` and channel delivery cannot find them.
+- Bash from the [CLI](/cli) still runs on the MíngZhàn server, in the directory where the CLI was launched.
+- MíngZhàn checks `MINGZHAN_BASH_BACKEND` and `MINGZHAN_BASH_SANDBOX_NETWORK` at startup. An invalid value stops the server from starting.
+
+MíngZhàn fails closed. A missing URL or token, a rejected token, an unreachable service, or a malformed reply is an error. MíngZhàn never falls back to host bash.
+
+#### Service contract
+
+Any provider can implement the service. MíngZhàn sends one request per tool call:
+
+```http
+POST <MINGZHAN_BASH_REMOTE_URL>
+Authorization: Bearer <MINGZHAN_BASH_REMOTE_TOKEN>
+Content-Type: application/json
+
+{
+  "sandboxId": "mingzhan-<orgId>-<profileId>",
+  "command": "ls -la",
+  "cwd": "/workspace/src",
+  "env": { "LANG": "C.UTF-8" },
+  "timeoutMs": 30000,
+  "network": "off"
+}
+```
+
+- `sandboxId` is stable per profile. Reuse one sandbox per id, and never share one between ids.
+- `cwd` is always `/workspace` or a path under it.
+- `env` holds only the tool call's own `env`. MíngZhàn removes keys that look like secrets (`*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_URL`, and similar) and never sends the server's environment.
+- `network` is `off` or `public`. Block outbound traffic when it is `off`.
+- Stop the command at `timeoutMs`.
+- If the client disconnects, kill the command.
+
+Reply `200` with:
+
+```json
+{ "stdout": "...", "stderr": "...", "exitCode": 0, "timedOut": false }
+```
+
+On timeout, reply with the output so far, `"exitCode": null` and `"timedOut": true`. Reply `401` or `403` for a bad token. MíngZhàn cancels the request when the user stops the turn, and gives up 10 seconds after `timeoutMs` with `timedOut: true` and no output.
+
+## Next steps
+
+- [Deployment hardening](/deployment-hardening) — keep port 4310 private and protect the data root
+- [Outbound connections](/outbound-connections) — plan egress for enabled providers, channels, and tools
+- [Quickstart](/quickstart) — first-run flow from zero
+- [Backup and restore](/backup-restore) — export and restore your data root
+- [Providers](/providers) — LLM API keys and models

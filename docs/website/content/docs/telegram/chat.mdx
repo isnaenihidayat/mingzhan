@@ -1,0 +1,97 @@
+---
+title: "Chat behavior & commands"
+description: "How the MíngZhàn Telegram bot behaves in private chats, groups, and topics — plus the commands and message types it supports."
+---
+
+Once the bridge is running and your account is paired, here is how the bot behaves and what you can send it.
+
+## Private chat behavior
+
+Private chat is the simplest mode.
+
+Once paired or allowlisted:
+
+- normal messages go to the MíngZhàn agent
+- the bot keeps a Telegram chat session
+- Telegram commands work immediately
+
+If an unlinked user opens the bot, MíngZhàn asks for the pairing code instead of sending the message to the agent.
+
+## Group chat behavior
+
+MíngZhàn supports Telegram groups, but it is intentionally conservative about when it replies.
+
+In a group, the bot responds only when the message is:
+
+- a slash command like `/status`
+- a reply to one of the bot's messages
+- a direct mention like `@your_bot_name hello`
+
+This keeps group chats usable without making the bot noisy.
+
+### Group topics
+
+Each topic keeps a separate conversation with the same owning agent. `/profile` and `/org` report the connection’s fixed ownership; they cannot switch it.
+
+## Telegram commands
+
+These commands are available in Telegram:
+
+| Command | What it does |
+| --- | --- |
+| `/start` | Welcome and help |
+| `/help` | Show command help |
+| `/stop` | Stop the current in-progress reply |
+| `/clear` | Clear chat history |
+| `/compact` | Compact conversation history |
+| `/new` | Start a new conversation |
+| `/org` | Report the fixed organization |
+| `/profile` | Report the fixed agent |
+| `/status` | Show server and model status |
+
+## Supported message types
+
+Telegram can send more than plain text into MíngZhàn.
+
+Supported inputs include:
+
+- text messages
+- photos
+- voice notes and audio messages
+- supported documents such as `pdf`, `docx`, `txt`, and `csv`
+
+Small supported documents are downloaded and forwarded into the MíngZhàn chat flow. Voice notes and audio messages are first transcribed with the configured OpenAI audio transcription model. Unsupported media gets a friendly rejection message instead of silently failing.
+
+## Rich Markdown replies
+
+Agents can reply in normal Markdown-style text. MíngZhàn converts a safe subset into Telegram rich formatting.
+
+Supported formatting includes:
+
+- `**bold**`
+- `*italic*`
+- `__underline__`
+- inline code
+- fenced code blocks
+- headings
+- simple links
+
+If Telegram rejects the rich rendering, MíngZhàn falls back to plain text.
+
+## Saved artifacts and share links
+
+When your agent saves a file for you with the `save_artifact` tool, MíngZhàn posts a **Publish-style share link** after the reply in Telegram chat.
+
+- The link uses the same unguessable `/s/{token}` URLs as dashboard Publish — no MíngZhàn login required to open it.
+- Anyone who can read the Telegram message can open the link until the share is revoked from the web app.
+- Set **Web Public URL** in MíngZhàn settings (or `MINGZHAN_WEB_PUBLIC_URL`) so channel footers include absolute links.
+
+To receive the file itself in Telegram, ask in plain language — for example, “send the file” or “attach it”. MíngZhàn sends a native Telegram document when the file is within Telegram’s size limit. If the file is too large, use the share link instead.
+
+Only successful artifact saves produce share links or attachments.
+
+## Next steps
+
+- [Outbound notifications](/telegram/notifications)
+- [Troubleshooting](/telegram/troubleshooting)
+- [Telegram setup](/telegram)

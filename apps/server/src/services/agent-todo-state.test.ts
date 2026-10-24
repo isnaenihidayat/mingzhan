@@ -1,0 +1,141 @@
+import { expect, test } from "bun:test";
+import { createInMemoryDatabaseAdapter } from "@mingzhan/db";
+import { AgentTodoState } from "./agent-todo-state";
+
+async function createState() {
+  const db = createInMemoryDatabaseAdapter();
+  const state = new AgentTodoState(db);
+
+  await db.upsertSession({
+    agentQuestionnaire: null,
+    agentTodos: [],
+    channel: "web",
+    createdAt: new Date().toISOString(),
+    id: "session_test",
+    model: null,
+    profileId: "default",
+    title: null,
+  });
+
+  return { db, state };
+}
+
+test("write replaces todos when merge is false", async () => {
+  const { state, db } = await createState();
+
+  const todos = await state.write("session_test", {
+    merge: false,
+    todos: [
+      { content: "First", id: "1", status: "in_progress" },
+      { content: "Second", id: "2", status: "pending" },
+    ],
+  });
+
+  expect(todos).toHaveLength(2);
+  expect(await db.getSessionTodos("session_test")).toEqual(todos);
+});
+
+test("write merges todos by id when merge is true", async () => {
+  const { state, db } = await createState();
+
+  await state.write("session_test", {
+    merge: false,
+    todos: [{ content: "First", id: "1", status: "in_progress" }],
+  });
+
+  const todos = await state.write("session_test", {
+    merge: true,
+    todos: [{ id: "1", status: "completed" }],
+  });
+
+  expect(todos).toEqual([]);
+  expect(await db.getSessionTodos("session_test")).toEqual([]);
+});
+
+test("write keeps todos while work remains unfinished", async () => {
+  const { state } = await createState();
+
+  await state.write("session_test", {
+    merge: false,
+    todos: [
+      { content: "First", id: "1", status: "completed" },
+      { content: "Second", id: "2", status: "pending" },
+    ],
+  });
+
+  const todos = await state.listActive("session_test");
+
+  expect(todos).toEqual([
+    { content: "First", id: "1", status: "completed" },
+    { content: "Second", id: "2", status: "pending" },
+  ]);
+});
+
+test("listActive clears completed-only plans from storage", async () => {
+  const { db } = await createState();
+
+  await db.updateSessionTodos("session_test", [
+    { content: "Done", id: "1", status: "completed" },
+  ]);
+
+  const state = new AgentTodoState(db);
+  expect(await state.listActive("session_test")).toEqual([]);
+  expect(await db.getSessionTodos("session_test")).toEqual([]);
+});
+
+test("write demotes extra in_progress todos to pending", async () => {
+  const { state } = await createState();
+
+  const todos = await state.write("session_test", {
+    merge: false,
+    todos: [
+      { content: "First", id: "1", status: "in_progress" },
+      { content: "Second", id: "2", status: "in_progress" },
+    ],
+  });
+
+  expect(todos.find((todo) => todo.id === "1")?.status).toBe("pending");
+  expect(todos.find((todo) => todo.id === "2")?.status).toBe("in_progress");
+});
+
+test("formatForPrompt returns empty string when no todos", async () => {
+  const { state } = await createState();
+  expect(await state.formatForPrompt("session_test")).toBe("");
+});
+
+test("formatForPrompt renders active todos", async () => {
+  const { state } = await createState();
+
+  await state.write("session_test", {
+    merge: false,
+    todos: [{ content: "Ship feature", id: "a", status: "in_progress" }],
+  });
+
+  const formatted = await state.formatForPrompt("session_test");
+
+  expect(formatted).toContain("[in progress] Ship feature");
+});
+
+test("formatForPrompt returns empty string when plan is complete", async () => {
+  const { state } = await createState();
+
+  await state.write("session_test", {
+    merge: false,
+    todos: [{ content: "Done", id: "1", status: "completed" }],
+  });
+
+  expect(await state.formatForPrompt("session_test")).toBe("");
+});
+
+test("list loads from database on cold cache", async () => {
+  const { db } = await createState();
+
+  await db.updateSessionTodos("session_test", [
+    { content: "Cached", id: "x", status: "pending" },
+  ]);
+
+  const state = new AgentTodoState(db);
+  expect(await state.list("session_test")).toEqual([
+    { content: "Cached", id: "x", status: "pending" },
+  ]);
+});

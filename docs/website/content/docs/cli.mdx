@@ -1,0 +1,104 @@
+---
+title: "CLI"
+description: "Use MíngZhàn from the terminal — interactive chat and slash commands."
+---
+
+## Run the CLI
+
+Start the MíngZhàn server first, in another terminal:
+
+```bash
+bun run dev:server
+```
+
+Then run the CLI from the MíngZhàn repository:
+
+```bash
+bun run cli
+```
+
+The connection is chosen by `--server`, then `MINGZHAN_SERVER_URL`, then a saved server URL, then the local server address. `bun run cli` only connects; it never starts the server. Remote server URLs must use HTTPS.
+
+The CLI then:
+
+1. Resolves your saved or selected organization
+2. Selects the saved profile, Super MíngZhàn, or prompts you when needed
+3. Opens an interactive chat session
+
+Use `--profile` to choose a profile by ID, exact name, unique partial name, or number from the sorted picker. If you don't pass one, the CLI reuses the saved profile, then Super MíngZhàn, then prompts you to pick from the sorted list, where an empty answer selects the organization default. Use `--org` to choose an organization by ID or slug.
+
+When the CLI connects to a local server, coding-agent and shell work use the directory where you launched the CLI. Run the command from the project directory when you want an agent to work in that checkout. Remote server sessions stay in the server's profile workspace.
+
+If the local server has no provider configured yet, chat runs in offline mode until you finish [First-time setup](/first-time-setup).
+
+## Flags
+
+| Flag | Description |
+|---|---|
+| `--org`, `-o <id>` | Organization ID or slug |
+| `--profile`, `-p <id>` | Profile ID or name |
+| `--theme light\|dark` | Terminal theme (also `MINGZHAN_THEME`) |
+
+Set `MINGZHAN_ORG_ID` to skip org selection when you belong to multiple organizations.
+
+Examples:
+
+```bash
+bun run cli -- --org docs-demo --profile default
+bun run cli -- --theme light
+```
+
+## Slash commands
+
+Inside chat, type `/` for autocomplete:
+
+| Command | Description |
+|---|---|
+| `/help` | Show commands |
+| `/profile` | Show or switch bot profile |
+| `/model` | Choose or switch model |
+| `/thinking` | Show or change extended thinking |
+| `/compact` | Compact conversation history |
+| `/clear` | Clear history |
+| `/status` | Show server and model status |
+| `/soul` | Show or initialize profile soul files |
+| `/user` | Show or initialize `USER.md` |
+| `/create` | Draft an automation |
+| `/learn` | Distill a reusable skill from sources |
+| `/paste` | Attach an image from the clipboard |
+| `/debug` | Toggle layout debug overlay |
+| `/org` | List or switch organizations |
+| `/exit` | Quit |
+
+Switch models with `/model providerId::modelId` when the same model ID exists on multiple providers.
+
+## Attach images
+
+Paste an image path or use clipboard attach:
+
+```text
+@/path/to/screenshot.png What changed in this UI?
+/paste
+```
+
+Copy an image, press **Ctrl+V** in the CLI, then type a message and press **Enter**. The prompt shows the attached image count. With an empty message, **Backspace** removes the last image. **Cmd+V** also works when your terminal sends an empty paste event; otherwise use **Ctrl+V** or `/paste` to send the clipboard image directly.
+
+Images are read on the computer running the CLI and uploaded to the connected server, whether local or remote. Run the CLI on your own computer to use your clipboard with a remote server; an SSH session cannot read your computer’s image clipboard.
+
+The CLI accepts PNG, JPEG, GIF, and WebP images up to 5 MB each, with at most five images per message.
+
+## Rotate local auth token
+
+Platform workers and local bridges read the MíngZhàn local auth token from disk. To rotate it:
+
+```bash
+bun run cli -- rotate-token
+```
+
+Workers reload from disk on the next request. Restart platform workers if anything stays disconnected.
+
+## Next steps
+
+- [Quickstart](/quickstart) — install and open the dashboard
+- [Coding agent](/coding-agent) — Codex, Claude Code, OpenCode, pi, or Cursor Agent from chat
+- [Telegram](/telegram) — add a messaging channel

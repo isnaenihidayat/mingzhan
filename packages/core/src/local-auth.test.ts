@@ -1,0 +1,167 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  LocalAuthTokenManagedExternallyError,
+  loadLocalAuthToken,
+  rotateLocalAuthToken,
+  verifyLocalAuthToken,
+} from "./local-auth";
+import {
+  getUserConfigDir,
+  getUserConfigPath,
+  loadUserConfig,
+  saveUserConfig,
+} from "./user-config";
+
+describe("loadLocalAuthToken", () => {
+  let configDir = "";
+
+  afterEach(async () => {
+    if (configDir) {
+      await rm(configDir, { force: true, recursive: true });
+      configDir = "";
+    }
+
+    delete process.env.MINGZHAN_CONFIG_DIR;
+    delete process.env.MINGZHAN_LOCAL_AUTH_TOKEN;
+  });
+
+  test("generates a token when none is configured", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-local-auth-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const token = await loadLocalAuthToken();
+    expect(token).toStartWith("tc_local_");
+
+    if (token === null) {
+      throw new Error("Expected a local token");
+    }
+
+    const rawConfig = await readFile(getUserConfigPath(), "utf8");
+    expect(rawConfig).toContain("local_auth_token_hash=");
+    expect(rawConfig).not.toContain(token);
+
+    const storedToken = await readFile(
+      join(getUserConfigDir(), "local-auth-token"),
+      "utf8"
+    );
+
+    expect(storedToken.trim()).toBe(token);
+    await expect(verifyLocalAuthToken(token)).resolves.toEqual({
+      email: "local-client@mingzhan.internal",
+    });
+  });
+
+  test("reuses the token from the private local token file", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-local-auth-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+    const tokenValue = "tc_local_configured_token";
+
+    await saveUserConfig({
+      defaultProviderId: null,
+      localAuthTokenHash: createHash("sha256").update(tokenValue).digest("hex"),
+      providers: [],
+    });
+    await writeFile(
+      join(getUserConfigDir(), "local-auth-token"),
+      `${tokenValue}\n`,
+      "utf8"
+    );
+
+    const token = await loadLocalAuthToken("whatsapp@mingzhan.internal");
+    expect(token).toBe(tokenValue);
+
+    const rawConfig = await readFile(getUserConfigPath(), "utf8");
+    expect(rawConfig).toContain("local_auth_token_hash=");
+    expect(rawConfig).not.toContain(
+      "local_auth_token=tc_local_configured_token"
+    );
+  });
+
+  test("verifies the configured local auth token", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-local-auth-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const token = await loadLocalAuthToken();
+
+    await expect(verifyLocalAuthToken(token!)).resolves.toEqual({
+      email: "local-client@mingzhan.internal",
+    });
+    await expect(verifyLocalAuthToken("wrong-token")).resolves.toBeNull();
+  });
+
+  test("prefers env token for production-style setup", async () => {
+    process.env.MINGZHAN_LOCAL_AUTH_TOKEN = "tc_local_from_env";
+    await expect(loadLocalAuthToken()).resolves.toBe("tc_local_from_env");
+    await expect(verifyLocalAuthToken("tc_local_from_env")).resolves.toEqual({
+      email: "local-client@mingzhan.internal",
+    });
+  });
+
+  test("rotateLocalAuthToken replaces the stored token and invalidates the old one", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-local-auth-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const original = await loadLocalAuthToken();
+    const rotated = await rotateLocalAuthToken();
+
+    expect(rotated).toStartWith("tc_local_");
+    expect(rotated).not.toBe(original);
+    await expect(verifyLocalAuthToken(original!)).resolves.toBeNull();
+    await expect(verifyLocalAuthToken(rotated)).resolves.toEqual({
+      email: "local-client@mingzhan.internal",
+    });
+    await expect(loadLocalAuthToken()).resolves.toBe(rotated);
+  });
+
+  test("rotateLocalAuthToken preserves the full user config", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-local-auth-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const original = await loadLocalAuthToken();
+
+    const config = {
+      defaultProviderId: "provider-test",
+      imageModel: "openai:gpt-image-1",
+      providers: [
+        {
+          apiKey: "sk-test",
+          createdAt: "2026-09-25T00:00:00.000Z",
+          id: "provider-test",
+          label: "Test provider",
+          type: "openai" as const,
+        },
+      ],
+      thinkingEffort: "low" as const,
+      thinkingEnabled: false,
+      timezone: "America/New_York",
+      transcriptionModel: "openai:whisper-1",
+      visionModel: "openai:gpt-4o",
+    };
+
+    await saveUserConfig({
+      ...config,
+      localAuthTokenHash: createHash("sha256").update(original!).digest("hex"),
+    });
+    const before = await loadUserConfig();
+
+    const rotated = await rotateLocalAuthToken();
+    const after = await loadUserConfig();
+
+    expect(after).toEqual({
+      ...before,
+      localAuthTokenHash: createHash("sha256").update(rotated).digest("hex"),
+    });
+    expect(after?.localAuthTokenHash).not.toBe(before?.localAuthTokenHash);
+  });
+
+  test("rotateLocalAuthToken refuses when the token comes from env", async () => {
+    process.env.MINGZHAN_LOCAL_AUTH_TOKEN = "tc_local_from_env";
+    await expect(rotateLocalAuthToken()).rejects.toBeInstanceOf(
+      LocalAuthTokenManagedExternallyError
+    );
+  });
+});

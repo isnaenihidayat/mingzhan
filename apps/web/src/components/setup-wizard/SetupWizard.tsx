@@ -1,0 +1,163 @@
+import { type ReactNode, useCallback, useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { SetupStepAccount } from "@/components/setup-wizard/SetupStepAccount";
+import { SetupStepOrganization } from "@/components/setup-wizard/SetupStepOrganization";
+import { SetupStepProvider } from "@/components/setup-wizard/SetupStepProvider";
+import { SetupStepUserContext } from "@/components/setup-wizard/SetupStepUserContext";
+import { SetupWizardStepper } from "@/components/setup-wizard/SetupWizardStepper";
+import type {
+  SetupAccountDraft,
+  SetupStepId,
+  SetupWizardProps,
+} from "@/components/setup-wizard/setup-wizard.shared";
+import { useAppContext } from "@/context/use-app-context";
+import { pathForPage } from "@/lib/navigation";
+
+const NEXT_STEP: Record<SetupStepId, SetupStepId> = {
+  1: 2,
+  2: 3,
+  3: 4,
+  4: 4,
+};
+
+const PREVIOUS_STEP: Record<SetupStepId, SetupStepId> = {
+  1: 1,
+  2: 1,
+  3: 2,
+  4: 3,
+};
+
+export function SetupWizard({ onComplete }: SetupWizardProps) {
+  const navigate = useNavigate();
+  const { health } = useAppContext();
+  const userAlreadyConfigured = health?.userConfigured === true;
+  const firstStep: SetupStepId = userAlreadyConfigured ? 3 : 1;
+  const [currentStep, setCurrentStep] = useState<SetupStepId>(firstStep);
+
+  const [accountDraft, setAccountDraft] = useState<SetupAccountDraft | null>(
+    null
+  );
+
+  useEffect(() => {
+    if (!userAlreadyConfigured && currentStep === 2 && !accountDraft) {
+      setCurrentStep(1);
+    }
+  }, [currentStep, accountDraft, userAlreadyConfigured]);
+
+  const goNext = useCallback(() => {
+    setCurrentStep((prev) => NEXT_STEP[prev]);
+  }, []);
+
+  const goSkip = useCallback(() => {
+    setCurrentStep((prev) => NEXT_STEP[prev]);
+  }, []);
+
+  const goBack = useCallback(() => {
+    setCurrentStep((prev) => {
+      if (prev <= firstStep) {
+        return firstStep;
+      }
+
+      return PREVIOUS_STEP[prev];
+    });
+  }, [firstStep]);
+
+  const handleComplete = useCallback(() => {
+    if (onComplete) {
+      onComplete();
+    } else {
+      navigate(pathForPage("chat"), { replace: true });
+    }
+  }, [navigate, onComplete]);
+
+  const handleStepAdvance = useCallback(() => {
+    if (currentStep >= 4) {
+      handleComplete();
+    } else {
+      goNext();
+    }
+  }, [currentStep, goNext, handleComplete]);
+
+  const handleSkip = useCallback(() => {
+    if (currentStep >= 4) {
+      handleComplete();
+    } else {
+      goSkip();
+    }
+  }, [currentStep, goSkip, handleComplete]);
+
+  const heading =
+    currentStep === 1
+      ? "Create your admin account"
+      : currentStep === 2
+        ? "Create your organization"
+        : currentStep === 3
+          ? "Welcome to MíngZhàn"
+          : "Tell us about yourself";
+
+  const subtitle =
+    currentStep === 1
+      ? "Set up your admin account to secure the dashboard, or restore a backup ZIP from a previous install."
+      : currentStep === 2
+        ? "Every workspace lives inside an organization. Name yours to finish setup."
+        : currentStep === 3
+          ? "Add an AI provider now, or skip it and add one from Settings later."
+          : "Help the agent understand your preferences. Optional.";
+
+  function renderStep(): ReactNode {
+    switch (currentStep) {
+      case 1:
+        return (
+          <SetupStepAccount
+            initialDraft={accountDraft}
+            onNext={(account) => {
+              setAccountDraft(account);
+              goNext();
+            }}
+          />
+        );
+      case 2:
+        if (!accountDraft) {
+          return null;
+        }
+
+        return (
+          <SetupStepOrganization
+            account={accountDraft}
+            onBack={goBack}
+            onNext={handleStepAdvance}
+          />
+        );
+      case 3:
+        return (
+          <SetupStepProvider
+            onNext={() => handleStepAdvance()}
+            onSkip={handleSkip}
+          />
+        );
+      case 4:
+        return (
+          <SetupStepUserContext
+            onBack={goBack}
+            onNext={handleStepAdvance}
+            onSkip={handleSkip}
+          />
+        );
+      default:
+        throw new Error(`Unexpected setup step: ${currentStep}`);
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="space-y-1">
+        <h1 className="font-semibold text-foreground text-xl">{heading}</h1>
+        <p className="text-muted-foreground text-sm">{subtitle}</p>
+      </div>
+
+      <SetupWizardStepper currentStep={currentStep} />
+
+      <div key={currentStep}>{renderStep()}</div>
+    </div>
+  );
+}

@@ -1,0 +1,542 @@
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { getUserConfigDir } from "@mingzhan/core";
+import { unzipSync, zipSync } from "fflate";
+import {
+  closeAgentGroupDatabases,
+  createAgentGroup,
+  listAgentGroups,
+} from "../../services/agent-group-store";
+import * as dataPortability from "../../services/data-portability";
+import {
+  createMíngZhànDataExport,
+  MAX_IMPORT_ENTRIES,
+  previewMíngZhànDataImport,
+} from "../../services/data-portability";
+import { sessionTurnRegistry } from "../../services/session-turn-registry";
+import { setupTestConfigDir } from "../../test-config-dir";
+import { createMinimalHonoApp } from "../test-app-helpers";
+import { loginPlatformAdminSession } from "../test-session-helpers";
+
+// Before the config dir cleanup, which Windows refuses while a file is open.
+afterEach(closeAgentGroupDatabases);
+
+setupTestConfigDir("mingzhan-setup-import-routes-test-");
+
+function createApp() {
+  return createMinimalHonoApp({
+    agent: {
+      listProfiles: async () => ({ profiles: [{ id: "default" }] }),
+      providerConfigured: true,
+    },
+  });
+}
+
+async function createArchiveOverEntryLimit(): Promise<Buffer> {
+  const archive = (
+    await createMíngZhànDataExport({ rootDir: getUserConfigDir() })
+  ).data;
+
+  const entries = unzipSync(archive);
+
+  for (let index = 0; index < MAX_IMPORT_ENTRIES; index += 1) {
+    entries[`empty-${index}.txt`] = new Uint8Array();
+  }
+
+  return Buffer.from(zipSync(entries, { level: 0 }));
+}
+
+describe("setup import routes", () => {
+  test("setup import rejects bodies that are not application/json", async () => {
+    const { app } = createApp();
+    const configPath = join(getUserConfigDir(), "config.ini");
+    await writeFile(configPath, "original");
+
+    const archive = (
+      await createMíngZhànDataExport({ rootDir: getUserConfigDir() })
+    ).data;
+
+    await writeFile(configPath, "changed");
+
+    const previewResponse = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/setup/import/preview", {
+        body: JSON.stringify({ data: archive.toString("base64") }),
+        headers: { "Content-Type": "text/plain;charset=UTF-8" },
+        method: "POST",
+      })
+    );
+
+    const restoreResponse = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/setup/import/restore", {
+        body: JSON.stringify({
+          confirm: true,
+          data: archive.toString("base64"),
+        }),
+        headers: { "Content-Type": "text/plain;charset=UTF-8" },
+        method: "POST",
+      })
+    );
+
+    expect(previewResponse.status).toBe(415);
+    expect(restoreResponse.status).toBe(415);
+    await expect(readFile(configPath, "utf8")).resolves.toBe("changed");
+  });
+
+  test("restore blocks traffic and waits for active turns before replacing data", async () => {
+    let stopped = false;
+
+    const { app } = createMinimalHonoApp({
+      onBeforeDataRestore: () => {
+        stopped = true;
+      },
+      onDataRestored: async () => {},
+    });
+
+    const archive = (
+      await createMíngZhànDataExport({ rootDir: getUserConfigDir() })
+    ).data;
+
+    sessionTurnRegistry.beginTurn("restore-drain-test");
+
+    const restoring = app.fetch(
+      new Request("http://localhost/v1/auth/setup/import/restore", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          confirm: true,
+          data: archive.toString("base64"),
+        }),
+      })
+    );
+
+    try {
+      let status = 0;
+
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        status = (await app.fetch(new Request("http://localhost/v1/auth/me")))
+          .status;
+
+        if (status === 503) {
+          break;
+        }
+
+        await Bun.sleep(5);
+      }
+
+      expect(status).toBe(503);
+      expect(stopped).toBe(false);
+    } finally {
+      sessionTurnRegistry.cancelTurn("restore-drain-test");
+    }
+
+    expect((await restoring).status).toBe(200);
+    expect(stopped).toBe(true);
+    expect(
+      (await app.fetch(new Request("http://localhost/v1/auth/me"))).status
+    ).toBe(401);
+  });
+
+  test("fresh install can preview and restore import without authentication", async () => {
+    const { app } = createApp();
+    await writeFile(join(getUserConfigDir(), "config.ini"), "original");
+
+    const archive = (
+      await createMíngZhànDataExport({ rootDir: getUserConfigDir() })
+    ).data;
+
+    await writeFile(join(getUserConfigDir(), "config.ini"), "changed");
+
+    const previewResponse = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/setup/import/preview", {
+        body: JSON.stringify({ data: archive.toString("base64") }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(previewResponse.status).toBe(200);
+    await expect(previewResponse.json()).resolves.toMatchObject({
+      archiveFileCount: 1,
+      willReplaceRoot: true,
+    });
+    await expect(
+      readFile(join(getUserConfigDir(), "config.ini"), "utf8")
+    ).resolves.toBe("changed");
+
+    const restoreResponse = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/setup/import/restore", {
+        body: JSON.stringify({
+          confirm: true,
+          data: archive.toString("base64"),
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(restoreResponse.status).toBe(200);
+    await expect(restoreResponse.json()).resolves.toMatchObject({
+      // createApp() omits onDataRestored — client must restart.
+      requiresRestart: true,
+      restoredFileCount: 1,
+    });
+    await expect(
+      readFile(join(getUserConfigDir(), "config.ini"), "utf8")
+    ).resolves.toBe("original");
+  });
+
+  test("setup restore reports requiresRestart false after onDataRestored succeeds", async () => {
+    let restoredCalls = 0;
+
+    const { app } = createMinimalHonoApp({
+      agent: {
+        listProfiles: async () => ({ profiles: [{ id: "default" }] }),
+        providerConfigured: true,
+      },
+      onDataRestored: async () => {
+        restoredCalls += 1;
+      },
+    });
+
+    await writeFile(join(getUserConfigDir(), "config.ini"), "original");
+
+    const archive = (
+      await createMíngZhànDataExport({ rootDir: getUserConfigDir() })
+    ).data;
+
+    await writeFile(join(getUserConfigDir(), "config.ini"), "changed");
+
+    const restoreResponse = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/setup/import/restore", {
+        body: JSON.stringify({
+          confirm: true,
+          data: archive.toString("base64"),
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(restoreResponse.status).toBe(200);
+    expect(restoredCalls).toBe(1);
+    expect(
+      (await app.fetch(new Request("http://localhost/v1/auth/me"))).status
+    ).toBe(401);
+    await expect(restoreResponse.json()).resolves.toMatchObject({
+      requiresRestart: false,
+      restoredFileCount: 1,
+    });
+  });
+
+  test("restore reopens agent group files from the restored data", async () => {
+    const { app } = createMinimalHonoApp({ onDataRestored: async () => {} });
+    await writeFile(join(getUserConfigDir(), "config.ini"), "original");
+
+    const archive = (
+      await createMíngZhànDataExport({ rootDir: getUserConfigDir() })
+    ).data;
+
+    // Opens and keeps the org's group file, which the archive does not have.
+    createAgentGroup("org_restore", "u1", "Launch", ["p1", "p2"]);
+
+    const restoreResponse = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/setup/import/restore", {
+        body: JSON.stringify({
+          confirm: true,
+          data: archive.toString("base64"),
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(restoreResponse.status).toBe(200);
+    expect(listAgentGroups("org_restore", "u1")).toEqual([]);
+  });
+
+  test("setup restore keeps 200 with requiresRestart when onDataRestored throws", async () => {
+    const { app } = createMinimalHonoApp({
+      agent: {
+        listProfiles: async () => ({ profiles: [{ id: "default" }] }),
+        providerConfigured: true,
+      },
+      onDataRestored: async () => {
+        throw new Error("reopen failed");
+      },
+    });
+
+    await writeFile(join(getUserConfigDir(), "config.ini"), "original");
+
+    const archive = (
+      await createMíngZhànDataExport({ rootDir: getUserConfigDir() })
+    ).data;
+
+    const restoreResponse = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/setup/import/restore", {
+        body: JSON.stringify({
+          confirm: true,
+          data: archive.toString("base64"),
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(restoreResponse.status).toBe(200);
+    await expect(restoreResponse.json()).resolves.toMatchObject({
+      requiresRestart: true,
+    });
+    expect(
+      (await app.fetch(new Request("http://localhost/v1/auth/me"))).status
+    ).toBe(503);
+    await expect(
+      readFile(join(getUserConfigDir(), "config.ini"), "utf8")
+    ).resolves.toBe("original");
+  });
+
+  test("setup restore releases the database before files move and reopens after", async () => {
+    const calls: string[] = [];
+
+    const { app } = createMinimalHonoApp({
+      agent: {
+        listProfiles: async () => ({ profiles: [{ id: "default" }] }),
+        providerConfigured: true,
+      },
+      onBeforeDataRestore: async () => {
+        const live = await readFile(
+          join(getUserConfigDir(), "config.ini"),
+          "utf8"
+        );
+
+        calls.push(`release:${live}`);
+      },
+      onDataRestored: async () => {
+        calls.push("reopen");
+      },
+    });
+
+    await writeFile(join(getUserConfigDir(), "config.ini"), "original");
+
+    const archive = (
+      await createMíngZhànDataExport({ rootDir: getUserConfigDir() })
+    ).data;
+
+    await writeFile(join(getUserConfigDir(), "config.ini"), "changed");
+
+    const restoreResponse = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/setup/import/restore", {
+        body: JSON.stringify({
+          confirm: true,
+          data: archive.toString("base64"),
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(restoreResponse.status).toBe(200);
+    expect(calls).toEqual(["release:changed", "reopen"]);
+  });
+
+  test("setup restore reopens the database when it fails after releasing it", async () => {
+    let reopened = 0;
+
+    const { app } = createMinimalHonoApp({
+      agent: {
+        listProfiles: async () => ({ profiles: [{ id: "default" }] }),
+        providerConfigured: true,
+      },
+      onBeforeDataRestore: () => {
+        throw new Error("release failed");
+      },
+      onDataRestored: async () => {
+        reopened += 1;
+      },
+    });
+
+    await writeFile(join(getUserConfigDir(), "config.ini"), "original");
+
+    const archive = (
+      await createMíngZhànDataExport({ rootDir: getUserConfigDir() })
+    ).data;
+
+    await writeFile(join(getUserConfigDir(), "config.ini"), "changed");
+
+    const restoreResponse = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/setup/import/restore", {
+        body: JSON.stringify({
+          confirm: true,
+          data: archive.toString("base64"),
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(restoreResponse.status).toBe(400);
+    expect(reopened).toBe(1);
+    await expect(
+      readFile(join(getUserConfigDir(), "config.ini"), "utf8")
+    ).resolves.toBe("changed");
+  });
+
+  test("setup import is blocked after the first admin account exists", async () => {
+    const { app, authService, databaseAdapter } = createApp();
+    await loginPlatformAdminSession(app, authService, databaseAdapter);
+
+    const archive = (
+      await createMíngZhànDataExport({ rootDir: getUserConfigDir() })
+    ).data;
+
+    const previewResponse = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/setup/import/preview", {
+        body: JSON.stringify({ data: archive.toString("base64") }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(previewResponse.status).toBe(409);
+    await expect(previewResponse.json()).resolves.toEqual({
+      error:
+        "Setup import is only available before the first admin account is created.",
+    });
+  });
+
+  test("invalid setup import archive is rejected", async () => {
+    const { app } = createApp();
+    await writeFile(join(getUserConfigDir(), "config.ini"), "keep");
+
+    const response = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/setup/import/preview", {
+        body: JSON.stringify({
+          data: Buffer.from("not a zip").toString("base64"),
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: "Invalid ZIP archive.",
+    });
+    await expect(
+      readFile(join(getUserConfigDir(), "config.ini"), "utf8")
+    ).resolves.toBe("keep");
+  });
+
+  test("setup preview and restore reject archives over the entry limit", async () => {
+    const { app } = createApp();
+    const configPath = join(getUserConfigDir(), "config.ini");
+    await writeFile(configPath, "keep");
+    const archive = await createArchiveOverEntryLimit();
+    const data = archive.toString("base64");
+
+    const previewResponse = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/setup/import/preview", {
+        body: JSON.stringify({ data }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    const restoreResponse = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/setup/import/restore", {
+        body: JSON.stringify({ confirm: true, data }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(restoreResponse.status).toBe(400);
+    await expect(readFile(configPath, "utf8")).resolves.toBe("keep");
+  });
+
+  test("wrong-typed setup import body is rejected before decoding", async () => {
+    const { app } = createApp();
+
+    const previewResponse = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/setup/import/preview", {
+        body: JSON.stringify({ data: 42 }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(previewResponse.status).toBe(400);
+
+    const restoreResponse = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/setup/import/restore", {
+        body: JSON.stringify({ confirm: "yes", data: "archive" }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(restoreResponse.status).toBe(400);
+  });
+
+  test("setup import preview does not leak an unexpected error's message", async () => {
+    const { app } = createApp();
+    await writeFile(join(getUserConfigDir(), "config.ini"), "keep");
+
+    const archive = (
+      await createMíngZhànDataExport({ rootDir: getUserConfigDir() })
+    ).data;
+
+    const previewSpy = spyOn(
+      dataPortability,
+      "previewMíngZhànDataImport"
+    ).mockImplementation(async () => {
+      throw new Error(
+        "ENOENT: no such file or directory, open '/home/mingzhan/.config/mingzhan/mingzhan.db'"
+      );
+    });
+
+    try {
+      const response = await app.fetch(
+        new Request("http://localhost:4310/v1/auth/setup/import/preview", {
+          body: JSON.stringify({ data: archive.toString("base64") }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        })
+      );
+
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toEqual({
+        error: "An unexpected server error occurred.",
+      });
+    } finally {
+      previewSpy.mockRestore();
+    }
+  });
+
+  test("setup import preview accepts valid archives", async () => {
+    const { app } = createApp();
+    await writeFile(join(getUserConfigDir(), "config.ini"), "provider=openai");
+
+    const archive = (
+      await createMíngZhànDataExport({ rootDir: getUserConfigDir() })
+    ).data;
+
+    const preview = await previewMíngZhànDataImport(archive, {
+      rootDir: getUserConfigDir(),
+    });
+
+    const response = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/setup/import/preview", {
+        body: JSON.stringify({ data: archive.toString("base64") }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      archiveFileCount: preview.archiveFileCount,
+      topLevelPaths: preview.topLevelPaths,
+    });
+  });
+});

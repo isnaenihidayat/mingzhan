@@ -1,0 +1,89 @@
+import { Search01Icon } from "hugeicons-react";
+import {
+  AutomationListItem,
+  AutomationListSkeleton,
+  AutomationSearch,
+} from "@/pages/automations/automations-components";
+import type { AutomationsPageState } from "@/pages/automations/use-automations-page";
+
+type ListState = Pick<
+  AutomationsPageState,
+  | "automations"
+  | "unreadByAutomationId"
+  | "selectedId"
+  | "setSelectedId"
+  | "busy"
+  | "searchQuery"
+  | "setSearchQuery"
+  | "initialLoading"
+  | "filteredAutomations"
+  | "setDeleteTarget"
+  | "runningId"
+>;
+
+export function AutomationsListSidebar(state: ListState) {
+  const {
+    automations,
+    unreadByAutomationId,
+    selectedId,
+    setSelectedId,
+    busy,
+    searchQuery,
+    setSearchQuery,
+    initialLoading,
+    filteredAutomations,
+    setDeleteTarget,
+    runningId,
+  } = state;
+
+  return (
+    <aside className="hidden min-h-0 min-w-0 flex-col border-border border-b lg:flex lg:border-r lg:border-b-0">
+      <div className="shrink-0 space-y-3 border-border border-b px-3 py-3">
+        <AutomationSearch
+          disabled={initialLoading || automations.length === 0 || busy}
+          onChange={setSearchQuery}
+          onClear={() => setSearchQuery("")}
+          value={searchQuery}
+        />
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        {initialLoading ? (
+          <AutomationListSkeleton />
+        ) : filteredAutomations.length === 0 ? (
+          <div className="flex min-h-[12rem] flex-col items-center justify-center px-2 py-10 text-center">
+            <Search01Icon
+              aria-hidden
+              className="size-5 text-muted-foreground"
+            />
+            <p className="mt-3 font-medium text-foreground text-sm">
+              No matching automations
+            </p>
+            <p className="mt-1 text-muted-foreground text-sm">
+              Try a different search term.
+            </p>
+          </div>
+        ) : (
+          <ul className="divide-y divide-muted border-muted border-b dark:divide-muted/50 dark:border-muted/50">
+            {filteredAutomations.map((automation) => (
+              <li key={automation.id}>
+                <AutomationListItem
+                  automation={automation}
+                  busy={busy}
+                  onDelete={setDeleteTarget}
+                  onSelect={() => setSelectedId(automation.id)}
+                  running={
+                    runningId === automation.id ||
+                    automation.lastRunStatus === "running"
+                  }
+                  selected={selectedId === automation.id}
+                  unreadCount={unreadByAutomationId[automation.id] ?? 0}
+                />
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </aside>
+  );
+}

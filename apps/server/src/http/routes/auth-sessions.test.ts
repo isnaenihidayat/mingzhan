@@ -1,0 +1,296 @@
+import { describe, expect, test } from "bun:test";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { ListBrowserSessionsResponse } from "@mingzhan/core";
+import { createInMemoryDatabaseAdapter } from "@mingzhan/db";
+import { AgentService } from "../../services/agent-service";
+import { AuthService } from "../../services/auth-service";
+import { createMinimalHonoApp } from "../test-app-helpers";
+import {
+  type AppFetch,
+  loginPlatformAdminSession,
+  loginUserSession,
+  seedOrgAdmin,
+  setupFreshInstallSession,
+  type TestBrowserSession,
+} from "../test-session-helpers";
+
+const PASSWORD = "password123";
+
+async function createApp() {
+  process.env.MINGZHAN_CONFIG_DIR = await mkdtemp(
+    join(tmpdir(), "mingzhan-auth-sessions-route-")
+  );
+
+  const databaseAdapter = createInMemoryDatabaseAdapter();
+
+  return createMinimalHonoApp({
+    agent: new AgentService(null, null, databaseAdapter),
+    databaseAdapter,
+  });
+}
+
+async function listSessions(
+  app: AppFetch,
+  session: TestBrowserSession
+): Promise<ListBrowserSessionsResponse> {
+  const response = await app.fetch(
+    new Request("http://localhost:4310/v1/auth/sessions", {
+      headers: session.headers(),
+    })
+  );
+
+  expect(response.status).toBe(200);
+
+  // SAFETY: This test controls the fixture shape at this boundary.
+  return (await response.json()) as ListBrowserSessionsResponse;
+}
+
+async function revoke(
+  app: AppFetch,
+  session: TestBrowserSession,
+  sessionId: string
+): Promise<Response> {
+  return app.fetch(
+    new Request(
+      `http://localhost:4310/v1/auth/sessions/${encodeURIComponent(sessionId)}`,
+      {
+        headers: session.headers({ "X-CSRF-Token": session.csrfToken }),
+        method: "DELETE",
+      }
+    )
+  );
+}
+
+describe("browser session governance", () => {
+  test("platform admin selects an organization without membership", async () => {
+    const { app, databaseAdapter } = await createApp();
+    await setupFreshInstallSession(app, databaseAdapter);
+    const now = new Date().toISOString();
+    await databaseAdapter.upsertOrganization({
+      createdAt: now,
+      id: "org_remote",
+      name: "Remote",
+      slug: "remote",
+      updatedAt: now,
+    });
+    await databaseAdapter.upsertProfile({
+      createdAt: now,
+      id: "agent_remote",
+      isDefault: false,
+      isSuper: false,
+      model: null,
+      name: "Remote agent",
+      orgId: "org_remote",
+      systemPrompt: "",
+      updatedAt: now,
+    });
+
+    const admin = await loginPlatformAdminSession(
+      app,
+      new AuthService(),
+      databaseAdapter
+    );
+
+    const switched = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/active-org", {
+        body: JSON.stringify({ orgId: "org_remote" }),
+        headers: admin.headers({
+          "Content-Type": "application/json",
+          "X-CSRF-Token": admin.csrfToken,
+        }),
+        method: "POST",
+      })
+    );
+
+    expect(switched.status).toBe(200);
+    expect((await switched.json()).activeOrgId).toBe("org_remote");
+
+    const me = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/me", {
+        headers: admin.headers(),
+      })
+    );
+
+    expect((await me.json()).activeOrgId).toBe("org_remote");
+
+    const remoteProfiles = await app.fetch(
+      new Request("http://localhost:4310/v1/profiles", {
+        headers: admin.headers({}, "org_remote"),
+      })
+    );
+
+    expect(remoteProfiles.status).toBe(200);
+    expect((await remoteProfiles.json()).profiles).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "agent_remote" })])
+    );
+
+    await seedOrgAdmin(databaseAdapter, {
+      email: "member@example.com",
+      orgId: "org_member",
+      userId: "user_member",
+    });
+    const member = await loginUserSession(app, "member@example.com", PASSWORD);
+
+    const denied = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/active-org", {
+        body: JSON.stringify({ orgId: "org_remote" }),
+        headers: member.headers({
+          "Content-Type": "application/json",
+          "X-CSRF-Token": member.csrfToken,
+        }),
+        method: "POST",
+      })
+    );
+
+    expect(denied.status).toBe(404);
+
+    await databaseAdapter.upsertOrganization({
+      ...(await databaseAdapter.getOrganizationById("org_remote"))!,
+      archivedAt: new Date().toISOString(),
+    });
+
+    const archived = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/active-org", {
+        body: JSON.stringify({ orgId: "org_remote" }),
+        headers: admin.headers({
+          "Content-Type": "application/json",
+          "X-CSRF-Token": admin.csrfToken,
+        }),
+        method: "POST",
+      })
+    );
+
+    expect(archived.status).toBe(404);
+  });
+
+  test("a user lists their own devices and marks the one making the request", async () => {
+    const { app, databaseAdapter } = await createApp();
+    const first = await setupFreshInstallSession(app, databaseAdapter);
+    const second = await loginUserSession(app, "admin@example.com", PASSWORD);
+
+    const listed = await listSessions(app, second);
+
+    expect(listed.sessions).toHaveLength(2);
+    expect(listed.sessions.filter((entry) => entry.current)).toHaveLength(1);
+    // Nothing that authenticates a session may leave the database.
+    const serialized = JSON.stringify(listed);
+    expect(serialized).not.toContain("TokenHash");
+    expect(serialized).not.toContain(second.csrfToken);
+    void first;
+  });
+
+  test("a user revokes another of their sessions and its cookie stops working", async () => {
+    const { app, databaseAdapter } = await createApp();
+    await setupFreshInstallSession(app, databaseAdapter);
+    const keep = await loginUserSession(app, "admin@example.com", PASSWORD);
+    const doomed = await loginUserSession(app, "admin@example.com", PASSWORD);
+
+    // Ask the doomed session which row is its own, so the revoke targets it
+    // rather than whichever session happens to sort first.
+    const doomedOwn = await listSessions(app, doomed);
+
+    const doomedId =
+      doomedOwn.sessions.find((entry) => entry.current)?.id ?? "";
+
+    expect(doomedId).not.toBe("");
+
+    const response = await revoke(app, keep, doomedId);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ revoked: 1 });
+
+    const afterRevoke = await app.fetch(
+      new Request("http://localhost:4310/v1/auth/sessions", {
+        headers: doomed.headers(),
+      })
+    );
+
+    expect(afterRevoke.status).toBe(401);
+
+    // The caller's own session is untouched, and the revoked row is gone.
+    const remaining = await listSessions(app, keep);
+    expect(remaining.sessions.map((entry) => entry.id)).not.toContain(doomedId);
+    expect(remaining.sessions.some((entry) => entry.current)).toBe(true);
+  });
+
+  test("one user cannot revoke another user's session", async () => {
+    const { app, databaseAdapter } = await createApp();
+    const owner = await setupFreshInstallSession(app, databaseAdapter);
+    const ownerSessions = await listSessions(app, owner);
+    const ownerSessionId = ownerSessions.sessions[0]?.id ?? "";
+
+    const intruderEmail = "intruder@example.com";
+    await seedOrgAdmin(databaseAdapter, {
+      email: intruderEmail,
+      orgId: "org_intruder",
+      userId: "user_intruder",
+    });
+    const intruder = await loginUserSession(app, intruderEmail, PASSWORD);
+
+    const response = await revoke(app, intruder, ownerSessionId);
+
+    // A session that is not yours reads the same as one that is not there, so
+    // an id cannot be probed against another account.
+    expect(response.status).toBe(404);
+    const stillThere = await listSessions(app, owner);
+    expect(stillThere.sessions.map((entry) => entry.id)).toContain(
+      ownerSessionId
+    );
+  });
+
+  test("a platform admin force-revokes every session a user holds", async () => {
+    const { app, databaseAdapter } = await createApp();
+    const admin = await setupFreshInstallSession(app, databaseAdapter);
+    await loginUserSession(app, "admin@example.com", PASSWORD);
+    const victim = await databaseAdapter.getUserByEmail("admin@example.com");
+    expect(victim).not.toBeNull();
+
+    const response = await app.fetch(
+      new Request(
+        `http://localhost:4310/v1/auth/users/${encodeURIComponent(victim?.id ?? "")}/sessions`,
+        {
+          headers: admin.headers({ "X-CSRF-Token": admin.csrfToken }),
+          method: "DELETE",
+        }
+      )
+    );
+
+    expect(response.status).toBe(200);
+    // SAFETY: This test controls the fixture shape at this boundary.
+    const body = (await response.json()) as { revoked: number };
+    expect(body.revoked).toBeGreaterThanOrEqual(2);
+  });
+  test("an org admin who is not a platform admin cannot force-revoke anyone", async () => {
+    const { app, databaseAdapter } = await createApp();
+    const owner = await setupFreshInstallSession(app, databaseAdapter);
+    const victim = await databaseAdapter.getUserByEmail("admin@example.com");
+
+    await seedOrgAdmin(databaseAdapter, {
+      email: "orgadmin@example.com",
+      orgId: "org_other",
+      userId: "user_orgadmin",
+    });
+
+    const orgAdmin = await loginUserSession(
+      app,
+      "orgadmin@example.com",
+      PASSWORD
+    );
+
+    const response = await app.fetch(
+      new Request(
+        `http://localhost:4310/v1/auth/users/${encodeURIComponent(victim?.id ?? "")}/sessions`,
+        {
+          headers: orgAdmin.headers({ "X-CSRF-Token": orgAdmin.csrfToken }),
+          method: "DELETE",
+        }
+      )
+    );
+
+    expect(response.status).toBe(403);
+    // Refused, not partially applied: the owner is still signed in.
+    const stillLive = await listSessions(app, owner);
+    expect(stillLive.sessions.length).toBeGreaterThan(0);
+  });
+});

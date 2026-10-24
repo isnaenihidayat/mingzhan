@@ -1,0 +1,1159 @@
+import type {
+  MíngZhànClient,
+  RemoteChatSession,
+  SendStreamOptions,
+} from "@mingzhan/client";
+import {
+  extractPairedTurnArtifacts,
+  isAttachOnlyCommand,
+  pushDeliverableArtifact,
+} from "@mingzhan/core";
+import { formatClientError } from "@mingzhan/core/api-error";
+import {
+  clearActiveStream,
+  isAbortError,
+  registerActiveStream,
+  stopActiveStream,
+} from "@mingzhan/core/channel-active-stream";
+import { createChatLock } from "@mingzhan/core/channel-chat-lock";
+import {
+  type ChannelOrgStore,
+  findOrgBySelectionInput,
+  formatOrgSelectionPrompt,
+  formatOrgSwitchConfirmation,
+  prepareChannelOrgContext,
+} from "@mingzhan/core/channel-org";
+import type { ChannelSessionStore } from "@mingzhan/core/channel-session-store";
+import { createTypingLoop } from "@mingzhan/core/channel-typing-loop";
+import type {
+  SendMessageInput,
+  SendMessageRequest,
+} from "@mingzhan/core/contract";
+import {
+  MAX_DOCUMENT_BYTES,
+  MAX_IMAGE_BYTES,
+  normalizeDocumentMediaType,
+  validateDocumentAttachments,
+  validateImageAttachments,
+} from "@mingzhan/core/message-content";
+import { pickProfileForOrg } from "@mingzhan/core/profiles";
+import {
+  DEFAULT_WHATSAPP_REQUIRE_GROUP_MENTION,
+  hasActivePairingCode,
+  looksLikePairingCode,
+} from "@mingzhan/core/whatsapp-config";
+import {
+  downloadContentFromMessage,
+  type WASocket,
+} from "@whiskeysockets/baileys";
+import type { WhatsAppAuthStore } from "./auth-store";
+import {
+  maybeSendWhatsAppAttachOnlyCommand,
+  type PreparedWhatsAppArtifactCandidate,
+  parsePreparedWhatsAppArtifact,
+  sendArtifactDocumentForPath,
+} from "./channel-artifact-flow";
+import type { WhatsAppBridgeConfig } from "./config";
+import {
+  HELP_TEXT,
+  prepareWhatsAppReply,
+  splitWhatsAppMessage,
+} from "./format";
+import {
+  explainGroupMessageHandling,
+  extraJidsFromGroupParticipants,
+  isWhatsAppBotAddress,
+  resolveChannelOrgKey,
+  stripWhatsAppBotMention,
+} from "./group-message";
+import {
+  isWhatsAppOutboundEcho,
+  rememberWhatsAppOutbound,
+  type WhatsAppInboundChat,
+} from "./inbound-message";
+import { maskWhatsAppJid } from "./log-metadata";
+import { WhatsAppTodoStatusMessage } from "./todo-status-message";
+
+/** Optional verbose channel worker logging (per-message structural info). */
+function isChannelDebugEnabled(): boolean {
+  return process.env.MINGZHAN_CH_DEBUG === "1";
+}
+
+const chatLock = createChatLock();
+
+const GROUP_MESSAGE_PREFIX =
+  "[WhatsApp group — your reply is visible to everyone in this group.]\n";
+
+const LINK_IN_PRIVATE_REPLY =
+  "This WhatsApp number is not linked yet. Open a private chat with this account and send your pairing code from Integrations → WhatsApp.";
+
+const ALREADY_LINKED_REPLY = "This number is already linked.";
+
+const PAIRING_PROMPT =
+  "Welcome to MíngZhàn.\n\n" +
+  "Paste your pairing code from Integrations \u2192 WhatsApp in the web dashboard. " +
+  "You only need to do this once for this number.";
+
+export interface ChatHandlerDeps {
+  authStore: WhatsAppAuthStore;
+  client: MíngZhànClient;
+  config: WhatsAppBridgeConfig;
+  getSocket: () => WASocket | null;
+  orgStore: ChannelOrgStore;
+  sessionStore: ChannelSessionStore;
+  whatsappContextToken?: string;
+}
+
+export function createChatHandler(deps: ChatHandlerDeps) {
+  const {
+    client,
+    config,
+    authStore,
+    sessionStore,
+    orgStore,
+    getSocket,
+    whatsappContextToken,
+  } = deps;
+
+  if (config.orgId) {
+    client.setOrgId(config.orgId);
+  }
+
+  return async function handleMessage(
+    data: Pick<WhatsAppInboundChat, "jid" | "text"> &
+      Partial<Omit<WhatsAppInboundChat, "jid" | "text">>
+  ): Promise<void> {
+    const inbound = normalizeInboundChat(data);
+    const { jid, text } = inbound;
+
+    if (!(text.trim() || inbound.media)) {
+      return;
+    }
+
+    const trimmed = text.trim();
+
+    if (
+      isWhatsAppOutboundEcho({
+        fromMe: inbound.fromMe,
+        id: inbound.messageId,
+        jid,
+        text: trimmed,
+      })
+    ) {
+      if (isChannelDebugEnabled()) {
+        console.log(
+          [
+            "Ignored WhatsApp outbound echo",
+            `jid=${maskWhatsAppJid(jid)}`,
+            `fromMe=${inbound.fromMe ? "yes" : "no"}`,
+            `textBytes=${Buffer.byteLength(trimmed, "utf8")}`,
+          ].join(" ")
+        );
+      }
+
+      return;
+    }
+
+    const isGroup = inbound.isGroup;
+    const conversationKey = jid;
+    const channelOrgKey = resolveChannelOrgKey(jid, isGroup);
+    await authStore.reload();
+
+    const requireGroupMention =
+      authStore.getConfig()?.requireGroupMention ??
+      DEFAULT_WHATSAPP_REQUIRE_GROUP_MENTION;
+
+    const groupDecision = isGroup
+      ? explainGroupMessageHandling({
+          me: inbound.me,
+          mentionedJids: inbound.mentionedJids,
+          quotedParticipant: inbound.quotedParticipant,
+          requireMention: requireGroupMention,
+          text: trimmed || (inbound.media ? "[attachment]" : ""),
+        })
+      : null;
+
+    if (groupDecision && !groupDecision.shouldHandle) {
+      if (isChannelDebugEnabled()) {
+        console.log(
+          [
+            "Ignored WhatsApp group message",
+            `reason=${groupDecision.reason}`,
+            `jid=${maskWhatsAppJid(jid)}`,
+            `sender=${maskWhatsAppJid(inbound.senderJid)}`,
+            `textBytes=${Buffer.byteLength(trimmed, "utf8")}`,
+          ].join(" ")
+        );
+      }
+
+      return;
+    }
+
+    if (isStopCommand(trimmed)) {
+      await authStore.reload();
+      const stopSenderJids = [...inbound.senderJids];
+
+      let stopAuthorized =
+        inbound.fromMe ||
+        authStore.isAuthorized(stopSenderJids) ||
+        stopSenderJids.some((senderJid) =>
+          isWhatsAppBotAddress(senderJid, inbound.me)
+        );
+
+      if (!stopAuthorized && isGroup) {
+        const resolvedSenderJids = await resolveGroupSenderJids(
+          jid,
+          stopSenderJids
+        );
+
+        stopSenderJids.push(...resolvedSenderJids);
+        stopAuthorized = authStore.isAuthorized(stopSenderJids);
+      }
+
+      if (!stopAuthorized) {
+        return;
+      }
+
+      if (!stopActiveStream(conversationKey)) {
+        await sendText(jid, "Nothing to stop.");
+      }
+
+      return;
+    }
+
+    await withChatLock(conversationKey, async () => {
+      await authStore.reload();
+      const senderJids = [...inbound.senderJids];
+      const pairingText = isGroup ? stripWhatsAppBotMention(trimmed) : trimmed;
+
+      let authorized =
+        inbound.fromMe ||
+        authStore.isAuthorized(senderJids) ||
+        senderJids.some((senderJid) =>
+          isWhatsAppBotAddress(senderJid, inbound.me)
+        );
+
+      if (!authorized && isGroup) {
+        const resolvedSenderJids = await resolveGroupSenderJids(
+          jid,
+          senderJids
+        );
+
+        senderJids.push(...resolvedSenderJids);
+        authorized =
+          authStore.isAuthorized(senderJids) ||
+          authStore.getConfig()?.allowUnpairedGroupMembers === true;
+      }
+
+      if (authorized) {
+        await authStore.rememberIdentities(senderJids);
+      }
+
+      if (!authorized) {
+        if (!hasActivePairingCode(authStore.getConfig())) {
+          if (isChannelDebugEnabled()) {
+            console.log(
+              [
+                "Ignored WhatsApp message",
+                "reason=unauthorized",
+                `jid=${maskWhatsAppJid(jid)}`,
+                `sender=${maskWhatsAppJid(inbound.senderJid)}`,
+                `textBytes=${Buffer.byteLength(trimmed, "utf8")}`,
+              ].join(" ")
+            );
+          }
+
+          return;
+        }
+
+        if (isGroup) {
+          if (looksLikePairingCode(pairingText)) {
+            await handlePairing(inbound.senderJid, pairingText);
+
+            return;
+          }
+
+          if (groupDecision?.reason === "open-listen") {
+            return;
+          }
+
+          await sendText(jid, LINK_IN_PRIVATE_REPLY);
+
+          return;
+        }
+
+        await handlePairing(jid, trimmed);
+
+        return;
+      }
+
+      if (looksLikePairingCode(pairingText)) {
+        await sendText(jid, ALREADY_LINKED_REPLY);
+
+        return;
+      }
+
+      const command = trimmed.startsWith("/") ? parseCommand(trimmed) : null;
+
+      const bypassOrgGate =
+        command === "/help" || command === "/start" || command === "/org";
+
+      const orgGateText = isGroup ? stripWhatsAppBotMention(trimmed) : trimmed;
+
+      if (!bypassOrgGate) {
+        const orgReady = await ensureOrgReady(channelOrgKey, orgGateText, jid);
+
+        if (!orgReady) {
+          return;
+        }
+      }
+
+      const attachUserText = isGroup
+        ? stripWhatsAppBotMention(trimmed)
+        : trimmed;
+
+      // After pairing + org-ready: `/attach` skips handleCommand, not auth/org.
+      if (isAttachOnlyCommand(attachUserText)) {
+        const socket = getSocket();
+
+        if (!socket) {
+          await sendText(jid, "WhatsApp is not connected.");
+
+          return;
+        }
+
+        await resolveSession(conversationKey);
+
+        const profileId =
+          sessionStore.get(conversationKey)?.profileId ??
+          (await resolveProfileId());
+
+        await maybeSendWhatsAppAttachOnlyCommand({
+          client,
+          conversationKey,
+          jid,
+          profileId,
+          sendPlain: (text) => sendText(jid, text),
+          sessionStore,
+          socket,
+        });
+
+        return;
+      }
+
+      if (trimmed.startsWith("/")) {
+        await handleCommand(conversationKey, channelOrgKey, jid, trimmed);
+
+        return;
+      }
+
+      const mediaInput = inbound.media
+        ? await buildWhatsAppMediaInput(inbound.media)
+        : null;
+
+      if (mediaInput?.kind === "reject") {
+        await sendText(jid, mediaInput.message);
+
+        return;
+      }
+
+      await handleChatMessage(
+        conversationKey,
+        jid,
+        {
+          message: withGroupContext(
+            withQuotedContext(attachUserText, inbound.quotedText),
+            isGroup
+          ),
+          ...mediaInput?.input,
+        },
+        {
+          chatJid: jid,
+          fromMe: inbound.fromMe,
+          isGroup,
+          senderJid: inbound.senderJid,
+          senderJids: inbound.senderJids,
+        }
+      );
+    });
+  };
+
+  async function handlePairing(jid: string, text: string): Promise<void> {
+    const command = parseCommand(text);
+
+    if (command === "/help") {
+      await sendText(jid, `${PAIRING_PROMPT}\n\n${HELP_TEXT}`);
+
+      return;
+    }
+
+    if (!looksLikePairingCode(text)) {
+      await sendText(jid, PAIRING_PROMPT);
+
+      return;
+    }
+
+    const result = await authStore.tryPair(text, jid);
+    await sendText(jid, result.message);
+  }
+
+  async function handleCommand(
+    conversationKey: string,
+    channelOrgKey: string,
+    jid: string,
+    text: string
+  ): Promise<void> {
+    const command = parseCommand(text);
+
+    switch (command) {
+      case "/start":
+      case "/help":
+        await sendText(jid, HELP_TEXT);
+
+        return;
+
+      case "/clear": {
+        const session = await resolveSession(conversationKey);
+        await session.clear();
+        await clearSessionArtifactState(conversationKey);
+        await sendText(jid, "History cleared.");
+
+        return;
+      }
+
+      case "/compact": {
+        const session = await resolveSession(conversationKey);
+        const result = await session.compact({ force: true });
+        await sendText(
+          jid,
+          `Compacted (${result.action}). Messages: ${result.messagesAfter}.`
+        );
+
+        return;
+      }
+
+      case "/new": {
+        await createAndBindSession(conversationKey);
+        await sendText(jid, "Started a new conversation.");
+
+        return;
+      }
+
+      case "/status":
+        await replyStatus(jid);
+
+        return;
+
+      case "/org":
+        await handleOrgCommand(conversationKey, channelOrgKey, jid, text);
+
+        return;
+
+      default:
+        await sendText(jid, "Unknown command. Try /help");
+    }
+  }
+
+  async function ensureOrgReady(
+    channelOrgKey: string,
+    messageText: string,
+    replyJid: string
+  ): Promise<boolean> {
+    if (config.orgId) {
+      client.setOrgId(config.orgId);
+
+      return true;
+    }
+
+    const orgContext = await prepareChannelOrgContext({
+      getSelectedOrgId: () => orgStore.get(channelOrgKey)?.orgId,
+      listOrgs: () => client.listUserOrgs(),
+      saveSelectedOrgId: async (orgId) => {
+        orgStore.set(channelOrgKey, orgId);
+        await orgStore.save();
+      },
+      text: messageText.startsWith("/") ? undefined : messageText,
+    });
+
+    if (orgContext.status === "empty") {
+      await sendText(replyJid, "No organizations are configured yet.");
+
+      return false;
+    }
+
+    if (orgContext.status === "prompt") {
+      await sendText(replyJid, orgContext.message);
+
+      return false;
+    }
+
+    client.setOrgId(orgContext.orgId);
+
+    if (orgContext.justSelected) {
+      await sendText(replyJid, formatOrgSwitchConfirmation(orgContext.orgName));
+
+      return false;
+    }
+
+    return true;
+  }
+
+  async function handleOrgCommand(
+    conversationKey: string,
+    channelOrgKey: string,
+    jid: string,
+    text: string
+  ): Promise<void> {
+    if (config.orgId) {
+      await sendText(jid, "This number serves a single organization.");
+
+      return;
+    }
+
+    const { orgs } = await client.listUserOrgs();
+
+    if (orgs.length === 0) {
+      await sendText(jid, "No organizations are configured yet.");
+
+      return;
+    }
+
+    const arg = text.trim().split(/\s+/).slice(1).join(" ");
+
+    if (!arg) {
+      await sendText(
+        jid,
+        formatOrgSelectionPrompt(orgs, orgStore.get(channelOrgKey)?.orgId)
+      );
+
+      return;
+    }
+
+    const picked = findOrgBySelectionInput(arg, orgs);
+
+    if (!picked) {
+      await sendText(jid, "Unknown organization. Send /org to see the list.");
+
+      return;
+    }
+
+    const previousOrgId = orgStore.get(channelOrgKey)?.orgId;
+    orgStore.set(channelOrgKey, picked.id);
+    await orgStore.save();
+    client.setOrgId(picked.id);
+
+    if (previousOrgId && previousOrgId !== picked.id) {
+      sessionStore.delete(conversationKey);
+      await sessionStore.save();
+    }
+
+    await sendText(jid, formatOrgSwitchConfirmation(picked.name));
+  }
+
+  async function handleChatMessage(
+    conversationKey: string,
+    jid: string,
+    input: SendMessageInput,
+    whatsappMessage: NonNullable<SendMessageRequest["whatsappMessage"]>
+  ): Promise<void> {
+    const deliveryClient = client.forOrg(
+      config.owner?.orgId ??
+        config.orgId ??
+        orgStore.get(resolveChannelOrgKey(jid, jid.endsWith("@g.us")))?.orgId ??
+        null
+    );
+
+    const session = await resolveSession(conversationKey);
+    const profileId = sessionStore.get(conversationKey)?.profileId;
+    const socket = getSocket();
+
+    const typingLoop = createTypingLoop(async () => {
+      if (!socket) {
+        return;
+      }
+
+      await socket.sendPresenceUpdate("composing", jid);
+    });
+
+    const todoStatus = new WhatsAppTodoStatusMessage(socket, jid);
+    let reply = "";
+    let completed = false;
+
+    const selections: NonNullable<
+      ReturnType<typeof parsePreparedWhatsAppArtifact>
+    >[] = [];
+
+    const seenCalls = new Set<string>();
+    const seenPaths = new Set<string>();
+    const writeCalls = new Set<string>();
+    const signal = registerActiveStream(conversationKey);
+
+    try {
+      typingLoop.start();
+
+      try {
+        const streamOptions: SendStreamOptions = { signal };
+
+        if (whatsappContextToken) {
+          streamOptions.whatsappContextToken = whatsappContextToken;
+          streamOptions.whatsappMessage = whatsappMessage;
+        }
+
+        reply = await session.sendStream(
+          input,
+          {
+            onChunk: (delta) => {
+              reply += delta;
+            },
+            onDone: () => {
+              completed = true;
+            },
+            onThinking: () => typingLoop.ping(),
+            onTodosUpdated: (todos) => {
+              typingLoop.ping();
+              void todoStatus.update(todos);
+            },
+            onToolEnd: (event) => {
+              typingLoop.ping();
+
+              if (
+                event.tool === "write_file" ||
+                event.tool === "write_docx" ||
+                event.tool === "save_artifact" ||
+                event.tool === "edit_file"
+              ) {
+                writeCalls.add(event.toolCallId);
+              }
+
+              if (
+                event.tool !== "send_whatsapp_artifact" ||
+                seenCalls.has(event.toolCallId)
+              ) {
+                return;
+              }
+
+              seenCalls.add(event.toolCallId);
+
+              // SAFETY: The parser validates each field before returning an artifact.
+              const artifact = parsePreparedWhatsAppArtifact(
+                event.result as PreparedWhatsAppArtifactCandidate
+              );
+
+              if (artifact && !seenPaths.has(artifact.path)) {
+                seenPaths.add(artifact.path);
+                selections.push(artifact);
+              }
+            },
+            onToolStart: () => typingLoop.ping(),
+          },
+          streamOptions
+        );
+
+        if (signal.aborted) {
+          throw new DOMException("Stopped", "AbortError");
+        }
+
+        if (!completed) {
+          throw new Error(
+            "The agent turn was interrupted before completion. No documents were sent."
+          );
+        }
+      } finally {
+        if (profileId && writeCalls.size > 0) {
+          try {
+            const messages = await session.getMessages({
+              signal: AbortSignal.timeout(30_000),
+            });
+
+            // Keep assistant call inputs but exclude tools from any earlier turn.
+            const artifacts = extractPairedTurnArtifacts(
+              messages.filter(
+                (message) =>
+                  message.role !== "tool" || writeCalls.has(message.toolCallId)
+              )
+            );
+
+            let registry =
+              sessionStore.getDeliverableArtifacts(conversationKey);
+
+            for (const artifact of artifacts) {
+              registry = pushDeliverableArtifact(registry, {
+                ...artifact,
+                sharePath: null,
+                shareUrl: null,
+              });
+            }
+
+            sessionStore.updateArtifactState(conversationKey, {
+              deliverableArtifacts: registry,
+            });
+            await sessionStore.save();
+          } catch (error) {
+            console.warn(
+              "WhatsApp artifact registry reconciliation failed",
+              error
+            );
+          }
+        }
+      }
+
+      let sent = 0;
+
+      for (const artifact of selections) {
+        if (signal.aborted) {
+          await todoStatus.stop();
+          await sendText(
+            jid,
+            `Stopped. Sent ${sent} of ${selections.length} documents.`
+          );
+
+          return;
+        }
+
+        const deliverySocket = getSocket();
+
+        if (!(profileId && deliverySocket)) {
+          throw new Error(
+            "WhatsApp is disconnected. No further documents were sent."
+          );
+        }
+
+        const result = await sendArtifactDocumentForPath({
+          ...artifact,
+          client: deliveryClient,
+          jid,
+          profileId,
+          sendPlain: (text) => sendText(jid, text),
+          signal,
+          socket: deliverySocket,
+        });
+
+        if (!result.ok) {
+          await todoStatus.fail();
+
+          if (sent) {
+            await sendText(
+              jid,
+              `Sent ${sent} of ${selections.length} documents; remaining uploads stopped.`
+            );
+          }
+
+          return;
+        }
+
+        sent += 1;
+        sessionStore.updateArtifactState(conversationKey, {
+          deliverableArtifacts: pushDeliverableArtifact(
+            sessionStore.getDeliverableArtifacts(conversationKey),
+            {
+              ...artifact,
+              savedAt: new Date().toISOString(),
+              sharePath: null,
+              shareUrl: null,
+            }
+          ),
+        });
+
+        try {
+          await sessionStore.save();
+        } catch (error) {
+          console.warn("WhatsApp sent artifact registry save failed", error);
+        }
+      }
+
+      if (signal.aborted) {
+        await todoStatus.stop();
+        await sendText(
+          jid,
+          `Stopped. Sent ${sent} of ${selections.length} documents.`
+        );
+
+        return;
+      }
+
+      await todoStatus.complete();
+
+      if (reply.trim()) {
+        await sendText(jid, reply.trim());
+      } else if (!sent) {
+        await sendText(jid, "(empty reply)");
+      }
+    } catch (error) {
+      if (isAbortError(error)) {
+        await todoStatus.stop();
+        await sendText(jid, "Stopped.");
+      } else {
+        await todoStatus.fail();
+        await sendText(jid, formatClientError(error));
+      }
+    } finally {
+      clearActiveStream(conversationKey, signal);
+      typingLoop.stop();
+    }
+  }
+
+  async function replyStatus(jid: string): Promise<void> {
+    try {
+      const health = await client.health();
+
+      const lines = [
+        `Server: ${health.ok ? "ok" : "degraded"}`,
+        `Provider configured: ${health.providerConfigured ? "yes" : "no"}`,
+      ];
+
+      if (health.providerConfigured) {
+        const models = await client.getModels();
+        const profileId = await resolveProfileId();
+        const profiles = await client.listProfiles();
+
+        const profile = profiles.profiles.find(
+          (entry) => entry.id === profileId
+        );
+
+        const modelLabel = profile?.model?.includes("::")
+          ? profile.model.slice(profile.model.indexOf("::") + 2)
+          : (profile?.model ?? "none");
+
+        lines.push(`Provider: ${models.provider ?? "unknown"}`);
+        lines.push(`Model: ${modelLabel}`);
+      } else {
+        lines.push("Chat runs in offline mode without an API key.");
+      }
+
+      await sendText(jid, lines.join("\n"));
+    } catch (error) {
+      await sendText(jid, formatClientError(error));
+    }
+  }
+
+  async function resolveProfileId(): Promise<string> {
+    if (config.owner) {
+      const { profiles } = await client.listProfiles(config.owner.orgId);
+
+      if (!profiles.some((profile) => profile.id === config.owner!.profileId)) {
+        throw new Error("The connection owner is unavailable.");
+      }
+
+      return config.owner.profileId;
+    }
+
+    const fileConfig = authStore.getConfig();
+
+    const preferredProfileId =
+      fileConfig?.profileId?.trim() || config.profileId;
+
+    const profiles = await client.listProfiles();
+
+    return pickProfileForOrg(profiles.profiles, preferredProfileId).id;
+  }
+
+  async function resolveSession(jid: string): Promise<RemoteChatSession> {
+    const profileId = await resolveProfileId();
+    const existing = sessionStore.get(jid);
+
+    if (existing && existing.profileId === profileId) {
+      if (config.owner) {
+        const { sessions } = await client.listSessions(profileId, "whatsapp");
+
+        if (
+          !sessions.some(
+            (session) =>
+              session.id === existing.sessionId &&
+              session.profileId === profileId
+          )
+        ) {
+          sessionStore.delete(jid);
+          await sessionStore.save();
+
+          return createAndBindSession(jid, profileId);
+        }
+      }
+
+      const hot = sessionStore.getHotSession<RemoteChatSession>(jid);
+
+      if (hot) {
+        return hot;
+      }
+
+      const session = client.createChatSession(existing.sessionId, "whatsapp");
+
+      try {
+        await session.getMessages();
+        sessionStore.setHotSession(jid, session);
+
+        return session;
+      } catch {
+        // Session missing on server; create a new one below
+      }
+    }
+
+    return createAndBindSession(jid, profileId);
+  }
+
+  async function createAndBindSession(
+    jid: string,
+    profileId?: string
+  ): Promise<RemoteChatSession> {
+    const resolvedProfileId = config.owner
+      ? await resolveProfileId()
+      : (profileId ?? (await resolveProfileId()));
+
+    const session = await client.createSession("whatsapp", {
+      profileId: resolvedProfileId,
+    });
+
+    sessionStore.set(jid, {
+      profileId: resolvedProfileId,
+      sessionId: session.id,
+      updatedAt: new Date().toISOString(),
+    });
+    sessionStore.setHotSession(jid, session);
+    await sessionStore.save();
+
+    return session;
+  }
+
+  async function sendText(
+    jid: string,
+    text: string,
+    options?: { raw?: boolean }
+  ): Promise<void> {
+    const socket = getSocket();
+
+    if (!socket) {
+      return;
+    }
+
+    const prepared = options?.raw ? text.trim() : prepareWhatsAppReply(text);
+
+    if (!prepared) {
+      return;
+    }
+
+    for (const chunk of splitWhatsAppMessage(prepared)) {
+      rememberWhatsAppOutbound({ jid, text: chunk });
+      const sent = await socket.sendMessage(jid, { text: chunk });
+      rememberWhatsAppOutbound({
+        id: readSentMessageId(sent),
+        jid,
+        text: chunk,
+      });
+    }
+  }
+
+  async function clearSessionArtifactState(
+    conversationKey: string
+  ): Promise<void> {
+    const existing = sessionStore.get(conversationKey);
+
+    if (!existing) {
+      return;
+    }
+
+    sessionStore.set(conversationKey, {
+      profileId: existing.profileId,
+      sessionId: existing.sessionId,
+      updatedAt: new Date().toISOString(),
+    });
+    await sessionStore.save();
+  }
+
+  async function resolveGroupSenderJids(
+    groupJid: string,
+    senderJids: readonly string[]
+  ): Promise<string[]> {
+    const socket = getSocket();
+
+    if (!socket) {
+      return [];
+    }
+
+    try {
+      const metadata = await socket.groupMetadata(groupJid);
+
+      return extraJidsFromGroupParticipants(
+        metadata.participants ?? [],
+        senderJids
+      );
+    } catch {
+      return [];
+    }
+  }
+}
+
+function readSentMessageId(
+  sent: Awaited<ReturnType<WASocket["sendMessage"]>>
+): string | null {
+  return sent?.key.id?.trim() || null;
+}
+
+function normalizeInboundChat(
+  data: Pick<WhatsAppInboundChat, "jid" | "text"> &
+    Partial<Omit<WhatsAppInboundChat, "jid" | "text">>
+): WhatsAppInboundChat {
+  return {
+    fromMe: data.fromMe ?? false,
+    isGroup: data.isGroup ?? false,
+    jid: data.jid,
+    me: data.me,
+    media: data.media,
+    mentionedJids: data.mentionedJids ?? [],
+    messageId: data.messageId ?? null,
+    quotedParticipant: data.quotedParticipant ?? null,
+    quotedText: data.quotedText ?? null,
+    senderJid: data.senderJid ?? data.jid,
+    senderJids: data.senderJids ?? [data.senderJid ?? data.jid],
+    text: data.text,
+  };
+}
+
+async function buildWhatsAppMediaInput(
+  media: NonNullable<WhatsAppInboundChat["media"]>
+): Promise<
+  | { kind: "input"; input: Pick<SendMessageInput, "images" | "documents"> }
+  | { kind: "reject"; message: string }
+> {
+  const filename =
+    media.kind === "document"
+      ? media.message.fileName?.trim() || "document"
+      : "";
+
+  const declaredType = media.message.mimetype?.trim().toLowerCase() || "";
+  const extension = filename.slice(filename.lastIndexOf(".")).toLowerCase();
+
+  const imageTypeFromName = new Map([
+    [".jpeg", "image/jpeg"],
+    [".jpg", "image/jpeg"],
+    [".png", "image/png"],
+    [".webp", "image/webp"],
+  ]).get(extension);
+
+  const imageType =
+    declaredType === "image/jpg"
+      ? "image/jpeg"
+      : declaredType && declaredType !== "application/octet-stream"
+        ? declaredType
+        : imageTypeFromName || (media.kind === "image" ? "image/jpeg" : "");
+
+  const isImage = media.kind === "image" || imageType.startsWith("image/");
+
+  const mediaType = isImage
+    ? imageType
+    : normalizeDocumentMediaType(declaredType, filename);
+
+  if (
+    isImage
+      ? !["image/jpeg", "image/png", "image/webp"].includes(mediaType)
+      : mediaType !== "application/pdf"
+  ) {
+    return {
+      kind: "reject",
+      message:
+        "Unsupported file type. Send a JPG, PNG, WebP, or PDF (max 5 MB).",
+    };
+  }
+
+  const maxBytes = isImage ? MAX_IMAGE_BYTES : MAX_DOCUMENT_BYTES;
+
+  if (Number(media.message.fileLength ?? 0) > maxBytes) {
+    return {
+      kind: "reject",
+      message: "File is too large. Maximum size is 5 MB.",
+    };
+  }
+
+  try {
+    const stream = await downloadContentFromMessage(media.message, media.kind);
+    const chunks: Buffer[] = [];
+    let size = 0;
+
+    for await (const chunk of stream) {
+      size += chunk.length;
+
+      if (size > maxBytes) {
+        stream.destroy();
+
+        return {
+          kind: "reject",
+          message: "File is too large. Maximum size is 5 MB.",
+        };
+      }
+
+      chunks.push(chunk);
+    }
+
+    const data = Buffer.concat(chunks).toString("base64");
+
+    if (isImage) {
+      const images = [{ data, mediaType }];
+      validateImageAttachments(images);
+
+      return { input: { images }, kind: "input" };
+    }
+
+    const documents = [{ data, filename, mediaType }];
+    validateDocumentAttachments(documents);
+
+    return { input: { documents }, kind: "input" };
+  } catch {
+    return {
+      kind: "reject",
+      message: "Could not download that file. Try again.",
+    };
+  }
+}
+
+function withQuotedContext(message: string, quotedText: string | null): string {
+  const quote = quotedText?.trim();
+
+  if (!quote) {
+    return message;
+  }
+
+  if (message.trim()) {
+    return `[Quoted message]\n${quote}\n\n${message}`;
+  }
+
+  return `[Quoted message]\n${quote}`;
+}
+
+function withGroupContext(message: string, isGroup: boolean): string {
+  if (!isGroup) {
+    return message;
+  }
+
+  if (message.trim()) {
+    return `${GROUP_MESSAGE_PREFIX}${message}`;
+  }
+
+  return GROUP_MESSAGE_PREFIX.trim();
+}
+
+function parseCommand(text: string): string {
+  const token = text.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+
+  return token;
+}
+
+function isStopCommand(text: string): boolean {
+  return parseCommand(text) === "/stop";
+}
+
+export function resetChatLocksForTests(): void {
+  chatLock.resetForTests();
+}
+
+export async function withChatLock(
+  jid: string,
+  fn: () => Promise<void>
+): Promise<void> {
+  return chatLock.withLock(jid, fn);
+}
+
+/** @internal Test helper — seed a predecessor promise (rejection-safety tests). */
+export function seedChatLockForTests(
+  jid: string,
+  promise: Promise<void>
+): void {
+  chatLock.seedForTests(jid, promise);
+}

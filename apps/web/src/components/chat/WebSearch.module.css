@@ -1,0 +1,364 @@
+/* Adapted from AIcss Web Search (https://www.aicss.dev/components/web-search) — licensed component. */
+.ws {
+  --c-text: var(--foreground);
+  --c-muted: var(--muted-foreground);
+  --c-subtle: color-mix(in oklch, var(--muted-foreground) 85%, transparent);
+  --c-border: var(--border);
+  --c-success: #15a06a;
+  --ease: cubic-bezier(0.32, 0.72, 0, 1);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  color: var(--c-muted);
+}
+
+:global(.dark) .ws,
+:global([data-theme="dark"]) .ws {
+  --c-success: #34d399;
+}
+
+.wsRow {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  width: 100%;
+  min-height: 20px;
+}
+
+.wsRowButton {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  width: 100%;
+  min-height: 20px;
+  padding: 0;
+  font: inherit;
+  color: var(--c-muted);
+  text-align: left;
+  cursor: pointer;
+  background: transparent;
+  border: 0;
+  transition: color 0.16s var(--ease);
+}
+
+.wsRowButton:hover {
+  color: var(--c-text);
+}
+
+.wsRow > svg,
+.wsRowButton > svg {
+  flex: none;
+  color: var(--c-muted);
+}
+
+/* Matches the other tool rows: an opaque 20px box that breaks the timeline line. */
+.wsIcon {
+  position: relative;
+  z-index: 10;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 20px;
+  color: var(--c-muted);
+  background: var(--background);
+}
+
+.wsIcon svg {
+  display: block;
+  opacity: 0.5;
+}
+
+.wsRowButton:hover .wsIcon {
+  color: var(--c-muted);
+}
+
+.wsLabel {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.wsQuote {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.wsShimmer {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--c-text) 45%, transparent) 0%,
+    var(--c-text) 44%,
+    color-mix(in srgb, var(--c-text) 45%, transparent) 80%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  background-size: 220% 100%;
+  animation: ws-shimmer 2.7s linear infinite;
+}
+
+.wsShimmer.isDone {
+  color: currentColor;
+  -webkit-text-fill-color: currentColor;
+  background: none;
+  animation: none;
+}
+
+.wsChevronIcon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-left: auto;
+  color: var(--c-subtle);
+  transition:
+    transform 0.2s var(--ease),
+    color 0.16s var(--ease);
+}
+
+.wsRowButton:hover .wsChevronIcon {
+  color: var(--c-muted);
+}
+
+.wsChevronCollapsed {
+  transform: rotate(-90deg);
+}
+
+.wsCollapsible {
+  display: grid;
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transition:
+    grid-template-rows 0.32s var(--ease),
+    opacity 0.22s var(--ease);
+}
+
+.wsCollapsible.isCollapsed {
+  grid-template-rows: 0fr;
+  pointer-events: none;
+  opacity: 0;
+}
+
+.wsCollapsibleInner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.wsResults {
+  position: relative;
+  padding-left: 20px;
+}
+
+.wsList {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 4px 0 2px;
+  margin: 0;
+  list-style: none;
+}
+
+.wsSite {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--c-muted);
+  opacity: 0;
+  transform: translateY(4px);
+  animation: ws-enter 0.34s var(--ease) forwards;
+}
+
+.wsSite[data-state="done"] {
+  cursor: pointer;
+}
+
+.wsSiteLink {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+  color: inherit;
+  text-decoration: none;
+}
+
+.wsBullet {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+}
+
+.wsDots {
+  position: absolute;
+  inset: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--c-subtle);
+  pointer-events: none;
+  opacity: 1;
+  transition: opacity 0.32s var(--ease);
+}
+
+.wsDots svg,
+.wsCheck svg {
+  flex: none;
+}
+
+.wsSite[data-state="loading"] .wsDots,
+.wsSite[data-state="done"] .wsDots {
+  opacity: 0;
+}
+
+.wsGlobe {
+  position: absolute;
+  inset: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--c-subtle);
+  opacity: 0;
+  transform: scale(0.88);
+  transition:
+    opacity 0.32s var(--ease),
+    transform 0.36s var(--ease);
+}
+
+.wsSite[data-state="loading"] .wsGlobe {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.wsSite[data-state="done"] .wsGlobe {
+  opacity: 0;
+  transform: scale(0.775);
+  transition:
+    opacity 0.22s var(--ease),
+    transform 0.26s var(--ease);
+}
+
+.wsCheck {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--c-success);
+  opacity: 0;
+  transform: scale(1.175);
+  transition:
+    opacity 0.24s var(--ease) 0.06s,
+    transform 0.28s var(--ease) 0.06s;
+}
+
+.wsSite[data-state="done"] .wsCheck {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.wsTitle {
+  flex: none;
+  font-weight: 450;
+  color: var(--c-text);
+  white-space: nowrap;
+}
+
+.wsSite[data-state="pending"] .wsTitle {
+  color: var(--c-muted);
+}
+
+.wsSite[data-state="loading"] .wsTitle {
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--c-text) 50%, transparent) 0%,
+    var(--c-text) 44%,
+    color-mix(in srgb, var(--c-text) 50%, transparent) 80%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  background-size: 220% 100%;
+  animation: ws-shimmer 2.7s linear infinite;
+}
+
+.wsSep {
+  flex: none;
+  color: var(--c-subtle);
+}
+
+.wsUrl {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--c-muted);
+  white-space: nowrap;
+  transition: color 0.16s var(--ease);
+}
+
+.wsArrow {
+  display: inline-flex;
+  flex: none;
+  margin-left: -2px;
+  color: var(--c-subtle);
+  opacity: 0;
+  transform: rotate(45deg) translate(0, 2px);
+  transition:
+    opacity 0.16s var(--ease),
+    transform 0.22s var(--ease);
+}
+
+.wsSite[data-state="done"]:hover .wsArrow {
+  opacity: 1;
+  transform: rotate(45deg) translate(0, 0);
+}
+
+.wsSite[data-state="done"]:hover .wsUrl {
+  color: var(--c-text);
+}
+
+@keyframes ws-shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+@keyframes ws-enter {
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wsShimmer,
+  .wsSite[data-state="loading"] .wsTitle {
+    color: var(--c-text);
+    -webkit-text-fill-color: var(--c-text);
+    background: none;
+    animation: none;
+  }
+
+  .wsSite {
+    opacity: 1;
+    transform: none;
+    animation: none;
+  }
+}

@@ -1,0 +1,210 @@
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import type { ToolSourceResponse } from "@mingzhan/core";
+import { MíngZhànApiError, pathExists } from "@mingzhan/core";
+import type { StoredToolRecord } from "@mingzhan/db";
+import { getCustomToolHandler } from "./custom-tool-handlers";
+import { readHandlerModulePath } from "./custom-tool-shared";
+
+const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+
+const serverSrcDir = path.join(
+  moduleDir,
+  path.basename(moduleDir) === "dist" ? "../src" : ".."
+);
+
+const corePackageRoot = path.resolve(serverSrcDir, "../../../packages/core");
+
+const BUILTIN_SOURCE_BY_NAME = new Map(
+  Object.entries({
+    delete_file: {
+      displayPath: "packages/core/src/tools/builtin.ts",
+      filePath: path.join(corePackageRoot, "src/tools/builtin.ts"),
+    },
+    edit_file: {
+      displayPath: "packages/core/src/tools/builtin.ts",
+      filePath: path.join(corePackageRoot, "src/tools/builtin.ts"),
+    },
+    email: {
+      displayPath: "packages/core/src/tools/email.ts",
+      filePath: path.join(corePackageRoot, "src/tools/email.ts"),
+    },
+    read_file: {
+      displayPath: "packages/core/src/tools/builtin.ts",
+      filePath: path.join(corePackageRoot, "src/tools/builtin.ts"),
+    },
+    search_files: {
+      displayPath: "packages/core/src/tools/search-files.ts",
+      filePath: path.join(corePackageRoot, "src/tools/search-files.ts"),
+    },
+    sqlite: {
+      displayPath: "packages/core/src/tools/sqlite.ts",
+      filePath: path.join(corePackageRoot, "src/tools/sqlite.ts"),
+    },
+    web_search: {
+      displayPath: "packages/core/src/tools/web-search.ts",
+      filePath: path.join(corePackageRoot, "src/tools/web-search.ts"),
+    },
+    write_file: {
+      displayPath: "packages/core/src/tools/builtin.ts",
+      filePath: path.join(corePackageRoot, "src/tools/builtin.ts"),
+    },
+  })
+);
+
+const BASH_SOURCE = {
+  displayPath: "apps/server/src/tools/bash.ts",
+  filePath: path.join(serverSrcDir, "tools/bash.ts"),
+};
+
+const SUB_AGENT_SOURCE = {
+  displayPath: "apps/server/src/tools/sub-agent-tool.ts",
+  filePath: path.join(serverSrcDir, "tools/sub-agent-tool.ts"),
+};
+
+const GENERATE_IMAGE_SOURCE = {
+  displayPath: "apps/server/src/tools/generate-image-tool.ts",
+  filePath: path.join(serverSrcDir, "tools/generate-image-tool.ts"),
+};
+
+const SAVE_ARTIFACT_SOURCE = {
+  displayPath: "apps/server/src/tools/save-artifact-tool.ts",
+  filePath: path.join(serverSrcDir, "tools/save-artifact-tool.ts"),
+};
+
+const BROWSER_SOURCE = {
+  displayPath: "apps/server/src/tools/browser-tools.ts",
+  filePath: path.join(serverSrcDir, "tools/browser-tools.ts"),
+};
+
+const SESSION_SOURCE = {
+  displayPath: "apps/server/src/tools/session-tools.ts",
+  filePath: path.join(serverSrcDir, "tools/session-tools.ts"),
+};
+
+export async function readToolSource(
+  record: StoredToolRecord
+): Promise<ToolSourceResponse> {
+  if (getCustomToolHandler(record.handlerType)) {
+    return readCustomToolSource(record);
+  }
+
+  if (record.handlerType === "bash") {
+    return readFixedToolSource(BASH_SOURCE, "typescript");
+  }
+
+  if (record.handlerType === "sub_agent") {
+    return readFixedToolSource(SUB_AGENT_SOURCE, "typescript");
+  }
+
+  if (record.handlerType === "generate_image") {
+    return readFixedToolSource(GENERATE_IMAGE_SOURCE, "typescript");
+  }
+
+  if (record.handlerType === "save_artifact") {
+    return readFixedToolSource(SAVE_ARTIFACT_SOURCE, "typescript");
+  }
+
+  if (record.handlerType === "session") {
+    return readFixedToolSource(SESSION_SOURCE, "typescript");
+  }
+
+  if (record.handlerType === "browser") {
+    return readFixedToolSource(BROWSER_SOURCE, "typescript");
+  }
+
+  if (record.handlerType === "plugin") {
+    const pluginId = record.pluginId ?? "plugin";
+    const actionKey = record.pluginKey ?? record.name;
+
+    return {
+      content: "",
+      language: "javascript",
+      path: `plugins/${pluginId}/${actionKey}`,
+    };
+  }
+
+  if (record.handlerType === "builtin") {
+    const source = BUILTIN_SOURCE_BY_NAME.get(record.name);
+
+    if (!source) {
+      throw new MíngZhànApiError(
+        `No source mapping for built-in tool "${record.name}".`,
+        404
+      );
+    }
+
+    return readFixedToolSource(source, "typescript");
+  }
+
+  throw new MíngZhànApiError(
+    `Unsupported tool handler type: ${record.handlerType}.`,
+    404
+  );
+}
+
+async function readCustomToolSource(
+  record: StoredToolRecord
+): Promise<ToolSourceResponse> {
+  const handler = getCustomToolHandler(record.handlerType);
+
+  if (!handler) {
+    throw new MíngZhànApiError(
+      `Unsupported tool handler type: ${record.handlerType}.`,
+      404
+    );
+  }
+
+  const modulePath = readHandlerModulePath(record.handlerConfig);
+
+  if (!modulePath) {
+    throw new MíngZhànApiError(
+      `Tool "${record.name}" is missing handlerConfig.modulePath.`,
+      404
+    );
+  }
+
+  let resolvedPath: string;
+
+  try {
+    resolvedPath = handler.resolveModulePath(modulePath, record.orgId);
+  } catch (error) {
+    throw new MíngZhànApiError(
+      error instanceof Error ? error.message : String(error),
+      404
+    );
+  }
+
+  if (!(await pathExists(resolvedPath))) {
+    throw new MíngZhànApiError(`Tool module not found: ${modulePath}`, 404);
+  }
+
+  const content = await readFile(resolvedPath, "utf8");
+
+  return {
+    content,
+    language: handler.language,
+    path: modulePath,
+  };
+}
+
+async function readFixedToolSource(
+  source: { filePath: string; displayPath: string },
+  language: ToolSourceResponse["language"]
+): Promise<ToolSourceResponse> {
+  if (!(await pathExists(source.filePath))) {
+    throw new MíngZhànApiError(
+      `Tool source file not found: ${source.displayPath}`,
+      404
+    );
+  }
+
+  const content = await readFile(source.filePath, "utf8");
+
+  return {
+    content,
+    language,
+    path: source.displayPath,
+  };
+}

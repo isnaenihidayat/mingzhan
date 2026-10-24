@@ -1,0 +1,403 @@
+---
+title: "Skills"
+description: "Learn how reusable skills extend MíngZhàn profiles, including bundled memory, artifact, automation, and skill-authoring workflows."
+---
+
+A **skill** is a reusable instruction bundle you assign to a profile.
+
+Think of it as a saved workflow:
+
+- The profile keeps its main identity in soul files or `systemPrompt`
+- A skill adds a focused procedure for a specific kind of task
+- The agent can match and use that procedure when it is relevant
+
+Use skills when you want the bot to follow the same steps repeatedly without cramming everything into the main prompt.
+
+## Why skills matter
+
+Skills help keep profiles clean.
+
+For example:
+
+- A support bot can have one skill for bug triage
+- A content bot can have one skill for rewriting release notes
+- An ops bot can have one skill for incident summaries
+
+This gives you smaller, clearer building blocks instead of one giant prompt.
+
+## How skills fit with profiles
+
+Skills are assigned per profile, just like tools and MCP servers.
+
+| Layer | What it controls |
+|------|-------------------|
+| Soul / `systemPrompt` | The bot's overall identity and rules |
+| Skills | Repeatable workflows or task-specific instructions |
+| Tools | Actions the bot is allowed to take |
+| MCP servers | Extra external tools |
+
+A profile can have many skills, and the same global skill can be assigned to more than one profile.
+
+## Two kinds of skills
+
+### Global skills
+
+Global skills live in the shared skill library:
+
+```text
+~/.mingzhan/agent/skills/
+```
+
+These are useful when the same workflow should be reusable across multiple profiles.
+
+### Profile-scoped skills
+
+Profile-scoped skills live inside one org/profile workspace:
+
+```text
+~/.mingzhan/orgs/{orgId}/profiles/{profileId}/skills/
+```
+
+These are useful when the workflow only makes sense for one specific bot.
+
+## Skill file format
+
+Each skill is stored in its own directory with a `SKILL.md` file.
+
+Minimal example:
+
+```md
+---
+name: weather
+description: Use when the user asks for a weather forecast.
+---
+
+# Skill instructions
+
+1. Ask for the city if missing.
+2. Check the forecast.
+3. Summarize it clearly.
+```
+
+Required frontmatter:
+
+| Field | Required | Meaning |
+|------|----------|---------|
+| `name` | Yes | Lowercase letters, numbers, and hyphens only |
+| `description` | Yes | Short summary of when the skill should be used |
+
+Optional frontmatter:
+
+| Field | Meaning |
+|------|---------|
+| `disable-model-invocation` | Only run on explicit invocation |
+| `include-body-on-match` | Include the full body when the skill auto-matches |
+
+## Skills with tools
+
+A skill can also include a local tool module in the same directory:
+
+- `tool.ts`
+- `tool.js`
+- `tool.py`
+
+When present, the dashboard shows the skill as **includes tool**.
+
+This is useful when the workflow needs both:
+
+- Instructions in `SKILL.md`
+- A small custom tool that the skill can use
+
+`tool.ts` and `tool.js` are imported into the server process. `tool.py` runs as
+a separate process instead: MíngZhàn spawns `python3 <file>`, writes the call
+arguments to stdin as JSON, and reads one JSON value back from stdout. It gets a
+trimmed environment (`PATH`, `MINGZHAN_WORKSPACE_ROOT`, and `MINGZHAN_CONFIG_DIR`
+only for server-shipped skills) and 30 seconds to answer.
+
+```python
+# tool.py
+import json
+import sys
+
+
+def run(input, context):
+    return {"total": input["quantity"] * input["price"]}
+
+
+if __name__ == "__main__":
+    print(json.dumps(run(json.loads(sys.stdin.read() or "{}"), {})))
+```
+
+### More than one script
+
+A skill often outgrows a single file. List the extra scripts in the
+frontmatter and each one becomes its own tool, named after the skill and the
+file:
+
+```markdown
+---
+name: invoicing
+description: Price an order and write the invoice.
+scripts: scripts/pricing.py, scripts/invoice.py
+---
+```
+
+Paths are relative to the skill directory, separated by commas, and only `.py`
+is accepted today. Each script needs the same `run(input, context)` and
+`__main__` block as `tool.py` above. A script that is in the skill but not
+declared, and is not named `tool.py`, is reported in the dashboard as not
+runnable rather than silently ignored.
+
+A script can import its siblings by bare name. Python puts the running script's
+own directory first on `sys.path`, so `scripts/invoice.py` can `import pricing`
+with no packaging.
+
+### Python written for Claude Code
+
+Skills written for Claude Code ship ordinary modules: functions to import and a
+`__main__` that prints a demo. They have no `run(input, context)`, so neither
+`tool.py` nor `scripts:` reaches them.
+
+On a profile that has the `bash` tool, each such skill also gets a
+`<skill>_run_python` tool. The agent passes `{"code": "..."}`, the code runs with
+the skill directory first on `sys.path`, and whatever it prints comes back as
+`stdout`. It is the same subprocess, environment allowlist and 30 second timeout
+as `tool.py`, and it never receives `MINGZHAN_CONFIG_DIR`. A profile without
+`bash` gets nothing new, because running model-written Python is the same power
+as a shell.
+
+### Whose code runs
+
+A skill's tool module and scripts are host code: `tool.py` and every declared
+script are spawned as a process, and `tool.ts` / `tool.js` are imported into the
+server. A skill that ships with MíngZhàn, or that an operator installed globally,
+always runs.
+
+A skill written into a profile's own skills directory — by hand, or by an
+organization member asking the agent to create one with `skill_manage` — does
+not, until the org reviews its writes. Turn on **Ask me before saving a skill** for the
+profile in **Agent → your agent → Behavior** and every write to that profile's skills is
+staged for an admin to approve. Code already in the skill stays blocked until
+reviewed: ask the agent to use `skill_manage` with `action: approve_code`, the
+skill name, and the code file path, then approve its proposal. Each code file
+must match what the admin approved; changing it blocks the skill's code again.
+With approval off, the skill still reads as instructions, and calling its tool
+returns an error saying the code is not runnable here.
+
+Python skill processes for member-authored skills are spawned without
+`MINGZHAN_CONFIG_DIR`, so they are not told where the deployment keeps its
+configuration and API keys.
+
+### Python in a profile pack
+
+Because a skill's Python runs on the server host, importing a profile pack only
+installs `.py` files when a **platform admin** approves it. An org-admin import
+lists every packed `tool.py` and declared `scripts/*.py` in the preview as
+skipped and never writes them to the workspace, so the imported skill lands as
+instructions only. See [Profiles → Export and import a profile pack](/profiles#export-and-import-a-profile-pack).
+
+### What Python is available
+
+The published image ships `python3` and the standard library, with no
+third-party packages.
+
+A skill that needs packages lists them in a `requirements.txt` in its folder.
+Until they are installed, the skill page names each missing package under
+**Script issues**, so nobody meets a `ModuleNotFoundError` on the first call.
+
+A platform admin installs them with **Install Python packages** on the skill
+page (`POST /v1/skills/<id>/python-packages`). That builds a virtualenv for this
+skill alone under `MINGZHAN_CONFIG_DIR/python-envs/`, so it survives restarts and
+image upgrades, and runs `pip install -r requirements.txt` into it. The skill's
+`tool.py`, declared scripts and `_run_python` tool then run with that
+interpreter. Nothing is installed when a skill is created or when the server
+starts, because an agent can write skills and pip runs package build code on the
+host. Run the install again after editing `requirements.txt`. A second install
+for the same skill while one is running returns 409, and deleting the skill
+removes its virtualenv.
+
+Python tools outside skills still use one interpreter for the whole install.
+Point `MINGZHAN_PYTHON_BIN` at a virtualenv to give them packages:
+
+```bash
+python3 -m venv /opt/mingzhan-python
+/opt/mingzhan-python/bin/pip install matplotlib
+export MINGZHAN_PYTHON_BIN=/opt/mingzhan-python/bin/python3
+```
+
+## How skills are used at runtime
+
+When a profile starts a chat, MíngZhàn appends the assigned skills catalog to the agent prompt.
+
+On each user turn, MíngZhàn can also attach matched skill context for the current message.
+
+That means skills are not a separate bot. They are extra behavior layers attached to a profile.
+
+## Invoking skills in chat
+
+In the web chat composer, type `/` to open a picker for skills assigned to the active profile.
+
+You can:
+
+- Type to filter the skill list
+- Use Arrow Up and Arrow Down to move through options
+- Press Enter to insert the selected skill
+- Press Escape to close the picker
+
+Selecting a skill inserts an explicit invocation like:
+
+```text
+/skill weather
+```
+
+The composer highlights the selected skill, but the message still sends as plain text so it works with the normal skill matcher.
+
+The slash picker also reserves **`/learn`** — use it to turn notes, a URL, a local folder, or the workflow you just finished into a reusable skill. See [Self-improving skills](/self-improving-skills#learn-from-sources).
+
+MíngZhàn also ships bundled skills for system workflows. The `create-profile` bundled skill is assigned only to Super MíngZhàn, so profile-authoring instructions load when Super MíngZhàn is asked to create a profile without adding those instructions to ordinary profile prompts. That skill runs a confirm-first factory: draft soul files in chat, wait for explicit confirmation, then create.
+
+The `create-skill` bundled skill is also assigned only to Super MíngZhàn. When you ask Super MíngZhàn to write or improve a skill, it drafts the full `SKILL.md` in chat, waits for your confirmation, then saves it with `skill_manage`. If write approval is on, the skill waits for an admin to approve it.
+
+For more detail, see [Agent prompts](/agent-prompt).
+
+## How to create and assign skills
+
+There are two common paths.
+
+### From the dashboard
+
+Platform admins can:
+
+1. Open **Agent**
+2. Open a profile
+3. Use the **Skills** section to add, assign, unassign, or inspect skills
+
+The dashboard also supports a shared skill library through the skills API and sync flow.
+
+### From the agent itself
+
+Profiles receive bundled skills for common workflows:
+
+- `create-automation` — scheduling, reminders, and saved automations
+- `skill-installer` — find and install skills from public GitHub repositories into the current profile
+- `manage-skills` — create, patch, edit, and delete profile-scoped skills (and supporting files under a skill directory) with the `skill_manage` tool (file tools still inspect skills; they cannot write under `skills/*/` when `skill_manage` is present)
+- `update-profile-memory` — record facts in active `MEMORY.md` via file tools
+- `archive-profile-memory` — move facts from active `MEMORY.md` into `memory-archive/` without deleting them
+- `artifact-design` — design rules for the HTML pages, dashboards, and slide decks the agent saves under `artifacts/`
+- `mingzhan-guide` — a map of the MíngZhàn web app, so the agent can tell users which page holds a setting and who can change it
+- `coding-agent` — invoke a coding agent for repo work via `bash` (Super MíngZhàn by default; see [Coding agent](/coding-agent))
+- `agent-browser` — interactive browser automation via `bash` (opt-in; see [Agent browser](/agent-browser))
+
+Every profile receives the default bundled skills above when they are installed and synced on the server, including `manage-skills` for skill authoring. MíngZhàn backfills missing default bundled skills onto existing profiles during startup. Super MíngZhàn additionally receives its Super MíngZhàn-specific skills, while opt-in skills such as `agent-browser` still require assignment.
+
+To reuse a skill from GitHub, ask in web or CLI chat: **“Install this skill”** and paste its public GitHub directory or SKILL.md link. The agent installs it for the current profile, ready on the next turn. If write approval is enabled, an admin must approve it first. References, scripts, and assets are included. Reinstalling the same skill restores missing files. External programs required by a skill still need separate setup. Existing skills with different content are not overwritten.
+
+When `manage-skills` or `skill-installer` is assigned, interactive chat gets a `skill_manage` tool (`install` / `create` / `patch` / `edit` / `delete` / `write_file` / `remove_file`). Creates auto-assign to the profile. Automations and messaging channels do not receive `skill_manage`. For crystallization, optional write approval, admin review UI, and the Phase 3–4 roadmap, see [Self-improving skills](/self-improving-skills).
+
+### Write approval (optional)
+
+Org admins can enable **Ask me before a bot saves a skill** under **Control center → Workspace → Organization → How bots learn skills → Customize**. Agent owners can turn it on or off for their own agent under **Agent → your agent → Behavior**. When the gate is on, skill changes wait for admin review before they go live; see [Self-improving skills](/self-improving-skills). Unused agent- and human-authored skills can be archived (moved, never deleted) by the optional **Auto clean-up of skills** on the same Organization page. A separate opt-in can also **consolidate** overlapping agent skills with an LLM; see [Self-improving skills](/self-improving-skills).
+
+### Bundled system skills
+
+`update-profile-memory` and `archive-profile-memory` replace older dedicated builtins. They teach the agent how to use generic file tools safely:
+
+- **Memory write path:** read or create `MEMORY.md`, append a dated `- bullet` under the user's timezone date, keep the `# Memory Log` preamble, stay under 4096 bytes
+- **Archive path:** copy exact bullets to `memory-archive/YYYY-MM.md`, then remove them from `MEMORY.md`
+- **Artifact path** (chat prompt rules): save the file the agent produced with `save_artifact` or `write_docx` under `artifacts/{filename}` with the correct file extension. MíngZhàn derives the file type, size, and timestamp automatically. Use `save_artifact` for text, Markdown, HTML, JSON, and code; use `write_docx` when the user wants a real Word document.
+
+These skills use `include-body-on-match: true`, so the full procedure loads when the user's message matches the skill description. The chat wrapper also mentions memory skills when `read_file` and `edit_file` are available, and the artifact save rules when `save_artifact` or `write_file` is available.
+
+They are hidden from the `/skill` slash picker (like `create-automation` and `manage-skills`) because they are system workflows, not user-authored skills. Agents can still invoke them explicitly with `/skill update-profile-memory`, `/skill archive-profile-memory`, or `/skill artifact-design`.
+
+### Coding agent
+
+The `coding-agent` bundled skill teaches when to invoke a coding agent, how to install CLIs via `bash`, when to ask which backend to use, and how to summarize CLI results. Super MíngZhàn receives it by default. Setup and runtime flow are in [Coding agent](/coding-agent).
+
+### Agent browser
+
+The `agent-browser` bundled skill teaches agents to drive interactive browsers through `bash` for login walls, forms, and client-rendered pages. Setup, usage, session policy, optional Cloak stealth Chromium, and troubleshooting are in [Agent browser](/agent-browser).
+
+## Version history
+
+Skills change over time. People edit them, and agents patch them. Version history shows each change, so you can see what changed, who changed it, and go back if a change makes the skill worse.
+
+![Version history with a pending suggestion and its diff](/screenshots/skill-version-history.png)
+
+To open it:
+
+1. Open **Agent**
+2. Open a profile
+3. In the **Skills** section, open a skill
+4. Scroll below `SKILL.md` to **Version history**
+
+Each row is one saved version of `SKILL.md`:
+
+| Label | Meaning |
+|------|---------|
+| **Created** | The first version, saved when the skill was created in the dashboard |
+| **Original** | The text before the first tracked change, for skills made before version history, by an agent, or by an install |
+| **Updated** | A saved edit from the dashboard, an agent, or an approved proposal |
+| **Restored** | An older version that someone put back |
+| **Suggested · Pending review** | A proposal that waits for admin approval (only when [write approval](#write-approval-optional) is on) |
+
+The newest saved version has the **Current** tag. Click a row to see its changes compared to the version before it. For a suggestion, the changes are compared to the current `SKILL.md`. To approve or reject a suggestion, use **Review**, as in [Self-improving skills](/self-improving-skills#review-proposals).
+
+### Add a change note
+
+When you edit a skill in the dashboard, type a short note in **Change note** before you click **Save**. The note shows as the title of that version, for example "Added Google Ads to the weekly pull". The note is optional.
+
+### Restore an older version
+
+1. Click the version you want to go back to
+2. Look at its changes
+3. Click **Restore this version**
+
+![An older version, open, with Restore this version](/screenshots/skill-version-restore.png)
+
+Restore does not delete history. It saves the older text as a new **Restored** version on top, so you can undo a restore the same way.
+
+Version history covers `SKILL.md` only. Other files in the skill folder, such as templates, have no history. Bundled skills and plugin skills cannot be edited, so you cannot restore them.
+
+## Sync behavior
+
+MíngZhàn discovers skills from disk and syncs them into the database.
+
+This is why there is a skills sync step:
+
+- Files on disk are the source material
+- The database stores discovered metadata for the dashboard and API
+
+If you add or change skill folders manually, run skill sync so MíngZhàn refreshes what it knows.
+
+## Permissions
+
+Skill management is a platform-admin operation in the dashboard and API.
+
+| Actor | Can manage skills | Can use a profile with skills |
+|------|-------------------|-------------------------------|
+| Platform admin | Yes | Yes |
+| Org admin | No | Yes |
+| Org member | No | Yes |
+
+
+## When to use a skill vs something else
+
+- Use a **skill** for a repeatable workflow
+- Use **`update-profile-memory`** for user facts, preferences, and durable context (not procedures)
+- Use **`archive-profile-memory`** when the user wants to forget, tidy, or free space in active memory without deleting history
+- Use the **main profile prompt** for always-on behavior and identity
+- Use a **builtin tool** for a native capability like web search or file access
+- Use **`save_artifact`** or **`write_docx`** when the agent should save a file for you (reports, summaries, generated text, Word documents) under `artifacts/`; **`artifact-design`** sets how HTML pages, dashboards, and decks look
+- Use **`coding-agent`** with **`bash`** when repo work is better handled by a dedicated coding agent ([setup](/coding-agent))
+- Use **`agent-browser`** with **`bash`** for login walls, forms, and interactive browsing ([setup](/agent-browser))
+- Use an **MCP server** for external tool integrations
+
+## Next steps
+
+- [Profiles](/profiles) — how skills attach to a bot
+- [Self-improving skills](/self-improving-skills) — agents save workflows as skills; optional admin approval
+- [Coding agent](/coding-agent) — skill-driven install and the `coding-agent` skill
+- [Agent browser](/agent-browser) — interactive browsing via `bash` and the `agent-browser` skill
+- [Builtin tools](/builtin-tools) — the actions a profile can take
+- [MCP servers](/mcp) — external tools assigned to a profile

@@ -1,0 +1,301 @@
+import type {
+  ComposioConnectRequest,
+  ComposioConnectResponse,
+  ComposioToolkitSummary,
+  EnableComposioToolkitRequest,
+  ListComposioToolkitsResponse,
+  ListProfileComposioToolkitsResponse,
+  UpdateProfileComposioToolkitsRequest,
+} from "@mingzhan/core";
+import { MíngZhànApiError } from "@mingzhan/core";
+import { resolveComposioCallbackBaseUrl } from "../../services/composio-callback-url";
+import type { ServerOptions } from "../context";
+import {
+  requireOrgAdminFromContext,
+  requireOrgMemberFromContext,
+} from "../org-guards";
+import {
+  errorResponse,
+  json,
+  oauthResultPage,
+  readJson,
+  readOptionalJson,
+} from "../shared";
+import type { HonoApp } from "../types";
+
+export function registerComposioOAuthRoutes(
+  app: HonoApp,
+  options: ServerOptions
+): void {
+  const service = options.composioService;
+
+  if (!service) {
+    return;
+  }
+
+  app.get("/v1/composio/oauth/callback", async (c) => {
+    const state = c.req.query("state");
+
+    if (!state) {
+      return errorResponse("Missing OAuth state.", 400);
+    }
+
+    try {
+      const connectedAccountId = c.req.query("connected_account_id");
+      const result = await service.completeOAuth(state, { connectedAccountId });
+
+      if (result.returnTo) {
+        return c.redirect(result.returnTo);
+      }
+
+      const accept = c.req.header("accept") ?? "";
+
+      const wantsHtml =
+        accept.includes("text/html") || !accept.includes("application/json");
+
+      if (wantsHtml) {
+        return oauthResultPage(
+          `${result.toolkitSlug} connected`,
+          "You can close this tab and return to Discord, Telegram, or chat.",
+          {
+            href: `/integrations?section=composio&connected=${encodeURIComponent(result.toolkitSlug)}`,
+            label: "Open Integrations",
+          }
+        );
+      }
+
+      return c.redirect(
+        `/integrations?section=composio&connected=${encodeURIComponent(result.toolkitSlug)}`
+      );
+    } catch (error) {
+      if (error instanceof MíngZhànApiError) {
+        return errorResponse(error.message, error.status);
+      }
+
+      return errorResponse(
+        error instanceof Error ? error.message : String(error),
+        400
+      );
+    }
+  });
+}
+
+export function registerComposioRoutes(
+  app: HonoApp,
+  options: ServerOptions
+): void {
+  const service = options.composioService;
+
+  if (!service) {
+    return;
+  }
+
+  app.get("/v1/composio/toolkits", async (c) => {
+    const auth = requireOrgMemberFromContext(c);
+
+    return json<ListComposioToolkitsResponse>(
+      await service.listToolkits(auth.activeOrgId!, auth.user.id)
+    );
+  });
+
+  app.post("/v1/composio/toolkits/:toolkitSlug/enable", async (c) => {
+    const auth = requireOrgAdminFromContext(c);
+
+    try {
+      return json<ComposioToolkitSummary>(
+        await service.enableToolkit(auth.activeOrgId!, {
+          toolkitSlug: c.req.param("toolkitSlug"),
+        } satisfies EnableComposioToolkitRequest)
+      );
+    } catch (error) {
+      if (error instanceof MíngZhànApiError) {
+        return errorResponse(error.message, error.status);
+      }
+
+      return errorResponse(
+        error instanceof Error ? error.message : String(error),
+        400
+      );
+    }
+  });
+
+  app.post("/v1/composio/toolkits/:toolkitSlug/disable", async (c) => {
+    const auth = requireOrgAdminFromContext(c);
+
+    try {
+      return json<ComposioToolkitSummary>(
+        await service.disableToolkit(
+          auth.activeOrgId!,
+          c.req.param("toolkitSlug")
+        )
+      );
+    } catch (error) {
+      if (error instanceof MíngZhànApiError) {
+        return errorResponse(error.message, error.status);
+      }
+
+      return errorResponse(
+        error instanceof Error ? error.message : String(error),
+        400
+      );
+    }
+  });
+
+  app.post("/v1/composio/meet/:toolkitSlug/connect", async (c) => {
+    const auth = requireOrgMemberFromContext(c);
+
+    try {
+      const body = await readOptionalJson<ComposioConnectRequest>(
+        c.req.raw,
+        {}
+      );
+
+      return json<ComposioConnectResponse>(
+        await service.connectMeetRecordingSource(
+          auth.activeOrgId!,
+          auth.user.id,
+          c.req.param("toolkitSlug"),
+          resolveComposioCallbackBaseUrl({
+            clientOrigin: body.callbackOrigin,
+            request: c.req.raw,
+          })
+        )
+      );
+    } catch (error) {
+      if (error instanceof MíngZhànApiError) {
+        return errorResponse(error.message, error.status);
+      }
+
+      return errorResponse(
+        error instanceof Error ? error.message : String(error),
+        400
+      );
+    }
+  });
+
+  app.post("/v1/composio/toolkits/:toolkitSlug/connect", async (c) => {
+    const auth = requireOrgMemberFromContext(c);
+
+    try {
+      const body = await readOptionalJson<ComposioConnectRequest>(
+        c.req.raw,
+        {}
+      );
+
+      return json<ComposioConnectResponse>(
+        await service.connectToolkit(
+          auth.activeOrgId!,
+          auth.user.id,
+          c.req.param("toolkitSlug"),
+          resolveComposioCallbackBaseUrl({
+            clientOrigin: body.callbackOrigin,
+            request: c.req.raw,
+          }),
+          { returnTo: "/integrations?section=composio" }
+        )
+      );
+    } catch (error) {
+      if (error instanceof MíngZhànApiError) {
+        return errorResponse(error.message, error.status);
+      }
+
+      return errorResponse(
+        error instanceof Error ? error.message : String(error),
+        400
+      );
+    }
+  });
+
+  app.post("/v1/composio/toolkits/:toolkitSlug/disconnect", async (c) => {
+    const auth = requireOrgMemberFromContext(c);
+
+    try {
+      return json<ComposioToolkitSummary>(
+        await service.disconnectToolkit(
+          auth.activeOrgId!,
+          auth.user.id,
+          c.req.param("toolkitSlug")
+        )
+      );
+    } catch (error) {
+      if (error instanceof MíngZhànApiError) {
+        return errorResponse(error.message, error.status);
+      }
+
+      return errorResponse(
+        error instanceof Error ? error.message : String(error),
+        400
+      );
+    }
+  });
+
+  app.post("/v1/composio/toolkits/:toolkitSlug/sync", async (c) => {
+    const auth = requireOrgMemberFromContext(c);
+
+    try {
+      return json<ComposioToolkitSummary>(
+        await service.syncUserToolkit(
+          auth.activeOrgId!,
+          auth.user.id,
+          c.req.param("toolkitSlug")
+        )
+      );
+    } catch (error) {
+      if (error instanceof MíngZhànApiError) {
+        return errorResponse(error.message, error.status);
+      }
+
+      return errorResponse(
+        error instanceof Error ? error.message : String(error),
+        400
+      );
+    }
+  });
+
+  app.get("/v1/profiles/:profileId/composio-toolkits", async (c) => {
+    const auth = requireOrgAdminFromContext(c);
+
+    const profile = await options.databaseAdapter?.getProfile(
+      c.req.param("profileId")
+    );
+
+    if (!profile || profile.orgId !== auth.activeOrgId) {
+      return errorResponse("Profile not found.", 404);
+    }
+
+    return json<ListProfileComposioToolkitsResponse>(
+      await service.listProfileAssignments(auth.activeOrgId!, profile)
+    );
+  });
+
+  app.put("/v1/profiles/:profileId/composio-toolkits", async (c) => {
+    const auth = requireOrgAdminFromContext(c);
+
+    const profile = await options.databaseAdapter?.getProfile(
+      c.req.param("profileId")
+    );
+
+    if (!profile || profile.orgId !== auth.activeOrgId) {
+      return errorResponse("Profile not found.", 404);
+    }
+
+    try {
+      const body = await readJson<UpdateProfileComposioToolkitsRequest>(
+        c.req.raw
+      );
+
+      return json<ListProfileComposioToolkitsResponse>(
+        await service.updateProfileAssignments(auth.activeOrgId!, profile, body)
+      );
+    } catch (error) {
+      if (error instanceof MíngZhànApiError) {
+        return errorResponse(error.message, error.status);
+      }
+
+      return errorResponse(
+        error instanceof Error ? error.message : String(error),
+        400
+      );
+    }
+  });
+}

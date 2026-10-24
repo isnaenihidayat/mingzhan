@@ -1,0 +1,759 @@
+import { describe, expect, spyOn, test } from "bun:test";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import {
+  StreamableHTTPClientTransport,
+  StreamableHTTPError,
+} from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { getProfileSoulDir, MíngZhànApiError, nanoid } from "@mingzhan/core";
+import { PREINSTALLED_MCP_SERVER_IDS } from "@mingzhan/core/mcp/preinstalled";
+import {
+  createInMemoryDatabaseAdapter,
+  ensurePreinstalledMcpServers,
+} from "@mingzhan/db";
+import { McpClientManager } from "./mcp-client-manager";
+import { McpService } from "./mcp-service";
+import { buildMcpToolDefinitions } from "./mcp-tool-bridge";
+
+async function seedProfile(
+  db: ReturnType<typeof createInMemoryDatabaseAdapter>
+) {
+  const now = new Date().toISOString();
+
+  const profile = {
+    createdAt: now,
+    id: nanoid(),
+    isSuper: false,
+    model: null,
+    name: "Test Bot",
+    systemPrompt: "You are helpful.",
+    updatedAt: now,
+  };
+
+  await db.upsertProfile(profile);
+
+  return profile.id;
+}
+
+describe("McpClientManager", () => {
+  test("closes the stdio transport when listing tools fails", async () => {
+    using _connect = spyOn(Client.prototype, "connect").mockResolvedValue(
+      undefined
+    );
+
+    using _listTools = spyOn(Client.prototype, "listTools").mockRejectedValue(
+      new Error("list tools failed")
+    );
+
+    let closeCount = 0;
+
+    using _close = spyOn(
+      StdioClientTransport.prototype,
+      "close"
+    ).mockImplementation(async () => {
+      closeCount += 1;
+    });
+
+    const manager = new McpClientManager();
+
+    await expect(
+      manager.connect({
+        cachedTools: [],
+        config: { command: "fake-mcp" },
+        createdAt: "",
+        enabled: true,
+        id: "stdio-server",
+        lastError: null,
+        name: "fake",
+        status: "disconnected",
+        transport: "stdio",
+        updatedAt: "",
+      })
+    ).rejects.toThrow("list tools failed");
+
+    expect(closeCount).toBe(1);
+    expect(manager.getConnectedCount()).toBe(0);
+  });
+
+  test("closes the HTTP transport when listing tools fails", async () => {
+    using _connect = spyOn(Client.prototype, "connect").mockResolvedValue(
+      undefined
+    );
+
+    using _listTools = spyOn(Client.prototype, "listTools").mockRejectedValue(
+      new Error("list tools failed")
+    );
+
+    let closeCount = 0;
+
+    using _close = spyOn(
+      StreamableHTTPClientTransport.prototype,
+      "close"
+    ).mockImplementation(async () => {
+      closeCount += 1;
+    });
+
+    const manager = new McpClientManager();
+
+    await expect(
+      manager.connectHttpEndpoint("http-server", "https://example.com/mcp")
+    ).rejects.toThrow("list tools failed");
+
+    expect(closeCount).toBe(1);
+    expect(manager.getConnectedCount()).toBe(0);
+  });
+});
+
+describe("McpService", () => {
+  test("refreshes tools from a new MCP connection", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const calls: string[] = [];
+
+    // SAFETY: This test double supplies only the fields exercised by this test.
+    // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- This test fixture uses a narrow compatibility cast for its mock.
+    const manager = {
+      async connect() {
+        calls.push("connect");
+
+        return [{ description: "New tool", inputSchema: {}, name: "new_tool" }];
+      },
+      async disconnect() {
+        calls.push("disconnect");
+      },
+    } as unknown as McpClientManager;
+
+    const service = new McpService(db, manager);
+
+    const created = await service.createServer({
+      config: { url: "https://example.com/mcp" },
+      connect: false,
+      name: "demo",
+      transport: "http",
+    });
+
+    const refreshed = await service.syncServer(created.server.id);
+
+    expect(calls).toEqual(["disconnect", "connect"]);
+    expect(refreshed.server.cachedTools.map((tool) => tool.name)).toEqual([
+      "new_tool",
+    ]);
+    expect((await db.getMcpServer(created.server.id))?.cachedTools).toEqual([
+      { description: "New tool", inputSchema: {}, name: "new_tool" },
+    ]);
+  });
+
+  test("disabling disconnects and blocks current and future tool use", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const calls: string[] = [];
+
+    // SAFETY: This test double supplies only the fields exercised by this test.
+    // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- This test fixture uses a narrow compatibility cast for its mock.
+    const manager = {
+      async callTool() {
+        calls.push("callTool");
+
+        return { ok: true };
+      },
+      async connect() {
+        calls.push("connect");
+
+        return [
+          { description: "Read a file", inputSchema: {}, name: "read_file" },
+        ];
+      },
+      async disconnect() {
+        calls.push("disconnect");
+      },
+      async ensureConnected() {
+        calls.push("ensureConnected");
+      },
+    } as unknown as McpClientManager;
+
+    const service = new McpService(db, manager);
+
+    const created = await service.createServer({
+      config: { command: "mcp-filesystem" },
+      name: "filesystem",
+      transport: "stdio",
+    });
+
+    const profileId = await seedProfile(db);
+
+    await service.assignServerToProfile(profileId, created.server.id);
+
+    const existingTools = buildMcpToolDefinitions(
+      await db.listMcpServersForProfile(profileId),
+      service,
+      db,
+      "org_test",
+      profileId
+    );
+
+    expect(existingTools).toHaveLength(1);
+
+    const updated = await service.updateServer(created.server.id, {
+      enabled: false,
+    });
+
+    const futureTools = buildMcpToolDefinitions(
+      await db.listMcpServersForProfile(profileId),
+      service,
+      db,
+      "org_test",
+      profileId
+    );
+
+    const existingResult = await existingTools[0]!.run({}, {});
+
+    expect(updated.server).toMatchObject({
+      enabled: false,
+      status: "disconnected",
+    });
+    expect(futureTools).toEqual([]);
+    expect(existingResult).toEqual({ error: expect.any(String) });
+    await expect(service.connectServer(created.server.id)).rejects.toThrow();
+    expect(calls).toEqual(["connect", "disconnect"]);
+  });
+
+  test("reconnects a dropped HTTP server and retries a lost session once", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const calls: string[] = [];
+    let connected = false;
+    let callCount = 0;
+
+    // SAFETY: This test double supplies only the fields exercised by this test.
+    // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- This test fixture uses a narrow compatibility cast for its mock.
+    const manager = {
+      async callTool() {
+        calls.push("callTool");
+        callCount += 1;
+
+        if (callCount === 1) {
+          throw new StreamableHTTPError(404, "Session not found");
+        }
+
+        return { ok: true };
+      },
+      async connect() {
+        calls.push("connect");
+        connected = true;
+
+        return [{ description: "Search", inputSchema: {}, name: "search" }];
+      },
+      async dropConnection() {
+        calls.push("dropConnection");
+        connected = false;
+      },
+      isConnected: () => connected,
+    } as unknown as McpClientManager;
+
+    const service = new McpService(db, manager);
+
+    const created = await service.createServer({
+      config: { url: "https://example.com/mcp" },
+      connect: false,
+      name: "search",
+      transport: "http",
+    });
+
+    const server = await db.getMcpServer(created.server.id);
+
+    const result = await service.callTool(
+      server!,
+      "search",
+      {},
+      "org_test",
+      "profile_test"
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(calls).toEqual([
+      "connect",
+      "callTool",
+      "dropConnection",
+      "connect",
+      "callTool",
+    ]);
+    expect((await db.getMcpServer(created.server.id))?.status).toBe(
+      "connected"
+    );
+  });
+
+  test("does not retry a tool call that may have run", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    let callCount = 0;
+
+    // SAFETY: This test double supplies only the fields exercised by this test.
+    // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- This test fixture uses a narrow compatibility cast for its mock.
+    const manager = {
+      async callTool() {
+        callCount += 1;
+        throw new Error("Request timed out");
+      },
+      isConnected: () => true,
+    } as unknown as McpClientManager;
+
+    const service = new McpService(db, manager);
+
+    const created = await service.createServer({
+      config: { url: "https://example.com/mcp" },
+      connect: false,
+      name: "search",
+      transport: "http",
+    });
+
+    const server = await db.getMcpServer(created.server.id);
+
+    await expect(
+      service.callTool(server!, "search", {}, "org_test", "profile_test")
+    ).rejects.toThrow();
+    expect(callCount).toBe(1);
+  });
+
+  test("reports a stored connected HTTP server as disconnected when it dropped", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    let connected = true;
+
+    // SAFETY: This test double supplies only the fields exercised by this test.
+    // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- This test fixture uses a narrow compatibility cast for its mock.
+    const manager = {
+      async connect() {
+        return [];
+      },
+      isConnected: () => connected,
+    } as unknown as McpClientManager;
+
+    const service = new McpService(db, manager);
+
+    const created = await service.createServer({
+      config: { url: "https://example.com/mcp" },
+      name: "search",
+      transport: "http",
+    });
+
+    expect(created.server.status).toBe("connected");
+    connected = false;
+
+    expect((await service.getServer(created.server.id)).server.status).toBe(
+      "disconnected"
+    );
+    expect((await service.listServers()).servers[0]?.status).toBe(
+      "disconnected"
+    );
+  });
+
+  test("creates and lists MCP servers", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const service = new McpService(db, new McpClientManager());
+
+    await service.createServer({
+      config: { url: "https://example.com/mcp" },
+      connect: false,
+      name: "demo",
+      transport: "http",
+    });
+
+    const listed = await service.listServers();
+
+    expect(listed.servers).toHaveLength(1);
+    expect(listed.servers[0]?.name).toBe("demo");
+    expect(listed.servers[0]?.toolCount).toBe(0);
+  });
+
+  test("assigns MCP servers to profiles", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const service = new McpService(db, new McpClientManager());
+
+    const created = await service.createServer({
+      config: { url: "https://example.com/mcp" },
+      connect: false,
+      name: "demo",
+      transport: "http",
+    });
+
+    const profileId = await seedProfile(db);
+
+    await service.assignServerToProfile(profileId, created.server.id);
+
+    const assigned = await db.listMcpServersForProfile(profileId);
+
+    expect(assigned).toHaveLength(1);
+    expect(assigned[0]?.id).toBe(created.server.id);
+  });
+
+  test("updates MCP server config while preserving blank header values", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const service = new McpService(db, new McpClientManager());
+
+    const created = await service.createServer({
+      config: {
+        headers: {
+          Authorization: "secret-token",
+          "X-Custom": "keep-me",
+        },
+        url: "https://example.com/mcp",
+      },
+      connect: false,
+      name: "demo",
+      transport: "http",
+    });
+
+    const updated = await service.updateServer(created.server.id, {
+      config: {
+        headers: {
+          Authorization: "",
+          "X-Custom": "updated-value",
+        },
+        url: "https://example.com/mcp",
+      },
+    });
+
+    const stored = await db.getMcpServer(created.server.id);
+
+    expect(updated.server.config).toMatchObject({
+      headers: {
+        Authorization: "••••••••",
+        "X-Custom": "••••••••",
+      },
+    });
+    expect(stored?.config).toEqual({
+      headers: {
+        Authorization: "secret-token",
+        "X-Custom": "updated-value",
+      },
+      url: "https://example.com/mcp",
+    });
+  });
+
+  test("creates and lists stdio MCP servers", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const service = new McpService(db, new McpClientManager());
+
+    await service.createServer({
+      config: {
+        args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+        command: "npx",
+      },
+      connect: false,
+      name: "filesystem",
+      transport: "stdio",
+    });
+
+    const listed = await service.listServers();
+
+    expect(listed.servers).toHaveLength(1);
+    expect(listed.servers[0]?.name).toBe("filesystem");
+    expect(listed.servers[0]?.transport).toBe("stdio");
+  });
+
+  test("rejects stdio MCP servers without command", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const service = new McpService(db, new McpClientManager());
+
+    await expect(
+      service.createServer({
+        config: { command: "" },
+        connect: false,
+        name: "broken",
+        transport: "stdio",
+      })
+    ).rejects.toThrow("stdio MCP servers require config.command.");
+  });
+
+  test("does not persist a stdio server whose command fails to connect", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const service = new McpService(db, new McpClientManager());
+
+    const error = await service
+      .createServer({
+        config: { command: "qa-nonexistent-cmd-xyz" },
+        name: "broken",
+        transport: "stdio",
+      })
+      // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The test callback ignores framework inputs that this case does not inspect.
+      .catch((caught: unknown) => caught);
+
+    expect(error instanceof MíngZhànApiError).toBe(true);
+    // SAFETY: This test double supplies only the fields exercised by this test.
+    expect((error as MíngZhànApiError).status).toBe(422);
+
+    const listed = await service.listServers();
+    expect(listed.servers).toHaveLength(0);
+  });
+
+  test("updates stdio MCP server config while preserving blank env values", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const service = new McpService(db, new McpClientManager());
+
+    const created = await service.createServer({
+      config: {
+        args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+        command: "npx",
+        env: {
+          API_KEY: "secret-token",
+          NODE_ENV: "production",
+        },
+      },
+      connect: false,
+      name: "filesystem",
+      transport: "stdio",
+    });
+
+    const updated = await service.updateServer(created.server.id, {
+      config: {
+        args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+        command: "npx",
+        env: {
+          API_KEY: "",
+          NODE_ENV: "development",
+        },
+      },
+    });
+
+    const stored = await db.getMcpServer(created.server.id);
+
+    expect(updated.server.config).toEqual({
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      command: "npx",
+      env: {
+        API_KEY: "••••••••",
+        NODE_ENV: "••••••••",
+      },
+    });
+    expect(stored?.config).toEqual({
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      command: "npx",
+      env: {
+        API_KEY: "secret-token",
+        NODE_ENV: "development",
+      },
+    });
+  });
+
+  test("accepts command as an alias for stdio transport", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const service = new McpService(db, new McpClientManager());
+
+    await service.createServer({
+      config: {
+        args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+        command: "npx",
+      },
+      connect: false,
+      name: "filesystem",
+      // SAFETY: This test double supplies only the fields exercised by this test.
+      transport: "command" as "stdio",
+    });
+
+    const listed = await service.listServers();
+
+    expect(listed.servers[0]?.transport).toBe("stdio");
+  });
+
+  test("rejects stdio config when transport is http", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const service = new McpService(db, new McpClientManager());
+
+    await expect(
+      service.createServer({
+        config: { command: "npx" },
+        connect: false,
+        name: "broken",
+        transport: "http",
+      })
+    ).rejects.toThrow("HTTP MCP servers require config.url.");
+  });
+
+  test("rejects HTTP config when transport is stdio", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const service = new McpService(db, new McpClientManager());
+
+    await expect(
+      service.createServer({
+        config: { url: "https://example.com/mcp" },
+        connect: false,
+        name: "broken",
+        transport: "stdio",
+      })
+    ).rejects.toThrow("stdio MCP servers require config.command.");
+  });
+
+  test("blocks delete when MCP server is assigned to a profile", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const service = new McpService(db, new McpClientManager());
+
+    const created = await service.createServer({
+      config: { url: "https://example.com/mcp" },
+      connect: false,
+      name: "demo",
+      transport: "http",
+    });
+
+    const profileId = await seedProfile(db);
+    await service.assignServerToProfile(profileId, created.server.id);
+
+    await expect(service.deleteServer(created.server.id)).rejects.toMatchObject(
+      {
+        profiles: [{ id: profileId, name: "Test Bot" }],
+        status: 409,
+      }
+    );
+
+    expect(await db.getMcpServer(created.server.id)).not.toBeNull();
+
+    await service.deleteServer(created.server.id, true);
+
+    expect(await db.getMcpServer(created.server.id)).toBeNull();
+    expect(await db.listProfilesForMcpServer(created.server.id)).toEqual([]);
+  });
+
+  test("deletes MCP server when not assigned to any profile", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const service = new McpService(db, new McpClientManager());
+
+    const created = await service.createServer({
+      config: { url: "https://example.com/mcp" },
+      connect: false,
+      name: "demo",
+      transport: "http",
+    });
+
+    await service.deleteServer(created.server.id);
+
+    expect(await db.getMcpServer(created.server.id)).toBeNull();
+  });
+
+  test("blocks delete for preinstalled MCP servers", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const service = new McpService(db, new McpClientManager());
+
+    await ensurePreinstalledMcpServers(db);
+
+    await expect(
+      service.deleteServer(PREINSTALLED_MCP_SERVER_IDS.exa)
+    ).rejects.toThrow('Preinstalled MCP server "exa" cannot be deleted.');
+
+    expect(
+      await db.getMcpServer(PREINSTALLED_MCP_SERVER_IDS.exa)
+    ).not.toBeNull();
+
+    await expect(
+      service.deleteServer(PREINSTALLED_MCP_SERVER_IDS.firecrawl)
+    ).rejects.toThrow('Preinstalled MCP server "firecrawl" cannot be deleted.');
+
+    expect(
+      await db.getMcpServer(PREINSTALLED_MCP_SERVER_IDS.firecrawl)
+    ).not.toBeNull();
+  });
+
+  test("lists assigned profile counts on MCP servers", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const service = new McpService(db, new McpClientManager());
+
+    const created = await service.createServer({
+      config: { url: "https://example.com/mcp" },
+      connect: false,
+      name: "demo",
+      transport: "http",
+    });
+
+    const profileId = await seedProfile(db);
+    await service.assignServerToProfile(profileId, created.server.id);
+
+    const listed = await service.listServers();
+
+    expect(listed.servers[0]?.assignedProfileCount).toBe(1);
+  });
+
+  test("defers stdio startup and opens one process in the profile cwd", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    const startupConnections: string[] = [];
+
+    const spawns: Array<{
+      cwd: string;
+      orgId: string;
+      profileId: string;
+    }> = [];
+
+    // SAFETY: This test double supplies only the fields exercised by this test.
+    // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- This test fixture uses a narrow compatibility cast for its mock.
+    const manager = {
+      async callTool(
+        _serverId: string,
+        _transport: "stdio",
+        _toolName: string,
+        // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The test callback ignores framework inputs that this case does not inspect.
+        _input: unknown,
+        profileId: string,
+        orgId: string
+      ) {
+        return { orgId, profileId };
+      },
+      async connect(server: { id: string }) {
+        startupConnections.push(server.id);
+
+        return [];
+      },
+      async ensureConnected(
+        // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The test callback ignores framework inputs that this case does not inspect.
+        _server: unknown,
+        orgId: string,
+        profileId: string
+      ) {
+        spawns.push({
+          cwd: getProfileSoulDir(orgId, profileId),
+          orgId,
+          profileId,
+        });
+      },
+    } as unknown as McpClientManager;
+
+    const service = new McpService(db, manager);
+
+    const created = await service.createServer({
+      config: { command: "fake-stdio-server" },
+      connect: false,
+      name: "filesystem",
+      transport: "stdio",
+    });
+
+    const server = await db.getMcpServer(created.server.id);
+
+    await service.connectEnabledServers();
+
+    expect(startupConnections).toEqual([]);
+
+    const profileId = await seedProfile(db);
+    await service.assignServerToProfile(profileId, created.server.id);
+    const orgId = "org_test";
+    expect(server).not.toBeNull();
+
+    const scopedServer = {
+      ...server!,
+      cachedTools: [
+        {
+          description: "Read a scoped file",
+          inputSchema: { type: "object" },
+          name: "read",
+        },
+      ],
+    };
+
+    await db.upsertMcpServer(scopedServer);
+
+    const tools = buildMcpToolDefinitions(
+      [scopedServer],
+      service,
+      db,
+      orgId,
+      profileId
+    );
+
+    const result = await tools[0]!.run({}, {});
+
+    expect(spawns).toEqual([
+      { cwd: getProfileSoulDir(orgId, profileId), orgId, profileId },
+    ]);
+    expect(result).toEqual({ orgId, profileId });
+  });
+});

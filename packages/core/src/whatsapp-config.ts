@@ -1,0 +1,895 @@
+import { randomBytes } from "node:crypto";
+import { rm } from "node:fs/promises";
+import { join } from "node:path";
+import { z } from "zod";
+import {
+  assertChannelPath,
+  ChannelConfigBusyError,
+  type ChannelConfigScope,
+  claimChannelIdentity,
+  createPairingCodeSecret,
+  getChannelConfigDir,
+  isChannelOwner,
+  releaseChannelClaims,
+  resetChannelConversationState,
+  withPairingConfigLock,
+} from "./channel-config-shared";
+import type { WhatsAppAllowedPhoneDetail } from "./contract";
+import {
+  parseIni,
+  pathExists,
+  readDirectoryOrEmpty,
+  readTextOrNull,
+  removeFile,
+  writeTextFile,
+} from "./fs";
+import {
+  generatePairingCode,
+  getPairingAttemptBudget,
+  isPairingAttemptBlocked,
+  isPairingCodeActive,
+  looksLikePairingCode,
+  normalizePairingCode,
+  pairingCodesMatch,
+  pairingFailureMessage,
+  recordPairingFailure,
+} from "./pairing-code";
+import { getUserConfigDir } from "./user-config";
+import { parseAllowedWhatsAppPhones } from "./whatsapp-phones";
+
+export { parseAllowedWhatsAppPhones } from "./whatsapp-phones";
+
+export {
+  generatePairingCode,
+  isPairingCodeActive,
+  looksLikePairingCode,
+  normalizePairingCode,
+};
+
+/** A stored code is only usable while its own expiry is still in the future. */
+export function hasActivePairingCode(
+  config: Pick<
+    WhatsAppConfigFile,
+    "pairingCode" | "pairingCodeExpiresAt"
+  > | null,
+  now = Date.now()
+): boolean {
+  return isPairingCodeActive(
+    config?.pairingCode ?? null,
+    config?.pairingCodeExpiresAt ?? null,
+    now
+  );
+}
+
+export const DEFAULT_WHATSAPP_PROFILE_ID = "default";
+
+const SPENT_PAIRING_SECRET = {
+  pairingCode: null,
+  pairingCodeExpiresAt: null,
+};
+
+export const DEFAULT_WHATSAPP_REQUIRE_GROUP_MENTION = true;
+
+export type WhatsAppAllowedPhoneDetails = Record<
+  string,
+  WhatsAppAllowedPhoneDetail
+>;
+
+export interface WhatsAppConfigFile {
+  allowedPhoneDetails?: WhatsAppAllowedPhoneDetails;
+  allowedPhones: string[];
+  allowUnpairedGroupMembers: boolean;
+  outboundPort?: string | null;
+  outboundToken?: string | null;
+  pairedJid: string | null;
+  pairedLid: string | null;
+  pairingCode: string | null;
+  pairingCodeExpiresAt: string | null;
+  phoneNumber: string;
+  profileId: string;
+  requireGroupMention: boolean;
+}
+
+export interface WhatsAppSettingsPublic {
+  allowedPhoneDetails: WhatsAppAllowedPhoneDetails;
+  allowedPhones: string[];
+  allowUnpairedGroupMembers: boolean;
+  configured: boolean;
+  pairedJid: string | null;
+  pairingCode: string | null;
+  phoneNumberMasked: string | null;
+  profileId: string;
+  requireGroupMention: boolean;
+}
+
+export interface UpdateWhatsAppSettingsInput {
+  /** Display names keyed by phone; an empty name clears it. */
+  allowedPhoneNames?: Record<string, string>;
+  allowedPhones?: string;
+  allowUnpairedGroupMembers?: boolean;
+  phoneNumber?: string;
+  profileId?: string;
+  requireGroupMention?: boolean;
+}
+
+export type WhatsAppConfigScope = ChannelConfigScope;
+
+export function getWhatsAppConfigDir(
+  orgId: WhatsAppConfigScope = null
+): string {
+  return getChannelConfigDir("whatsapp", orgId);
+}
+
+export function getWhatsAppConfigPath(
+  orgId: WhatsAppConfigScope = null
+): string {
+  const path = join(getWhatsAppConfigDir(orgId), "config.ini");
+
+  if (isChannelOwner(orgId)) {
+    assertChannelPath(path);
+    assertChannelPath(`${path}.tmp`);
+  }
+
+  return path;
+}
+
+export function maskPhoneNumber(phoneNumber: string): string | null {
+  const trimmed = phoneNumber.trim();
+
+  if (!trimmed) {
+    return null;
+  }
+
+  if (trimmed.length <= 4) {
+    return `+${"•".repeat(trimmed.length)}`;
+  }
+
+  return `+${"•".repeat(Math.min(trimmed.length - 2, 10))}${trimmed.slice(-2)}`;
+}
+
+function phoneDigits(phone: string): string {
+  return phone.replace(/\D/g, "");
+}
+
+function phoneToWhatsAppJid(phone: string): string {
+  return `${phoneDigits(phone)}@s.whatsapp.net`;
+}
+
+export function whatsAppUserDigits(jid: string): string {
+  return phoneDigits(jid.split("@")[0]?.split(":")[0] ?? "");
+}
+
+function maskPhoneNumberFromJid(jid: string | null): string | null {
+  if (!jid) {
+    return null;
+  }
+
+  const digits = whatsAppUserDigits(jid);
+
+  return digits ? maskPhoneNumber(digits) : null;
+}
+
+function whatsAppJidServer(jid: string): string {
+  return jid.split("@")[1]?.trim() ?? "";
+}
+
+function normalizeWhatsAppUserJid(jid: string): string {
+  const server = whatsAppJidServer(jid);
+
+  if (server !== "s.whatsapp.net" && server !== "lid") {
+    return jid.trim();
+  }
+
+  return `${jid.split("@")[0]?.split(":")[0] ?? ""}@${server}`;
+}
+
+function isSameWhatsAppUserJid(left: string, right: string): boolean {
+  if (!(left && right)) {
+    return false;
+  }
+
+  if (normalizeWhatsAppUserJid(left) === normalizeWhatsAppUserJid(right)) {
+    return true;
+  }
+
+  if (
+    whatsAppJidServer(left) !== whatsAppJidServer(right) ||
+    (whatsAppJidServer(left) !== "s.whatsapp.net" &&
+      whatsAppJidServer(left) !== "lid")
+  ) {
+    return false;
+  }
+
+  const leftDigits = whatsAppUserDigits(left);
+  const rightDigits = whatsAppUserDigits(right);
+
+  return Boolean(leftDigits && leftDigits === rightDigits);
+}
+
+export function isWhatsAppUserAuthorized(
+  jid: string | readonly string[],
+  config: Pick<WhatsAppConfigFile, "pairedJid" | "pairedLid"> & {
+    allowedPhones?: string[];
+  }
+): boolean {
+  const jids = Array.isArray(jid) ? jid : [jid];
+  const allowedPhones = config.allowedPhones ?? [];
+
+  return jids.some((entry) => {
+    if (!entry) {
+      return false;
+    }
+
+    if (
+      config.pairedJid &&
+      (isSameWhatsAppUserJid(entry, config.pairedJid) ||
+        (config.pairedLid
+          ? isSameWhatsAppUserJid(entry, config.pairedLid)
+          : false))
+    ) {
+      return true;
+    }
+
+    const digits = whatsAppUserDigits(entry);
+
+    return Boolean(digits && allowedPhones.includes(digits));
+  });
+}
+
+export async function rememberWhatsAppPairedIdentities(
+  jids: readonly string[],
+  orgId: WhatsAppConfigScope = null
+): Promise<void> {
+  const config = await loadWhatsAppConfigFile(orgId);
+
+  if (
+    !(
+      config &&
+      isWhatsAppUserAuthorized(jids, {
+        allowedPhones: [],
+        pairedJid: config.pairedJid,
+        pairedLid: config.pairedLid,
+      })
+    )
+  ) {
+    return;
+  }
+
+  const phoneJid = jids.find(
+    (jid) => whatsAppJidServer(jid) === "s.whatsapp.net"
+  );
+
+  const lidJid = jids.find((jid) => whatsAppJidServer(jid) === "lid");
+
+  const nextPairedJid =
+    phoneJid &&
+    config.pairedJid &&
+    isSameWhatsAppUserJid(phoneJid, config.pairedJid)
+      ? phoneJid
+      : config.pairedJid;
+
+  const nextPairedLid = lidJid ?? config.pairedLid;
+
+  if (
+    nextPairedJid === config.pairedJid &&
+    nextPairedLid === config.pairedLid
+  ) {
+    return;
+  }
+
+  await writeWhatsAppConfigFile(
+    {
+      ...config,
+      pairedJid: nextPairedJid,
+      pairedLid: nextPairedLid,
+    },
+    orgId
+  );
+}
+
+export async function loadWhatsAppConfigFile(
+  orgId: WhatsAppConfigScope = null
+): Promise<WhatsAppConfigFile | null> {
+  const raw = await readTextOrNull(getWhatsAppConfigPath(orgId));
+
+  if (raw === null) {
+    return null;
+  }
+
+  const values = parseIni(raw);
+  const phoneNumber = values.phone_number?.trim() ?? "";
+  const profileId = values.profile_id?.trim() || DEFAULT_WHATSAPP_PROFILE_ID;
+  const pairingCode = values.pairing_code?.trim() || null;
+  const pairingCodeExpiresAt = values.pairing_code_expires_at?.trim() || null;
+  const pairedJid = values.paired_jid?.trim() || null;
+  const pairedLid = values.paired_lid?.trim() || null;
+  const outboundPort = values.outbound_port?.trim() || null;
+  const outboundToken = values.outbound_token?.trim() || null;
+
+  const requireGroupMention = parseIniBoolean(
+    values.require_group_mention,
+    DEFAULT_WHATSAPP_REQUIRE_GROUP_MENTION
+  );
+
+  return {
+    allowedPhoneDetails: parseAllowedPhoneDetails(values.allowed_phone_details),
+    allowedPhones: parseAllowedWhatsAppPhones(values.allowed_phones ?? ""),
+    // Files written before this setting existed opened the group to everyone
+    // exactly when the mention requirement was off, so a missing value keeps that.
+    allowUnpairedGroupMembers: parseIniBoolean(
+      values.allow_unpaired_group_members,
+      !requireGroupMention
+    ),
+    outboundPort,
+    outboundToken,
+    pairedJid,
+    pairedLid,
+    pairingCode,
+    pairingCodeExpiresAt,
+    phoneNumber,
+    profileId,
+    requireGroupMention,
+  };
+}
+
+/**
+ * Shared secret for the loopback outbound server, minted on first use and kept
+ * in the 0600 config file, so a process running as another user cannot post to
+ * 127.0.0.1/send and make the bot message the paired owner.
+ */
+export async function ensureWhatsAppOutboundToken(
+  orgId: WhatsAppConfigScope = null
+): Promise<string | null> {
+  const config = await loadWhatsAppConfigFile(orgId);
+
+  if (!config) {
+    return null;
+  }
+
+  if (config.outboundToken) {
+    return config.outboundToken;
+  }
+
+  const outboundToken = randomBytes(32).toString("hex");
+  await writeWhatsAppConfigFile({ ...config, outboundToken }, orgId);
+
+  return outboundToken;
+}
+
+export function toWhatsAppSettingsPublic(
+  file: WhatsAppConfigFile | null
+): WhatsAppSettingsPublic {
+  if (!file) {
+    return {
+      allowedPhoneDetails: {},
+      allowedPhones: [],
+      allowUnpairedGroupMembers: false,
+      configured: false,
+      pairedJid: null,
+      pairingCode: null,
+      phoneNumberMasked: null,
+      profileId: DEFAULT_WHATSAPP_PROFILE_ID,
+      requireGroupMention: DEFAULT_WHATSAPP_REQUIRE_GROUP_MENTION,
+    };
+  }
+
+  return {
+    allowedPhoneDetails: file.allowedPhoneDetails ?? {},
+    allowedPhones: file.allowedPhones,
+    allowUnpairedGroupMembers: file.allowUnpairedGroupMembers,
+    configured: true,
+    pairedJid: file.pairedJid,
+    // An expired code is worse than none: the dashboard would offer a secret
+    // that no longer works.
+    pairingCode: hasActivePairingCode(file) ? file.pairingCode : null,
+    phoneNumberMasked:
+      maskPhoneNumber(file.phoneNumber) ??
+      maskPhoneNumberFromJid(file.pairedJid),
+    profileId: file.profileId,
+    requireGroupMention: file.requireGroupMention,
+  };
+}
+
+export async function loadWhatsAppSettingsPublic(
+  orgId: WhatsAppConfigScope = null
+): Promise<WhatsAppSettingsPublic> {
+  return toWhatsAppSettingsPublic(await loadWhatsAppConfigFile(orgId));
+}
+
+async function writeWhatsAppConfigFile(
+  config: WhatsAppConfigFile,
+  orgId: WhatsAppConfigScope = null
+): Promise<void> {
+  const lines = [
+    "# MíngZhàn WhatsApp bridge",
+    `profile_id=${config.profileId}`,
+    ...(config.phoneNumber.trim()
+      ? [`phone_number=${config.phoneNumber}`]
+      : []),
+    ...(config.pairingCode
+      ? [
+          `pairing_code=${config.pairingCode}`,
+          ...(config.pairingCodeExpiresAt
+            ? [`pairing_code_expires_at=${config.pairingCodeExpiresAt}`]
+            : []),
+        ]
+      : []),
+    ...(config.pairedJid ? [`paired_jid=${config.pairedJid}`] : []),
+    ...(config.pairedLid ? [`paired_lid=${config.pairedLid}`] : []),
+    ...(config.allowedPhones.length > 0
+      ? [`allowed_phones=${config.allowedPhones.join(",")}`]
+      : []),
+    ...(Object.keys(config.allowedPhoneDetails ?? {}).length > 0
+      ? [`allowed_phone_details=${JSON.stringify(config.allowedPhoneDetails)}`]
+      : []),
+    ...(config.outboundPort ? [`outbound_port=${config.outboundPort}`] : []),
+    ...(config.outboundToken ? [`outbound_token=${config.outboundToken}`] : []),
+    `require_group_mention=${config.requireGroupMention ? "true" : "false"}`,
+    `allow_unpaired_group_members=${config.allowUnpairedGroupMembers ? "true" : "false"}`,
+    "",
+  ];
+
+  await writeTextFile(getWhatsAppConfigPath(orgId), lines.join("\n"), {
+    ensureDir: getWhatsAppConfigDir(orgId),
+  });
+}
+
+function resolvePhoneNumber(
+  input: UpdateWhatsAppSettingsInput,
+  existing: WhatsAppConfigFile | null
+): string {
+  return input.phoneNumber === undefined
+    ? (existing?.phoneNumber ?? "")
+    : input.phoneNumber.trim();
+}
+
+function resolveProfileId(
+  input: UpdateWhatsAppSettingsInput,
+  existing: WhatsAppConfigFile | null
+): string {
+  return (
+    input.profileId?.trim() ||
+    existing?.profileId ||
+    DEFAULT_WHATSAPP_PROFILE_ID
+  );
+}
+
+interface PairingSecret {
+  pairingCode: string | null;
+  pairingCodeExpiresAt: string | null;
+}
+
+function resolvePairingSecret(
+  existing: WhatsAppConfigFile | null,
+  pairedJid: string | null
+): PairingSecret {
+  if (pairedJid) {
+    return SPENT_PAIRING_SECRET;
+  }
+
+  if (hasActivePairingCode(existing)) {
+    return {
+      pairingCode: existing?.pairingCode ?? null,
+      pairingCodeExpiresAt: existing?.pairingCodeExpiresAt ?? null,
+    };
+  }
+
+  const { code, expiresAt } = createPairingCodeSecret();
+
+  return { pairingCode: code, pairingCodeExpiresAt: expiresAt };
+}
+
+function buildSavedWhatsAppConfig(
+  input: UpdateWhatsAppSettingsInput,
+  existing: WhatsAppConfigFile | null
+): WhatsAppConfigFile {
+  const phoneNumber = resolvePhoneNumber(input, existing);
+  const pairedJid = existing?.pairedJid ?? null;
+  const allowedPhones = resolveAllowedPhones(input, existing);
+
+  return {
+    allowedPhoneDetails: resolveAllowedPhoneDetails(
+      input,
+      existing,
+      allowedPhones
+    ),
+    allowedPhones,
+    allowUnpairedGroupMembers:
+      input.allowUnpairedGroupMembers ??
+      existing?.allowUnpairedGroupMembers ??
+      false,
+    outboundPort: existing?.outboundPort ?? null,
+    outboundToken: existing?.outboundToken ?? null,
+    pairedJid,
+    pairedLid: existing?.pairedLid ?? null,
+    ...resolvePairingSecret(existing, pairedJid),
+    phoneNumber,
+    profileId: resolveProfileId(input, existing),
+    requireGroupMention: resolveRequireGroupMention(input, existing),
+  };
+}
+
+function resolveRequireGroupMention(
+  input: UpdateWhatsAppSettingsInput,
+  existing: WhatsAppConfigFile | null
+): boolean {
+  return input.requireGroupMention === undefined
+    ? (existing?.requireGroupMention ?? DEFAULT_WHATSAPP_REQUIRE_GROUP_MENTION)
+    : input.requireGroupMention;
+}
+
+function resolveAllowedPhones(
+  input: UpdateWhatsAppSettingsInput,
+  existing: WhatsAppConfigFile | null
+): string[] {
+  return input.allowedPhones === undefined
+    ? (existing?.allowedPhones ?? [])
+    : parseAllowedWhatsAppPhones(input.allowedPhones);
+}
+
+const AllowedPhoneDetailsSchema = z.record(
+  z.string(),
+  z.object({
+    addedAt: z.string().nullable().catch(null),
+    name: z.string().catch(""),
+  })
+);
+
+function parseAllowedPhoneDetails(raw: string | undefined) {
+  if (!raw) {
+    return {};
+  }
+
+  try {
+    return AllowedPhoneDetailsSchema.parse(JSON.parse(raw));
+  } catch {
+    return {};
+  }
+}
+
+function resolveAllowedPhoneDetails(
+  input: UpdateWhatsAppSettingsInput,
+  existing: WhatsAppConfigFile | null,
+  allowedPhones: string[]
+) {
+  const previous = existing?.allowedPhoneDetails ?? {};
+  const previousPhones = new Set(existing?.allowedPhones ?? []);
+  const names = new Map<string, string>();
+
+  for (const [phone, name] of Object.entries(input.allowedPhoneNames ?? {})) {
+    names.set(phone.replace(/\D/g, ""), name.replace(/\s+/g, " ").trim());
+  }
+
+  const now = new Date().toISOString();
+  const details: WhatsAppAllowedPhoneDetails = {};
+
+  for (const phone of allowedPhones) {
+    const name = names.get(phone) ?? previous[phone]?.name ?? "";
+
+    // Numbers saved before details existed have no known add time.
+    const addedAt = previousPhones.has(phone)
+      ? (previous[phone]?.addedAt ?? null)
+      : now;
+
+    if (name || addedAt) {
+      details[phone] = { addedAt, name };
+    }
+  }
+
+  return details;
+}
+
+export async function saveWhatsAppConfig(
+  input: UpdateWhatsAppSettingsInput,
+  orgId: WhatsAppConfigScope = null
+): Promise<WhatsAppSettingsPublic> {
+  const existing = await loadWhatsAppConfigFile(orgId);
+  const next = buildSavedWhatsAppConfig(input, existing);
+
+  if (isChannelOwner(orgId)) {
+    next.profileId = orgId.profileId;
+  }
+
+  await writeWhatsAppConfigFile(next, orgId);
+
+  return toWhatsAppSettingsPublic(next);
+}
+
+function getWhatsAppAuthDir(orgId: WhatsAppConfigScope = null): string {
+  return join(getWhatsAppConfigDir(orgId), "auth");
+}
+
+// ponytail: filename mirrors whatsapp-worker.ts QR_CODE_FILENAME
+function getWhatsAppQrCodePath(orgId: WhatsAppConfigScope = null): string {
+  return join(getWhatsAppConfigDir(orgId), "worker-qr.txt");
+}
+
+export async function resetWhatsAppSessionForReconnect(
+  orgId: WhatsAppConfigScope = null
+): Promise<WhatsAppSettingsPublic> {
+  const existing = await loadWhatsAppConfigFile(orgId);
+
+  if (!existing) {
+    throw new Error(
+      "Enable WhatsApp in this agent’s Connections before reconnecting."
+    );
+  }
+
+  if (await pathExists(getWhatsAppAuthDir(orgId))) {
+    await rm(getWhatsAppAuthDir(orgId), { force: true, recursive: true });
+  }
+
+  const qrPath = getWhatsAppQrCodePath(orgId);
+
+  if (await pathExists(qrPath)) {
+    await removeFile(qrPath);
+  }
+
+  if (isChannelOwner(orgId)) {
+    await resetChannelConversationState("whatsapp", orgId);
+    await releaseChannelClaims("whatsapp", orgId);
+  }
+
+  const next: WhatsAppConfigFile = {
+    ...existing,
+    outboundPort: null,
+    outboundToken: null,
+    pairedJid: null,
+    pairedLid: null,
+    ...SPENT_PAIRING_SECRET,
+  };
+
+  await writeWhatsAppConfigFile(next, orgId);
+
+  return toWhatsAppSettingsPublic(next);
+}
+
+export async function regenerateWhatsAppPairingCode(
+  orgId: WhatsAppConfigScope = null
+): Promise<WhatsAppSettingsPublic> {
+  const existing = await loadWhatsAppConfigFile(orgId);
+
+  if (!existing) {
+    throw new Error(
+      "Enable WhatsApp in this agent’s Connections before generating a pairing code."
+    );
+  }
+
+  const { code, expiresAt } = createPairingCodeSecret();
+
+  const next: WhatsAppConfigFile = {
+    ...existing,
+    pairingCode: code,
+    pairingCodeExpiresAt: expiresAt,
+  };
+
+  await writeWhatsAppConfigFile(next, orgId);
+
+  return toWhatsAppSettingsPublic(next);
+}
+
+/**
+ * One pairing transaction: check the budget, compare in constant time, then
+ * consume the code under an exclusive lock. Every rejection returns the same
+ * message, so an attacker cannot tell an expired code from a wrong one.
+ */
+export async function verifyAndPairWhatsAppUser(
+  pairingCodeInput: string,
+  jid: string,
+  orgId: WhatsAppConfigScope = null
+): Promise<{ ok: true; message: string } | { ok: false; message: string }> {
+  const configDir = getWhatsAppConfigDir(orgId);
+
+  const failure = {
+    message: pairingFailureMessage("WhatsApp"),
+    ok: false,
+  } as const;
+
+  try {
+    return await withPairingConfigLock(configDir, async () => {
+      const config = await loadWhatsAppConfigFile(orgId);
+
+      if (!(config && hasActivePairingCode(config))) {
+        return failure;
+      }
+
+      if (isWhatsAppUserAuthorized(jid, config)) {
+        return { message: "This number is already linked.", ok: true };
+      }
+
+      const expected = config.pairingCode;
+
+      if (!expected) {
+        return failure;
+      }
+
+      const budget = getPairingAttemptBudget(configDir, expected);
+
+      if (isPairingAttemptBlocked(budget)) {
+        return failure;
+      }
+
+      if (!pairingCodesMatch(pairingCodeInput, expected)) {
+        // Exhausting the per-code budget retires the code, so a guessing run
+        // cannot keep at the same secret.
+        if (recordPairingFailure(budget)) {
+          await writeWhatsAppConfigFile(
+            { ...config, ...SPENT_PAIRING_SECRET },
+            orgId
+          );
+        }
+
+        return failure;
+      }
+
+      const isLid = jid.endsWith("@lid");
+      const phoneFromJid = isLid ? "" : whatsAppUserDigits(jid);
+      const pairedLid = isLid ? jid : config.pairedLid;
+
+      const pairedJid = isLid
+        ? (config.pairedJid ??
+          (config.phoneNumber ? phoneToWhatsAppJid(config.phoneNumber) : null))
+        : jid;
+
+      await writeWhatsAppConfigFile(
+        {
+          ...config,
+          pairedJid,
+          pairedLid,
+          ...SPENT_PAIRING_SECRET,
+          phoneNumber: phoneFromJid || config.phoneNumber,
+        },
+        orgId
+      );
+
+      return {
+        message: "Linked successfully. You can chat with MíngZhàn now.",
+        ok: true,
+      };
+    });
+  } catch (error) {
+    if (error instanceof ChannelConfigBusyError) {
+      return failure;
+    }
+
+    throw error;
+  }
+}
+
+/** After QR link, pair the owner and store their LID for inbound routing. */
+export async function syncWhatsAppOwnerPairing(
+  options: {
+    ownerJid: string;
+    ownerLid?: string | null;
+  },
+  orgId: WhatsAppConfigScope = null
+): Promise<void> {
+  const config = await loadWhatsAppConfigFile(orgId);
+
+  if (!config) {
+    return;
+  }
+
+  if (isChannelOwner(orgId)) {
+    await claimChannelIdentity(
+      "whatsapp",
+      orgId,
+      normalizeWhatsAppUserJid(options.ownerJid)
+    );
+  }
+
+  const isPhoneJid = whatsAppJidServer(options.ownerJid) === "s.whatsapp.net";
+  const ownerPhone = isPhoneJid ? whatsAppUserDigits(options.ownerJid) : "";
+  const ownerLid = options.ownerLid?.trim() || null;
+
+  const next: WhatsAppConfigFile = {
+    ...config,
+    pairedJid: config.pairedJid ?? options.ownerJid,
+    // Preserve an existing chat LID. `me.lid` can be a device/account LID, which
+    // does not always match the private self-chat JID used for inbound messages.
+    pairedLid: config.pairedLid ?? ownerLid,
+    ...SPENT_PAIRING_SECRET,
+    phoneNumber: ownerPhone || config.phoneNumber,
+  };
+
+  if (
+    next.pairedJid === config.pairedJid &&
+    next.pairedLid === config.pairedLid &&
+    next.pairingCode === config.pairingCode &&
+    next.pairingCodeExpiresAt === config.pairingCodeExpiresAt
+  ) {
+    return;
+  }
+
+  await writeWhatsAppConfigFile(next, orgId);
+}
+
+export function resolveWhatsAppConfigFromSources(options: {
+  env?: Record<string, string | undefined>;
+  file?: WhatsAppConfigFile | null;
+}): WhatsAppConfigFile | null {
+  const env = options.env ?? process.env;
+  const file = options.file ?? null;
+
+  if (!(file || env.WHATSAPP_PHONE_NUMBER?.trim())) {
+    return null;
+  }
+
+  return {
+    allowedPhones: file?.allowedPhones ?? [],
+    allowUnpairedGroupMembers: file?.allowUnpairedGroupMembers ?? false,
+    pairedJid: file?.pairedJid ?? null,
+    pairedLid: file?.pairedLid ?? null,
+    pairingCode: file?.pairingCode ?? null,
+    pairingCodeExpiresAt: file?.pairingCodeExpiresAt ?? null,
+    phoneNumber:
+      env.WHATSAPP_PHONE_NUMBER?.trim() || file?.phoneNumber?.trim() || "",
+    profileId:
+      env.MINGZHAN_WHATSAPP_PROFILE_ID?.trim() ||
+      file?.profileId?.trim() ||
+      DEFAULT_WHATSAPP_PROFILE_ID,
+    requireGroupMention:
+      file?.requireGroupMention ?? DEFAULT_WHATSAPP_REQUIRE_GROUP_MENTION,
+  };
+}
+
+function parseIniBoolean(
+  value: string | undefined,
+  fallback: boolean
+): boolean {
+  const trimmed = value?.trim().toLowerCase();
+
+  if (!trimmed) {
+    return fallback;
+  }
+
+  if (
+    trimmed === "true" ||
+    trimmed === "1" ||
+    trimmed === "yes" ||
+    trimmed === "on"
+  ) {
+    return true;
+  }
+
+  if (
+    trimmed === "false" ||
+    trimmed === "0" ||
+    trimmed === "no" ||
+    trimmed === "off"
+  ) {
+    return false;
+  }
+
+  return fallback;
+}
+
+/** Configured orgs are enumerated for worker recovery; credentials never fall back across orgs. */
+export async function listWhatsAppConfigOrgIds(): Promise<string[]> {
+  const configured: string[] = [];
+
+  for (const orgId of await readDirectoryOrEmpty(
+    join(getUserConfigDir(), "orgs")
+  )) {
+    if (await pathExists(getWhatsAppConfigPath(orgId))) {
+      configured.push(orgId);
+    }
+  }
+
+  return configured;
+}
+
+/** Persist the ephemeral loopback port allocated to this account's worker. */
+export async function saveWhatsAppOutboundPort(
+  port: number,
+  orgId: WhatsAppConfigScope = null
+): Promise<void> {
+  const config = await loadWhatsAppConfigFile(orgId);
+
+  if (config) {
+    await writeWhatsAppConfigFile(
+      { ...config, outboundPort: String(port) },
+      orgId
+    );
+  }
+}

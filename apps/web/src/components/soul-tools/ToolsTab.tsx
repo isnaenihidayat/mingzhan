@@ -1,0 +1,537 @@
+import type { ToolDetail } from "@mingzhan/core/contract";
+import {
+  BUILTIN_TOOL_IDS,
+  isProtectedToolId,
+} from "@mingzhan/core/tools/protected";
+import { Button } from "@mingzhan/ui/button";
+import { Card, CardContent } from "@mingzhan/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@mingzhan/ui/dialog";
+import { Input } from "@mingzhan/ui/input";
+import { Spinner } from "@mingzhan/ui/spinner";
+import { cn } from "@mingzhan/ui/utils";
+import { Add01Icon, Delete02Icon, Search01Icon } from "hugeicons-react";
+import { useMemo, useState } from "react";
+import { Link } from "react-router-dom";
+import { EmailSettingsDialog } from "@/components/EmailSettingsDialog";
+import { useAuth } from "@/context/use-auth";
+import { useAppNavigation } from "@/hooks/use-app-navigation";
+import { useProfilesQuery, useToolsQuery } from "@/hooks/use-app-queries";
+import { isPluginOwned } from "@/hooks/use-plugins";
+import { useDeleteToolMutation } from "@/hooks/use-resource-mutations";
+import { formatError } from "@/lib/client";
+import {
+  canUseToolPlayground,
+  pluginIcon,
+  pluginManagementPath,
+  toolPlaygroundPath,
+} from "@/lib/navigation";
+import { findSuperMingzhanProfile } from "@/lib/profiles";
+
+const toolSearchThreshold = 4;
+
+function isDeletableTool(tool: ToolDetail): boolean {
+  return !(isProtectedToolId(tool.id) || isPluginOwned(tool));
+}
+
+function isListedCustomTool(tool: ToolDetail): boolean {
+  return !isProtectedToolId(tool.id);
+}
+
+export function ToolsTab({ embedded = false }: { embedded?: boolean } = {}) {
+  const { navigateToNewChat } = useAppNavigation();
+  const { user, activeOrg } = useAuth();
+  const canConfigureEmail = user?.isPlatformAdmin === true;
+
+  const canUsePlayground = canUseToolPlayground(
+    user?.isPlatformAdmin === true,
+    activeOrg?.role
+  );
+
+  const { data: tools = [], isLoading, error } = useToolsQuery();
+  const { data: profiles = [] } = useProfilesQuery();
+  const superMingzhanProfile = findSuperMingzhanProfile(profiles);
+  const deleteToolMutation = useDeleteToolMutation();
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [emailConfigOpen, setEmailConfigOpen] = useState(false);
+
+  const [deleteTarget, setDeleteTarget] = useState<{
+    id: string;
+    name: string;
+  } | null>(null);
+
+  const loading = isLoading && tools.length === 0;
+  const busy = deleteToolMutation.isPending;
+  const errorMessage = actionError ?? (error ? formatError(error) : null);
+  const customTools = tools.filter(isListedCustomTool);
+  const builtinTools = tools.filter((tool) => !isListedCustomTool(tool));
+
+  function goToCreateTool() {
+    if (!superMingzhanProfile) {
+      setActionError("No super mingzhan profile exists in this organization.");
+
+      return;
+    }
+
+    navigateToNewChat(superMingzhanProfile.id);
+  }
+
+  function requestDeleteTool(toolId: string, toolName: string) {
+    if (isProtectedToolId(toolId)) {
+      return;
+    }
+
+    setDeleteTarget({ id: toolId, name: toolName });
+  }
+
+  async function confirmDeleteTool() {
+    if (!deleteTarget || isProtectedToolId(deleteTarget.id)) {
+      return;
+    }
+
+    setActionError(null);
+
+    try {
+      await deleteToolMutation.mutateAsync(deleteTarget.id);
+      setDeleteTarget(null);
+    } catch (err) {
+      setActionError(formatError(err));
+    }
+  }
+
+  if (loading) {
+    return <PageState embedded={embedded} message="Loading tools…" />;
+  }
+
+  const content = (
+    <div className={cn("min-w-0 space-y-8", embedded && "p-4 sm:p-5")}>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h2 className="font-normal text-sm">All tools</h2>
+          <p className="type-body mt-1 text-pretty text-xs tabular-nums">
+            {tools.length === 0
+              ? "No tools registered yet"
+              : `${tools.length} registered · ${customTools.length} custom · ${builtinTools.length} built-in`}
+          </p>
+        </div>
+
+        <Button onClick={goToCreateTool} size="sm" type="button">
+          <Add01Icon aria-hidden className="size-4" data-icon="inline-start" />
+          Create tool
+        </Button>
+      </div>
+
+      {tools.length === 0 ? (
+        <div className="flex min-h-48 flex-col items-center justify-center gap-3 text-center text-muted-foreground text-sm">
+          <p>No tools yet. Ask Super MíngZhàn to create one.</p>
+          <Button onClick={goToCreateTool} size="sm" type="button">
+            <Add01Icon
+              aria-hidden
+              className="size-4"
+              data-icon="inline-start"
+            />
+            Create tool
+          </Button>
+        </div>
+      ) : (
+        <div className="space-y-8">
+          <ToolListSection
+            busy={busy}
+            canConfigureEmail={canConfigureEmail}
+            canUsePlayground={canUsePlayground}
+            onConfigureEmail={() => setEmailConfigOpen(true)}
+            onCreateTool={goToCreateTool}
+            onDelete={requestDeleteTool}
+            title="Custom tools"
+            tools={customTools}
+          />
+
+          <ToolListSection
+            busy={busy}
+            canConfigureEmail={canConfigureEmail}
+            canUsePlayground={canUsePlayground}
+            onConfigureEmail={() => setEmailConfigOpen(true)}
+            onDelete={requestDeleteTool}
+            title="Built-in tools"
+            tools={builtinTools}
+          />
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <>
+      <div
+        className={cn("min-w-0 space-y-4", !embedded && "mx-auto max-w-3xl")}
+      >
+        {errorMessage ? (
+          <p className="rounded-md border border-destructive/40 bg-destructive/10 px-4 py-3 text-destructive text-sm">
+            {errorMessage}
+          </p>
+        ) : null}
+
+        {content}
+      </div>
+
+      {canConfigureEmail ? (
+        <EmailSettingsDialog
+          onOpenChange={setEmailConfigOpen}
+          open={emailConfigOpen}
+        />
+      ) : null}
+
+      <Dialog
+        onOpenChange={(open) => {
+          if (!(open || busy)) {
+            setDeleteTarget(null);
+          }
+        }}
+        open={deleteTarget !== null}
+      >
+        <DialogContent className="gap-6 p-6 sm:max-w-md">
+          <DialogHeader className="gap-3">
+            <DialogTitle>Delete tool?</DialogTitle>
+            <DialogDescription>
+              Remove{" "}
+              {deleteTarget?.name ? `"${deleteTarget.name}"` : "this tool"} from
+              every profile it is assigned to.
+            </DialogDescription>
+          </DialogHeader>
+
+          <DialogFooter className="mx-0 mb-0 gap-2 border-0 bg-transparent p-0 sm:flex-row sm:justify-end">
+            <Button
+              disabled={busy}
+              onClick={() => setDeleteTarget(null)}
+              type="button"
+              variant="outline"
+            >
+              Cancel
+            </Button>
+            <Button
+              disabled={busy}
+              onClick={() => void confirmDeleteTool()}
+              type="button"
+              variant="destructive"
+            >
+              {busy ? <Spinner className="size-4" /> : "Delete"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+function ToolListSection({
+  title,
+  tools,
+  busy,
+  canUsePlayground,
+  canConfigureEmail,
+  onCreateTool,
+  onDelete,
+  onConfigureEmail,
+}: {
+  title: string;
+  tools: ToolDetail[];
+  busy: boolean;
+  canUsePlayground: boolean;
+  canConfigureEmail: boolean;
+  onCreateTool?: () => void;
+  onDelete: (toolId: string, toolName: string) => void;
+  onConfigureEmail: () => void;
+}) {
+  const [query, setQuery] = useState("");
+  const trimmedQuery = query.trim();
+  const showSearch = tools.length >= toolSearchThreshold;
+
+  const filteredTools = useMemo(() => {
+    const needle = trimmedQuery.toLowerCase();
+
+    if (!needle) {
+      return tools;
+    }
+
+    return tools.filter((tool) => {
+      const haystack =
+        `${tool.id} ${tool.name} ${tool.description}`.toLowerCase();
+
+      return haystack.includes(needle);
+    });
+  }, [tools, trimmedQuery]);
+
+  const pluginGroups = new Map<string, ToolDetail[]>();
+  const standaloneTools: ToolDetail[] = [];
+
+  for (const tool of filteredTools) {
+    if (tool.pluginId) {
+      const group = pluginGroups.get(tool.pluginId) ?? [];
+      group.push(tool);
+      pluginGroups.set(tool.pluginId, group);
+    } else {
+      standaloneTools.push(tool);
+    }
+  }
+
+  return (
+    <section>
+      <div className="mb-3 flex items-baseline gap-2">
+        <h3 className="font-normal text-muted-foreground/55 text-sm">
+          {title}
+        </h3>
+        {tools.length > 0 ? (
+          <span className="text-muted-foreground text-xs tabular-nums">
+            {trimmedQuery
+              ? `${filteredTools.length}/${tools.length}`
+              : tools.length}
+          </span>
+        ) : null}
+      </div>
+
+      {tools.length === 0 ? (
+        <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border border-dashed px-4 py-6 text-center">
+          <p className="text-pretty text-muted-foreground text-xs">
+            None registered.
+          </p>
+          {onCreateTool ? (
+            <Button
+              disabled={busy}
+              onClick={onCreateTool}
+              size="sm"
+              type="button"
+            >
+              <Add01Icon
+                aria-hidden
+                className="size-4"
+                data-icon="inline-start"
+              />
+              Create custom tool
+            </Button>
+          ) : null}
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {showSearch ? (
+            <div className="relative">
+              <Search01Icon
+                aria-hidden
+                className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground"
+              />
+              <Input
+                aria-label={`Search ${title.toLowerCase()}`}
+                className="h-8 border-border/60 bg-muted/20 pl-8 text-sm shadow-none focus-visible:border-foreground/20 focus-visible:bg-background focus-visible:ring-1 focus-visible:ring-foreground/10 dark:bg-muted/15 dark:focus-visible:bg-background/60"
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="Search tools…"
+                value={query}
+              />
+            </div>
+          ) : null}
+
+          {filteredTools.length === 0 ? (
+            <p className="text-pretty py-6 text-center text-muted-foreground text-sm">
+              No tools match &ldquo;{trimmedQuery}&rdquo;.
+            </p>
+          ) : (
+            <Card className="w-full overflow-hidden shadow-none">
+              <CardContent className="p-0">
+                <ul className="divide-y divide-border">
+                  {standaloneTools.map((tool) => (
+                    <ToolListItem
+                      busy={busy}
+                      key={tool.id}
+                      onConfigure={
+                        canConfigureEmail && tool.id === BUILTIN_TOOL_IDS.email
+                          ? onConfigureEmail
+                          : undefined
+                      }
+                      onDelete={() => onDelete(tool.id, tool.name)}
+                      playgroundHref={
+                        canUsePlayground && isDeletableTool(tool)
+                          ? toolPlaygroundPath(tool.id)
+                          : undefined
+                      }
+                      tool={tool}
+                    />
+                  ))}
+                  {[...pluginGroups].map(([pluginId, group]) => (
+                    <PluginToolGroup
+                      busy={busy}
+                      key={`${pluginId}:${Boolean(trimmedQuery)}`}
+                      pluginId={pluginId}
+                      searching={Boolean(trimmedQuery)}
+                      tools={group}
+                    />
+                  ))}
+                </ul>
+              </CardContent>
+            </Card>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function PluginToolGroup({
+  pluginId,
+  tools,
+  busy,
+  searching,
+}: {
+  pluginId: string;
+  tools: ToolDetail[];
+  busy: boolean;
+  searching: boolean;
+}) {
+  const Icon = pluginIcon(pluginId);
+  const label = pluginId === "supermemory" ? "Supermemory" : pluginId;
+
+  return (
+    <li>
+      <details open={searching}>
+        <summary className="cursor-pointer rounded-md px-4 py-3 text-sm marker:text-muted-foreground hover:bg-muted/40 focus-visible:outline-2 focus-visible:outline-ring">
+          <span className="ml-2 inline-flex items-center gap-2 align-middle">
+            <Icon aria-hidden className="size-4" />
+            <span>{label}</span>
+            <span className="text-muted-foreground text-xs tabular-nums">
+              {tools.length} {tools.length === 1 ? "tool" : "tools"}
+            </span>
+          </span>
+        </summary>
+        <ul className="divide-y divide-border border-border border-t">
+          {tools.map((tool) => (
+            <ToolListItem busy={busy} key={tool.id} tool={tool} />
+          ))}
+        </ul>
+      </details>
+    </li>
+  );
+}
+
+function ToolListItem({
+  tool,
+  busy,
+  playgroundHref,
+  onDelete,
+  onConfigure,
+}: {
+  tool: ToolDetail;
+  busy: boolean;
+  playgroundHref?: string;
+  onDelete?: () => void;
+  onConfigure?: () => void;
+}) {
+  const deletable = isDeletableTool(tool);
+
+  const summary = (
+    <div className="min-w-0">
+      <p className="font-normal text-foreground text-sm">{tool.name}</p>
+      <p className="mt-0.5 line-clamp-2 text-pretty text-muted-foreground text-xs leading-relaxed">
+        {tool.description}
+      </p>
+    </div>
+  );
+
+  return (
+    <li className="group flex items-start justify-between gap-3 px-4 py-3 transition-colors duration-150 ease-out first:rounded-t-md last:rounded-b-md hover:bg-muted/40">
+      {playgroundHref ? (
+        <Link
+          aria-label={`Open playground for ${tool.name}`}
+          className={cn(
+            "min-w-0 flex-1 text-left",
+            busy && "pointer-events-none opacity-50"
+          )}
+          to={playgroundHref}
+        >
+          {summary}
+        </Link>
+      ) : (
+        <div className="min-w-0 flex-1">{summary}</div>
+      )}
+
+      <div className="flex shrink-0 flex-col items-end gap-2 sm:flex-row sm:items-center">
+        {isPluginOwned(tool) ? (
+          <span className="scope-badge scope-badge-custom">
+            {tool.pluginId}
+          </span>
+        ) : deletable ? (
+          <span className="scope-badge scope-badge-custom">custom</span>
+        ) : (
+          <span className="scope-badge scope-badge-active">built-in</span>
+        )}
+        {tool.pluginId ? (
+          <Button
+            render={<Link to={pluginManagementPath()} />}
+            size="sm"
+            variant="outline"
+          >
+            Plugin
+          </Button>
+        ) : null}
+
+        {onConfigure ? (
+          <Button
+            disabled={busy}
+            onClick={(event) => {
+              event.stopPropagation();
+              onConfigure();
+            }}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            Configure
+          </Button>
+        ) : null}
+
+        {deletable ? (
+          <Button
+            className="text-muted-foreground hover:text-destructive"
+            disabled={busy}
+            onClick={(event) => {
+              event.stopPropagation();
+              onDelete?.();
+            }}
+            size="sm"
+            type="button"
+            variant="ghost"
+          >
+            <Delete02Icon
+              aria-hidden
+              className="size-4"
+              data-icon="inline-start"
+            />
+            Delete
+          </Button>
+        ) : null}
+      </div>
+    </li>
+  );
+}
+
+function PageState({
+  message,
+  embedded = false,
+}: {
+  message: string;
+  embedded?: boolean;
+}) {
+  return (
+    <div
+      className={cn(
+        !embedded && "mx-auto max-w-3xl",
+        "flex min-h-64 flex-col items-center justify-center gap-3 p-8 text-muted-foreground text-sm"
+      )}
+    >
+      <Spinner className="size-5" />
+      {message}
+    </div>
+  );
+}

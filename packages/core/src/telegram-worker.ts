@@ -1,0 +1,42 @@
+import type { TelegramWorkerStatus } from "./contract";
+import {
+  getTelegramConfigDir,
+  loadTelegramSettingsPublic,
+  resolveTelegramScopeForOrg,
+  type TelegramConfigScope,
+  type TelegramSettingsPublic,
+} from "./telegram-config";
+import {
+  createWorkerHeartbeatStore,
+  isHeartbeatAlive,
+} from "./worker-heartbeat";
+
+export { isHeartbeatAlive };
+
+/** One heartbeat per identity: the file lives beside the config it belongs to. */
+export function createTelegramWorkerHeartbeat(orgId: TelegramConfigScope) {
+  return createWorkerHeartbeatStore({
+    getDir: () => getTelegramConfigDir(orgId),
+  });
+}
+
+export function resolveTelegramWorkerStatus(
+  settings: TelegramSettingsPublic,
+  running: boolean
+): TelegramWorkerStatus {
+  const configured = settings.configured;
+  const paired = settings.pairedUserIds.length > 0;
+  const ok = !configured || running;
+
+  return { configured, ok, paired, running };
+}
+
+export async function getTelegramWorkerStatus(
+  orgId: TelegramConfigScope
+): Promise<TelegramWorkerStatus> {
+  const scope = await resolveTelegramScopeForOrg(orgId);
+  const settings = await loadTelegramSettingsPublic(scope);
+  const running = await createTelegramWorkerHeartbeat(scope).isRunning();
+
+  return resolveTelegramWorkerStatus(settings, running);
+}

@@ -1,0 +1,257 @@
+import { mkdir } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { bypass, HttpResponse, http } from "msw";
+import { setupServer } from "msw/node";
+import { z } from "zod";
+
+export type LlmCassetteMode = "auto" | "record" | "replay";
+
+type LlmCassetteExchange = {
+  request: {
+    method: string;
+    url: string;
+    /** Chat completions JSON body (messages, tools, model, …). */
+    body?: unknown;
+  };
+  response: {
+    status: number;
+    body: z.infer<ReturnType<typeof z.json>>;
+  };
+};
+
+export type LlmCassette = {
+  version: 1 | 2;
+  name: string;
+  recordedAt: string;
+  /** @deprecated Prefer `exchanges`. Kept for v1 cassettes. */
+  request?: LlmCassetteExchange["request"];
+  /** @deprecated Prefer `exchanges`. Kept for v1 cassettes. */
+  response?: LlmCassetteExchange["response"];
+  exchanges?: LlmCassetteExchange[];
+};
+
+const cassetteSchema = z.object({
+  exchanges: z
+    .array(
+      z.object({
+        request: z.object({
+          body: z.unknown().optional(),
+          method: z.string(),
+          url: z.string(),
+        }),
+        response: z.object({ body: z.json(), status: z.number() }),
+      })
+    )
+    .optional(),
+  name: z.string(),
+  recordedAt: z.string(),
+  request: z
+    .object({
+      body: z.unknown().optional(),
+      method: z.string(),
+      url: z.string(),
+    })
+    .optional(),
+  response: z.object({ body: z.json(), status: z.number() }).optional(),
+  version: z.union([z.literal(1), z.literal(2)]),
+});
+
+/** Shared cassette root for all server LLM live tests. */
+const LLM_CASSETTES_DIR = join(import.meta.dir, "cassettes");
+
+const server = setupServer();
+
+let cassetteQueue = Promise.resolve();
+
+function resolveMode(explicit?: LlmCassetteMode): LlmCassetteMode {
+  if (explicit) {
+    return explicit;
+  }
+
+  const fromEnv = process.env.LLM_VCR_MODE?.trim().toLowerCase();
+
+  if (fromEnv === "record" || fromEnv === "replay" || fromEnv === "auto") {
+    return fromEnv;
+  }
+
+  return process.env.CI ? "replay" : "auto";
+}
+
+export function cassetteFilePath(
+  name: string,
+  cassettesDir: string = LLM_CASSETTES_DIR
+): string {
+  return join(cassettesDir, `${name.replaceAll("/", "-")}.json`);
+}
+
+function normalizeCassetteExchanges(
+  cassette: LlmCassette
+): LlmCassetteExchange[] {
+  if (cassette.exchanges?.length) {
+    return cassette.exchanges;
+  }
+
+  if (cassette.request && cassette.response) {
+    return [
+      {
+        request: cassette.request,
+        response: cassette.response,
+      },
+    ];
+  }
+
+  return [];
+}
+
+export async function loadCassette(
+  filePath: string
+): Promise<LlmCassette | null> {
+  const file = Bun.file(filePath);
+
+  if (!(await file.exists())) {
+    return null;
+  }
+
+  return cassetteSchema.parse(await file.json());
+}
+
+async function saveCassette(
+  filePath: string,
+  cassette: LlmCassette
+): Promise<void> {
+  await mkdir(dirname(filePath), { recursive: true });
+  await Bun.write(filePath, `${JSON.stringify(cassette, null, 2)}\n`);
+}
+
+/**
+ * Record/replay LLM HTTP via MSW.
+ *
+ * Supports multiple exchanges per cassette (multi-turn chats).
+ * v1 single request/response cassettes still replay.
+ *
+ * - replay: serve cassette exchanges in order (no network)
+ * - record: hit the real API with `bypass()`, then save all exchanges
+ * - auto: replay if cassette exists, otherwise record
+ */
+export async function withMswCassette<T>(
+  name: string,
+  fn: () => Promise<T>,
+  options: {
+    cassettesDir?: string;
+    mode?: LlmCassetteMode;
+    /** URL pattern for MSW. Defaults to OpenAI chat completions. */
+    url?: string | RegExp;
+  } = {}
+): Promise<T> {
+  const mode = resolveMode(options.mode);
+  const cassettesDir = options.cassettesDir ?? LLM_CASSETTES_DIR;
+  const filePath = cassetteFilePath(name, cassettesDir);
+  const existing = await loadCassette(filePath);
+  const url = options.url ?? "https://api.openai.com/v1/chat/completions";
+
+  const shouldReplay =
+    mode === "replay" || (mode === "auto" && existing !== null);
+
+  if (shouldReplay && !existing) {
+    throw new Error(
+      `MSW cassette missing: ${filePath}. Record with LLM_VCR_MODE=record.`
+    );
+  }
+
+  const replayExchanges = existing ? normalizeCassetteExchanges(existing) : [];
+  let replayIndex = 0;
+  const recordedExchanges: LlmCassetteExchange[] = [];
+
+  const previous = cassetteQueue;
+  let release = () => {};
+
+  cassetteQueue = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+
+  server.use(
+    http.post(url, async ({ request }) => {
+      if (shouldReplay) {
+        const exchange = replayExchanges[replayIndex];
+
+        if (!exchange) {
+          throw new Error(
+            `MSW cassette ${name} ran out of exchanges at index ${replayIndex}. Re-record with LLM_VCR_MODE=record.`
+          );
+        }
+
+        replayIndex += 1;
+
+        return HttpResponse.json(exchange.response.body, {
+          status: exchange.response.status,
+        });
+      }
+
+      const requestBodyText = await request.clone().text();
+      let requestBody: unknown = requestBodyText;
+
+      try {
+        requestBody = JSON.parse(requestBodyText);
+      } catch {
+        // keep raw text
+      }
+
+      const response = await fetch(bypass(request));
+      const contentType = response.headers.get("content-type") ?? "";
+
+      const body = contentType.includes("application/json")
+        ? await response.json()
+        : await response.text();
+
+      if (!response.ok) {
+        const detail = contentType.includes("application/json")
+          ? JSON.stringify(body)
+          : body;
+
+        throw new Error(`LLM request failed (${response.status}): ${detail}`);
+      }
+
+      recordedExchanges.push({
+        request: {
+          body: requestBody,
+          method: "POST",
+          url: request.url,
+        },
+        response: {
+          body,
+          status: response.status,
+        },
+      });
+
+      return HttpResponse.json(body, { status: response.status });
+    })
+  );
+
+  server.listen({ onUnhandledRequest: "bypass" });
+
+  try {
+    const result = await fn();
+
+    if (recordedExchanges.length > 0) {
+      const first = recordedExchanges[0]!;
+
+      const cassette = {
+        exchanges: recordedExchanges.length > 1 ? recordedExchanges : undefined,
+        name,
+        recordedAt: new Date().toISOString(),
+        request: first.request,
+        response: first.response,
+        version: recordedExchanges.length > 1 ? 2 : 1,
+      } satisfies LlmCassette;
+
+      await saveCassette(filePath, cassette);
+    }
+
+    return result;
+  } finally {
+    server.resetHandlers();
+    server.close();
+    release();
+  }
+}

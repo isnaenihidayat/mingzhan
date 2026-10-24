@@ -1,0 +1,476 @@
+import { join } from "node:path";
+import { z } from "zod";
+import {
+  assertChannelPath,
+  type ChannelConfigScope,
+  claimChannelIdentity,
+  createPairingCodeSecret,
+  getChannelConfigDir,
+  hasActiveHandshakeCode,
+  isBotChannelUserAuthorized,
+  isChannelOwner,
+  loadBotChannelIniConfig,
+  maskBotToken,
+  releaseChannelClaims,
+  resetChannelConversationState,
+  resolveHandshakeOnSave,
+  verifyAndPairBotChannelUser,
+  writeBotChannelIniConfig,
+} from "./channel-config-shared";
+import { readEnvValue } from "./config";
+
+export {
+  hasActiveHandshakeCode,
+  isPairingCodeActive,
+  looksLikePairingCode,
+  maskBotToken,
+} from "./channel-config-shared";
+
+export { generatePairingCode } from "./pairing-code";
+
+export const DEFAULT_DISCORD_PROFILE_ID = "default";
+
+export const SNOWFLAKE_PATTERN = /^\d{17,20}$/;
+
+export const DISCORD_API_BASE_URL = "https://discord.com/api/v10";
+
+export const DISCORD_USER_AGENT =
+  "DiscordBot (https://github.com/ahmadrosid/mingzhan, 1.0)";
+
+export function isDiscordSnowflake(value: string): boolean {
+  return SNOWFLAKE_PATTERN.test(value);
+}
+
+export interface DiscordConfigFile {
+  allowedUserIds: string[];
+  botToken: string;
+  handshakeCode: string | null;
+  handshakeExpiresAt: string | null;
+  pairedUserIds: string[];
+  profileId: string;
+}
+
+export interface DiscordSettingsPublic {
+  allowedUserIds: string[];
+  botTokenMasked: string | null;
+  configured: boolean;
+  handshakeCode: string | null;
+  inviteUrl: string | null;
+  pairedUserIds: string[];
+  profileId: string;
+}
+
+export interface UpdateDiscordSettingsInput {
+  allowedUserIds?: string;
+  botToken?: string;
+  profileId?: string;
+}
+
+export function getDiscordConfigDir(scope: ChannelConfigScope = null): string {
+  return getChannelConfigDir("discord", scope);
+}
+
+export function getDiscordConfigPath(scope: ChannelConfigScope = null): string {
+  const path = join(getDiscordConfigDir(scope), "config.ini");
+
+  if (isChannelOwner(scope)) {
+    assertChannelPath(path);
+    assertChannelPath(`${path}.tmp`);
+  }
+
+  return path;
+}
+
+const DISCORD_INVITE_PERMISSIONS = 101_376; // 68608 | 32768 (Attach Files)
+
+const DISCORD_INVITE_SCOPES = "bot applications.commands";
+
+const discordApplicationIdCache = new Map<string, string>();
+
+export function buildDiscordInviteUrl(applicationId: string): string {
+  const params = new URLSearchParams({
+    client_id: applicationId,
+    permissions: String(DISCORD_INVITE_PERMISSIONS),
+    scope: DISCORD_INVITE_SCOPES,
+  });
+
+  return `https://discord.com/oauth2/authorize?${params.toString()}`;
+}
+
+function clearDiscordApplicationIdCache(botToken: string): void {
+  discordApplicationIdCache.delete(botToken.trim());
+}
+
+export async function resolveDiscordApplicationId(
+  botToken: string,
+  options: { forceRefresh?: boolean } = {}
+): Promise<string | null> {
+  const token = botToken.trim();
+
+  if (!token) {
+    return null;
+  }
+
+  if (options.forceRefresh) {
+    clearDiscordApplicationIdCache(token);
+  }
+
+  const cached = discordApplicationIdCache.get(token);
+
+  if (cached) {
+    return cached;
+  }
+
+  try {
+    const response = await fetch(
+      `${DISCORD_API_BASE_URL}/oauth2/applications/@me`,
+      {
+        headers: { Authorization: `Bot ${token}` },
+        signal: AbortSignal.timeout(5000),
+      }
+    );
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const payload = z
+      .object({ id: z.string().optional() })
+      .safeParse(await response.json());
+
+    const applicationId = payload.success ? payload.data.id?.trim() : undefined;
+
+    if (!(applicationId && SNOWFLAKE_PATTERN.test(applicationId))) {
+      return null;
+    }
+
+    discordApplicationIdCache.set(token, applicationId);
+
+    return applicationId;
+  } catch {
+    return null;
+  }
+}
+
+async function withDiscordInviteUrl(
+  settings: DiscordSettingsPublic,
+  botToken: string | null
+): Promise<DiscordSettingsPublic> {
+  if (!(settings.configured && botToken?.trim())) {
+    return settings;
+  }
+
+  const applicationId = await resolveDiscordApplicationId(botToken);
+
+  return {
+    ...settings,
+    inviteUrl: applicationId ? buildDiscordInviteUrl(applicationId) : null,
+  };
+}
+
+export function parseAllowedUserIds(raw: string): string[] {
+  const ids = new Set<string>();
+
+  for (const part of raw.split(",")) {
+    const trimmed = part.trim();
+
+    if (!trimmed) {
+      continue;
+    }
+
+    if (!SNOWFLAKE_PATTERN.test(trimmed)) {
+      throw new Error(`Invalid Discord user ID: ${trimmed}`);
+    }
+
+    ids.add(trimmed);
+  }
+
+  return [...ids];
+}
+
+export function isDiscordUserAuthorized(
+  userId: string,
+  config: Pick<DiscordConfigFile, "pairedUserIds" | "allowedUserIds">
+): boolean {
+  return isBotChannelUserAuthorized(userId, config);
+}
+
+async function loadDiscordConfigFile(
+  scope: ChannelConfigScope = null
+): Promise<DiscordConfigFile | null> {
+  return loadBotChannelIniConfig({
+    configPath: getDiscordConfigPath(scope),
+    defaultProfileId: DEFAULT_DISCORD_PROFILE_ID,
+    parseUserIds: parseAllowedUserIds,
+  });
+}
+
+export { loadDiscordConfigFile };
+
+export function toDiscordSettingsPublic(
+  file: DiscordConfigFile | null
+): DiscordSettingsPublic {
+  if (!file) {
+    return {
+      allowedUserIds: [],
+      botTokenMasked: null,
+      configured: false,
+      handshakeCode: null,
+      inviteUrl: null,
+      pairedUserIds: [],
+      profileId: DEFAULT_DISCORD_PROFILE_ID,
+    };
+  }
+
+  return {
+    allowedUserIds: file.allowedUserIds,
+    botTokenMasked: maskBotToken(file.botToken),
+    configured: Boolean(file.botToken.trim()),
+    // An expired code is worse than none: the dashboard would offer a secret
+    // that no longer works.
+    handshakeCode: hasActiveHandshakeCode(file) ? file.handshakeCode : null,
+    inviteUrl: null,
+    pairedUserIds: file.pairedUserIds,
+    profileId: file.profileId,
+  };
+}
+
+export async function loadDiscordSettingsPublic(
+  scope: ChannelConfigScope = null
+): Promise<DiscordSettingsPublic> {
+  const file = await loadDiscordConfigFile(scope);
+  const base = toDiscordSettingsPublic(file);
+
+  return withDiscordInviteUrl(base, file?.botToken ?? null);
+}
+
+async function writeDiscordConfigFile(
+  config: DiscordConfigFile,
+  scope: ChannelConfigScope = null
+): Promise<void> {
+  await writeBotChannelIniConfig({
+    config,
+    configDir: getDiscordConfigDir(scope),
+    configPath: getDiscordConfigPath(scope),
+    label: "Discord",
+  });
+}
+
+function resolveDiscordBotToken(
+  input: UpdateDiscordSettingsInput,
+  existing: DiscordConfigFile | null
+): string {
+  return input.botToken === undefined
+    ? (existing?.botToken ?? "")
+    : input.botToken.trim();
+}
+
+function resolveDiscordProfileId(
+  input: UpdateDiscordSettingsInput,
+  existing: DiscordConfigFile | null
+): string {
+  return (
+    input.profileId?.trim() || existing?.profileId || DEFAULT_DISCORD_PROFILE_ID
+  );
+}
+
+function resolveAllowedUserIdsInput(
+  input: UpdateDiscordSettingsInput,
+  existing: DiscordConfigFile | null
+): string[] {
+  const raw =
+    input.allowedUserIds === undefined
+      ? (existing?.allowedUserIds.join(",") ?? "")
+      : input.allowedUserIds.trim();
+
+  return raw ? parseAllowedUserIds(raw) : [];
+}
+
+function buildSavedDiscordConfig(
+  input: UpdateDiscordSettingsInput,
+  existing: DiscordConfigFile | null
+): DiscordConfigFile {
+  const botToken = resolveDiscordBotToken(input, existing);
+
+  if (!botToken) {
+    throw new Error("Bot token is required.");
+  }
+
+  const allowedUserIds = resolveAllowedUserIdsInput(input, existing);
+
+  return {
+    allowedUserIds,
+    botToken,
+    ...resolveHandshakeOnSave(existing, allowedUserIds),
+    pairedUserIds: existing?.pairedUserIds ?? [],
+    profileId: resolveDiscordProfileId(input, existing),
+  };
+}
+
+export async function saveDiscordConfig(
+  input: UpdateDiscordSettingsInput,
+  scope: ChannelConfigScope = null
+): Promise<DiscordSettingsPublic> {
+  const existing = await loadDiscordConfigFile(scope);
+
+  const changed =
+    existing &&
+    input.botToken !== undefined &&
+    existing.botToken !== input.botToken.trim();
+
+  const next = buildSavedDiscordConfig(input, changed ? null : existing);
+
+  if (isChannelOwner(scope)) {
+    next.profileId = scope.profileId;
+  }
+
+  if (
+    existing?.botToken.trim() &&
+    existing.botToken.trim() !== next.botToken.trim()
+  ) {
+    clearDiscordApplicationIdCache(existing.botToken);
+  }
+
+  const identity = isChannelOwner(scope)
+    ? await resolveDiscordApplicationId(next.botToken)
+    : null;
+
+  if (isChannelOwner(scope) && !identity) {
+    throw new Error("Invalid Discord bot token");
+  }
+
+  const rollback =
+    isChannelOwner(scope) && identity
+      ? await claimChannelIdentity("discord", scope, identity)
+      : async () => {};
+
+  try {
+    if (changed && isChannelOwner(scope)) {
+      await resetChannelConversationState("discord", scope);
+    }
+
+    await writeDiscordConfigFile(next, scope);
+  } catch (error) {
+    await rollback();
+    throw error;
+  }
+
+  if (isChannelOwner(scope)) {
+    await releaseChannelClaims("discord", scope, identity!);
+  }
+
+  return withDiscordInviteUrl(toDiscordSettingsPublic(next), next.botToken);
+}
+
+export async function addDiscordAllowedUserId(
+  userId: string,
+  scope: ChannelConfigScope = null
+): Promise<
+  | { alreadyAllowed: boolean; ok: true; userId: string }
+  | { message: string; ok: false }
+> {
+  const trimmed = userId.trim();
+
+  if (!SNOWFLAKE_PATTERN.test(trimmed)) {
+    return { message: "Invalid Discord user ID.", ok: false };
+  }
+
+  const config = await loadDiscordConfigFile(scope);
+
+  if (!config) {
+    return {
+      message: "Discord is not configured on the server yet.",
+      ok: false,
+    };
+  }
+
+  if (config.allowedUserIds.includes(trimmed)) {
+    return { alreadyAllowed: true, ok: true, userId: trimmed };
+  }
+
+  try {
+    await writeDiscordConfigFile(
+      {
+        ...config,
+        allowedUserIds: [...config.allowedUserIds, trimmed],
+      },
+      scope
+    );
+  } catch {
+    return {
+      message: "Could not update the Discord allowed list.",
+      ok: false,
+    };
+  }
+
+  return { alreadyAllowed: false, ok: true, userId: trimmed };
+}
+
+export async function regenerateDiscordHandshake(
+  scope: ChannelConfigScope = null
+): Promise<DiscordSettingsPublic> {
+  const existing = await loadDiscordConfigFile(scope);
+
+  if (!existing?.botToken.trim()) {
+    throw new Error("Save a bot token before generating a pairing code.");
+  }
+
+  const { code, expiresAt } = createPairingCodeSecret();
+
+  const next: DiscordConfigFile = {
+    ...existing,
+    handshakeCode: code,
+    handshakeExpiresAt: expiresAt,
+  };
+
+  await writeDiscordConfigFile(next, scope);
+
+  return withDiscordInviteUrl(toDiscordSettingsPublic(next), next.botToken);
+}
+
+export async function verifyAndPairDiscordUser(
+  handshakeInput: string,
+  userId: string,
+  scope: ChannelConfigScope = null
+): Promise<{ ok: true; message: string } | { ok: false; message: string }> {
+  return verifyAndPairBotChannelUser({
+    configDir: getDiscordConfigDir(scope),
+    handshakeInput,
+    isAuthorized: isDiscordUserAuthorized,
+    label: "Discord",
+    load: () => loadDiscordConfigFile(scope),
+    userId,
+    write: (config) => writeDiscordConfigFile(config, scope),
+  });
+}
+
+export function resolveDiscordConfigFromSources(options: {
+  env?: Record<string, string | undefined>;
+  file?: DiscordConfigFile | null;
+}): DiscordConfigFile | null {
+  const env = options.env ?? process.env;
+  const file = options.file ?? null;
+
+  const botToken =
+    readEnvValue(env, "DISCORD_BOT_TOKEN") || file?.botToken?.trim() || "";
+
+  if (!botToken) {
+    return null;
+  }
+
+  const envAllowlist = env.DISCORD_ALLOWED_USER_IDS?.trim();
+
+  return {
+    allowedUserIds: envAllowlist
+      ? parseAllowedUserIds(envAllowlist)
+      : (file?.allowedUserIds ?? []),
+    botToken,
+    handshakeCode: file?.handshakeCode ?? null,
+    handshakeExpiresAt: file?.handshakeExpiresAt ?? null,
+    pairedUserIds: file?.pairedUserIds ?? [],
+    profileId:
+      env.MINGZHAN_DISCORD_PROFILE_ID?.trim() ||
+      file?.profileId?.trim() ||
+      DEFAULT_DISCORD_PROFILE_ID,
+  };
+}

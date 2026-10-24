@@ -1,0 +1,478 @@
+import uFuzzy from "@leeoniya/ufuzzy";
+import type { SkillSummary } from "@mingzhan/core/contract";
+
+const commandSearch = new uFuzzy({
+  compare: () => 0,
+  intraIns: Number.POSITIVE_INFINITY,
+});
+
+export interface SkillSlashRange {
+  end: number;
+  query: string;
+  start: number;
+}
+
+export interface SkillTokenRange {
+  end: number;
+  name: string;
+  start: number;
+}
+
+export type ComposerAddCommandAction =
+  | "add-mcp"
+  | "add-plugin"
+  | "add-skill"
+  | "add-tool";
+
+export interface ReservedSlashCommand {
+  action?: ComposerAddCommandAction;
+  description: string;
+  name: string;
+}
+
+/** A plugin page the active agent can open with `/open <pluginId>`. */
+export interface ComposerOpenPlugin {
+  label: string;
+  pluginId: string;
+}
+
+export type ComposerSlashSuggestion =
+  | { kind: "command"; command: ReservedSlashCommand }
+  | { kind: "plugin"; plugin: ComposerOpenPlugin }
+  | { kind: "skill"; skill: SkillSummary };
+
+/** Anything the composer picker lists: slash entries plus `@` mentions. */
+export type ComposerSuggestion =
+  | ComposerSlashSuggestion
+  | { kind: "mention"; mention: ReservedSlashCommand };
+
+// `/open <plugin>` keeps the picker open past the space, unlike other commands.
+const OPEN_PLUGIN_QUERY_PATTERN = /^open\s+[a-z0-9-]*$/i;
+
+const OPEN_PLUGIN_COMMAND_PATTERN = /^\/open\s+(\S+)$/i;
+
+const EXPLICIT_SKILL_TOKEN_PATTERN = /(?:^|\s)\/skill\s+([a-z0-9-]+)\b/g;
+
+const HIDDEN_SLASH_SKILL_NAMES = new Set<string>([
+  "create-automation",
+  "manage-skills",
+  "update-profile-memory",
+  "archive-profile-memory",
+  "artifact-design",
+]);
+
+/** Composer slash tokens that are not skill names (must not become `/skill …`). */
+const RESERVED_COMPOSER_SLASH_COMMANDS: ReservedSlashCommand[] = [
+  {
+    description: "Enable automatic learning after complex turns",
+    name: "enable-learning-loop",
+  },
+  {
+    description: "Distill a reusable skill from sources",
+    name: "learn",
+  },
+];
+
+/** Opens a dialog instead of inserting text. Shown when the user can assign tools. */
+const COMPOSER_ADD_SLASH_COMMANDS: ReservedSlashCommand[] = [
+  {
+    action: "add-plugin",
+    description: "Enable a plugin for this agent",
+    name: "add-plugin",
+  },
+  {
+    action: "add-tool",
+    description: "Assign a tool to this agent",
+    name: "add-tool",
+  },
+  {
+    action: "add-mcp",
+    description: "Assign or add an MCP server",
+    name: "add-mcp",
+  },
+  {
+    action: "add-skill",
+    description: "Add a skill from GitHub or a ZIP file",
+    name: "add-skill",
+  },
+];
+
+/** Opens a side chat next to the page. Shown on the main chat page only. */
+const BTW_SLASH_COMMAND: ReservedSlashCommand = {
+  description: "Ask a side question in a new chat",
+  name: "btw",
+};
+
+const BTW_COMMAND_PATTERN = /^\/btw(?:\s+([\s\S]*))?$/i;
+
+/** `@` tokens the server acts on (`@image` asks the agent for generate_image). */
+const COMPOSER_MENTIONS: ReservedSlashCommand[] = [
+  {
+    description: "Generate an image from your message",
+    name: "image",
+  },
+];
+
+const MENTION_TOKEN_PATTERN = new RegExp(
+  String.raw`(^|\s)(@(?:` +
+    COMPOSER_MENTIONS.map((mention) => mention.name).join("|") +
+    String.raw`))(?=\s|$)`,
+  "gi"
+);
+
+export function findActiveSkillSlashRange(
+  value: string,
+  cursorIndex: number,
+  trigger: "/" | "@" = "/"
+): SkillSlashRange | null {
+  const boundedCursor = Math.max(0, Math.min(cursorIndex, value.length));
+  const beforeCursor = value.slice(0, boundedCursor);
+  const slashIndex = beforeCursor.lastIndexOf(trigger);
+
+  if (slashIndex === -1) {
+    return null;
+  }
+
+  const previous = slashIndex > 0 ? value[slashIndex - 1] : "";
+
+  if (previous && !/\s/.test(previous)) {
+    return null;
+  }
+
+  const query = value.slice(slashIndex + 1, boundedCursor);
+
+  if (
+    /\s/.test(query) &&
+    !(trigger === "/" && OPEN_PLUGIN_QUERY_PATTERN.test(query))
+  ) {
+    return null;
+  }
+
+  return {
+    end: boundedCursor,
+    query,
+    start: slashIndex,
+  };
+}
+
+export function filterReservedSlashCommands(
+  query: string,
+  commands: ReservedSlashCommand[] = RESERVED_COMPOSER_SLASH_COMMANDS
+): ReservedSlashCommand[] {
+  const normalized = query.trim().toLowerCase();
+
+  if (!normalized) {
+    return [...commands];
+  }
+
+  // Search names only: description matches can steal focus from commands.
+  const needle = normalized.replace(/[-_]/g, "");
+
+  if (!needle) {
+    return [];
+  }
+
+  const [indices, info, order] = commandSearch.search(
+    commands.map((command) => command.name.toLowerCase().replace(/[-_]/g, "")),
+    needle
+  );
+
+  const matches =
+    info && order ? order.map((index) => info.idx[index]) : indices;
+
+  return (matches ?? []).map((index) => commands[index]);
+}
+
+export function filterComposerMentionSuggestions(
+  query: string
+): ComposerSuggestion[] {
+  return filterReservedSlashCommands(query, COMPOSER_MENTIONS).map(
+    (mention) => ({ kind: "mention" as const, mention })
+  );
+}
+
+export function matchComposerAddCommand(
+  text: string
+): ComposerAddCommandAction | null {
+  const token = text.trim();
+
+  const command = COMPOSER_ADD_SLASH_COMMANDS.find(
+    (item) => `/${item.name}` === token
+  );
+
+  return command?.action ?? null;
+}
+
+/** The question a sent `/btw …` asks (empty for a bare `/btw`), or null. */
+export function matchComposerBtwCommand(text: string): string | null {
+  const match = BTW_COMMAND_PATTERN.exec(text.trim());
+
+  return match ? (match[1] ?? "").trim() : null;
+}
+
+/** Plugin pages that match `/o`, `/open`, or `/open dat`, by id or label. */
+function filterOpenPluginSuggestions(
+  plugins: ComposerOpenPlugin[],
+  query: string
+): ComposerSlashSuggestion[] {
+  const [command = "", ...rest] = query.trim().toLowerCase().split(/\s+/);
+  const needle = rest.join(" ");
+
+  if (
+    !(command && "open".startsWith(command)) ||
+    (needle && command !== "open")
+  ) {
+    return [];
+  }
+
+  return plugins.flatMap((plugin) =>
+    !needle ||
+    plugin.pluginId.includes(needle) ||
+    plugin.label.toLowerCase().includes(needle)
+      ? [{ kind: "plugin" as const, plugin }]
+      : []
+  );
+}
+
+/** The plugin a sent `/open <plugin>` names, matched by id or label. */
+export function matchComposerOpenCommand(
+  text: string,
+  plugins: ComposerOpenPlugin[]
+): ComposerOpenPlugin | null {
+  const name = OPEN_PLUGIN_COMMAND_PATTERN.exec(
+    text.trim()
+  )?.[1]?.toLowerCase();
+
+  return name
+    ? (plugins.find(
+        (plugin) =>
+          plugin.pluginId === name || plugin.label.toLowerCase() === name
+      ) ?? null)
+    : null;
+}
+
+function profileCanUseLearnCommand(skills: SkillSummary[]): boolean {
+  return skills.some((skill) => skill.name === "manage-skills");
+}
+
+export function matchComposerLearningLoopCommand(text: string): boolean {
+  return text.trim() === "/enable-learning-loop";
+}
+
+export function filterSkillsForSlashQuery(
+  skills: SkillSummary[],
+  query: string
+): SkillSummary[] {
+  const visibleSkills = skills.filter(
+    (skill) => !HIDDEN_SLASH_SKILL_NAMES.has(skill.name)
+  );
+
+  const normalized = query.trim().toLowerCase();
+
+  if (!normalized) {
+    return visibleSkills;
+  }
+
+  return visibleSkills.filter((skill) => {
+    const name = skill.name.toLowerCase();
+    const description = skill.description.toLowerCase();
+
+    return name.includes(normalized) || description.includes(normalized);
+  });
+}
+
+export function filterComposerSlashSuggestions(
+  skills: SkillSummary[],
+  query: string,
+  options: {
+    enableAddCommands?: boolean;
+    enableBtw?: boolean;
+    openPlugins?: ComposerOpenPlugin[];
+  } = {}
+): ComposerSlashSuggestion[] {
+  const btwCommands = options.enableBtw
+    ? filterReservedSlashCommands(query, [BTW_SLASH_COMMAND]).map(
+        (command) => ({ command, kind: "command" as const })
+      )
+    : [];
+
+  const addCommands = options.enableAddCommands
+    ? filterReservedSlashCommands(query, COMPOSER_ADD_SLASH_COMMANDS).map(
+        (command) => ({
+          command,
+          kind: "command" as const,
+        })
+      )
+    : [];
+
+  const learnCommands = profileCanUseLearnCommand(skills)
+    ? filterReservedSlashCommands(query).map((command) => ({
+        command,
+        kind: "command" as const,
+      }))
+    : [];
+
+  const skillSuggestions = filterSkillsForSlashQuery(skills, query).map(
+    (skill) => ({
+      kind: "skill" as const,
+      skill,
+    })
+  );
+
+  const pluginSuggestions = filterOpenPluginSuggestions(
+    options.openPlugins ?? [],
+    query
+  );
+
+  return [
+    ...btwCommands,
+    ...addCommands,
+    ...learnCommands,
+    ...pluginSuggestions,
+    ...skillSuggestions,
+  ];
+}
+
+export function replaceSlashRangeWithSkillInvocation(
+  value: string,
+  range: SkillSlashRange,
+  skill: Pick<SkillSummary, "name">
+): { value: string; cursorIndex: number } {
+  const invocation = `/skill ${skill.name} `;
+  const nextValue = `${value.slice(0, range.start)}${invocation}${value.slice(range.end)}`;
+
+  // oxlint-disable-next-line anti-slop/no-known-value-widening -- This public result intentionally keeps its documented broad return contract.
+  return {
+    cursorIndex: range.start + invocation.length,
+    value: nextValue,
+  };
+}
+
+export function replaceSlashRangeWithReservedCommand(
+  value: string,
+  range: SkillSlashRange,
+  command: Pick<ReservedSlashCommand, "name">,
+  trigger: "/" | "@" = "/"
+): { value: string; cursorIndex: number } {
+  const insertion = `${trigger}${command.name} `;
+  const nextValue = `${value.slice(0, range.start)}${insertion}${value.slice(range.end)}`;
+
+  // oxlint-disable-next-line anti-slop/no-known-value-widening -- This public result intentionally keeps its documented broad return contract.
+  return {
+    cursorIndex: range.start + insertion.length,
+    value: nextValue,
+  };
+}
+
+export function getSkillTokenRanges(value: string): SkillTokenRange[] {
+  const ranges: SkillTokenRange[] = [];
+
+  for (const match of value.matchAll(EXPLICIT_SKILL_TOKEN_PATTERN)) {
+    const fullMatch = match[0] ?? "";
+    const leadingWhitespace = fullMatch.startsWith("/skill") ? 0 : 1;
+    const start = (match.index ?? 0) + leadingWhitespace;
+    const name = match[1];
+
+    if (!name) {
+      continue;
+    }
+
+    ranges.push({
+      end: start + fullMatch.length - leadingWhitespace,
+      name,
+      start,
+    });
+  }
+
+  return ranges;
+}
+
+// Only a leading command is real: the server trims then treats `/learn …` as a
+// command, so mid-sentence `/learn` is plain text and must not be highlighted.
+const RESERVED_COMMAND_NAMES = RESERVED_COMPOSER_SLASH_COMMANDS.map(
+  (command) => command.name
+).join("|");
+
+const LEADING_RESERVED_COMMAND_PATTERN = new RegExp(
+  String.raw`^(\s*)(/(?:` + RESERVED_COMMAND_NAMES + String.raw`))(?=\s|$)`
+);
+
+/** Range of a leading reserved command (e.g. `/learn`) for composer highlighting. */
+export function getReservedCommandTokenRanges(
+  value: string,
+  options: { enableLearn?: boolean } = {}
+): SkillTokenRange[] {
+  if (options.enableLearn === false) {
+    return [];
+  }
+
+  const match = LEADING_RESERVED_COMMAND_PATTERN.exec(value);
+  const token = match?.[2];
+
+  if (!(match && token)) {
+    return [];
+  }
+
+  const start = match[1]?.length ?? 0;
+
+  return [
+    {
+      end: start + token.length,
+      name: token.slice(1),
+      start,
+    },
+  ];
+}
+
+/** Ranges of `@image`-style mention tokens for composer highlighting. */
+export function getMentionTokenRanges(value: string): SkillTokenRange[] {
+  return [...value.matchAll(MENTION_TOKEN_PATTERN)].map((match) => {
+    const start = (match.index ?? 0) + (match[1]?.length ?? 0);
+    const token = match[2] ?? "";
+
+    return { end: start + token.length, name: token.slice(1), start };
+  });
+}
+
+export interface LeadingCommand {
+  description: string;
+  range: SkillTokenRange;
+}
+
+/** The leading `/learn` or `/skill name` token, with what it does, for the composer banner. */
+export function getLeadingCommand(
+  value: string,
+  skills: SkillSummary[]
+): LeadingCommand | null {
+  const leadingOffset = value.length - value.trimStart().length;
+
+  const reservedRange = getReservedCommandTokenRanges(value, {
+    enableLearn: profileCanUseLearnCommand(skills),
+  }).find((range) => range.start === leadingOffset);
+
+  if (reservedRange) {
+    const command = RESERVED_COMPOSER_SLASH_COMMANDS.find(
+      (candidate) => candidate.name === reservedRange.name
+    );
+
+    if (command) {
+      return { description: command.description, range: reservedRange };
+    }
+  }
+
+  const skillRange = getSkillTokenRanges(value).find(
+    (range) => range.start === leadingOffset
+  );
+
+  if (skillRange) {
+    const skill = skills.find(
+      (candidate) => candidate.name === skillRange.name
+    );
+
+    if (skill) {
+      return { description: skill.description.trim(), range: skillRange };
+    }
+  }
+
+  return null;
+}

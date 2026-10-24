@@ -1,0 +1,89 @@
+import { Button } from "@mingzhan/ui/button";
+import { DialogFooter } from "@mingzhan/ui/dialog";
+import { Input } from "@mingzhan/ui/input";
+import { Spinner } from "@mingzhan/ui/spinner";
+
+export function EmailSettingsFooter({
+  hint,
+  formError,
+  testRecipient,
+  testPending,
+  savePending,
+  configured,
+  onTestRecipientChange,
+  onTestSend,
+  onSave,
+}: {
+  hint: string | null;
+  formError: string | null;
+  testRecipient: string;
+  testPending: boolean;
+  savePending: boolean;
+  configured: boolean;
+  onTestRecipientChange: (value: string) => void;
+  onTestSend: () => void;
+  onSave: () => void;
+}) {
+  return (
+    <DialogFooter className="mx-0 mb-0 flex-col items-stretch gap-3 px-4 py-3 sm:flex-col">
+      {hint || formError ? (
+        <div className="space-y-1">
+          {hint ? (
+            <p className="text-emerald-200 text-xs" role="status">
+              {hint}
+            </p>
+          ) : null}
+          {formError ? (
+            <p className="text-destructive text-sm" role="alert">
+              {formError}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 flex-1 gap-2">
+          <Input
+            className="min-w-0 flex-1"
+            id="email-test-recipient"
+            onChange={(event) => onTestRecipientChange(event.target.value)}
+            placeholder="Test recipient"
+            value={testRecipient}
+          />
+          <Button
+            className="shrink-0"
+            disabled={testPending || !configured}
+            onClick={onTestSend}
+            type="button"
+            variant="secondary"
+          >
+            {testPending ? (
+              <>
+                <Spinner className="mr-2" />
+                Sending…
+              </>
+            ) : (
+              "Send test"
+            )}
+          </Button>
+        </div>
+
+        <Button
+          className="shrink-0 sm:ml-3"
+          disabled={savePending}
+          onClick={onSave}
+          type="button"
+        >
+          {savePending ? (
+            <>
+              <Spinner className="mr-2" />
+              Saving…
+            </>
+          ) : (
+            "Save settings"
+          )}
+        </Button>
+      </div>
+    </DialogFooter>
+  );
+}

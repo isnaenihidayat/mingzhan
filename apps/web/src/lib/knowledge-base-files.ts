@@ -1,0 +1,58 @@
+import { DOCX_MEDIA_TYPE } from "@mingzhan/core/artifact-mime";
+import type { DocumentAttachment } from "@mingzhan/core/contract";
+import {
+  normalizeDocumentMediaType,
+  parseDocumentDataUrl,
+} from "@mingzhan/core/message-content";
+
+import { readFileAsDataUrl } from "./read-file-as-data-url";
+
+export const KNOWLEDGE_BASE_ACCEPT = `.pdf,.docx,.txt,.md,.csv,.zip,application/pdf,${DOCX_MEDIA_TYPE},text/plain,text/csv,text/markdown,application/zip`;
+
+const KB_EXTENSIONS = new Set([".pdf", ".docx", ".txt", ".md", ".csv"]);
+
+export function isKnowledgeBaseZipFile(file: File): boolean {
+  return file.name.trim().toLowerCase().endsWith(".zip");
+}
+
+export async function fileToZipBase64(file: File): Promise<string> {
+  const dataUrl = await readFileAsDataUrl(file);
+
+  return dataUrl.slice(dataUrl.indexOf(",") + 1);
+}
+
+export function isKnowledgeBaseFile(file: File): boolean {
+  const filename = file.name.trim();
+  const extension = filename.slice(filename.lastIndexOf(".")).toLowerCase();
+  const mediaType = normalizeDocumentMediaType(file.type, filename);
+
+  return (
+    KB_EXTENSIONS.has(extension) ||
+    mediaType === "application/pdf" ||
+    mediaType === DOCX_MEDIA_TYPE ||
+    mediaType === "text/plain" ||
+    mediaType === "text/csv" ||
+    mediaType === "text/markdown"
+  );
+}
+
+export function fileToDocumentAttachment(
+  file: File
+): Promise<DocumentAttachment | null> {
+  return readFileAsDataUrl(file).then(
+    (data) => parseDocumentDataUrl(data, file.name.trim() || "document"),
+    () => null
+  );
+}
+
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}

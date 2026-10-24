@@ -1,0 +1,73 @@
+---
+title: "Backup and restore"
+description: "Export and restore your MíngZhàn data root with dashboard ZIP backup."
+---
+
+## Export
+
+Platform admins can export local MíngZhàn data from **Control center → Workspace → Settings → Export ZIP**.
+
+The export is a `.zip` backup of the configured MíngZhàn data root, which defaults to `~/.mingzhan` and follows `MINGZHAN_CONFIG_DIR` when set.
+
+Treat export ZIPs as sensitive. They can include:
+
+- Provider settings and API keys
+- Auth data
+- Org and profile workspaces (soul files, memory, artifacts)
+- Org-level `MEMORY.md`, `memory-archive/`, and `memory-history/` (see [Org memory](/org-memory))
+- Custom tools and skills
+- Plugin packages and organization plugin data (snapshotted, not copied mid-write)
+- The local SQLite database when it lives under the MíngZhàn root
+
+## Import
+
+Importing is a whole-install restore:
+
+1. Preview the ZIP first
+2. Confirm restore to replace the current local data root
+
+The import accepts a ZIP up to 100 MB, up to 10,000 entries of 100 MB each, and up to 500 MB of uncompressed data. A larger archive is rejected before restore. Plan for downtime during restore because this replaces the active data root rather than merging individual records.
+
+On a fresh install, you can also restore during [First-time setup](/first-time-setup) before creating a new admin account.
+
+Restored plugins stay **disabled** until an organization admin enables them in **Control center → Agent tools → Plugins**. If a restored package no longer matches its stored hash, that release stays unavailable and must be installed again.
+
+### Teams and shared resources
+
+A full backup retains organization and team relationships, saved team conversations, and memory.
+Restore does not revive publications removed after the backup.
+Only matching publications that are still authorized remain available.
+Restoring into a fresh installation leaves shared references inactive because no existing publication authority can be verified.
+
+After restore, a parent admin can review resources in **System → Organization** and publish permitted sources again.
+Shared agents keep their saved team work when access is unavailable.
+New turns use restored configuration after the server reloads its sessions.
+
+An organization export contains that organization's work. It does not include parent secrets or unpublished parent files.
+Organization exports cannot replace a whole installation through restore.
+
+## Profile packs (single agent)
+
+To move **one** profile without a full-root backup, open **Agent**, select the profile, and choose **Export** or **Import**. See [Export and import an agent pack](/profiles#export-and-import-a-profile-pack).
+
+Those packs deliberately omit secrets and are not interchangeable with Export ZIP above.
+
+## Desktop data
+
+MíngZhàn Desktop uses `~/.mingzhan-desktop` for server data instead of the normal `~/.mingzhan` root. Its browser session lives in Electron's `MíngZhàn Desktop Electron` app-data directory. The desktop app does not import an existing web server's `~/.mingzhan` data, and restoring a normal Export ZIP doesn't automatically merge those stores.
+
+To move Desktop server data, quit the app and copy the complete `~/.mingzhan-desktop` directory. To restore it on another machine, place the copy at `~/.mingzhan-desktop` before opening the app. Keep the browser session directory too when you want the saved login and window state. See [Desktop](/desktop) for supported platforms and local-server behavior.
+
+Desktop packaging and source builds are separate from backups. Build on macOS ARM64 or Windows x64. The macOS package targets macOS 15 or later on Apple Silicon; the Windows package targets Windows 10 build 19041 or later through the Microsoft Store. Cloud models still require internet access and provider credentials.
+
+## Docker volumes
+
+When MíngZhàn runs in Docker, persist `/mingzhan/data` with a named volume or bind mount. Back up that volume (or use Export ZIP from the dashboard) before upgrades or migrations.
+
+See [Docker](/docker) for volume setup.
+
+## Next steps
+
+- [Quickstart](/quickstart) — install and first-run setup
+- [First-time setup](/first-time-setup) — restore a backup during the setup wizard
+- [Docker](/docker) — container deployment and volumes

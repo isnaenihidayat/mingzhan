@@ -1,0 +1,693 @@
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { readFile, unlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { createInMemoryDatabaseAdapter } from "@mingzhan/db";
+import { zipSync } from "fflate";
+import { asTestFetch } from "../../providers/test-helpers";
+import { SkillsService } from "../../services/skills-service";
+import { setupTestConfigDir } from "../../test-config-dir";
+import { createMinimalHonoApp } from "../test-app-helpers";
+import {
+  loginUserSession,
+  seedOrgAdmin,
+  setupFreshInstallSession,
+} from "../test-session-helpers";
+
+setupTestConfigDir("mingzhan-skills-install-routes-test-");
+
+const VALID_SKILL = `---
+name: github-weather
+description: Get weather from a public GitHub skill.
+---
+
+Call the weather tool.
+`;
+
+const INVALID_SKILL = `# No frontmatter
+
+Just a body.
+`;
+
+function createApp() {
+  const databaseAdapter = createInMemoryDatabaseAdapter();
+  const skillsService = new SkillsService(databaseAdapter);
+
+  return {
+    ...createMinimalHonoApp({
+      agent: {
+        listSkills: (orgId: string) => skillsService.listSkills(orgId),
+        listSkillFiles: (orgId: string, skillId: string) =>
+          skillsService.listSkillFiles(orgId, skillId),
+        readSkillFile: (orgId: string, skillId: string, filePath: string) =>
+          skillsService.readSkillFile(orgId, skillId, filePath),
+        installSkillFromGitHub: (
+          orgId: string,
+          request: Parameters<SkillsService["installSkillFromGitHub"]>[1]
+        ) => skillsService.installSkillFromGitHub(orgId, request),
+        listProfiles: async () => ({ profiles: [] }),
+      },
+      databaseAdapter,
+    }),
+    skillsService,
+  };
+}
+
+const BASE = "http://localhost:4310";
+
+test("skill catalog permits tenant admins without exposing private tenant skills", async () => {
+  const { app, authService, databaseAdapter, skillsService } = createApp();
+
+  const admin = await seedOrgAdmin(databaseAdapter, {
+    authService,
+    email: "catalog-admin@example.com",
+    orgId: "catalog-parent",
+  });
+
+  const session = await loginUserSession(
+    app,
+    admin.email,
+    admin.password,
+    admin.orgId
+  );
+
+  const now = new Date().toISOString();
+  const skillIds = new Map<string, string>();
+
+  const { skill: globalSkill } = await skillsService.createSkill(admin.orgId, {
+    body: "Global instructions",
+    description: "Existing global skill",
+    name: "catalog-global",
+  });
+
+  for (const orgId of [
+    admin.orgId,
+    "catalog-team",
+    "catalog-sibling",
+    "catalog-other",
+  ]) {
+    if (orgId !== admin.orgId) {
+      await databaseAdapter.upsertOrganization({
+        createdAt: now,
+        id: orgId,
+        name: orgId,
+        parentOrgId: orgId === "catalog-other" ? null : admin.orgId,
+        slug: orgId,
+        updatedAt: now,
+      });
+    }
+
+    const profileId = `${orgId}-profile`;
+    await databaseAdapter.upsertProfile({
+      createdAt: now,
+      id: profileId,
+      isSuper: false,
+      model: null,
+      name: orgId,
+      orgId,
+      systemPrompt: "Private profile",
+      updatedAt: now,
+    });
+
+    const { skill } = await skillsService.createSkill(orgId, {
+      body: "Private instructions",
+      description: "Private skill",
+      name: orgId,
+      profileId,
+    });
+
+    skillIds.set(orgId, skill.id);
+  }
+
+  await databaseAdapter.upsertOrgMember({
+    createdAt: now,
+    orgId: "catalog-team",
+    role: "admin",
+    userId: admin.userId,
+  });
+
+  for (const orgId of [admin.orgId, "catalog-team"]) {
+    const response = await app.fetch(
+      new Request(`${BASE}/v1/skills`, {
+        headers: session.headers({}, orgId),
+      })
+    );
+
+    expect(response.status).toBe(200);
+
+    const result: Awaited<ReturnType<SkillsService["listSkills"]>> =
+      await response.json();
+
+    expect(
+      result.skills.filter((skill) => skill.orgId).map((skill) => skill.id)
+    ).toEqual([skillIds.get(orgId)!]);
+    expect(result.skills.map((skill) => skill.id)).toContain(globalSkill.id);
+    expect(result.publishedSkills).toEqual([]);
+  }
+
+  for (const orgId of ["catalog-sibling", "catalog-other"]) {
+    const response = await app.fetch(
+      new Request(`${BASE}/v1/skills`, {
+        headers: session.headers({}, orgId),
+      })
+    );
+
+    expect(response.status).toBe(404);
+  }
+
+  const write = await app.fetch(
+    new Request(`${BASE}/v1/skills`, {
+      body: "{}",
+      headers: session.headers(
+        {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": session.csrfToken,
+        },
+        admin.orgId
+      ),
+      method: "POST",
+    })
+  );
+
+  expect(write.status).toBe(403);
+
+  for (const role of ["member"] as const) {
+    await databaseAdapter.upsertOrgMember({
+      createdAt: now,
+      orgId: admin.orgId,
+      role,
+      userId: admin.userId,
+    });
+
+    const response = await app.fetch(
+      new Request(`${BASE}/v1/skills`, {
+        headers: session.headers({}, admin.orgId),
+      })
+    );
+
+    expect(response.status).toBe(403);
+  }
+});
+
+describe("POST /v1/skills/install", () => {
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  test("platform admin installs a valid public SKILL.md and assigns it", async () => {
+    // SAFETY: This test controls the fixture shape at this boundary.
+    globalThis.fetch = asTestFetch(
+      mock(
+        async () =>
+          new Response(
+            zipSync({
+              "skills-main/weather/SKILL.md": new TextEncoder().encode(
+                VALID_SKILL
+              ),
+              "skills-main/weather/references/explainer.md":
+                new TextEncoder().encode("Explainer instructions"),
+            })
+          )
+      )
+    );
+
+    const { app, databaseAdapter, skillsService } = createApp();
+
+    const adminSession = await setupFreshInstallSession(
+      app,
+      databaseAdapter,
+      "admin@org.com"
+    );
+
+    const orgId = adminSession.orgId!;
+    const profiles = await databaseAdapter.listProfilesForOrg(orgId);
+    const profileId = profiles[0]!.id;
+
+    const response = await app.fetch(
+      new Request(`${BASE}/v1/skills/install`, {
+        body: JSON.stringify({
+          profileId,
+          url: "https://github.com/acme/skills/blob/main/weather/SKILL.md",
+        }),
+        headers: adminSession.headers(
+          {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": adminSession.csrfToken,
+          },
+          orgId
+        ),
+        method: "POST",
+      })
+    );
+
+    expect(response.status).toBe(201);
+
+    // SAFETY: This test controls the fixture shape at this boundary.
+    const body = (await response.json()) as {
+      skill: { name: string; id: string; createdBy: string };
+    };
+
+    expect(body.skill.name).toBe("github-weather");
+    expect(body.skill.createdBy).toBe("human");
+
+    const filesResponse = await app.fetch(
+      new Request(`${BASE}/v1/skills/${body.skill.id}/files`, {
+        headers: adminSession.headers({}, orgId),
+      })
+    );
+
+    expect(filesResponse.status).toBe(200);
+    expect((await filesResponse.json()).files).toContainEqual({
+      path: "references/explainer.md",
+      type: "file",
+    });
+
+    const fileResponse = await app.fetch(
+      new Request(
+        `${BASE}/v1/skills/${body.skill.id}/file?path=references%2Fexplainer.md`,
+        { headers: adminSession.headers({}, orgId) }
+      )
+    );
+
+    expect(fileResponse.status).toBe(200);
+    expect((await fileResponse.json()).content).toBe("Explainer instructions");
+
+    const installed = await databaseAdapter.getSkillByName(
+      "github-weather",
+      orgId
+    );
+
+    expect(
+      await readFile(
+        join(installed!.sourcePath, "references/explainer.md"),
+        "utf8"
+      )
+    ).toBe("Explainer instructions");
+
+    const reference = join(installed!.sourcePath, "references/explainer.md");
+    await unlink(reference);
+    await skillsService.installSkillFromGitHub(orgId, {
+      profileId,
+      url: "https://github.com/acme/skills/tree/main/weather",
+    });
+    expect(await readFile(reference, "utf8")).toBe("Explainer instructions");
+    await writeFile(reference, "Local edits");
+    await expect(
+      skillsService.installSkillFromGitHub(orgId, {
+        profileId,
+        url: "https://github.com/acme/skills/tree/main/weather",
+      })
+    ).rejects.toThrow();
+    expect(await readFile(reference, "utf8")).toBe("Local edits");
+
+    const assigned = await databaseAdapter.listSkillsForProfile(profileId);
+    expect(assigned.some((skill) => skill.id === body.skill.id)).toBe(true);
+  });
+
+  test("installs a skill from an npx skills add command", async () => {
+    let requestedUrl = "";
+    // SAFETY: This test controls the fixture shape at this boundary.
+    globalThis.fetch = asTestFetch(
+      mock(async (input) => {
+        requestedUrl = String(input);
+
+        return new Response(
+          zipSync({
+            "agent-skills-main/pdf/SKILL.md": new TextEncoder().encode(
+              VALID_SKILL.replace("github-weather", "pdf")
+            ),
+          })
+        );
+      })
+    );
+
+    const { app, databaseAdapter } = createApp();
+
+    const adminSession = await setupFreshInstallSession(
+      app,
+      databaseAdapter,
+      "admin-command@org.com"
+    );
+
+    const orgId = adminSession.orgId!;
+    const profileId = (await databaseAdapter.listProfilesForOrg(orgId))[0]!.id;
+
+    const response = await app.fetch(
+      new Request(`${BASE}/v1/skills/install`, {
+        body: JSON.stringify({
+          command: "npx skills add vercel-labs/agent-skills --skill pdf",
+          profileId,
+        }),
+        headers: adminSession.headers(
+          {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": adminSession.csrfToken,
+          },
+          orgId
+        ),
+        method: "POST",
+      })
+    );
+
+    expect(response.status).toBe(201);
+    expect(requestedUrl).toBe(
+      "https://codeload.github.com/vercel-labs/agent-skills/zip/HEAD"
+    );
+  });
+
+  test("invalid frontmatter returns 400 and writes no skill", async () => {
+    // SAFETY: This test controls the fixture shape at this boundary.
+    globalThis.fetch = asTestFetch(
+      mock(
+        async () =>
+          new Response(
+            zipSync({
+              "skills-main/broken/SKILL.md": new TextEncoder().encode(
+                INVALID_SKILL
+              ),
+            })
+          )
+      )
+    );
+
+    const { app, databaseAdapter } = createApp();
+
+    const adminSession = await setupFreshInstallSession(
+      app,
+      databaseAdapter,
+      "admin@org.com"
+    );
+
+    const orgId = adminSession.orgId!;
+    const profiles = await databaseAdapter.listProfilesForOrg(orgId);
+    const profileId = profiles[0]!.id;
+    const before = await databaseAdapter.listSkills();
+
+    const response = await app.fetch(
+      new Request(`${BASE}/v1/skills/install`, {
+        body: JSON.stringify({
+          profileId,
+          url: "https://github.com/acme/skills/blob/main/broken/SKILL.md",
+        }),
+        headers: adminSession.headers(
+          {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": adminSession.csrfToken,
+          },
+          orgId
+        ),
+        method: "POST",
+      })
+    );
+
+    expect(response.status).toBe(400);
+    const after = await databaseAdapter.listSkills();
+    expect(after).toHaveLength(before.length);
+  });
+
+  test("non-GitHub URL returns 400", async () => {
+    const { app, databaseAdapter } = createApp();
+
+    const adminSession = await setupFreshInstallSession(
+      app,
+      databaseAdapter,
+      "admin@org.com"
+    );
+
+    const orgId = adminSession.orgId!;
+    const profiles = await databaseAdapter.listProfilesForOrg(orgId);
+    const profileId = profiles[0]!.id;
+
+    const response = await app.fetch(
+      new Request(`${BASE}/v1/skills/install`, {
+        body: JSON.stringify({
+          profileId,
+          url: "https://example.com/skills/weather/SKILL.md",
+        }),
+        headers: adminSession.headers(
+          {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": adminSession.csrfToken,
+          },
+          orgId
+        ),
+        method: "POST",
+      })
+    );
+
+    expect(response.status).toBe(400);
+    // SAFETY: This test controls the fixture shape at this boundary.
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toMatch(/GitHub/i);
+  });
+
+  test("non-admin returns 403", async () => {
+    const { app, databaseAdapter } = createApp();
+
+    const adminSession = await setupFreshInstallSession(
+      app,
+      databaseAdapter,
+      "admin@org.com"
+    );
+
+    const orgId = adminSession.orgId!;
+
+    const memberResp = await app.fetch(
+      new Request(`${BASE}/v1/orgs/${orgId}/members`, {
+        body: JSON.stringify({
+          email: "member@org.com",
+          name: "Member",
+          role: "member",
+        }),
+        headers: adminSession.headers(
+          {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": adminSession.csrfToken,
+          },
+          orgId
+        ),
+        method: "POST",
+      })
+    );
+
+    // SAFETY: This test controls the fixture shape at this boundary.
+    const memberProvisioned = (await memberResp.json()) as {
+      temporaryPassword: string;
+    };
+
+    const memberSession = await loginUserSession(
+      app,
+      "member@org.com",
+      memberProvisioned.temporaryPassword,
+      orgId
+    );
+
+    for (const suffix of ["files", "file?path=SKILL.md"]) {
+      const result = await app.fetch(
+        new Request(`${BASE}/v1/skills/any-skill/${suffix}`, {
+          headers: memberSession.headers({}, orgId),
+        })
+      );
+
+      expect(result.status).toBe(403);
+    }
+
+    const profiles = await databaseAdapter.listProfilesForOrg(orgId);
+    const profileId = profiles[0]!.id;
+
+    const response = await app.fetch(
+      new Request(`${BASE}/v1/skills/install`, {
+        body: JSON.stringify({
+          profileId,
+          url: "https://github.com/acme/skills/blob/main/weather/SKILL.md",
+        }),
+        headers: memberSession.headers(
+          {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": memberSession.csrfToken,
+          },
+          orgId
+        ),
+        method: "POST",
+      })
+    );
+
+    expect(response.status).toBe(403);
+  });
+
+  test("incomplete body returns 400, not 500", async () => {
+    const { app, databaseAdapter } = createApp();
+
+    const adminSession = await setupFreshInstallSession(
+      app,
+      databaseAdapter,
+      "admin-malformed@org.com"
+    );
+
+    const orgId = adminSession.orgId!;
+
+    const response = await app.fetch(
+      new Request(`${BASE}/v1/skills/install`, {
+        body: JSON.stringify({ profileId: "p" }),
+        headers: adminSession.headers(
+          {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": adminSession.csrfToken,
+          },
+          orgId
+        ),
+        method: "POST",
+      })
+    );
+
+    expect(response.status).toBe(400);
+    // SAFETY: This test controls the fixture shape at this boundary.
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toMatch(/GitHub URL.*ZIP file/i);
+  });
+
+  test("installing the same skill onto a second profile returns 409", async () => {
+    // SAFETY: This test controls the fixture shape at this boundary.
+    globalThis.fetch = asTestFetch(
+      mock(
+        async () =>
+          new Response(
+            zipSync({
+              "skills-main/weather/SKILL.md": new TextEncoder().encode(
+                VALID_SKILL
+              ),
+            })
+          )
+      )
+    );
+
+    const { app, databaseAdapter } = createApp();
+
+    const adminSession = await setupFreshInstallSession(
+      app,
+      databaseAdapter,
+      "admin-dup@org.com"
+    );
+
+    const orgId = adminSession.orgId!;
+    const profiles = await databaseAdapter.listProfilesForOrg(orgId);
+    const firstProfileId = profiles[0]!.id;
+
+    const first = await app.fetch(
+      new Request(`${BASE}/v1/skills/install`, {
+        body: JSON.stringify({
+          profileId: firstProfileId,
+          url: "https://github.com/acme/skills/blob/main/weather/SKILL.md",
+        }),
+        headers: adminSession.headers(
+          {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": adminSession.csrfToken,
+          },
+          orgId
+        ),
+        method: "POST",
+      })
+    );
+
+    expect(first.status).toBe(201);
+
+    const now = new Date().toISOString();
+    const secondProfileId = "profile_second";
+    await databaseAdapter.upsertProfile({
+      createdAt: now,
+      id: secondProfileId,
+      isDefault: false,
+      isSuper: false,
+      model: null,
+      name: "Second",
+      orgId,
+      skillsPostTurnReview: false,
+      skillsWriteApproval: false,
+      systemPrompt: "",
+      updatedAt: now,
+    });
+
+    const second = await app.fetch(
+      new Request(`${BASE}/v1/skills/install`, {
+        body: JSON.stringify({
+          profileId: secondProfileId,
+          url: "https://github.com/acme/skills/blob/main/weather/SKILL.md",
+        }),
+        headers: adminSession.headers(
+          {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": adminSession.csrfToken,
+          },
+          orgId
+        ),
+        method: "POST",
+      })
+    );
+
+    expect(second.status).toBe(409);
+    // SAFETY: This test controls the fixture shape at this boundary.
+    const body = (await second.json()) as { error: string };
+    expect(body.error).toMatch(/already exists|cannot be attached/i);
+  });
+
+  // pip runs package build code on the host, so an org admin is not enough.
+  test("installing a skill's Python packages needs a platform admin", async () => {
+    const { app, databaseAdapter } = createApp();
+
+    const adminSession = await setupFreshInstallSession(
+      app,
+      databaseAdapter,
+      "admin@org.com"
+    );
+
+    const orgId = adminSession.orgId!;
+
+    const created = await app.fetch(
+      new Request(`${BASE}/v1/orgs/${orgId}/members`, {
+        body: JSON.stringify({
+          email: "orgadmin@org.com",
+          name: "Org Admin",
+          role: "admin",
+        }),
+        headers: adminSession.headers(
+          {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": adminSession.csrfToken,
+          },
+          orgId
+        ),
+        method: "POST",
+      })
+    );
+
+    // SAFETY: This test controls the fixture shape at this boundary.
+    const { temporaryPassword } = (await created.json()) as {
+      temporaryPassword: string;
+    };
+
+    const orgAdmin = await loginUserSession(
+      app,
+      "orgadmin@org.com",
+      temporaryPassword,
+      orgId
+    );
+
+    const response = await app.fetch(
+      new Request(`${BASE}/v1/skills/any-skill/python-packages`, {
+        headers: orgAdmin.headers(
+          { "X-CSRF-Token": orgAdmin.csrfToken },
+          orgId
+        ),
+        method: "POST",
+      })
+    );
+
+    expect(response.status).toBe(403);
+  });
+});

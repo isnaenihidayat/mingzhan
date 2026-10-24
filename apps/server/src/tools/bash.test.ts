@@ -1,0 +1,942 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { getProfileSoulDir, PathGuardError } from "@mingzhan/core";
+import { removeTestDir } from "../test-config-dir";
+import { resolveHostBash, runBash } from "./bash";
+
+describe("host Bash discovery", () => {
+  const env = {
+    ProgramFiles: "C:\\Program Files",
+    "ProgramFiles(x86)": "C:\\Program Files (x86)",
+  };
+
+  const gitBash = "C:\\Program Files\\Git\\usr\\bin\\bash.exe";
+  const gitBashX86 = "C:\\Program Files (x86)\\Git\\usr\\bin\\bash.exe";
+  const pathBash = "C:\\msys64\\usr\\bin\\bash.exe";
+
+  test("prefers Git Bash over PATH, including paths with spaces", () => {
+    expect(
+      resolveHostBash(
+        "win32",
+        env,
+        () => true,
+        () => pathBash
+      )
+    ).toBe(gitBash);
+    expect(
+      resolveHostBash(
+        "win32",
+        env,
+        (file) => file === gitBashX86,
+        () => pathBash
+      )
+    ).toBe(gitBashX86);
+  });
+
+  test("falls back to native Bash on PATH", () => {
+    expect(
+      resolveHostBash(
+        "win32",
+        env,
+        () => false,
+        () => pathBash
+      )
+    ).toBe(pathBash);
+  });
+
+  test("rejects missing Bash and legacy WSL launchers", () => {
+    for (const shell of [
+      null,
+      "C:\\Windows\\System32\\bash.exe",
+      "c:/WINDOWS/Sysnative/bash.exe",
+    ]) {
+      expect(() =>
+        resolveHostBash(
+          "win32",
+          env,
+          () => false,
+          () => shell
+        )
+      ).toThrow();
+    }
+  });
+
+  test("keeps Unix Bash and falls back to PATH when needed", () => {
+    expect(
+      resolveHostBash(
+        "linux",
+        {},
+        () => true,
+        () => "/usr/bin/bash"
+      )
+    ).toBe("/bin/bash");
+    expect(
+      resolveHostBash(
+        "darwin",
+        {},
+        () => false,
+        () => "/opt/bin/bash"
+      )
+    ).toBe("/opt/bin/bash");
+    expect(() =>
+      resolveHostBash(
+        "linux",
+        {},
+        () => false,
+        () => null
+      )
+    ).toThrow();
+  });
+});
+
+// A login shell on a busy Windows runner can take over a second to get here.
+// This returns as soon as the file holds a PID, so the longer wait is free.
+async function waitForPositivePid(pidPath: string): Promise<number> {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    try {
+      const pid = Number((await readFile(pidPath, "utf8")).trim());
+
+      if (Number.isInteger(pid) && pid > 0) {
+        return pid;
+      }
+    } catch {
+      // The shell has not created the PID file yet.
+    }
+
+    await Bun.sleep(10);
+  }
+
+  return 0;
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Git Bash's POSIX PIDs differ from the Windows PIDs used by process.kill.
+// The /proc entry can lag the fork, so read it until it is there.
+const childPidCommand =
+  process.platform === "win32"
+    ? "(until cat /proc/$!/winpid 2>/dev/null; do sleep 0.05; done)"
+    : "echo $!";
+
+describe("bash tool", () => {
+  let workspaceRoot = "";
+
+  test("coding-agent commands preserve quoted arguments in a workspace with spaces", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan bash "));
+
+    const result = await runBash(
+      {
+        codingAgent: true,
+        command: "printf '%s' 'quoted argument with spaces' > result.txt",
+      },
+      { orgId: "org_test", profileId: "profile_test" },
+      { backend: "host", workspaceRoot }
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(await readFile(path.join(workspaceRoot, "result.txt"), "utf8")).toBe(
+      "quoted argument with spaces"
+    );
+  });
+
+  afterEach(async () => {
+    if (workspaceRoot) {
+      await removeTestDir(workspaceRoot);
+      workspaceRoot = "";
+    }
+  });
+
+  for (const mode of ["abort", "timeout"] as const) {
+    test(`${mode} stops shell descendants and finishes the tool`, async () => {
+      workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+      // A native child reports its own Windows PID, without MSYS fork/exec IDs.
+      await writeFile(
+        path.join(workspaceRoot, "child.cjs"),
+        'const fs = require("node:fs"); fs.writeFileSync("heartbeat", String(Date.now())); fs.writeFileSync("child.pid", String(process.pid)); setInterval(() => fs.writeFileSync("heartbeat", String(Date.now())), 20);'
+      );
+      const controller = new AbortController();
+
+      const pending = runBash(
+        {
+          command: '"$MINGZHAN_TEST_BUN" child.cjs & wait',
+          env: { MINGZHAN_TEST_BUN: process.execPath },
+          // The clock starts at spawn. On Windows the shell and the child can
+          // need more than 500 ms to start, and then no PID is ever written.
+          timeoutMs:
+            mode === "timeout"
+              ? process.platform === "win32"
+                ? 3000
+                : 500
+              : 30_000,
+        },
+        {
+          orgId: "org_test",
+          profileId: "profile_test",
+          signal: controller.signal,
+        },
+        { backend: "host", workspaceRoot }
+      ).catch((error: Error) => error);
+
+      const pid = await waitForPositivePid(
+        path.join(workspaceRoot, "child.pid")
+      );
+
+      try {
+        expect(pid).toBeGreaterThan(0);
+
+        if (mode === "abort") {
+          controller.abort();
+        }
+
+        const result = await Promise.race([
+          pending,
+          Bun.sleep(process.platform === "win32" ? 5000 : 2000).then(
+            () => "hung"
+          ),
+        ]);
+
+        expect(result).not.toBe("hung");
+
+        if (mode === "abort") {
+          expect(result).toMatchObject({ name: "AbortError" });
+        } else {
+          expect(result).toMatchObject({ timedOut: true });
+        }
+
+        // Reaping descendants can lag the shell's close event slightly.
+        for (let i = 0; i < 50 && isProcessAlive(pid); i++) {
+          await Bun.sleep(10);
+        }
+
+        expect(isProcessAlive(pid)).toBe(false);
+
+        const heartbeat = await readFile(
+          path.join(workspaceRoot, "heartbeat"),
+          "utf8"
+        );
+
+        await Bun.sleep(100);
+        expect(
+          await readFile(path.join(workspaceRoot, "heartbeat"), "utf8")
+        ).toBe(heartbeat);
+      } finally {
+        if (pid > 0 && isProcessAlive(pid)) {
+          process.kill(pid, "SIGKILL");
+        }
+
+        controller.abort();
+        await pending;
+      }
+    }, 10_000);
+  }
+
+  test("returns after shell exit when a quiet descendant holds the pipes", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+
+    const pending = runBash(
+      {
+        command: `sleep 30 & ${childPidCommand} > child.pid; echo done; exit 0`,
+      },
+      { orgId: "org_test", profileId: "profile_test" },
+      { backend: "host", workspaceRoot }
+    );
+
+    const pid = await waitForPositivePid(path.join(workspaceRoot, "child.pid"));
+
+    try {
+      expect(pid).toBeGreaterThan(0);
+
+      const result = await Promise.race([
+        pending,
+        Bun.sleep(2000).then(() => "hung"),
+      ]);
+
+      expect(result).toMatchObject({
+        exitCode: 0,
+        stdout: "done\n",
+        timedOut: false,
+      });
+    } finally {
+      if (pid > 0 && isProcessAlive(pid)) {
+        process.kill(pid, "SIGKILL");
+      }
+
+      await pending;
+    }
+  }, 10_000);
+
+  test("drains active descendant output after the shell exits", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+    // Spawning Git Bash's sleep.exe can exceed the 100 ms idle grace on Windows.
+    // Keep output in one native process and let it start before the shell exits.
+    await writeFile(
+      path.join(workspaceRoot, "output.cjs"),
+      `const fs = require("node:fs");
+let i = 0;
+const timer = setInterval(() => {
+  process.stdout.write(String(++i) + "\\n");
+  if (i === 1) fs.writeFileSync("ready", "");
+  if (i === 8) clearInterval(timer);
+}, 40);`
+    );
+
+    const result = await runBash(
+      {
+        command:
+          '"$MINGZHAN_TEST_BUN" output.cjs & while [ ! -f ready ]; do sleep 0.01; done; exit 0',
+        env: { MINGZHAN_TEST_BUN: process.execPath },
+      },
+      { orgId: "org_test", profileId: "profile_test" },
+      { backend: "host", workspaceRoot }
+    );
+
+    expect(result).toMatchObject({
+      exitCode: 0,
+      stdout: "1\n2\n3\n4\n5\n6\n7\n8\n",
+      timedOut: false,
+    });
+  });
+
+  test("does not spawn a command after cancellation", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      runBash(
+        { command: "echo started > marker" },
+        {
+          orgId: "org_test",
+          profileId: "profile_test",
+          signal: controller.signal,
+        },
+        { backend: "host", workspaceRoot }
+      )
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(await readdir(workspaceRoot)).toEqual([]);
+  });
+
+  test("kills the shell when the turn is cancelled", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+
+    const controller = new AbortController();
+    const startedAt = Date.now();
+
+    // 30s beats any plausible test runtime, so finishing fast can only mean the
+    // abort killed it rather than the command completing on its own.
+    const pending = runBash(
+      { command: "sleep 30" },
+      {
+        orgId: "org_test",
+        profileId: "profile_test",
+        signal: controller.signal,
+      },
+      { workspaceRoot }
+    );
+
+    setTimeout(() => controller.abort(), 50);
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(Date.now() - startedAt).toBeLessThan(5000);
+  });
+
+  test("force kills a shell that traps SIGTERM after cancellation", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+    const pidPath = path.join(workspaceRoot, "trapped.pid");
+    const controller = new AbortController();
+
+    const pending = runBash(
+      {
+        command: `trap '' TERM; ${process.platform === "win32" ? "cat /proc/$$/winpid" : "echo $$"} > trapped.pid; while :; do sleep 1; done`,
+      },
+      {
+        orgId: "org_test",
+        profileId: "profile_test",
+        signal: controller.signal,
+      },
+      { workspaceRoot }
+    );
+
+    const childPid = await waitForPositivePid(pidPath);
+
+    controller.abort();
+    await expect(pending).rejects.toThrow();
+    expect(childPid).toBeGreaterThan(0);
+
+    let survivedAbort = true;
+    const forceKillDeadline = Date.now() + 6500;
+
+    while (Date.now() < forceKillDeadline) {
+      if (!isProcessAlive(childPid)) {
+        survivedAbort = false;
+        break;
+      }
+
+      await Bun.sleep(25);
+    }
+
+    if (survivedAbort) {
+      process.kill(childPid, "SIGKILL");
+    }
+
+    expect(survivedAbort).toBe(false);
+  }, 10_000);
+
+  test("runs commands in the profile workspace by default", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+
+    const result = await runBash(
+      { command: process.platform === "win32" ? "pwd -W" : "pwd" },
+      { orgId: "org_test", profileId: "profile_test" },
+      { workspaceRoot }
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe(
+      (await realpath(workspaceRoot)).replaceAll("\\", "/")
+    );
+    expect(result.timedOut).toBe(false);
+  });
+
+  test("ordinary commands resolve the profile workspace without an override", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+    const previousConfigDir = process.env.MINGZHAN_CONFIG_DIR;
+    process.env.MINGZHAN_CONFIG_DIR = workspaceRoot;
+
+    try {
+      const profileWorkspace = getProfileSoulDir("org_test", "profile_test");
+      await mkdir(profileWorkspace, { recursive: true });
+
+      for (const codingWorkspaceRoot of [undefined, workspaceRoot]) {
+        for (const cwd of [undefined, ".", profileWorkspace]) {
+          const result = await runBash(
+            { command: process.platform === "win32" ? "pwd -W" : "pwd", cwd },
+            {
+              codingWorkspaceRoot,
+              orgId: "org_test",
+              profileId: "profile_test",
+            },
+            { backend: "host" }
+          );
+
+          expect(result.exitCode).toBe(0);
+          expect(result.stdout.trim()).toBe(
+            (await realpath(profileWorkspace)).replaceAll("\\", "/")
+          );
+        }
+      }
+    } finally {
+      if (previousConfigDir === undefined) {
+        delete process.env.MINGZHAN_CONFIG_DIR;
+      } else {
+        process.env.MINGZHAN_CONFIG_DIR = previousConfigDir;
+      }
+    }
+  });
+
+  test("ordinary commands use the active user workspace from context", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-user-"));
+
+    const result = await runBash(
+      { command: process.platform === "win32" ? "pwd -W" : "pwd" },
+      {
+        orgId: "org_test",
+        profileId: "profile_test",
+        workspaceRoot,
+      },
+      { backend: "host" }
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe(
+      (await realpath(workspaceRoot)).replaceAll("\\", "/")
+    );
+  });
+
+  test("CLI commands use the launch directory without coding-agent mode", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+
+    const context = {
+      channel: "cli" as const,
+      codingWorkspaceRoot: workspaceRoot,
+      orgId: "org_test",
+      profileId: "profile_test",
+    };
+
+    const nestedDir = path.join(workspaceRoot, "nested");
+    await mkdir(nestedDir);
+
+    for (const cwd of [undefined, ".", workspaceRoot, "nested"]) {
+      const result = await runBash(
+        { command: process.platform === "win32" ? "pwd -W" : "pwd", cwd },
+        context,
+        {
+          backend: "host",
+        }
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        (
+          await realpath(cwd === "nested" ? nestedDir : workspaceRoot)
+        ).replaceAll("\\", "/")
+      );
+    }
+
+    await expect(
+      runBash(
+        { command: process.platform === "win32" ? "pwd -W" : "pwd", cwd: ".." },
+        context,
+        { backend: "host" }
+      )
+    ).rejects.toBeInstanceOf(PathGuardError);
+  });
+
+  test("coding-agent workspace selection respects explicit overrides", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+
+    const codingWorkspaceRoot = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-coding-workspace-")
+    );
+
+    const codingResult = await runBash(
+      {
+        codingAgent: true,
+        command: process.platform === "win32" ? "pwd -W" : "pwd",
+      },
+      {
+        codingWorkspaceRoot,
+        orgId: "org_test",
+        profileId: "profile_test",
+      }
+    );
+
+    const ordinaryResult = await runBash(
+      { command: process.platform === "win32" ? "pwd -W" : "pwd" },
+      {
+        codingWorkspaceRoot,
+        orgId: "org_test",
+        profileId: "profile_test",
+      },
+      { workspaceRoot }
+    );
+
+    expect(codingResult.stdout.trim().split("\n")[0]).toBe(
+      (await realpath(codingWorkspaceRoot)).replaceAll("\\", "/")
+    );
+    expect(ordinaryResult.stdout.trim()).toBe(
+      (await realpath(workspaceRoot)).replaceAll("\\", "/")
+    );
+    await rm(codingWorkspaceRoot, { force: true, recursive: true });
+  });
+
+  test("supports cwd within the profile workspace", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+    const nestedDir = path.join(workspaceRoot, "nested");
+    await mkdir(nestedDir, { recursive: true });
+
+    const result = await runBash(
+      {
+        command: process.platform === "win32" ? "pwd -W" : "pwd",
+        cwd: "nested",
+      },
+      { orgId: "org_test", profileId: "profile_test" },
+      { workspaceRoot }
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe(
+      (await realpath(nestedDir)).replaceAll("\\", "/")
+    );
+  });
+
+  test("rejects cwd outside the profile workspace", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+
+    await expect(
+      runBash(
+        {
+          command: process.platform === "win32" ? "pwd -W" : "pwd",
+          cwd: "/tmp",
+        },
+        { orgId: "org_test", profileId: "profile_test" },
+        { workspaceRoot }
+      )
+    ).rejects.toBeInstanceOf(PathGuardError);
+  });
+
+  test("requires profileId", async () => {
+    await expect(
+      runBash({ command: process.platform === "win32" ? "pwd -W" : "pwd" }, {})
+    ).rejects.toThrow("profileId is required.");
+  });
+
+  test("accepts delegation-scale timeouts up to 30 minutes", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+
+    const result = await runBash(
+      { command: "echo ok", timeoutMs: 30 * 60_000 },
+      { orgId: "org_test", profileId: "profile_test" },
+      { workspaceRoot }
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe("ok");
+  });
+
+  test("merges explicit env vars into the spawned shell process", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+
+    const result = await runBash(
+      {
+        command: "printf '%s' \"$ANTHROPIC_BASE_URL\"",
+        env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:4310" },
+      },
+      { orgId: "org_test", profileId: "profile_test" },
+      { workspaceRoot }
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("http://127.0.0.1:4310");
+  });
+
+  // Git Bash keeps the inherited Path, so the tool leaves Windows alone.
+  test.skipIf(process.platform === "win32")(
+    "finds a CLI the server can see when the login profile rebuilds PATH",
+    async () => {
+      workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+      const binDir = path.join(workspaceRoot, "bin");
+      const home = path.join(workspaceRoot, "home");
+      await mkdir(binDir);
+      await mkdir(home);
+      await writeFile(
+        path.join(binDir, "mingzhan-fake-cli"),
+        "#!/bin/sh\necho found\n"
+      );
+      await chmod(path.join(binDir, "mingzhan-fake-cli"), 0o755);
+      // Debian's /etc/profile does this, and the Docker image is Debian.
+      await writeFile(
+        path.join(home, ".bash_profile"),
+        "PATH=/usr/local/bin:/usr/bin:/bin\n"
+      );
+      const originalPath = process.env.PATH;
+      process.env.PATH = `${binDir}${path.delimiter}${originalPath}`;
+
+      try {
+        const result = await runBash(
+          { command: "mingzhan-fake-cli", env: { HOME: home } },
+          { orgId: "org_test", profileId: "profile_test" },
+          { workspaceRoot }
+        );
+
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout.trim()).toBe("found");
+      } finally {
+        process.env.PATH = originalPath;
+      }
+    }
+  );
+
+  test("summarizes Cursor stream-json for coding-agent runs and saves a full log", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+    const agentPath = path.join(workspaceRoot, "agent");
+
+    const stream = [
+      '{"type":"system","subtype":"init","model":"composer-2","cwd":"/tmp/repo"}',
+      ...Array.from({ length: 80 }, (_, i) =>
+        JSON.stringify({
+          subtype: "started",
+          tool_call: { readToolCall: { args: { path: `pad-${i}.ts` } } },
+          type: "tool_call",
+        })
+      ),
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"Patched the flaky test."}]}}',
+      '{"type":"result","subtype":"success","result":"All checks passed.","duration_ms":42}',
+      "",
+    ].join("\n");
+
+    await writeFile(
+      agentPath,
+      `#!/bin/bash\ncat <<'EOF'\n${stream}EOF\n`,
+      "utf8"
+    );
+    await chmod(agentPath, 0o755);
+
+    const result = await runBash(
+      {
+        codingAgent: true,
+        command:
+          "./agent -p 'fix the flaky test' --output-format stream-json --yolo",
+      },
+      { orgId: "org_test", profileId: "profile_test" },
+      { workspaceRoot }
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("# Cursor Agent result");
+    expect(result.stdout).toContain("Patched the flaky test.");
+    expect(result.stdout).toContain("All checks passed.");
+    expect(result.stdout).toContain(
+      `Full coding-agent log: ${path.join("artifacts", "coding-agent-runs")}${path.sep}`
+    );
+    expect(result.stdout).not.toContain('...[truncated]\n{"type":"system"');
+
+    const logDir = path.join(workspaceRoot, "artifacts", "coding-agent-runs");
+    const logs = await readdir(logDir);
+    expect(logs.length).toBe(1);
+    const logBody = await readFile(path.join(logDir, logs[0]!), "utf8");
+    expect(logBody).toContain('"type":"result"');
+    expect(logBody).toContain("All checks passed.");
+  });
+
+  test("keep-tails long plain coding-agent stdout instead of head-truncating", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+    const agentPath = path.join(workspaceRoot, "agent");
+    const body = `${"n".repeat(40_000)}TAIL_MARKER_OK`;
+    await writeFile(
+      agentPath,
+      `#!/bin/bash\ncat <<'EOF'\n${body}EOF\n`,
+      "utf8"
+    );
+    await chmod(agentPath, 0o755);
+
+    const result = await runBash(
+      {
+        codingAgent: true,
+        command: "./agent -p 'hello' --output-format text --yolo",
+      },
+      { orgId: "org_test", profileId: "profile_test" },
+      { workspaceRoot }
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("TAIL_MARKER_OK");
+    expect(result.stdout).toContain("Full coding-agent log:");
+  });
+
+  // `/bin/bash -lc` sources BASH_ENV before it runs the command, so an env key
+  // the model chose is arbitrary code execution unless it is stripped.
+  test("drops env keys that hijack the shell before the command runs", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+    const hijackPath = path.join(workspaceRoot, "hijack.sh");
+    await writeFile(hijackPath, "echo HIJACKED\n", "utf8");
+
+    const result = await runBash(
+      {
+        command: 'echo "keep=$KEEP_ME preload=$LD_PRELOAD node=$NODE_OPTIONS"',
+        env: {
+          BASH_ENV: hijackPath,
+          KEEP_ME: "kept",
+          LD_PRELOAD: "/tmp/evil.so",
+          NODE_OPTIONS: "--require=/tmp/evil.js",
+        },
+      },
+      { orgId: "org_test", profileId: "profile_test" },
+      { workspaceRoot }
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain("HIJACKED");
+    expect(result.stdout.trim()).toBe("keep=kept preload= node=");
+  });
+
+  test("prunes coding-agent logs to the newest 10 and leaves other artifacts", async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
+    const logDir = path.join(workspaceRoot, "artifacts", "coding-agent-runs");
+    await mkdir(logDir, { recursive: true });
+    await writeFile(path.join(logDir, "keep-me.txt"), "user file", "utf8");
+
+    const now = Date.now();
+
+    for (let i = 0; i < 15; i++) {
+      const name = `old-${String(i).padStart(2, "0")}.log`;
+      const filePath = path.join(logDir, name);
+      await writeFile(filePath, `old ${i}`, "utf8");
+      const stamp = new Date(now - (15 - i) * 60_000);
+      await utimes(filePath, stamp, stamp);
+    }
+
+    const agentPath = path.join(workspaceRoot, "agent");
+    await writeFile(agentPath, "#!/bin/bash\necho done\n", "utf8");
+    await chmod(agentPath, 0o755);
+
+    const result = await runBash(
+      {
+        codingAgent: true,
+        command: "./agent -p 'hello' --output-format text --yolo",
+      },
+      { orgId: "org_test", profileId: "profile_test" },
+      { workspaceRoot }
+    );
+
+    expect(result.exitCode).toBe(0);
+    const remaining = await readdir(logDir);
+    const logs = remaining.filter((name) => name.endsWith(".log"));
+    expect(logs).toHaveLength(10);
+    expect(remaining).toContain("keep-me.txt");
+    expect(remaining).not.toContain("old-00.log");
+    expect(logs.some((name) => !name.startsWith("old-"))).toBe(true);
+  });
+});
+
+describe("bash tool MíngZhàn state guard", () => {
+  let configDir = "";
+  let previousConfigDir: string | undefined;
+  let profileWorkspace = "";
+  const context = { orgId: "org_test", profileId: "profile_test" };
+
+  afterEach(async () => {
+    if (previousConfigDir === undefined) {
+      delete process.env.MINGZHAN_CONFIG_DIR;
+    } else {
+      process.env.MINGZHAN_CONFIG_DIR = previousConfigDir;
+    }
+
+    if (configDir) {
+      await rm(configDir, { force: true, recursive: true });
+      configDir = "";
+    }
+  });
+
+  async function setupConfigDir(): Promise<void> {
+    previousConfigDir = process.env.MINGZHAN_CONFIG_DIR;
+    configDir = await realpath(
+      await mkdtemp(path.join(os.tmpdir(), "mingzhan-guard-"))
+    );
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+    profileWorkspace = getProfileSoulDir("org_test", "profile_test");
+    await mkdir(profileWorkspace, { recursive: true });
+    await mkdir(path.join(configDir, "data", "sqlite"), { recursive: true });
+    await writeFile(path.join(configDir, "local-auth-token"), "tc_local_x\n");
+    await writeFile(path.join(configDir, "config.ini"), "api_key=secret\n");
+    await writeFile(
+      path.join(configDir, "data", "sqlite", "mingzhan.sqlite"),
+      ""
+    );
+    await writeFile(
+      path.join(configDir, "orgs", "org_test", "workflow-data.sqlite"),
+      ""
+    );
+  }
+
+  test("refuses commands that read MíngZhàn secrets or server databases", async () => {
+    await setupConfigDir();
+    const root = configDir.replaceAll("\\", "/");
+    const marker = path.join(profileWorkspace, "ran.txt").replaceAll("\\", "/");
+
+    const commands = [
+      `cat ${root}/local-auth-token`,
+      `curl -s -H "Authorization: Bearer $(cat ${root}/local-auth-token)" http://127.0.0.1:4310/v1/profiles`,
+      `sqlite3 ${root}/data/sqlite/mingzhan.sqlite "select * from users"`,
+      `cat "$MINGZHAN_CONFIG_DIR/config.ini" | sed 's/key=.*/key=***/'`,
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
+      "sqlite3 ${MINGZHAN_CONFIG_DIR}/orgs/org_test/workflow-data.sqlite .tables",
+      `find ${root} -name '*.sqlite'`,
+      "cd ../../.. && sqlite3 orgs/org_test/workflow-data.sqlite .tables",
+    ];
+
+    for (const command of commands) {
+      await expect(
+        runBash({ command: `${command}; touch ${marker}` }, context, {
+          backend: "host",
+        })
+      ).rejects.toThrow();
+    }
+
+    expect(await readdir(profileWorkspace)).not.toContain("ran.txt");
+  });
+
+  test("MINGZHAN_TENANT_BASH=0 refuses every channel but the CLI", async () => {
+    await setupConfigDir();
+    const previousTenantBash = process.env.MINGZHAN_TENANT_BASH;
+    process.env.MINGZHAN_TENANT_BASH = "0";
+
+    try {
+      await expect(
+        runBash({ command: "touch ran.txt" }, context, { backend: "host" })
+      ).rejects.toThrow(/MINGZHAN_TENANT_BASH=0/);
+      expect(await readdir(profileWorkspace)).not.toContain("ran.txt");
+
+      const cli = await runBash(
+        { command: "echo ok" },
+        { ...context, channel: "cli" },
+        { backend: "host" }
+      );
+
+      expect(cli.stdout.trim()).toBe("ok");
+    } finally {
+      if (previousTenantBash === undefined) {
+        delete process.env.MINGZHAN_TENANT_BASH;
+      } else {
+        process.env.MINGZHAN_TENANT_BASH = previousTenantBash;
+      }
+    }
+  });
+
+  test("still runs ordinary commands in the profile workspace", async () => {
+    await setupConfigDir();
+    await writeFile(path.join(profileWorkspace, "notes.md"), "hello notes\n");
+    const workspace = profileWorkspace.replaceAll("\\", "/");
+
+    const listing = await runBash({ command: "ls" }, context, {
+      backend: "host",
+    });
+
+    expect(listing.exitCode).toBe(0);
+    expect(listing.stdout).toContain("notes.md");
+
+    const read = await runBash(
+      { command: `cat notes.md && cat ${workspace}/notes.md` },
+      context,
+      { backend: "host" }
+    );
+
+    expect(read.exitCode).toBe(0);
+    expect(read.stdout).toBe("hello notes\nhello notes\n");
+
+    const ownDatabase = await runBash(
+      { command: `echo rows > ${workspace}/own.db && cat ${workspace}/own.db` },
+      context,
+      { backend: "host" }
+    );
+
+    expect(ownDatabase.exitCode).toBe(0);
+    expect(ownDatabase.stdout.trim()).toBe("rows");
+
+    const build = await runBash(
+      {
+        command:
+          "mkdir -p plugin-drafts/demo && cd plugin-drafts/demo && echo 'console.log(1)' > index.ts && bun build index.ts --outfile=dist/index.js",
+        timeoutMs: 60_000,
+      },
+      context,
+      { backend: "host" }
+    );
+
+    expect(build.exitCode).toBe(0);
+    expect(
+      await readdir(
+        path.join(profileWorkspace, "plugin-drafts", "demo", "dist")
+      )
+    ).toContain("index.js");
+  }, 60_000);
+});

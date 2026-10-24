@@ -1,0 +1,191 @@
+import { toArtifactsRelativePath } from "@/lib/chat-artifacts";
+import type { ChatListItem } from "@/lib/chat-history";
+import {
+  parseStreamingArtifactToolInput,
+  type StreamingArtifactToolInput,
+} from "@/lib/streaming-artifact-input";
+
+export interface StreamingArtifactView {
+  message: ChatListItem;
+  parsed: StreamingArtifactToolInput;
+  tool: string;
+  toolCallId: string;
+}
+
+export function findLatestStreamingArtifact(
+  messages: ChatListItem[]
+): StreamingArtifactView | null {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+
+    if (
+      message?.role !== "tool" ||
+      !message.artifactStreaming ||
+      !message.toolInputAccumulatedJson?.trim()
+    ) {
+      continue;
+    }
+
+    const parsed = parseStreamingArtifactToolInput(
+      message.tool,
+      message.toolInputAccumulatedJson
+    );
+
+    if (!parsed.eligible) {
+      continue;
+    }
+
+    if (!(message.toolCallId && message.tool)) {
+      continue;
+    }
+
+    return {
+      message,
+      parsed,
+      tool: message.tool,
+      toolCallId: message.toolCallId,
+    };
+  }
+
+  return null;
+}
+
+export interface CompletedContentArtifact {
+  relativePath: string;
+  tool: string;
+  toolCallId: string;
+}
+
+function isContentArtifactTool(tool: string | undefined): boolean {
+  return (
+    tool === "write_file" || tool === "write_docx" || tool === "save_artifact"
+  );
+}
+
+function relativePathFromCompletedTool(message: ChatListItem): string | null {
+  // SAFETY: The branch checks that the tool result is a non-null object.
+  const result =
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- This guard validates decoded external data before the caller uses the domain value.
+    typeof message.toolResult === "object" && message.toolResult !== null
+      ? (message.toolResult as { path?: string; error?: string })
+      : null;
+
+  if (
+    !result ||
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- This guard validates decoded external data before the caller uses the domain value.
+    typeof result.error === "string" ||
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- This guard validates decoded external data before the caller uses the domain value.
+    typeof result.path !== "string"
+  ) {
+    return null;
+  }
+
+  const relativePath = toArtifactsRelativePath(result.path);
+
+  if (!relativePath || relativePath.includes(".mingzhan-meta")) {
+    return null;
+  }
+
+  return relativePath;
+}
+
+export function findCompletedContentArtifact(
+  messages: ChatListItem[],
+  toolCallId: string
+): CompletedContentArtifact | null {
+  const message = messages.find(
+    (entry) =>
+      entry.toolCallId === toolCallId &&
+      entry.role === "tool" &&
+      entry.toolStatus === "done" &&
+      isContentArtifactTool(entry.tool)
+  );
+
+  if (!(message?.toolCallId && message.tool)) {
+    return null;
+  }
+
+  const relativePath = relativePathFromCompletedTool(message);
+
+  if (!relativePath) {
+    return null;
+  }
+
+  return {
+    relativePath,
+    tool: message.tool,
+    toolCallId: message.toolCallId,
+  };
+}
+
+export function upsertStreamingToolMessage(
+  messages: ChatListItem[],
+  event: {
+    toolCallId: string;
+    toolGroupId?: string;
+    tool: string;
+    accumulatedArguments: string;
+  }
+): ChatListItem[] {
+  const parsed = parseStreamingArtifactToolInput(
+    event.tool,
+    event.accumulatedArguments
+  );
+
+  const isArtifactTool = isContentArtifactTool(event.tool);
+
+  if (!isArtifactTool) {
+    return messages;
+  }
+
+  if (!parsed.eligible) {
+    return messages;
+  }
+
+  const contentField = event.tool === "write_docx" ? "markdown" : "content";
+
+  const toolInput =
+    parsed.relativePath == null
+      ? undefined
+      : {
+          path: `artifacts/${parsed.relativePath}`,
+          // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- This optional field must stay absent when no value exists to preserve the wire payload contract.
+          ...(parsed.content == null ? {} : { [contentField]: parsed.content }),
+        };
+
+  const nextMessage: ChatListItem = {
+    artifactStreaming: true,
+    content: event.tool,
+    id: event.toolCallId,
+    role: "tool",
+    tool: event.tool,
+    toolCallId: event.toolCallId,
+    toolGroupId: event.toolGroupId,
+    toolInputAccumulatedJson: event.accumulatedArguments,
+    toolStatus: "running",
+    // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- This optional field must stay absent when no value exists to preserve the wire payload contract.
+    ...(toolInput ? { toolInput } : {}),
+  };
+
+  const existingIndex = messages.findIndex(
+    (message) => message.toolCallId === event.toolCallId
+  );
+
+  if (existingIndex >= 0) {
+    const next = [...messages];
+    next[existingIndex] = {
+      ...next[existingIndex],
+      ...nextMessage,
+    };
+
+    return next;
+  }
+
+  const next = messages.map((message) =>
+    message.role === "assistant" && message.streaming
+      ? { ...message, streaming: false }
+      : message
+  );
+
+  return [...next, nextMessage];
+}

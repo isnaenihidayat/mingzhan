@@ -1,0 +1,257 @@
+import { join } from "node:path";
+import { z } from "zod";
+import type {
+  ListOrgMemoryHistoryResponse,
+  OrgMemoryChangeLogEntry,
+} from "../contract";
+import {
+  pathExists,
+  readDirectoryEntries,
+  readText,
+  writeTextFile,
+} from "../fs";
+import { assertConfigPathSegment, getOrgMemoryHistoryDir } from "./resolve";
+
+export const ORG_MEMORY_HISTORY_MAX_ENTRIES = 50;
+
+const OrgMemoryChangeLogEntrySchema = z.object({
+  action: z.enum([
+    "edit",
+    "approve",
+    "add_fact",
+    "pin",
+    "unpin",
+    "archive",
+    "restore",
+  ]),
+  actorUserId: z.string().nullable(),
+  createdAt: z.string(),
+  id: z.string(),
+  label: z.string(),
+  orgId: z.string(),
+  restoredFromId: z.string().nullable().optional(),
+});
+
+const ORG_MEMORY_HISTORY_TRUNCATED_MARKER = "truncated.json";
+
+function historyTruncatedMarkerPath(orgId: string, configDir?: string): string {
+  return join(
+    getOrgMemoryHistoryDir(orgId, configDir),
+    ORG_MEMORY_HISTORY_TRUNCATED_MARKER
+  );
+}
+
+async function isOrgMemoryHistoryTruncated(
+  orgId: string,
+  configDir?: string
+): Promise<boolean> {
+  return pathExists(historyTruncatedMarkerPath(orgId, configDir));
+}
+
+async function markOrgMemoryHistoryTruncated(
+  orgId: string,
+  configDir?: string
+): Promise<void> {
+  const historyDir = getOrgMemoryHistoryDir(orgId, configDir);
+  await writeTextFile(
+    historyTruncatedMarkerPath(orgId, configDir),
+    `${JSON.stringify({ truncatedAt: new Date().toISOString() }, null, 2)}\n`,
+    { ensureDir: historyDir }
+  );
+}
+
+export async function listOrgMemoryHistoryWithCap(
+  orgId: string,
+  limit = ORG_MEMORY_HISTORY_MAX_ENTRIES,
+  configDir?: string
+): Promise<ListOrgMemoryHistoryResponse> {
+  const [changes, truncated] = await Promise.all([
+    listOrgMemoryHistory(orgId, limit, configDir),
+    isOrgMemoryHistoryTruncated(orgId, configDir),
+  ]);
+
+  return {
+    changes,
+    maxEntries: ORG_MEMORY_HISTORY_MAX_ENTRIES,
+    truncated,
+  };
+}
+
+export interface OrgMemoryChangeLogRecord extends OrgMemoryChangeLogEntry {
+  content: string;
+}
+
+function historyMetaPath(
+  orgId: string,
+  id: string,
+  configDir?: string
+): string {
+  return join(
+    getOrgMemoryHistoryDir(orgId, configDir),
+    `${assertConfigPathSegment(id, "revisionId")}.json`
+  );
+}
+
+function historyContentPath(
+  orgId: string,
+  id: string,
+  configDir?: string
+): string {
+  return join(
+    getOrgMemoryHistoryDir(orgId, configDir),
+    `${assertConfigPathSegment(id, "revisionId")}.md`
+  );
+}
+
+let orgMemoryChangeSequence = 0;
+
+export function createOrgMemoryChangeId(): string {
+  orgMemoryChangeSequence += 1;
+
+  return `omh_${String(orgMemoryChangeSequence).padStart(8, "0")}_${crypto.randomUUID().replace(/-/g, "")}`;
+}
+
+function parseOrgMemoryHistoryMetadata(
+  raw: string,
+  revisionId: string
+): OrgMemoryChangeLogEntry | null {
+  try {
+    return OrgMemoryChangeLogEntrySchema.parse(JSON.parse(raw));
+  } catch {
+    console.warn(
+      `Skipping malformed org memory history metadata for revision ${revisionId}.`
+    );
+
+    return null;
+  }
+}
+
+export async function appendOrgMemoryHistory(
+  orgId: string,
+  entry: OrgMemoryChangeLogEntry,
+  content: string,
+  configDir?: string
+): Promise<void> {
+  const historyDir = getOrgMemoryHistoryDir(orgId, configDir);
+  await writeTextFile(
+    historyMetaPath(orgId, entry.id, configDir),
+    `${JSON.stringify(entry, null, 2)}\n`,
+    {
+      ensureDir: historyDir,
+    }
+  );
+  await writeTextFile(historyContentPath(orgId, entry.id, configDir), content, {
+    ensureDir: historyDir,
+  });
+  await pruneOrgMemoryHistory(orgId, ORG_MEMORY_HISTORY_MAX_ENTRIES, configDir);
+}
+
+export async function listOrgMemoryHistory(
+  orgId: string,
+  limit = ORG_MEMORY_HISTORY_MAX_ENTRIES,
+  configDir?: string
+): Promise<OrgMemoryChangeLogEntry[]> {
+  const historyDir = getOrgMemoryHistoryDir(orgId, configDir);
+
+  if (!(await pathExists(historyDir))) {
+    return [];
+  }
+
+  const entries = await readDirectoryEntries(historyDir);
+
+  const ids = entries
+    .filter(
+      (entry) =>
+        entry.isFile() &&
+        entry.name.endsWith(".json") &&
+        entry.name !== ORG_MEMORY_HISTORY_TRUNCATED_MARKER
+    )
+    .map((entry) => entry.name.replace(/\.json$/, ""))
+    .sort((left, right) => right.localeCompare(left));
+
+  const records: OrgMemoryChangeLogEntry[] = [];
+
+  for (const id of ids) {
+    const raw = await readText(historyMetaPath(orgId, id, configDir));
+    const record = parseOrgMemoryHistoryMetadata(raw, id);
+
+    if (record) {
+      records.push(record);
+    }
+  }
+
+  records.sort((left, right) => {
+    const byCreatedAt = right.createdAt.localeCompare(left.createdAt);
+
+    if (byCreatedAt !== 0) {
+      return byCreatedAt;
+    }
+
+    return right.id.localeCompare(left.id);
+  });
+
+  return records.slice(0, limit);
+}
+
+export async function getOrgMemoryHistoryEntry(
+  orgId: string,
+  revisionId: string,
+  configDir?: string
+): Promise<OrgMemoryChangeLogRecord | null> {
+  const metaPath = historyMetaPath(orgId, revisionId, configDir);
+  const contentPath = historyContentPath(orgId, revisionId, configDir);
+
+  if (!((await pathExists(metaPath)) && (await pathExists(contentPath)))) {
+    return null;
+  }
+
+  const entry = parseOrgMemoryHistoryMetadata(
+    await readText(metaPath),
+    revisionId
+  );
+
+  if (!entry) {
+    return null;
+  }
+
+  const content = await readText(contentPath);
+
+  return { ...entry, content };
+}
+
+export async function pruneOrgMemoryHistory(
+  orgId: string,
+  maxEntries: number,
+  configDir?: string
+): Promise<void> {
+  const historyDir = getOrgMemoryHistoryDir(orgId, configDir);
+
+  if (!(await pathExists(historyDir))) {
+    return;
+  }
+
+  const entries = await listOrgMemoryHistory(
+    orgId,
+    Number.MAX_SAFE_INTEGER,
+    configDir
+  );
+
+  const stale = entries.slice(maxEntries);
+
+  if (stale.length === 0) {
+    return;
+  }
+
+  const { unlink } = await import("node:fs/promises");
+
+  for (const entry of stale) {
+    await unlink(historyMetaPath(orgId, entry.id, configDir)).catch(
+      () => undefined
+    );
+    await unlink(historyContentPath(orgId, entry.id, configDir)).catch(
+      () => undefined
+    );
+  }
+
+  await markOrgMemoryHistoryTruncated(orgId, configDir);
+}

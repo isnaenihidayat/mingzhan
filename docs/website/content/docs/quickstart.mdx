@@ -1,0 +1,98 @@
+---
+title: "Quickstart"
+description: "Try the live demo, or run MíngZhàn with managed hosting, Docker, or Bun and send your first chat message."
+---
+
+## Before you start
+
+The live demo needs no installation or provider credentials. To send messages on your own instance, choose a model provider during setup. Some providers use an API key; others use account sign-in or a local model. See [Providers](/providers).
+
+Install [Bun](https://bun.sh) only if you run from source. Managed hosting and Docker do not need it.
+
+## Choose a deployment path
+
+### Option 1: Try the demo
+
+Explore a live instance without installing anything. Open [https://demo.getmingzhan.cloud](https://demo.getmingzhan.cloud) and sign in with:
+
+- Username: `demo@getmingzhan.cloud`
+- Password: `demo1234`
+
+The demo is shared and reset periodically — use it to click around the dashboard, not for real data or API keys.
+
+### Option 2: Managed hosting
+
+If you do not want to run your own server, use [MíngZhàn Cloud](https://getmingzhan.cloud/). Sign up, create an instance, and open your dedicated URL (for example `acme.getmingzhan.cloud`).
+
+Complete the setup wizard in the browser and you are live. Skip to [First-time setup](/first-time-setup).
+
+### Option 3: Docker
+
+For a single-container deployment:
+
+```bash
+docker pull ghcr.io/mingpromotion/mingzhan:latest
+docker run -d -p 4310:4310 -v mingzhan-data:/mingzhan/data --name mingzhan ghcr.io/mingpromotion/mingzhan:latest
+```
+
+Open `http://localhost:4310`. See [Docker](/docker) for build-from-source, volumes, and production notes.
+
+### Option 4: Local development
+
+Clone the repository and install dependencies:
+
+```bash
+git clone https://github.com/mingpromotion/mingzhan.git
+cd mingzhan
+bun install
+bun run dev:web
+```
+
+Open:
+
+- Dashboard: `http://localhost:3003`
+- API server: `http://127.0.0.1:4310`
+- API docs: `http://127.0.0.1:4310/docs`
+
+If you only want the API server:
+
+```bash
+bun run dev:server
+```
+
+On first run, the browser setup wizard guides you through creating an admin account and organization, then configuring a model provider. Local settings are saved in `~/.mingzhan/config.ini`.
+
+## First-time setup
+
+After MíngZhàn is running:
+
+1. Open the dashboard
+2. Create the first admin account and first organization
+3. Configure your model provider
+4. Create or review profiles
+5. Send a test message to the default profile
+
+See [First-time setup](/first-time-setup) for the wizard walkthrough and [Providers](/providers) for supported LLM backends.
+
+## Common next steps
+
+### Connect a channel
+
+Use the web dashboard, [CLI](/cli), Telegram, WhatsApp, or Discord:
+
+- [CLI](/cli)
+- [Telegram](/telegram)
+- [WhatsApp](/whatsapp)
+- [Discord](/discord)
+
+### Understand the mental model
+
+Most of MíngZhàn fits four ideas: organization, profile, tool access, and channel. See [Overview](/overview).
+
+## Next steps
+
+- [Overview](/overview) — what MíngZhàn is and how to think about it
+- [Providers](/providers) — LLM API keys and model setup
+- [Profiles](/profiles) — how to define each bot
+- [Multi-tenancy](/multi-tenancy) — orgs, members, and roles
+- [Documentation hub](/docs/) — full docs map

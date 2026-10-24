@@ -1,0 +1,21 @@
+{
+  "name": "@mingzhan/plugin-data-view",
+  "version": "0.1.0",
+  "type": "module",
+  "files": [
+    "mingzhan.plugin.json",
+    "actions",
+    "migrations",
+    "ui",
+    "skills"
+  ],
+  "scripts": {
+    "build": "bun build ./src/actions.ts --outdir actions --target bun && bun build ./src/ui.tsx --outfile ui/app.js --target browser",
+    "test": "bun test src"
+  },
+  "devDependencies": {
+    "@mingzhan/core": "workspace:*",
+    "@mingzhan/ui": "workspace:*",
+    "@types/react": "^19.3.0"
+  }
+}

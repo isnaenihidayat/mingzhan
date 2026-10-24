@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ESNext"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "verbatimModuleSyntax": true,
+    "allowSyntheticDefaultImports": true,
+    "types": ["bun"],
+    "paths": {
+      "@mingzhan/agent": ["./packages/agent/src/index.ts"],
+      "@mingzhan/client": ["./packages/client/src/index.ts"],
+      "@mingzhan/core": ["./packages/core/src/index.ts"],
+      "@mingzhan/core/*": ["./packages/core/src/*"],
+      "@mingzhan/db": ["./packages/db/src/index.ts"]
+    }
+  }
+}

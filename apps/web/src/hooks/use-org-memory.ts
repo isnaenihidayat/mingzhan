@@ -1,0 +1,34 @@
+import type { UpdateOrgMemoryRequest } from "@mingzhan/core/contract";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { client } from "@/lib/client";
+import { invalidateQueries } from "@/lib/query-client";
+import { queryKeys } from "@/lib/query-keys";
+
+export function useOrgMemory(orgId: string | null) {
+  return useQuery({
+    enabled: Boolean(orgId),
+    queryFn: () => client.getOrgMemory(orgId ?? ""),
+    queryKey: queryKeys.orgMemory(orgId ?? ""),
+  });
+}
+
+function invalidateOrgMemory(
+  queryClient: ReturnType<typeof useQueryClient>,
+  orgId: string
+) {
+  return invalidateQueries(
+    queryClient,
+    queryKeys.orgMemory(orgId),
+    queryKeys.orgMemoryHistory(orgId)
+  );
+}
+
+export function useUpdateOrgMemory(orgId: string) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (request: UpdateOrgMemoryRequest) =>
+      client.updateOrgMemory(orgId, request),
+    onSuccess: () => invalidateOrgMemory(queryClient, orgId),
+  });
+}

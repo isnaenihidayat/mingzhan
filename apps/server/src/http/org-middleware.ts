@@ -1,0 +1,192 @@
+import type { OrgRole } from "@mingzhan/core";
+import { ORG_ROLES } from "@mingzhan/db";
+import type { MiddlewareHandler } from "hono";
+import type { ServerOptions } from "./context";
+import { isPublicRouteRequest } from "./public-routes";
+import {
+  errorResponse,
+  isPendingBrowserMfa,
+  isPendingMfaAllowedRequest,
+  type RequestAuthContext,
+} from "./shared";
+import type { AppEnv } from "./types";
+
+const ORG_ID_HEADER = "x-org-id";
+
+const PLUGIN_UI_PATH = /^\/v1\/plugins\/ui\/([^/]+)(?:\/|$)/;
+
+const PLUGIN_ACTION_PATH = /^\/v1\/plugins\/[^/]+\/actions\/[^/]+$/;
+
+const PROFILE_AVATAR_PATH = /^\/v1\/profiles\/[^/]+\/avatar$/;
+
+function isPlatformRoute(pathname: string): boolean {
+  return pathname === "/v1/platform" || pathname.startsWith("/v1/platform/");
+}
+
+function isAuthRoute(pathname: string): boolean {
+  return pathname === "/v1/auth" || pathname.startsWith("/v1/auth/");
+}
+
+function isOrgRole(role: string): role is OrgRole {
+  return ORG_ROLES.some((candidate) => candidate === role);
+}
+
+function assertOrgRole(role: string): asserts role is OrgRole {
+  if (!isOrgRole(role)) {
+    throw new Error(`Invalid organization role: ${role}`);
+  }
+}
+
+function pluginUiPathOrgId(pathname: string): string | null {
+  const match = pathname.match(PLUGIN_UI_PATH);
+
+  return match?.[1] ? decodeURIComponent(match[1]) : null;
+}
+
+function resolveOrgId(
+  request: Request,
+  auth: RequestAuthContext,
+  pathname: string
+): { conflict: true } | { orgId: string | null } {
+  const headerOrgId = request.headers.get(ORG_ID_HEADER)?.trim() || null;
+  const pathOrgId = pluginUiPathOrgId(pathname);
+
+  const avatarOrgId =
+    request.method === "GET" && PROFILE_AVATAR_PATH.test(pathname)
+      ? new URL(request.url).searchParams.get("orgId")?.trim() || null
+      : null;
+
+  if (
+    (headerOrgId && pathOrgId && headerOrgId !== pathOrgId) ||
+    (headerOrgId && avatarOrgId && headerOrgId !== avatarOrgId)
+  ) {
+    return { conflict: true };
+  }
+
+  if (headerOrgId) {
+    return { orgId: headerOrgId };
+  }
+
+  if (pathOrgId) {
+    return { orgId: pathOrgId };
+  }
+
+  if (avatarOrgId) {
+    return { orgId: avatarOrgId };
+  }
+
+  if (PLUGIN_ACTION_PATH.test(pathname) && request.method === "POST") {
+    return { orgId: null };
+  }
+
+  const sessionOrgId = auth.session?.activeOrgId?.trim();
+
+  return { orgId: sessionOrgId || null };
+}
+
+export function createOrgContextMiddleware(
+  options: ServerOptions
+): MiddlewareHandler<AppEnv> {
+  return async (c, next) => {
+    const { databaseAdapter } = options;
+
+    if (isPublicRouteRequest(c.req.method, c.req.path)) {
+      await next();
+
+      return;
+    }
+
+    const auth = c.get("auth");
+
+    if (!auth) {
+      await next();
+
+      return;
+    }
+
+    if (!databaseAdapter) {
+      c.res = errorResponse("Authentication not configured", 500);
+
+      return;
+    }
+
+    if (isPlatformRoute(c.req.path) || isAuthRoute(c.req.path)) {
+      await next();
+
+      return;
+    }
+
+    const resolved = resolveOrgId(c.req.raw, auth, c.req.path);
+
+    if ("conflict" in resolved) {
+      c.res = errorResponse("Organization context conflict", 400);
+
+      return;
+    }
+
+    let orgId = resolved.orgId;
+
+    const actionRequiresHeader =
+      PLUGIN_ACTION_PATH.test(c.req.path) && c.req.method === "POST";
+
+    if (!orgId && auth.mode === "local-token" && !actionRequiresHeader) {
+      // One membership leaves no ambiguity. With several, a memberships[0]
+      // pick silently routes the call to the alphabetically first org (see
+      // listUserOrganizations) — a moving target whenever a new org is
+      // created — so leave orgId unset and fail with 400 like cookie
+      // sessions do.
+      const memberships = await databaseAdapter.listUserOrganizations(
+        auth.user.id
+      );
+
+      orgId = memberships.length === 1 ? memberships[0].organization.id : null;
+    }
+
+    if (!orgId) {
+      c.res = errorResponse("Organization context required", 400);
+
+      return;
+    }
+
+    const organization = await databaseAdapter.getOrganizationById(orgId);
+
+    if (!organization || organization.archivedAt || organization.setupPending) {
+      c.res = errorResponse("Not found", 404);
+
+      return;
+    }
+
+    const member = await databaseAdapter.getOrgMember(orgId, auth.user.id);
+
+    if (!(member || auth.isPlatformAdmin)) {
+      c.res = errorResponse("Not found", 404);
+
+      return;
+    }
+
+    if (member) {
+      assertOrgRole(member.role);
+    }
+
+    const orgAuth = {
+      ...auth,
+      activeOrgId: orgId,
+      orgRole: member?.role,
+    };
+
+    if (
+      (await isPendingBrowserMfa(orgAuth, databaseAdapter, orgId)) &&
+      !isPendingMfaAllowedRequest(c.req.method, c.req.path)
+    ) {
+      c.res = errorResponse(
+        "Complete MFA enrollment before accessing this resource.",
+        403
+      );
+
+      return;
+    }
+
+    c.set("auth", orgAuth);
+    await next();
+  };
+}

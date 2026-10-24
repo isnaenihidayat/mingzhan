@@ -1,0 +1,508 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { MíngZhànApiError } from "./api-error";
+import { pathExists } from "./fs";
+import {
+  applyChatgptOAuthToInstance,
+  applyXaiOAuthToInstance,
+  chatgptOAuthNeedsRefresh,
+  createProviderInstanceId,
+  ensureUserConfigDir,
+  getUserConfigPath,
+  isChatgptProviderConnected,
+  isProviderConfigured,
+  loadUserConfig,
+  loadUserWebPublicUrl,
+  normalizeProviderInstanceLabel,
+  readChatgptOAuthFromInstance,
+  readXaiOAuthFromInstance,
+  saveUserConfig,
+  saveUserTimezone,
+  saveUserWebPublicUrl,
+  validateProviderApiKeyFormat,
+} from "./user-config";
+
+describe("saveUserTimezone", () => {
+  // readJson casts the body without validating it, so timezone can arrive
+  // undefined however the contract types it.
+  test("names the missing field and answers 400, not a TypeError at 500", async () => {
+    const cases = [
+      [undefined, "Timezone is required."],
+      ["  ", "Timezone is required."],
+      ["Not/AZone", "Invalid timezone: Not/AZone"],
+    ] as const;
+
+    for (const [value, message] of cases) {
+      try {
+        await saveUserTimezone(value);
+        throw new Error("expected a rejection");
+      } catch (error) {
+        if (!(error instanceof MíngZhànApiError)) {
+          throw error;
+        }
+
+        expect(error.message).toBe(message);
+        expect(error.status).toBe(400);
+      }
+    }
+  });
+});
+
+describe("validateProviderApiKeyFormat", () => {
+  test("rejects a key that is far too short for its provider", () => {
+    expect(() =>
+      validateProviderApiKeyFormat("sk-junk-qa-123", "openai")
+    ).toThrow(/valid OpenAI API key/i);
+  });
+
+  test("rejects a key with a mismatched prefix", () => {
+    expect(() =>
+      validateProviderApiKeyFormat(`AIza${"a".repeat(40)}`, "openai")
+    ).toThrow(/valid OpenAI API key/i);
+  });
+
+  test("accepts a well-formed key", () => {
+    const key = `sk-${"a".repeat(48)}`;
+    expect(validateProviderApiKeyFormat(key, "openai")).toBe(key);
+  });
+
+  test("skips format checks for providers without a documented key format", () => {
+    expect(validateProviderApiKeyFormat("short", "fireworks")).toBe("short");
+    expect(validateProviderApiKeyFormat("short", "ollama")).toBe("short");
+  });
+
+  test("returns an empty string unchanged instead of throwing", () => {
+    expect(validateProviderApiKeyFormat("", "openai")).toBe("");
+  });
+});
+
+describe("ensureUserConfigDir", () => {
+  let configDir = "";
+
+  afterEach(async () => {
+    if (configDir) {
+      await rm(configDir, { force: true, recursive: true });
+      configDir = "";
+    }
+
+    delete process.env.MINGZHAN_CONFIG_DIR;
+  });
+
+  test("creates the config directory when missing", async () => {
+    configDir = join(tmpdir(), `mingzhan-config-${Date.now()}`);
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    expect(await pathExists(configDir)).toBe(false);
+    await expect(ensureUserConfigDir()).resolves.toBe(configDir);
+    expect(await pathExists(configDir)).toBe(true);
+  });
+});
+
+describe("user config multi-provider", () => {
+  let configDir = "";
+
+  test("round-trips Grok OAuth tokens without using the API key field", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-xai-oauth-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const oauth = {
+      accessToken: "access",
+      expiresAt: "2027-01-01T00:00:00.000Z",
+      refreshToken: "refresh",
+    };
+
+    const instance = applyXaiOAuthToInstance(
+      {
+        apiKey: "",
+        createdAt: new Date().toISOString(),
+        id: "grok",
+        label: "Grok",
+        type: "xai_oauth",
+      },
+      oauth
+    );
+
+    await saveUserConfig({
+      defaultProviderId: instance.id,
+      providers: [instance],
+    });
+    const loaded = await loadUserConfig();
+    expect(readXaiOAuthFromInstance(loaded!.providers[0]!)).toEqual(oauth);
+    expect(loaded!.providers[0]!.apiKey).toBe("");
+  });
+
+  afterEach(async () => {
+    if (configDir) {
+      await rm(configDir, { force: true, recursive: true });
+      configDir = "";
+    }
+
+    delete process.env.MINGZHAN_CONFIG_DIR;
+  });
+
+  test("round-trips multiple provider instances", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-config-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const openaiId = createProviderInstanceId();
+    const compatibleId = createProviderInstanceId();
+
+    await saveUserConfig({
+      defaultProviderId: openaiId,
+      providers: [
+        {
+          apiKey: "sk-test",
+          createdAt: "2026-06-07T10:00:00.000Z",
+          id: openaiId,
+          label: "Work OpenAI",
+          type: "openai",
+        },
+        {
+          apiKey: "",
+          baseUrl: "http://localhost:11434/v1",
+          createdAt: "2026-06-07T11:00:00.000Z",
+          customModels: [
+            {
+              default: true,
+              id: "llama3.2",
+              name: "Llama 3.2",
+              supportsThinking: true,
+            },
+          ],
+          id: compatibleId,
+          label: "Ollama",
+          type: "openai_compatible",
+          wireApi: "responses",
+        },
+      ],
+      thinkingEffort: "medium",
+      thinkingEnabled: true,
+      timezone: "UTC",
+    });
+
+    const raw = await readFile(getUserConfigPath(), "utf8");
+    expect(raw).toContain(`[provider.${openaiId}]`);
+    expect(raw).toContain("label=Ollama");
+    expect(raw).toContain("default_provider_id=");
+
+    const loaded = await loadUserConfig();
+    expect(loaded?.providers).toHaveLength(2);
+    expect(loaded?.defaultProviderId).toBe(openaiId);
+    expect(loaded?.providers[1]?.baseUrl).toBe("http://localhost:11434/v1");
+    expect(loaded?.providers[1]?.customModels?.[0]?.id).toBe("llama3.2");
+    expect(loaded?.providers[1]?.customModels?.[0]?.supportsThinking).toBe(
+      true
+    );
+    expect(loaded?.providers[1]?.wireApi).toBe("responses");
+  });
+
+  test("round-trips cerebras models_json with capability flags", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-config-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const cerebrasId = createProviderInstanceId();
+
+    await saveUserConfig({
+      defaultProviderId: cerebrasId,
+      providers: [
+        {
+          apiKey: "csk-test",
+          createdAt: "2026-07-16T10:00:00.000Z",
+          customModels: [
+            {
+              default: true,
+              id: "gpt-oss-120b",
+              inputPerMillionUsd: 0.25,
+              name: "GPT OSS 120B",
+              outputPerMillionUsd: 0.69,
+              supportsThinking: true,
+              supportsVision: false,
+            },
+          ],
+          id: cerebrasId,
+          label: "Cerebras",
+          type: "cerebras",
+        },
+      ],
+    });
+
+    const loaded = await loadUserConfig();
+    expect(loaded?.providers[0]?.type).toBe("cerebras");
+    expect(loaded?.providers[0]?.customModels?.[0]?.id).toBe("gpt-oss-120b");
+    expect(loaded?.providers[0]?.customModels?.[0]?.supportsThinking).toBe(
+      true
+    );
+    expect(loaded?.providers[0]?.customModels?.[0]?.inputPerMillionUsd).toBe(
+      0.25
+    );
+  });
+
+  test("round-trips fireworks models_json with capability flags", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-config-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const fireworksId = createProviderInstanceId();
+
+    await saveUserConfig({
+      defaultProviderId: fireworksId,
+      providers: [
+        {
+          apiKey: "fw-test",
+          createdAt: "2026-07-24T10:00:00.000Z",
+          customModels: [
+            {
+              default: true,
+              id: "accounts/fireworks/models/kimi-k2p6",
+              inputPerMillionUsd: 0.6,
+              name: "Kimi K2.6",
+              outputPerMillionUsd: 2.5,
+              supportsThinking: true,
+              supportsVision: false,
+            },
+          ],
+          id: fireworksId,
+          label: "Fireworks",
+          type: "fireworks",
+        },
+      ],
+    });
+
+    const loaded = await loadUserConfig();
+    expect(loaded?.providers[0]?.type).toBe("fireworks");
+    expect(loaded?.providers[0]?.customModels?.[0]?.id).toBe(
+      "accounts/fireworks/models/kimi-k2p6"
+    );
+    expect(loaded?.providers[0]?.customModels?.[0]?.supportsThinking).toBe(
+      true
+    );
+    expect(loaded?.providers[0]?.customModels?.[0]?.inputPerMillionUsd).toBe(
+      0.6
+    );
+  });
+
+  test("round-trips discovered models_json for discovery providers", async () => {
+    // The writer persists customModels for every provider type, so the reader
+    // must parse them back for discovery providers too — otherwise a fetched
+    // catalog is written to disk and dropped on the next load.
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-config-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const moonshotId = createProviderInstanceId();
+    const zhipuId = createProviderInstanceId();
+
+    await saveUserConfig({
+      defaultProviderId: moonshotId,
+      providers: [
+        {
+          apiKey: "sk-moonshot-test",
+          baseUrl: "https://api.moonshot.ai/v1",
+          createdAt: "2026-09-08T10:00:00.000Z",
+          customModels: [
+            {
+              default: true,
+              id: "kimi-k2.5",
+              inputPerMillionUsd: 0.6,
+              name: "Kimi K2.5",
+              outputPerMillionUsd: 2.5,
+              supportsVision: false,
+            },
+          ],
+          id: moonshotId,
+          label: "Moonshot Kimi",
+          type: "moonshot",
+        },
+        {
+          apiKey: "zp-test",
+          createdAt: "2026-09-08T10:00:00.000Z",
+          customModels: [{ default: true, id: "glm-5.2" }],
+          id: zhipuId,
+          label: "GLM (Z.ai)",
+          type: "zhipu",
+        },
+      ],
+    });
+
+    const loaded = await loadUserConfig();
+    expect(loaded?.providers[0]?.customModels?.[0]?.id).toBe("kimi-k2.5");
+    expect(loaded?.providers[0]?.customModels?.[0]?.inputPerMillionUsd).toBe(
+      0.6
+    );
+    expect(loaded?.providers[1]?.customModels?.[0]?.id).toBe("glm-5.2");
+  });
+
+  test("round-trips catalog shortlist models_json for Xiaomi MiMo", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-config-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const xiaomiId = createProviderInstanceId();
+
+    await saveUserConfig({
+      defaultProviderId: xiaomiId,
+      providers: [
+        {
+          apiKey: "sk-xiaomi-test",
+          createdAt: "2026-09-09T10:00:00.000Z",
+          customModels: [
+            {
+              default: true,
+              id: "mimo-v2.5",
+              name: "MiMo V2.5",
+              supportsThinking: true,
+              supportsVision: true,
+            },
+          ],
+          id: xiaomiId,
+          label: "Xiaomi MiMo",
+          type: "xiaomi",
+        },
+      ],
+    });
+
+    const loaded = await loadUserConfig();
+    expect(loaded?.providers[0]?.customModels?.[0]?.id).toBe("mimo-v2.5");
+    expect(loaded?.providers[0]?.customModels?.[0]?.supportsThinking).toBe(
+      true
+    );
+  });
+
+  test("repairs literal undefined label on load", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-config-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const id = createProviderInstanceId();
+
+    await writeFile(
+      getUserConfigPath(),
+      `[provider.${id}]
+type=opencode_go
+label=undefined
+api_key=test-key
+created_at=2026-06-15T00:00:00.000Z
+`,
+      "utf8"
+    );
+
+    const loaded = await loadUserConfig();
+    expect(loaded?.providers[0]?.label).toBe("OpenCode Go");
+  });
+
+  test("normalizeProviderInstanceLabel rejects undefined string", () => {
+    expect(normalizeProviderInstanceLabel("openrouter", "undefined", [])).toBe(
+      "OpenRouter"
+    );
+  });
+
+  test("saveUserWebPublicUrl preserves path segments", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-config-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    await expect(
+      saveUserWebPublicUrl("https://gateway.devscale.id/v1/")
+    ).resolves.toBe("https://gateway.devscale.id/v1");
+    await expect(loadUserWebPublicUrl()).resolves.toBe(
+      "https://gateway.devscale.id/v1"
+    );
+  });
+});
+
+describe("chatgpt oauth helpers", () => {
+  test("recognizes a signed-in ChatGPT default provider without an API key", () => {
+    const provider = applyChatgptOAuthToInstance(
+      {
+        apiKey: "",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        id: "chatgpt-1",
+        label: "ChatGPT",
+        type: "chatgpt",
+      },
+      {
+        accessToken: "test-access",
+        accountId: "test-account",
+        expiresAt: "2026-01-02T00:00:00.000Z",
+        refreshToken: "test-refresh",
+      }
+    );
+
+    const config = { defaultProviderId: provider.id, providers: [provider] };
+
+    expect(isProviderConfigured(config, {})).toBe(true);
+
+    for (const patch of [
+      { chatgptRefreshToken: "" },
+      { chatgptAccountId: "" },
+    ]) {
+      expect(
+        isProviderConfigured(
+          { ...config, providers: [{ ...provider, ...patch }] },
+          {}
+        )
+      ).toBe(false);
+    }
+  });
+
+  test("isChatgptProviderConnected requires refresh token and account id", () => {
+    expect(
+      isChatgptProviderConnected({
+        apiKey: "",
+        chatgptAccountId: "acct_1",
+        chatgptRefreshToken: "refresh",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        id: "chatgpt-1",
+        label: "ChatGPT",
+        type: "chatgpt",
+      })
+    ).toBe(true);
+  });
+
+  test("readChatgptOAuthFromInstance returns null when fields are missing", () => {
+    expect(
+      readChatgptOAuthFromInstance({
+        apiKey: "",
+        chatgptRefreshToken: "refresh",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        id: "chatgpt-1",
+        label: "ChatGPT",
+        type: "chatgpt",
+      })
+    ).toBeNull();
+  });
+
+  test("applyChatgptOAuthToInstance stores oauth fields and clears api key", () => {
+    const updated = applyChatgptOAuthToInstance(
+      {
+        apiKey: "sk-old",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        id: "chatgpt-1",
+        label: "ChatGPT",
+        type: "chatgpt",
+      },
+      {
+        accessToken: "access",
+        accountId: "acct_1",
+        expiresAt: "2026-01-02T00:00:00.000Z",
+        refreshToken: "refresh",
+      }
+    );
+
+    expect(updated.apiKey).toBe("");
+    expect(updated.chatgptAccountId).toBe("acct_1");
+  });
+
+  test("chatgptOAuthNeedsRefresh is true within five minutes of expiry", () => {
+    const expiresAt = new Date("2026-01-01T00:04:00.000Z").toISOString();
+
+    expect(
+      chatgptOAuthNeedsRefresh(
+        {
+          accessToken: "access",
+          accountId: "acct_1",
+          expiresAt,
+          refreshToken: "refresh",
+        },
+        Date.parse("2026-01-01T00:00:00.000Z")
+      )
+    ).toBe(true);
+  });
+});

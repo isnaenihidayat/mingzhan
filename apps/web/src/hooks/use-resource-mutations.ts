@@ -1,0 +1,1128 @@
+import { MíngZhànApiError } from "@mingzhan/core/api-error";
+import type {
+  CreateProfileRequest,
+  CreateProfileWithSuperMingzhanRequest,
+  DocumentAttachment,
+  ImageAttachment,
+  KnowledgeBaseDuplicateAction,
+  ListSessionsResponse,
+  ProfileDetail,
+  ProfileSummary,
+  SoulStackFiles,
+  UpdateProfileRequest,
+  UpdateSessionRequest,
+  UserContextStatusResponse,
+  WorkspaceEntry,
+} from "@mingzhan/core/contract";
+import {
+  type InfiniteData,
+  useInfiniteQuery,
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { useCallback, useMemo } from "react";
+import { useRunningTurnsStore } from "@/context/running-turns-store";
+import { useAuth } from "@/context/use-auth";
+import { HISTORY_SESSION_CHANNELS } from "@/lib/chat-history";
+import { client } from "@/lib/client";
+import { invalidateQueries } from "@/lib/query-client";
+import { queryKeys } from "@/lib/query-keys";
+import { sessionListPollInterval, withFirstPage } from "@/lib/session-list";
+
+const EMPTY_USER_CONTEXT: UserContextStatusResponse = {
+  active: false,
+};
+
+async function fetchUserContext(
+  includeContent?: boolean
+): Promise<UserContextStatusResponse> {
+  try {
+    return await client.getUserContext({ includeContent });
+  } catch (error) {
+    if (error instanceof MíngZhànApiError && error.status === 404) {
+      return EMPTY_USER_CONTEXT;
+    }
+
+    throw error;
+  }
+}
+
+export function useDeleteToolMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (toolId: string) => client.deleteTool(toolId),
+    onSuccess: (_data, toolId) =>
+      invalidateQueries(
+        queryClient,
+        queryKeys.tools.all,
+        queryKeys.tools.detail(toolId),
+        queryKeys.tools.source(toolId),
+        queryKeys.profiles.all,
+        ["organizationOverview"],
+        ["organizationPublicationCatalog"]
+      ),
+  });
+}
+
+export function useCreateProfileMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (input: CreateProfileRequest) => client.createProfile(input),
+    onSuccess: (data) =>
+      invalidateQueries(
+        queryClient,
+        queryKeys.profiles.all,
+        ["organizationOverview"],
+        ["organizationPublicationCatalog"],
+        queryKeys.soul.profile(data.profile.id)
+      ),
+  });
+}
+
+export function useCreateProfileWithSuperMingzhanMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (input: CreateProfileWithSuperMingzhanRequest) =>
+      client.createProfileWithSuperMingzhan(input),
+    onSuccess: (data) =>
+      invalidateQueries(
+        queryClient,
+        queryKeys.profiles.all,
+        ["organizationOverview"],
+        ["organizationPublicationCatalog"],
+        queryKeys.soul.profile(data.profile.id)
+      ),
+  });
+}
+
+export function useUpdateProfileMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      profileId,
+      input,
+    }: {
+      profileId: string;
+      input: UpdateProfileRequest;
+    }) => client.updateProfile(profileId, input),
+    onError: (
+      _error,
+      variables,
+      context:
+        | { detail?: ProfileDetail; profiles?: ProfileSummary[] }
+        | null
+        | undefined
+    ) => {
+      if (!context) {
+        return;
+      }
+
+      queryClient.setQueryData(
+        queryKeys.profiles.detail(variables.profileId),
+        context.detail
+      );
+      queryClient.setQueryData(queryKeys.profiles.all, context.profiles);
+    },
+    // The automations switch moves before the save returns.
+    onMutate: async ({ profileId, input }) => {
+      const { automationsEnabled } = input;
+
+      if (automationsEnabled === undefined) {
+        return null;
+      }
+
+      await queryClient.cancelQueries({ queryKey: queryKeys.profiles.all });
+
+      const detailKey = queryKeys.profiles.detail(profileId);
+      const detail = queryClient.getQueryData<ProfileDetail>(detailKey);
+
+      const profiles = queryClient.getQueryData<ProfileSummary[]>(
+        queryKeys.profiles.all
+      );
+
+      queryClient.setQueryData<ProfileDetail>(detailKey, (current) =>
+        current ? { ...current, automationsEnabled } : current
+      );
+      queryClient.setQueryData<ProfileSummary[]>(
+        queryKeys.profiles.all,
+        (current) =>
+          current?.map((profile) =>
+            profile.id === profileId
+              ? { ...profile, automationsEnabled }
+              : profile
+          )
+      );
+
+      return { detail, profiles };
+    },
+    onSuccess: async (_data, variables) => {
+      if (variables.input.automationsEnabled !== undefined) {
+        void invalidateProfileQueries(queryClient, variables.profileId);
+
+        return;
+      }
+
+      await invalidateProfileQueries(queryClient, variables.profileId);
+    },
+  });
+}
+
+export function useUpdateSessionMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      sessionId,
+      input,
+    }: {
+      profileId: string;
+      sessionId: string;
+      input: UpdateSessionRequest;
+    }) => client.updateSession(sessionId, input),
+    onSuccess: (_data, variables) =>
+      invalidateQueries(queryClient, queryKeys.sessions(variables.profileId)),
+  });
+}
+
+export function useSetSessionOrderMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      profileId,
+      sessionIds,
+    }: {
+      profileId: string;
+      sessionIds: string[];
+    }) => client.setSessionOrder(profileId, sessionIds),
+    onSuccess: (_data, variables) =>
+      invalidateQueries(queryClient, queryKeys.sessions(variables.profileId)),
+  });
+}
+
+export function useDeleteSessionMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (sessionId: string) => client.deleteSession(sessionId),
+    onSuccess: () => invalidateQueries(queryClient, ["sessions"]),
+  });
+}
+
+export function useCloneProfileMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (profileId: string) => client.cloneProfile(profileId),
+    onSuccess: (data) =>
+      invalidateQueries(
+        queryClient,
+        queryKeys.profiles.all,
+        ["organizationOverview"],
+        ["organizationPublicationCatalog"],
+        queryKeys.soul.profile(data.profile.id)
+      ),
+  });
+}
+
+export function useDeleteProfileMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (profileId: string) => client.deleteProfile(profileId),
+    onSuccess: (_data, profileId) =>
+      invalidateProfileQueries(queryClient, profileId),
+  });
+}
+
+async function invalidateProfileQueries(
+  queryClient: ReturnType<typeof useQueryClient>,
+  profileId: string
+) {
+  await invalidateQueries(
+    queryClient,
+    queryKeys.profiles.all,
+    queryKeys.profiles.detail(profileId),
+    ["organizationOverview"],
+    ["organizationPublicationCatalog"]
+  );
+}
+
+export function useUploadProfileAvatarMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      profileId,
+      attachment,
+    }: {
+      profileId: string;
+      attachment: ImageAttachment;
+    }) => client.uploadProfileAvatar(profileId, attachment),
+    onSuccess: (_data, variables) =>
+      invalidateProfileQueries(queryClient, variables.profileId),
+  });
+}
+
+export function useDeleteProfileAvatarMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (profileId: string) => client.deleteProfileAvatar(profileId),
+    onSuccess: (_data, profileId) =>
+      invalidateProfileQueries(queryClient, profileId),
+  });
+}
+
+export function useAssignToolMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      profileId,
+      toolId,
+    }: {
+      profileId: string;
+      toolId: string | string[];
+    }) => {
+      const results = await Promise.allSettled(
+        (Array.isArray(toolId) ? toolId : [toolId]).map((id) =>
+          client.assignTool(profileId, { toolId: id })
+        )
+      );
+
+      const failure = results.find((result) => result.status === "rejected");
+
+      if (failure?.status === "rejected") {
+        throw failure.reason;
+      }
+    },
+    onSettled: (_data, _error, variables) =>
+      invalidateProfileQueries(queryClient, variables.profileId),
+  });
+}
+
+export function useUnassignToolMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      profileId,
+      toolId,
+    }: {
+      profileId: string;
+      toolId: string | string[];
+    }) => {
+      const results = await Promise.allSettled(
+        (Array.isArray(toolId) ? toolId : [toolId]).map((id) =>
+          client.unassignTool(profileId, id)
+        )
+      );
+
+      const failure = results.find((result) => result.status === "rejected");
+
+      if (failure?.status === "rejected") {
+        throw failure.reason;
+      }
+    },
+    onSettled: (_data, _error, variables) =>
+      invalidateProfileQueries(queryClient, variables.profileId),
+  });
+}
+
+export function useCreateMcpServerMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (input: Parameters<typeof client.createMcpServer>[0]) =>
+      client.createMcpServer(input),
+    onSuccess: async (data) => {
+      queryClient.setQueryData(
+        queryKeys.mcp.detail(data.server.id),
+        data.server
+      );
+      await invalidateQueries(
+        queryClient,
+        queryKeys.mcp.all,
+        queryKeys.profiles.all,
+        ["organizationOverview"],
+        ["organizationPublicationCatalog"]
+      );
+    },
+  });
+}
+
+export function useUpdateMcpServerMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      serverId,
+      request,
+    }: {
+      serverId: string;
+      request: Parameters<typeof client.updateMcpServer>[1];
+    }) => client.updateMcpServer(serverId, request),
+    onSuccess: async (data, { serverId }) => {
+      queryClient.setQueryData(queryKeys.mcp.detail(serverId), data.server);
+      await invalidateQueries(
+        queryClient,
+        queryKeys.mcp.all,
+        queryKeys.profiles.all,
+        ["organizationOverview"],
+        ["organizationPublicationCatalog"]
+      );
+    },
+  });
+}
+
+export function useDeleteMcpServerMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ serverId, force }: { serverId: string; force: boolean }) =>
+      client.deleteMcpServer(serverId, force),
+    onSuccess: (_data, { serverId }) =>
+      invalidateQueries(
+        queryClient,
+        queryKeys.mcp.all,
+        queryKeys.mcp.detail(serverId),
+        queryKeys.profiles.all,
+        ["organizationOverview"],
+        ["organizationPublicationCatalog"]
+      ),
+  });
+}
+
+export function useConnectMcpServerMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (serverId: string) => client.connectMcpServer(serverId),
+    onSuccess: async (data, serverId) => {
+      queryClient.setQueryData(queryKeys.mcp.detail(serverId), data.server);
+      await invalidateQueries(
+        queryClient,
+        queryKeys.mcp.all,
+        queryKeys.profiles.all,
+        ["organizationOverview"],
+        ["organizationPublicationCatalog"]
+      );
+    },
+  });
+}
+
+export function useSyncMcpServerMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (serverId: string) => client.syncMcpServer(serverId),
+    onSuccess: async (data, serverId) => {
+      queryClient.setQueryData(queryKeys.mcp.detail(serverId), data.server);
+      await invalidateQueries(
+        queryClient,
+        queryKeys.mcp.all,
+        queryKeys.profiles.all,
+        ["organizationOverview"],
+        ["organizationPublicationCatalog"]
+      );
+    },
+  });
+}
+
+export function useAssignMcpServerMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      profileId,
+      serverId,
+    }: {
+      profileId: string;
+      serverId: string;
+    }) => client.assignMcpServer(profileId, { serverId }),
+    onSuccess: (_data, variables) =>
+      invalidateProfileQueries(queryClient, variables.profileId),
+  });
+}
+
+export function useUnassignMcpServerMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      profileId,
+      serverId,
+    }: {
+      profileId: string;
+      serverId: string;
+    }) => client.unassignMcpServer(profileId, serverId),
+    onSuccess: (_data, variables) =>
+      invalidateProfileQueries(queryClient, variables.profileId),
+  });
+}
+
+export function useCreateSkillMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (input: Parameters<typeof client.createSkill>[0]) =>
+      client.createSkill(input),
+    onSuccess: () =>
+      invalidateQueries(
+        queryClient,
+        queryKeys.skills.all,
+        ["organizationOverview"],
+        ["organizationPublicationCatalog"]
+      ),
+  });
+}
+
+export function useInstallSkillMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (input: Parameters<typeof client.installSkill>[0]) =>
+      client.installSkill(input),
+    onSuccess: (_data, variables) =>
+      invalidateQueries(
+        queryClient,
+        queryKeys.skills.all,
+        queryKeys.profiles.all,
+        queryKeys.profiles.detail(variables.profileId),
+        ["organizationOverview"],
+        ["organizationPublicationCatalog"]
+      ),
+  });
+}
+
+export function usePatchSkillMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      skillId,
+      input,
+      profileId,
+    }: {
+      skillId: string;
+      input: Parameters<typeof client.patchSkill>[1];
+      profileId?: string;
+    }) =>
+      client.patchSkill(skillId, input, profileId ? { profileId } : undefined),
+    onSuccess: async (data, variables) => {
+      await Promise.all([
+        invalidateQueries(
+          queryClient,
+          ["organizationOverview"],
+          ["organizationPublicationCatalog"]
+        ),
+        invalidateQueries(queryClient, queryKeys.skills.all),
+        invalidateQueries(
+          queryClient,
+          queryKeys.skills.detail(variables.skillId)
+        ),
+        invalidateQueries(queryClient, queryKeys.profiles.all),
+        ...(variables.profileId
+          ? [
+              invalidateQueries(
+                queryClient,
+                queryKeys.profiles.detail(variables.profileId)
+              ),
+            ]
+          : []),
+      ]);
+      queryClient.setQueryData(
+        queryKeys.skills.detail(data.skill.id),
+        data.skill
+      );
+    },
+  });
+}
+
+export function useDeleteSkillMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (skillId: string) => client.deleteSkill(skillId),
+    onSuccess: () =>
+      invalidateQueries(
+        queryClient,
+        queryKeys.skills.all,
+        queryKeys.profiles.all,
+        ["organizationOverview"],
+        ["organizationPublicationCatalog"]
+      ),
+  });
+}
+
+export function useAssignSkillMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      profileId,
+      skillId,
+    }: {
+      profileId: string;
+      skillId: string;
+    }) => client.assignSkill(profileId, { skillId }),
+    onSuccess: (_data, variables) =>
+      invalidateProfileQueries(queryClient, variables.profileId),
+  });
+}
+
+export function useUnassignSkillMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      profileId,
+      skillId,
+    }: {
+      profileId: string;
+      skillId: string;
+    }) => client.unassignSkill(profileId, skillId),
+    onSuccess: (_data, variables) =>
+      invalidateProfileQueries(queryClient, variables.profileId),
+  });
+}
+
+const SESSION_PAGE_SIZE = 30;
+
+function listSessionPage(
+  profileId: string,
+  cursor: string | null,
+  search?: string,
+  all = false
+) {
+  return client.listSessions(profileId, HISTORY_SESSION_CHANNELS, {
+    cursor,
+    limit: all ? undefined : SESSION_PAGE_SIZE,
+    query: search || undefined,
+  });
+}
+
+/**
+ * Every history channel as one list, a page at a time, newest first. A
+ * `search` narrows it on the server to chats whose title or messages match;
+ * an empty one idles, so clearing a search does not refetch the plain list.
+ */
+export function useHistorySessionsQuery(
+  profileId: string,
+  search?: string,
+  all = false
+) {
+  const queryClient = useQueryClient();
+  const runningSessionIds = useRunningTurnsStore((state) => state.sessionIds);
+  const localTurn = runningSessionIds.length > 0;
+  const runningSessionIdSet = new Set(runningSessionIds);
+  const enabled = Boolean(profileId) && search !== "";
+
+  const queryKey = search
+    ? queryKeys.sessionSearch(profileId, search)
+    : all
+      ? [...queryKeys.sessions(profileId), "all"]
+      : queryKeys.sessions(profileId);
+
+  const query = useInfiniteQuery({
+    enabled,
+    getNextPageParam: (lastPage: ListSessionsResponse) =>
+      lastPage.nextCursor ?? undefined,
+    // SAFETY: The enclosing parser checks the value before this conversion.
+    initialPageParam: null as string | null,
+    // Typing on keeps the previous results up; a first search starts empty.
+    placeholderData: (previous, previousQuery) =>
+      previousQuery?.queryKey[2] === "search" ? previous : undefined,
+    queryFn: ({ pageParam }) =>
+      listSessionPage(profileId, pageParam, search, all),
+    queryKey,
+  });
+
+  // A title is written after the turn returns and a turn ends without telling
+  // anyone, so the list has to look again. Both show up on the first page, with
+  // the newest chats, so a poll reads only that page and costs the same however
+  // far the list was scrolled. Gated, so a quiet list makes no requests at all.
+  const pollInterval = sessionListPollInterval(query.data?.pages[0]?.sessions, {
+    localTurn,
+  });
+
+  useQuery({
+    enabled: enabled && pollInterval !== false,
+    queryFn: async () => {
+      const head = await listSessionPage(profileId, null, search, all);
+
+      const data =
+        queryClient.getQueryData<
+          InfiniteData<ListSessionsResponse, string | null>
+        >(queryKey);
+
+      if (!data) {
+        return null;
+      }
+
+      const next = withFirstPage(data, head);
+
+      if (next) {
+        queryClient.setQueryData(queryKey, next);
+      } else {
+        await queryClient.refetchQueries({ exact: true, queryKey });
+      }
+
+      return null;
+    },
+    queryKey: all
+      ? [...queryKeys.sessionListHead(profileId, search), "all"]
+      : queryKeys.sessionListHead(profileId, search),
+    refetchInterval: pollInterval,
+  });
+
+  const { fetchNextPage, refetch } = query;
+
+  const loadNextPage = useCallback(async () => {
+    const { data } = await fetchNextPage();
+
+    // Chats moved across the cursor between the two requests, so the pages
+    // no longer join up: load them again from the first one.
+    if (data?.pages.at(-1)?.stale) {
+      await refetch();
+    }
+  }, [fetchNextPage, refetch]);
+
+  const seen = new Set<string>();
+
+  const sessions = (query.data?.pages ?? [])
+    .flatMap((page) => page.sessions)
+    // A chat that moved between two page loads can come back on both.
+    .filter((session) => {
+      if (seen.has(session.id)) {
+        return false;
+      }
+
+      seen.add(session.id);
+
+      return true;
+    })
+    // The server answers from its own registry, which this tab can be ahead of
+    // for the moment between starting a turn and the list catching up.
+    .map((session) =>
+      session.active || !runningSessionIdSet.has(session.id)
+        ? session
+        : { ...session, active: true }
+    );
+
+  return {
+    data: sessions,
+    error: query.error,
+    fetchNextPage: loadNextPage,
+    hasNextPage: query.hasNextPage,
+    isFetchingNextPage: query.isFetchingNextPage,
+    isLoading: query.isLoading,
+  };
+}
+
+/** One chat's summary, for a chat on a page the list has not loaded. */
+export function useSessionSummaryQuery(
+  profileId: string,
+  sessionId: string | null
+) {
+  return useQuery({
+    enabled: Boolean(sessionId),
+    queryFn: () => client.getSession(sessionId!),
+    queryKey: queryKeys.sessionSummary(profileId, sessionId ?? ""),
+    retry: false,
+  });
+}
+
+export function useSoulStatusQuery(profileId: string | null) {
+  return useQuery({
+    enabled: Boolean(profileId),
+    queryFn: () => client.getProfileSoulStatus(profileId!),
+    queryKey: queryKeys.soul.profile(profileId ?? ""),
+  });
+}
+
+export function useOrganizationKnowledgeBaseQuery(orgId: string | null) {
+  return useQuery({
+    enabled: Boolean(orgId),
+    queryFn: () => client.listOrganizationKnowledgeBase(orgId!),
+    queryKey: queryKeys.knowledgeBase.organization(orgId ?? ""),
+  });
+}
+
+export function useKnowledgeBaseQuery(profileId: string | null) {
+  return useQuery({
+    enabled: Boolean(profileId),
+    queryFn: () => client.listKnowledgeBase(profileId!),
+    queryKey: queryKeys.knowledgeBase.profile(profileId ?? ""),
+  });
+}
+
+const EMPTY_PINNED_FILES: WorkspaceEntry[] = [];
+
+export function useFilePins(profileId: string | null, enabled: boolean) {
+  const { activeOrg, user } = useAuth();
+  const queryClient = useQueryClient();
+
+  const pins = useQuery({
+    enabled: Boolean(enabled && profileId && activeOrg),
+    queryFn: () => client.listProfileFilePins(profileId!),
+    queryKey: ["file-pins", activeOrg?.id, user?.id, profileId],
+  });
+
+  const mutation = useMutation({
+    mutationFn: (body: { path: string; pinned: boolean }) =>
+      client.setProfileFilePinned(profileId!, body),
+    onSuccess: () => invalidateQueries(queryClient, ["file-pins"]),
+  });
+
+  const entries = pins.data?.entries ?? EMPTY_PINNED_FILES;
+  const pending = pins.isPending || pins.isError || mutation.isPending;
+  const { mutate } = mutation;
+
+  const controls = useMemo(
+    () => ({
+      paths: new Set(entries.map((entry) => entry.path)),
+      pending,
+      toggle: (path: string, pinned: boolean) => mutate({ path, pinned }),
+    }),
+    [entries, pending, mutate]
+  );
+
+  return { controls, entries, error: pins.error || mutation.error };
+}
+
+export function useArtifactsQuery(profileId: string | null, folder = "") {
+  return useQuery({
+    enabled: Boolean(profileId),
+    // ponytail: fetch metadata once; paginate directory entries server-side if listings outgrow this response.
+    queryFn: () => client.listProfileArtifacts(profileId!, { folder }),
+    queryKey: [
+      ...queryKeys.artifacts.profile(profileId ?? ""),
+      "listing",
+      folder,
+    ],
+  });
+}
+
+/**
+ * Chat chips come from the transcript, which never learns that a file was
+ * deleted later. Returns false per artifact once the server confirms it is gone.
+ */
+export function useArtifactsExist(
+  artifacts: readonly { ownerProfileId?: string; path: string }[],
+  profileId: string | null | undefined,
+  enabled: boolean
+): boolean[] {
+  return useQueries({
+    // Unknown (loading or failed) keeps the chip: only a 404 hides it.
+    combine: (results) => results.map((result) => result.data !== false),
+    queries: artifacts.map((artifact) => {
+      const ownerId = artifact.ownerProfileId ?? profileId ?? "";
+
+      return {
+        enabled: enabled && Boolean(ownerId),
+        queryFn: () => client.hasProfileArtifact(ownerId, artifact.path),
+        queryKey: [
+          ...queryKeys.artifacts.profile(ownerId),
+          "exists",
+          artifact.path,
+        ],
+      };
+    }),
+  });
+}
+
+export function useWriteArtifactMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      profileId,
+      artifactPath,
+      content,
+    }: {
+      profileId: string;
+      artifactPath: string;
+      content: string;
+    }) => client.writeProfileArtifactContent(profileId, artifactPath, content),
+    onSuccess: (_data, variables) =>
+      invalidateQueries(
+        queryClient,
+        queryKeys.artifacts.profile(variables.profileId)
+      ),
+  });
+}
+
+export function useDeleteArtifactMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      profileId,
+      filename,
+    }: {
+      profileId: string;
+      filename: string;
+    }) => client.deleteProfileArtifact(profileId, filename),
+    onSuccess: async (_data, variables) => {
+      await invalidateQueries(queryClient, ["file-pins"]);
+      await invalidateQueries(
+        queryClient,
+        queryKeys.artifacts.profile(variables.profileId)
+      );
+    },
+  });
+}
+
+export function useArtifactShareStatusQuery(
+  profileId: string,
+  artifactPath: string,
+  orgId: string
+) {
+  return useQuery({
+    enabled: Boolean(profileId && artifactPath && orgId),
+    queryFn: () =>
+      client.getProfileArtifactShareStatus(profileId, artifactPath),
+    queryKey: queryKeys.artifacts.shareStatus(profileId, artifactPath),
+  });
+}
+
+export function usePublishArtifactShareMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ profileId, path }: { profileId: string; path: string }) =>
+      client.publishProfileArtifactShare(profileId, path),
+    onSuccess: (_data, variables) =>
+      invalidateQueries(
+        queryClient,
+        queryKeys.artifacts.shareStatus(variables.profileId, variables.path)
+      ),
+  });
+}
+
+export function useRevokeArtifactShareMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      profileId,
+      shareId,
+    }: {
+      profileId: string;
+      shareId: string;
+      path?: string;
+    }) => {
+      try {
+        return await client.revokeProfileArtifactShare(profileId, shareId);
+      } catch (error) {
+        // Another tab may have revoked this link; still clear stale share state.
+        if (error instanceof MíngZhànApiError && error.status === 404) {
+          return { id: shareId, revoked: false };
+        }
+
+        throw error;
+      }
+    },
+    onSuccess: async (_data, variables) => {
+      if (variables.path) {
+        await invalidateQueries(
+          queryClient,
+          queryKeys.artifacts.shareStatus(variables.profileId, variables.path)
+        );
+      }
+    },
+  });
+}
+
+export function useSoulFileQuery(
+  profileId: string | null,
+  fileKey: string | null,
+  enabled: boolean
+) {
+  return useQuery({
+    enabled: enabled && Boolean(profileId) && Boolean(fileKey),
+    queryFn: async () => {
+      const response = await client.getProfileSoulStatus(profileId!, {
+        includeContents: true,
+      });
+
+      // SAFETY: The enclosing parser checks the value before this conversion.
+      return response.contents?.[fileKey as keyof SoulStackFiles] ?? "";
+    },
+    queryKey: [
+      ...queryKeys.soul.profile(profileId ?? ""),
+      "file",
+      fileKey ?? "",
+    ] as const,
+  });
+}
+
+export function useBranchSessionMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      sessionId,
+      messageIndex,
+    }: {
+      profileId: string;
+      sessionId: string;
+      messageIndex: number;
+    }) => client.branchSession(sessionId, { messageIndex }),
+    onSuccess: (_data, variables) =>
+      invalidateQueries(queryClient, queryKeys.sessions(variables.profileId)),
+  });
+}
+
+export function useWriteSoulFileMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      profileId,
+      fileKey,
+      content,
+    }: {
+      profileId: string;
+      fileKey: keyof SoulStackFiles;
+      content: string;
+    }) => client.writeProfileSoulFile(profileId, fileKey, content),
+    onSuccess: async (_data, variables) => {
+      const soulKey = queryKeys.soul.profile(variables.profileId);
+
+      await invalidateQueries(queryClient, soulKey, queryKeys.profiles.all, [
+        ...soulKey,
+        "file",
+        variables.fileKey,
+      ]);
+    },
+  });
+}
+
+export function useUserContextQuery(
+  options: { includeContent?: boolean; orgId?: string | null } = {}
+) {
+  return useQuery({
+    enabled: options.orgId !== null,
+    queryFn: () => fetchUserContext(options.includeContent),
+    queryKey: [
+      ...queryKeys.userContext,
+      options.orgId ?? "no-org",
+      options.includeContent ? "content" : "status",
+    ] as const,
+  });
+}
+
+export function useWriteUserContextMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (content: string) => client.writeUserContext(content),
+    onSuccess: () => invalidateQueries(queryClient, queryKeys.userContext),
+  });
+}
+
+export function useUploadKnowledgeBaseDocumentMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      profileId,
+      document,
+      onDuplicate,
+    }: {
+      profileId: string;
+      document: DocumentAttachment;
+      onDuplicate?: KnowledgeBaseDuplicateAction;
+    }) => client.uploadKnowledgeBaseDocument(profileId, document, onDuplicate),
+    onSuccess: (_data, variables) =>
+      invalidateQueries(
+        queryClient,
+        queryKeys.knowledgeBase.profile(variables.profileId)
+      ),
+  });
+}
+
+export function useImportKnowledgeBaseZipMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      profileId,
+      zipBase64,
+    }: {
+      profileId: string;
+      zipBase64: string;
+    }) => client.importKnowledgeBaseZip(profileId, zipBase64),
+    onSettled: (_data, _error, variables) =>
+      invalidateQueries(
+        queryClient,
+        queryKeys.knowledgeBase.profile(variables.profileId)
+      ),
+  });
+}
+
+export function useAttachSharedKnowledgeBaseDocumentMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      profileId,
+      documentId,
+    }: {
+      profileId: string;
+      documentId: string;
+    }) => client.attachSharedKnowledgeBaseDocument(profileId, documentId),
+    onSuccess: (_data, variables) =>
+      invalidateQueries(
+        queryClient,
+        queryKeys.knowledgeBase.profile(variables.profileId)
+      ),
+  });
+}
+
+export function useDetachSharedKnowledgeBaseDocumentMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      profileId,
+      documentId,
+    }: {
+      profileId: string;
+      documentId: string;
+    }) => client.detachSharedKnowledgeBaseDocument(profileId, documentId),
+    onSuccess: (_data, variables) =>
+      invalidateQueries(
+        queryClient,
+        queryKeys.knowledgeBase.profile(variables.profileId)
+      ),
+  });
+}
+
+export function useDeleteKnowledgeBaseDocumentMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      profileId,
+      documentId,
+    }: {
+      profileId: string;
+      documentId: string;
+    }) => client.deleteKnowledgeBaseDocument(profileId, documentId),
+    onSuccess: (_data, variables) =>
+      invalidateQueries(
+        queryClient,
+        queryKeys.knowledgeBase.profile(variables.profileId)
+      ),
+  });
+}

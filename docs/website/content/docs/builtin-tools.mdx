@@ -1,0 +1,263 @@
+---
+title: "Builtin Tools"
+description: "Review the builtin tools that MíngZhàn profiles can use, how access is controlled, and how memory, artifact, and document workflows use file tools plus bundled skills."
+---
+
+Builtin tools are the actions a profile is allowed to take.
+
+The mental model is simple:
+
+- A profile can only use the tools assigned to it
+- Different profiles can have different permissions
+- Tool access is one of the main ways you control risk
+
+Platform admins assign tools to profiles from the dashboard.
+
+## Why tools matter
+
+The same model behaves very differently depending on its tools.
+
+For example:
+
+- A writing bot may need no tools at all
+- A research bot may need web search, web fetch, and knowledge base search
+- An ops bot may need file access and email
+- A power-user bot may need skills and MCP servers
+
+Give each profile the minimum tool set it needs.
+
+## Parallel execution
+
+When the model requests multiple tool calls in one turn, MíngZhàn can run them concurrently — but only when **every** call in the batch is marked `parallelSafe`.
+
+| Parallel-safe builtins | Sequential (default) |
+|------------------------|----------------------|
+| `read_file`, `search_files`, `knowledge_base_search`, `web_search`, `web_fetch`, `sub_agent` | `bash`, write/edit/delete file tools, email, Composio, MCP, session-state tools, and the rest |
+
+If a turn mixes parallel-safe and sequential tools — for example `read_file` and `bash` together — the whole turn runs sequentially.
+
+Custom JavaScript tools under `~/.mingzhan/tools/` default to sequential. Set `"parallelSafe": true` in the tool's `handlerConfig` to opt in.
+
+Parallel execution speeds up multi-file research and lets a parent agent delegate several independent `sub_agent` tasks at once. See [`sub_agent`](#sub_agent) below.
+
+## Default assignments
+
+MíngZhàn includes these builtins:
+
+| Tool | `default` / `super_mingzhan` | New custom profiles | Notes |
+|------|-------------------------|---------------------|-------|
+| `write_file` | Yes | Yes | |
+| `save_artifact` | Yes | Yes | Saves a file under `artifacts/` and records who made it |
+| `write_docx` | Yes | No | Create real `.docx` files from Markdown |
+| `delete_file` | Yes | No | |
+| `edit_file` | Yes | Yes | |
+| `read_file` | Yes | Yes | |
+| `search_files` | Yes | Yes | |
+| `knowledge_base_search` | Yes | Yes | |
+| `web_search` | Yes | No | |
+| `web_fetch` | Yes | Yes | |
+| `email` | Yes | No | Omitted at runtime when mailbox is unconfigured |
+| `extract_document_text` | Yes | No | Extracts text from PDF, Word, or Excel attachments returned by `email` |
+| `bash` | When assigned | No | Run shell commands in the profile workspace |
+| `sub_agent` | No | No | Opt-in: delegate to a same-profile sub-agent (see below) |
+| `list_profile_sessions` | Super MíngZhàn only | No | Opt-in: read another profile's session list (see below) |
+| `read_profile_session` | Super MíngZhàn only | No | Opt-in: read another profile's stored transcript (see below) |
+
+**New custom profiles** receive `read_file`, `write_file`, `save_artifact`, `edit_file`, `search_files`, `knowledge_base_search`, and `web_fetch` until a platform admin assigns additional tools. Memory writes, archives, and artifact saves use bundled skills with those file tools — see [Skills](/skills#bundled-system-skills). Word documents use `write_docx` (system profiles only by default). Coding-agent workflows use `bash` with the `coding-agent` skill — see [Coding agent](/coding-agent). Interactive browser automation (login walls, forms, clicks) uses `bash` with the opt-in `agent-browser` skill — see [Agent browser](/agent-browser). The `sub_agent` tool is seeded but **not** auto-assigned — platform admins opt in per profile. System profiles (`default`, `super_mingzhan`) get the full seeded builtin set; Super MíngZhàn also receives `bash`, `list_profile_sessions`, and `read_profile_session`. The two session readers are seeded like `sub_agent` and assigned per profile; Super MíngZhàn receives them at seed time, and that assignment is re-applied on every boot.
+
+## Choosing tools for a profile
+
+Good starting patterns:
+
+- **Simple chat bot**: no extra tools
+- **Research bot**: `web_search`, `web_fetch`, `knowledge_base_search`, optionally `sub_agent` for parallel deep dives
+- **Knowledge bot**: `knowledge_base_search`, file tools, bundled system skills
+- **Ops bot**: file tools, bundled `artifact-design` skill, `email`
+- **Delegation bot**: `sub_agent` for in-process research/review/planning subtasks
+- **Coding agent (Super MíngZhàn or custom)**: `bash` + `coding-agent` skill
+
+## Memory workflows
+
+Profile memory is not a separate builtin. Agents use `read_file`, `write_file`, and `edit_file` with two bundled skills:
+
+| Skill | Purpose |
+|-------|---------|
+| `update-profile-memory` | Append facts and preferences to active `MEMORY.md` |
+| `archive-profile-memory` | Move bullets to `memory-archive/` without deleting them |
+
+Active `MEMORY.md` has a **4096-byte** soft limit. Default and super-mingzhan profiles receive these skills when bundled skills are installed on the server. See [Bundled system skills](/skills#bundled-system-skills) for the full workflow.
+
+## Artifact saves
+
+Artifacts are files your agent creates and saves for you: reports, summaries, generated text, Word documents, and other outputs you can preview or download later from **Browse Files → Artifacts** or from web chat.
+
+Agents save text artifacts with `save_artifact`. The bundled `artifact-design` skill sets how HTML pages, dashboards, and decks look. Word documents use `write_docx`, and images use `generate_image`. MíngZhàn derives the file type, size, and timestamp automatically.
+
+`save_artifact` and `generate_image` also record which user made the file. **Browse Files → Artifacts** shows this in the **Created by** column. Files saved before this, or written by `bash` or a coding agent, show no owner.
+
+When a profile has `save_artifact`, `write_file` refuses new files under `artifacts/` and points the agent to `save_artifact`. `edit_file` still changes existing artifacts. When you upgrade, every profile that has `write_file` gets `save_artifact` once. You can remove it from a profile, and the next restart does not add it back.
+
+On web chat, `save_artifact`, `write_file`, and `write_docx` saves under `artifacts/` appear as attachment chips on the assistant message. Click a chip to open a resizable preview panel with copy, download, and fullscreen:
+
+On **Telegram**, **Discord**, and **WhatsApp**, the same saves post a Publish share link after the agent reply; ask to “send the file” when you want a native attachment. See [Telegram](/telegram/chat#saved-artifacts-and-share-links), [Discord](/discord#saved-artifacts-and-share-links), and [WhatsApp](/whatsapp#saved-artifacts-and-share-links).
+
+| Content type | Preview behavior |
+|--------------|------------------|
+| HTML (`.html`, `text/html`) | Sandboxed iframe render |
+| Markdown (`.md`, `text/markdown`) | Rendered prose |
+| Word (`.docx` from `write_docx`) | Server converts to Markdown for preview |
+| JSON, code, plain text | Syntax highlighting or monospace block |
+| Unknown extension | UTF-8 sniff — preview when the bytes look like text |
+
+Legacy `.doc` (Word 97–2003) is not supported for generation or preview. Binary formats outside these paths show a download-only message.
+
+## Coding agent
+
+Repo coding work is not a separate builtin. Profiles with the `coding-agent` skill invoke Codex, Claude Code, OpenCode, pi, or Cursor Agent through `bash`. See [Coding agent](/coding-agent) for skill-driven install, multi-CLI choice, provider passthrough, and runtime behavior.
+
+## Tool reference
+
+Parameters and return values for each tool are on [Tool reference](/tool-reference).
+
+## Configuration prerequisites
+
+### Email
+
+The `email` tool uses a deployment-global mailbox. Required keys in `~/.mingzhan/config.ini` under `[email]`:
+
+- `imap_host`, `smtp_host`
+- `username`, `password`
+- Resolvable `from` address
+- TLS flags as needed
+
+Org admins configure these from **Control center → Agent tools → Tools**.
+
+### Web search
+
+Requires an OpenAI or Anthropic provider with a configured API key, or an Exa, Firecrawl or Serply search back-end.
+
+Org admins can point `web_search` at an external search API from **Control center → Agent tools → AI Providers → Web search**: pick **Exa**, **Firecrawl** or **Serply**, then supply the API key. The key is stored in the `[web_search]` section of `~/.mingzhan/config.ini` and is only ever returned masked.
+
+Leave the provider on **Built-in** to keep using the model provider's own hosted search.
+
+### Knowledge base
+
+Upload documents via the profile dashboard or API. Search only indexes extracted text from documents with `status: "ready"`. Upload path: `~/.mingzhan/orgs/{orgId}/profiles/{profileId}/knowledge-base/`.
+
+### Data portability
+
+Platform admins can export and import the whole local MíngZhàn data root from **Control center → Workspace → Settings**.
+Use **Export ZIP** to download a backup.
+Exports are `.zip` backups and should be handled as sensitive files because they can include local auth, provider configuration, custom tools, skills, profile workspaces, and a local SQLite database.
+
+Import first previews the ZIP manifest and restore impact.
+Confirmed restore replaces the current local data root; selective merge, scheduled backups, cloud destinations, and encrypted archives are not part of the first version.
+
+## Custom tools
+
+Custom tools live in `~/.mingzhan/tools/` (follows `MINGZHAN_CONFIG_DIR` if set) and are registered by a platform admin from **Control center → Agent tools → Tools**. Each tool points at a module file and can then be assigned to agents like any builtin.
+
+Two handler types are supported, and both run as a subprocess per call rather than inside the MíngZhàn server process:
+
+| Type | File | Runs on |
+|---|---|---|
+| `javascript` | `*.js` | A `bun` subprocess per call |
+| `python` | `*.py` | A `python3` subprocess per call |
+
+Neither handler inherits the server's full environment. The child process only gets `PATH` (to resolve the interpreter), `MINGZHAN_CONFIG_DIR`, and `MINGZHAN_WORKSPACE_ROOT` (the active profile workspace) — provider API keys and anything else in the server's environment are not visible to a tool. The child's working directory is the tool's own file, not the server's checkout, so relative file access stays scoped to `~/.mingzhan/tools/`.
+
+### Giving a tool its settings
+
+Some custom tools call a paid or private API. They need a key, and often a base URL or an account ID. MíngZhàn keeps these values out of chat, out of the model, and out of the tool's source.
+
+When Super MíngZhàn builds such a tool, it lists the settings the tool needs, for example `WEATHER_API_URL` and a secret `WEATHER_API_KEY`. Org admins fill them in:
+
+- **Tool playground** — open the tool. The **Configuration** card shows one field per setting. Enter the values, then **Save**. Use **Update** to change them later. A blank secret field keeps the saved value.
+- **Configure card in chat** — shown when a tool runs before its settings are saved. It opens the playground.
+- **Super MíngZhàn setup card** — for a tool that only needs one API key, the approval card asks for it.
+
+![The tool playground with saved settings and a successful run](/screenshots/tool-playground-api-key.png)
+
+Each setting reaches the tool as an environment variable with the same name. A tool with a single key reads it from `MINGZHAN_TOOL_API_KEY`. Values belong to one organization and one tool, and are encrypted at rest. Secret values are never shown again after saving, and if a tool echoes one in its output or errors, MíngZhàn replaces it with `[REDACTED]`. Plain values such as URLs stay visible so admins can edit them.
+
+Setting names use `UPPER_SNAKE_CASE`. Names that change how the tool process starts, such as `PATH`, `NODE_OPTIONS`, or `PYTHONPATH`, and names starting with `MINGZHAN_` are not allowed.
+
+### Authoring a JavaScript tool
+
+A JavaScript tool is a `.js` file that exports a `run(input, context)` function. MíngZhàn loads it through a small runner subprocess — you do not write a stdin/stdout harness yourself:
+
+```javascript
+// ~/.mingzhan/tools/word_count.js
+export async function run(input, context) {
+  const text = String(input.text ?? "");
+  return { words: text.split(/\s+/).filter(Boolean).length };
+}
+```
+
+The contract:
+
+- MíngZhàn invokes `bun` with a built-in runner that imports your module, calls `run`, and prints one JSON value to stdout.
+- A non-zero exit code or non-JSON stdout is returned to the agent as an error message (stderr is included).
+- Calls time out after 30 seconds.
+- Set `MINGZHAN_BUN_BIN` before starting MíngZhàn if `bun` is not the right interpreter to invoke on `PATH`.
+
+Parameters and `parallelSafe` are declared in the tool's `handlerConfig` (`handlerConfig.parameters` as a JSON Schema, `handlerConfig.parallelSafe` as a boolean) — not read from the module, since each call is a fresh process. When `parameters` is omitted, the model sees a permissive open object and can pass any arguments.
+
+### Authoring a Python tool
+
+A Python tool is a `.py` file that defines a `run(input, context)` function and prints one JSON object to stdout when run as a script:
+
+```python
+# ~/.mingzhan/tools/word_count.py
+import json
+import sys
+
+def run(input, context):
+    text = str(input.get("text", ""))
+    return {"words": len(text.split())}
+
+if __name__ == "__main__":
+    payload = json.loads(sys.stdin.read() or "{}")
+    sys.stdout.write(json.dumps(run(payload, {})))
+```
+
+The contract:
+
+- MíngZhàn invokes `python3 <file>` once per call and writes the call arguments to stdin as JSON.
+- Whatever the script prints to stdout must be one JSON value — that becomes the tool result the agent sees.
+- A non-zero exit code or non-JSON stdout is returned to the agent as an error message (stderr is included).
+- Calls time out after 30 seconds.
+- Set `MINGZHAN_PYTHON_BIN` before starting MíngZhàn if your interpreter is not on `PATH` as `python3`.
+
+Parameters are declared as an optional JSON Schema in the tool's `handlerConfig.parameters`. When omitted, the model sees a permissive open object and can pass any arguments.
+
+Python tools run sequentially by default and cannot opt into parallel execution, because each call spawns a new process.
+
+## Safety boundaries
+
+File tools (`read_file`, `write_file`, `edit_file`, `delete_file`) are scoped to:
+
+- **Profile workspace:** `~/.mingzhan/orgs/{orgId}/profiles/{profileId}/` (soul files, knowledge base, `artifacts/`, etc.)
+- **Custom tools directory:** `~/.mingzhan/tools/` (follows `MINGZHAN_CONFIG_DIR` if set)
+
+Agents save artifact files under `artifacts/` with `save_artifact`. The bundled `artifact-design` skill sets their layout and styling.
+
+Path guards enforce:
+
+- **10 MB** maximum file size for reads and writes
+- No path traversal outside allowed directories
+- No reads of `config.ini` by basename
+- Blocked special paths (`/dev/`, `/proc/`, `/sys/`)
+
+All builtin tool IDs are protected and cannot be deleted from the dashboard.
+
+## Next steps
+
+- [Org memory](/org-memory) — shared facts, admin UI, and API
+- [Skills](/skills) — bundled system skills and reusable profile procedures
+- [Coding agent](/coding-agent) — hand repo work to Codex, Claude Code, OpenCode, pi, or Cursor Agent via `bash`
+- [Agent browser](/agent-browser) — interactive browsing via `bash` and the `agent-browser` skill
+- [Agent prompts](/agent-prompt) — how bundled system skills appear in the chat wrapper
+- [MCP servers](/mcp) — extend a profile with external tools via the Model Context Protocol
+- [Profiles](/profiles) — how to design each bot
+- [Multi-tenancy](/multi-tenancy) — who can assign tools and manage access

@@ -1,0 +1,407 @@
+/**
+ * Adapted from AIcss Web Search (https://www.aicss.dev/components/web-search).
+ * Production use requires a valid AIcss license per https://www.aicss.dev/pricing
+ */
+
+import { cn } from "@mingzhan/ui/utils";
+import { ArrowDown01Icon, GlobeIcon } from "hugeicons-react";
+import type { ReactNode } from "react";
+import styles from "./WebSearch.module.css";
+import type {
+  WebSearchSiteState,
+  WebSearchSource,
+  WebSourceCardMode,
+} from "./web-search.shared";
+
+const GLOBE_MERIDIANS = {
+  L: "M6.057 11.565 C2.081 11.565 0.371 8.159 0.371 5.964 C0.371 3.642 2.152 0.329 6.05 0.329",
+  ML: "M6.012 11.55 C4.575 10.496 3.333 8.116 3.321 5.964 C3.307 3.399 4.974 0.977 6.012 0.329",
+  MR: "M6.012 11.55 C7.211 10.781 8.715 8.287 8.715 5.964 C8.715 3.399 7.24 1.233 6.012 0.329",
+  R: "M6.012 11.55 C9.677 11.55 11.65 8.487 11.65 5.964 C11.65 3.499 9.748 0.329 6.012 0.329",
+};
+
+function Globe() {
+  const values = [
+    GLOBE_MERIDIANS.L,
+    GLOBE_MERIDIANS.ML,
+    GLOBE_MERIDIANS.MR,
+    GLOBE_MERIDIANS.R,
+    GLOBE_MERIDIANS.L,
+  ].join(";");
+
+  return (
+    <svg
+      aria-hidden
+      fill="none"
+      height="12"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeWidth="0.85"
+      style={{ overflow: "visible" }}
+      viewBox="0 0 12 12"
+      width="12"
+    >
+      <circle cx="6" cy="6" opacity="0.9" r="5.7" />
+      <line opacity="0.9" x1="0.3" x2="11.7" y1="6" y2="6" />
+      {["0s", "-1.2s", "-2.4s", "-3.6s", "-4.8s", "-6s"].map((begin) => (
+        <path d={GLOBE_MERIDIANS.L} key={begin} opacity="0">
+          <animate
+            attributeName="d"
+            begin={begin}
+            calcMode="spline"
+            dur="7.2s"
+            keySplines="0.42 0 0.58 1;0.42 0 0.58 1;0.42 0 0.58 1;0.42 0 0.58 1"
+            keyTimes="0;0.25;0.5;0.75;1"
+            repeatCount="indefinite"
+            values={values}
+          />
+          <animate
+            attributeName="opacity"
+            begin={begin}
+            calcMode="linear"
+            dur="7.2s"
+            keyTimes="0;0.05;0.7;0.75;1"
+            repeatCount="indefinite"
+            values="0;0.9;0.9;0;0"
+          />
+        </path>
+      ))}
+    </svg>
+  );
+}
+
+function SearchIcon() {
+  return (
+    <svg
+      aria-hidden
+      fill="none"
+      height="14"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth="1.8"
+      viewBox="0 0 24 24"
+      width="14"
+    >
+      <path d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z" />
+    </svg>
+  );
+}
+
+function ArrowUpIcon() {
+  return (
+    <svg
+      aria-hidden
+      fill="none"
+      height="10"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth="1.8"
+      viewBox="0 0 24 24"
+      width="10"
+    >
+      <path d="M4.5 10.5 12 3m0 0 7.5 7.5M12 3v18" />
+    </svg>
+  );
+}
+
+function DotsIcon() {
+  return (
+    <svg
+      aria-hidden
+      fill="none"
+      height="16"
+      stroke="currentColor"
+      viewBox="0 0 24 24"
+      width="16"
+    >
+      <circle
+        cx="12"
+        cy="12"
+        r="9"
+        strokeDasharray="1.8 3.6"
+        strokeLinecap="round"
+        strokeWidth="1.8"
+      />
+    </svg>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg
+      aria-hidden
+      fill="none"
+      height="16"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth="1.6"
+      viewBox="0 0 24 24"
+      width="16"
+    >
+      <path d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
+    </svg>
+  );
+}
+
+export interface WebSourceCardProps {
+  formatDisplayUrl?: (source: WebSearchSource) => string;
+  headerText: string;
+  isComplete: boolean;
+  mode: WebSourceCardMode;
+  onOpenChange: (open: boolean) => void;
+  open: boolean;
+  siteStates: WebSearchSiteState[];
+  sources: WebSearchSource[];
+}
+
+function formatWebSearchDisplayUrl(source: WebSearchSource): string {
+  const href = source.href ?? source.url;
+
+  try {
+    const parsed = new URL(href.startsWith("http") ? href : `https://${href}`);
+    const host = parsed.hostname.replace(/^www\./, "");
+    const path = parsed.pathname === "/" ? "" : parsed.pathname;
+
+    return `${host}${path}${parsed.search}`;
+  } catch {
+    return source.url;
+  }
+}
+
+function webSearchHeaderLabel(
+  mode: WebSourceCardMode,
+  isComplete: boolean
+): string {
+  if (mode === "fetch") {
+    return isComplete ? "Fetched" : "Fetching";
+  }
+
+  return isComplete ? "Searched" : "Searching";
+}
+
+function WebSourceCardHeaderContent({
+  canExpand,
+  headerLabel,
+  headerText,
+  isComplete,
+  mode,
+  open,
+  quoteHeader,
+}: {
+  canExpand: boolean;
+  headerLabel: string;
+  headerText: string;
+  isComplete: boolean;
+  mode: WebSourceCardMode;
+  open: boolean;
+  quoteHeader: boolean;
+}) {
+  return (
+    <>
+      <span className={styles.wsIcon}>
+        {mode === "fetch" ? (
+          <GlobeIcon aria-hidden size={14} />
+        ) : (
+          <SearchIcon />
+        )}
+      </span>
+      <span className={styles.wsLabel}>
+        <span
+          className={`${styles.wsShimmer}${isComplete ? ` ${styles.isDone}` : ""}`}
+        >
+          {headerLabel}{" "}
+          {quoteHeader ? (
+            <span className={styles.wsQuote}>&ldquo;{headerText}&rdquo;</span>
+          ) : (
+            <span className={styles.wsQuote}>{headerText}</span>
+          )}
+        </span>
+      </span>
+      {canExpand ? (
+        <ArrowDown01Icon
+          aria-hidden
+          className={cn(
+            styles.wsChevronIcon,
+            !open && styles.wsChevronCollapsed
+          )}
+        />
+      ) : null}
+    </>
+  );
+}
+
+function WebSourceSiteRow({
+  displayUrl,
+  title,
+}: {
+  displayUrl: string;
+  title: string;
+}) {
+  return (
+    <>
+      <span className={styles.wsBullet}>
+        <span className={styles.wsDots}>
+          <DotsIcon />
+        </span>
+        <span className={styles.wsGlobe}>
+          <Globe />
+        </span>
+        <span className={styles.wsCheck}>
+          <CheckIcon />
+        </span>
+      </span>
+      <span className={styles.wsTitle}>{title}</span>
+      <span className={styles.wsSep}>·</span>
+      <span className={styles.wsUrl}>{displayUrl}</span>
+      <span className={styles.wsArrow}>
+        <ArrowUpIcon />
+      </span>
+    </>
+  );
+}
+
+function WebSourceSiteItem({
+  formatDisplayUrl,
+  index,
+  source,
+  state,
+}: {
+  formatDisplayUrl: (source: WebSearchSource) => string;
+  index: number;
+  source: WebSearchSource;
+  state: WebSearchSiteState;
+}) {
+  const href = source.href ?? source.url;
+  const displayUrl = formatDisplayUrl(source);
+  const row = <WebSourceSiteRow displayUrl={displayUrl} title={source.title} />;
+  const linkHref = href.startsWith("http") ? href : `https://${href}`;
+
+  return (
+    <li
+      className={styles.wsSite}
+      data-state={state}
+      style={{ animationDelay: `${index * 40}ms` }}
+    >
+      {state === "done" && href ? (
+        <a
+          className={styles.wsSiteLink}
+          href={linkHref}
+          rel="noopener noreferrer"
+          target="_blank"
+        >
+          {row}
+        </a>
+      ) : (
+        row
+      )}
+    </li>
+  );
+}
+
+function WebSourceCardToggle({
+  canExpand,
+  children,
+  onOpenChange,
+  open,
+}: {
+  canExpand: boolean;
+  children: ReactNode;
+  onOpenChange: (open: boolean) => void;
+  open: boolean;
+}) {
+  if (canExpand) {
+    return (
+      <button
+        aria-expanded={open}
+        aria-label="Toggle results"
+        className={styles.wsRowButton}
+        onClick={() => onOpenChange(!open)}
+        type="button"
+      >
+        {children}
+      </button>
+    );
+  }
+
+  return <div className={styles.wsRow}>{children}</div>;
+}
+
+function WebSourceCardResults({
+  formatDisplayUrl,
+  open,
+  siteStates,
+  sources,
+}: {
+  formatDisplayUrl: (source: WebSearchSource) => string;
+  open: boolean;
+  siteStates: WebSearchSiteState[];
+  sources: WebSearchSource[];
+}) {
+  if (sources.length === 0) {
+    return null;
+  }
+
+  return (
+    <div
+      className={`${styles.wsCollapsible}${open ? "" : ` ${styles.isCollapsed}`}`}
+    >
+      <div className={styles.wsCollapsibleInner}>
+        <div className={styles.wsResults}>
+          <ul className={styles.wsList}>
+            {sources.map((source, index) => (
+              <WebSourceSiteItem
+                formatDisplayUrl={formatDisplayUrl}
+                index={index}
+                key={source.url}
+                source={source}
+                state={siteStates[index] ?? "pending"}
+              />
+            ))}
+          </ul>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function WebSourceCard({
+  mode,
+  headerText,
+  sources,
+  siteStates,
+  isComplete,
+  open,
+  onOpenChange,
+  formatDisplayUrl = formatWebSearchDisplayUrl,
+}: WebSourceCardProps) {
+  const canExpand = sources.length > 0;
+
+  return (
+    <div className={styles.ws} data-state={isComplete ? "done" : "loading"}>
+      <WebSourceCardToggle
+        canExpand={canExpand}
+        onOpenChange={onOpenChange}
+        open={open}
+      >
+        <WebSourceCardHeaderContent
+          canExpand={canExpand}
+          headerLabel={webSearchHeaderLabel(mode, isComplete)}
+          headerText={headerText}
+          isComplete={isComplete}
+          mode={mode}
+          open={open}
+          quoteHeader={mode === "search" || !/^\d+ pages$/.test(headerText)}
+        />
+      </WebSourceCardToggle>
+      <WebSourceCardResults
+        formatDisplayUrl={formatDisplayUrl}
+        open={open}
+        siteStates={siteStates}
+        sources={sources}
+      />
+    </div>
+  );
+}

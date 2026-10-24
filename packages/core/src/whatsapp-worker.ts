@@ -1,0 +1,123 @@
+import { join } from "node:path";
+import { z } from "zod";
+import type { ChannelConfigScope, ChannelOwner } from "./channel-config-shared";
+import type { WhatsAppWorkerStatus } from "./contract";
+import { pathExists, readTextOrNull, removeFile, writeTextFile } from "./fs";
+import {
+  getWhatsAppConfigDir,
+  loadWhatsAppSettingsPublic,
+  type WhatsAppSettingsPublic,
+} from "./whatsapp-config";
+import {
+  createWorkerHeartbeatStore,
+  type WorkerHeartbeatBase,
+} from "./worker-heartbeat";
+
+export interface WhatsAppWorkerHeartbeat extends WorkerHeartbeatBase {
+  connected?: boolean;
+  linkError?: string;
+  linkOwner?: ChannelOwner;
+}
+
+const QR_CODE_FILENAME = "worker-qr.txt";
+
+export function createWhatsAppWorkerHeartbeat(
+  orgId: ChannelConfigScope = null
+) {
+  return createWorkerHeartbeatStore<WhatsAppWorkerHeartbeat>({
+    getDir: () => getWhatsAppConfigDir(orgId),
+    parse: (value, base) => {
+      const parsed = z
+        .object({
+          connected: z.boolean().optional(),
+          linkError: z.string().optional(),
+          linkOwner: z
+            .object({ orgId: z.string(), profileId: z.string() })
+            .optional(),
+        })
+        .safeParse(value);
+
+      return parsed.success ? { ...base, ...parsed.data } : null;
+    },
+  });
+}
+
+const store = createWhatsAppWorkerHeartbeat();
+
+export const isWhatsAppHeartbeatAlive = store.isAlive;
+
+export function getWhatsAppQrCodePath(
+  orgId: ChannelConfigScope = null
+): string {
+  return join(getWhatsAppConfigDir(orgId), QR_CODE_FILENAME);
+}
+
+export function resolveWhatsAppWorkerStatus(
+  settings: WhatsAppSettingsPublic,
+  running: boolean,
+  qrCode: string | null,
+  connected = false
+): WhatsAppWorkerStatus {
+  const configured = settings.configured;
+  const paired = settings.pairedJid !== null;
+  const ok = !configured || running;
+
+  return { configured, connected, ok, paired, qrCode, running };
+}
+
+export async function writeWhatsAppQrCode(
+  qr: string,
+  orgId: ChannelConfigScope = null
+): Promise<void> {
+  await writeTextFile(getWhatsAppQrCodePath(orgId), qr, {
+    ensureDir: getWhatsAppConfigDir(orgId),
+  });
+}
+
+export async function clearWhatsAppQrCode(
+  orgId: ChannelConfigScope = null
+): Promise<void> {
+  const path = getWhatsAppQrCodePath(orgId);
+
+  if (await pathExists(path)) {
+    await removeFile(path);
+  }
+}
+
+export async function readWhatsAppQrCode(
+  orgId: ChannelConfigScope = null
+): Promise<string | null> {
+  const raw = await readTextOrNull(getWhatsAppQrCodePath(orgId));
+
+  return raw?.trim() || null;
+}
+
+/** Worker status plus the raw ids of the agent that holds a rejected number. */
+export async function getWhatsAppWorkerStatus(
+  orgId: ChannelConfigScope = null
+): Promise<WhatsAppWorkerStatus & { linkOwnerIds?: ChannelOwner }> {
+  const settings = await loadWhatsAppSettingsPublic(orgId);
+  const heartbeat = await createWhatsAppWorkerHeartbeat(orgId).read();
+  const running = isWhatsAppHeartbeatAlive(heartbeat);
+  const qrCode = await readWhatsAppQrCode(orgId);
+  const connected = heartbeat?.connected === true;
+
+  const status = resolveWhatsAppWorkerStatus(
+    settings,
+    running,
+    qrCode,
+    connected
+  );
+
+  if (!(running && heartbeat?.linkError)) {
+    return status;
+  }
+
+  return heartbeat.linkOwner
+    ? {
+        ...status,
+        linkError: heartbeat.linkError,
+        linkOwnerIds: heartbeat.linkOwner,
+      }
+    : { ...status, linkError: heartbeat.linkError };
+}

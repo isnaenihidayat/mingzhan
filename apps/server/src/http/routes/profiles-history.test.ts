@@ -1,0 +1,112 @@
+import { describe, expect, test } from "bun:test";
+import { createInMemoryDatabaseAdapter } from "@mingzhan/db";
+import { ProfileService } from "../../services/profile-service";
+import { setupTestConfigDir } from "../../test-config-dir";
+import { createMinimalHonoApp } from "../test-app-helpers";
+import {
+  loginUserSession,
+  setupFreshInstallSession,
+} from "../test-session-helpers";
+
+setupTestConfigDir("mingzhan-profile-history-routes-");
+
+const BASE = "http://localhost:4310";
+
+function createApp() {
+  const databaseAdapter = createInMemoryDatabaseAdapter();
+  const profileService = new ProfileService(databaseAdapter);
+
+  return {
+    ...createMinimalHonoApp({
+      agent: {
+        getProfile: (orgId: string, profileId: string) =>
+          profileService.getProfile(orgId, profileId),
+        listProfileChangeHistory: (
+          orgId: string,
+          profileId: string,
+          options?: { limit?: number; offset?: number }
+        ) => profileService.listProfileChangeHistory(orgId, profileId, options),
+        listProfiles: (orgId: string) => profileService.listProfiles(orgId),
+        updateProfile: (
+          orgId: string,
+          profileId: string,
+          request: Parameters<ProfileService["updateProfile"]>[2],
+          meta?: Parameters<ProfileService["updateProfile"]>[3]
+        ) => profileService.updateProfile(orgId, profileId, request, meta),
+      },
+      databaseAdapter,
+    }),
+    databaseAdapter,
+    profileService,
+  };
+}
+
+describe("GET /v1/profiles/:profileId/history", () => {
+  test("org admin can read history; member gets 403", async () => {
+    const { app, authService, databaseAdapter, profileService } = createApp();
+
+    const platform = await setupFreshInstallSession(
+      app,
+      databaseAdapter,
+      "history-admin@example.com"
+    );
+
+    const orgId = platform.orgId!;
+    const profiles = await databaseAdapter.listProfilesForOrg(orgId);
+    const profileId = profiles[0]!.id;
+
+    await profileService.updateProfile(
+      orgId,
+      profileId,
+      { systemPrompt: "changed by admin" },
+      { actorUserId: "user_platform", source: "dashboard" }
+    );
+
+    const allowed = await app.fetch(
+      new Request(`${BASE}/v1/profiles/${profileId}/history`, {
+        headers: platform.headers({}, orgId),
+      })
+    );
+
+    expect(allowed.status).toBe(200);
+
+    // SAFETY: This test controls the fixture shape at this boundary.
+    const body = (await allowed.json()) as {
+      events: Array<{ field: string; source: string }>;
+    };
+
+    expect(body.events.some((event) => event.field === "system_prompt")).toBe(
+      true
+    );
+
+    const now = new Date().toISOString();
+    await databaseAdapter.createUser({
+      createdAt: now,
+      email: "member-history@example.com",
+      id: "user_secondary_member_history",
+      passwordHash: await authService.hashPassword("password123"),
+      updatedAt: now,
+    });
+    await databaseAdapter.upsertOrgMember({
+      createdAt: now,
+      orgId,
+      role: "member",
+      userId: "user_secondary_member_history",
+    });
+
+    const member = await loginUserSession(
+      app,
+      "member-history@example.com",
+      "password123",
+      orgId
+    );
+
+    const denied = await app.fetch(
+      new Request(`${BASE}/v1/profiles/${profileId}/history`, {
+        headers: member.headers({}, orgId),
+      })
+    );
+
+    expect(denied.status).toBe(403);
+  }, 20_000);
+});
