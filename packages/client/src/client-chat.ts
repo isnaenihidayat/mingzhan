@@ -349,7 +349,7 @@ export class ChatClient extends ProfileFilesClient {
 
         if (options?.whatsappContextToken) {
           headers.set(
-            "X-MíngZhàn-WhatsApp-Context-Token",
+            "X-MingZhan-WhatsApp-Context-Token",
             options.whatsappContextToken
           );
         }

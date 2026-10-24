@@ -1104,7 +1104,7 @@ export function registerSessionRoutes(
     if (
       body.whatsappMessage &&
       !(await options.workerManager.verifyWhatsAppContextToken(
-        c.req.header("X-MíngZhàn-WhatsApp-Context-Token") ?? null
+        c.req.header("X-MingZhan-WhatsApp-Context-Token") ?? null
       ))
     ) {
       sessionTurnRegistry.cancelTurn(sessionId);

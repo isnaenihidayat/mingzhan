@@ -465,7 +465,7 @@ test.each(["http://localhost:4310", "https://mingzhan.example.com"])(
     );
     expect(request.headers.get("Authorization")).toBe("Bearer test-token");
     expect(request.headers.get("X-Org-Id")).toBe("org-a");
-    expect(request.headers.get("X-MíngZhàn-WhatsApp-Context-Token")).toBe(
+    expect(request.headers.get("X-MingZhan-WhatsApp-Context-Token")).toBe(
       "internal-worker-token"
     );
     expect(await request.json()).toMatchObject({

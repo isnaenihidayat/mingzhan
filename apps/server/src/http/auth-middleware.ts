@@ -75,7 +75,7 @@ export function createAuthMiddleware(
     }
 
     if (
-      c.req.header("X-MíngZhàn-App-User-Id") !== undefined &&
+      c.req.header("X-MingZhan-App-User-Id") !== undefined &&
       (c.req.path.startsWith("/v1/sessions") ||
         c.req.path.startsWith("/v1/attachments/") ||
         /^\/v1\/profiles\/[^/]+\/artifacts(?:\/|$)/.test(c.req.path))

@@ -439,7 +439,7 @@ describe("createHonoApp", () => {
               {
                 headers: {
                   Authorization: `Bearer ${token}`,
-                  "X-MíngZhàn-App-User-Id": "alice",
+                  "X-MingZhan-App-User-Id": "alice",
                 },
               }
             )
@@ -498,7 +498,7 @@ describe("createHonoApp", () => {
         (
           await app.fetch(
             new Request(`http://localhost${path}`, {
-              headers: session.headers({ "X-MíngZhàn-App-User-Id": "" }),
+              headers: session.headers({ "X-MingZhan-App-User-Id": "" }),
             })
           )
         ).status

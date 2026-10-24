@@ -126,7 +126,7 @@ describe("POST /v1/sessions with cognito", () => {
       });
 
       if (token) {
-        headers["X-MíngZhàn-WhatsApp-Context-Token"] = token;
+        headers["X-MingZhan-WhatsApp-Context-Token"] = token;
       }
 
       return app.fetch(
