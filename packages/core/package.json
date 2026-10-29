@@ -89,7 +89,6 @@
     "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@types/mailparser": "3.9.0",
     "@types/nodemailer": "^8.0.1"
   }
 }

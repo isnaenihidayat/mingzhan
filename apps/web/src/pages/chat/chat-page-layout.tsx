@@ -356,7 +356,7 @@ export function AgentMascot({ className }: { className?: string }) {
   );
 }
 
-export interface SuggestionCategory {
+interface SuggestionCategory {
   icon: React.ComponentType<{ className?: string }>;
   id: string;
   items: {
@@ -367,7 +367,7 @@ export interface SuggestionCategory {
   label: string;
 }
 
-export const SUGGESTION_CATEGORIES: SuggestionCategory[] = [
+const SUGGESTION_CATEGORIES: SuggestionCategory[] = [
   {
     icon: Target01Icon,
     id: "sales",

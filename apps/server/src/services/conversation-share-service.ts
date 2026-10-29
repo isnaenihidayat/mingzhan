@@ -19,7 +19,7 @@ import {
   resolveComposioCallbackBaseUrl,
 } from "./composio-callback-url";
 
-export function resolveConversationShareBaseUrl(options: {
+function resolveConversationShareBaseUrl(options: {
   clientOrigin?: string;
   request?: Request;
 }): string {

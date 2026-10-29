@@ -3,12 +3,10 @@ import type {
   UpdateProjectRequest,
 } from "@mingzhan/core/contract";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useState } from "react";
 import { useAuth } from "@/context/use-auth";
 import { client } from "@/lib/client";
 import { queryKeys } from "@/lib/query-keys";
 
-const ACTIVE_PROJECT_KEY = "mingzhan:active-project-id";
 
 export function useProjectsQuery() {
   const { isAuthenticated } = useAuth();
@@ -144,24 +142,6 @@ export function useDeleteProjectFileMutation() {
       });
     },
   });
-}
-
-export function useActiveProject() {
-  const [activeProjectId, setActiveProjectIdState] = useState<string | null>(
-    () => localStorage.getItem(ACTIVE_PROJECT_KEY)
-  );
-
-  const setActiveProjectId = useCallback((id: string | null) => {
-    setActiveProjectIdState(id);
-
-    if (id) {
-      localStorage.setItem(ACTIVE_PROJECT_KEY, id);
-    } else {
-      localStorage.removeItem(ACTIVE_PROJECT_KEY);
-    }
-  }, []);
-
-  return { activeProjectId, setActiveProjectId };
 }
 
 export function useProjectSessionsQuery(id: string | undefined) {

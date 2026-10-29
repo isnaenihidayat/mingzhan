@@ -15,7 +15,7 @@ export const LANGUAGE_OPTIONS: readonly LanguageOption[] = [
   { code: "ZH", id: "zh", label: "中文", nativeLabel: "Chinese" },
 ] as const;
 
-export function isLanguage(
+function isLanguage(
   value: string | null | undefined
 ): value is Language {
   return value === "en" || value === "id" || value === "zh";

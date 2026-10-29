@@ -21,7 +21,7 @@ import type {
   StoredProjectRecord,
 } from "@mingzhan/db";
 
-export function getProjectFilesDir(orgId: string, projectId: string): string {
+function getProjectFilesDir(orgId: string, projectId: string): string {
   const safeOrg = orgId.replace(/[^a-zA-Z0-9_-]/g, "_");
   const safeProj = projectId.replace(/[^a-zA-Z0-9_-]/g, "_");
 
@@ -35,7 +35,7 @@ export function getProjectFilesDir(orgId: string, projectId: string): string {
   );
 }
 
-export function getProjectFilePath(
+function getProjectFilePath(
   orgId: string,
   projectId: string,
   fileId: string
