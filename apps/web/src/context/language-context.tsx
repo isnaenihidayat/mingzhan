@@ -8,8 +8,8 @@ import {
 import { LanguageContext } from "@/context/language-context-shared";
 import {
   getInitialLanguage,
-  type Language,
   LANGUAGE_STORAGE_KEY,
+  type Language,
 } from "@/lib/language";
 
 export function LanguageProvider({ children }: { children: ReactNode }) {
@@ -17,11 +17,13 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
 
   const setLanguage = useCallback((nextLanguage: Language) => {
     setLanguageState(nextLanguage);
+
     try {
       localStorage.setItem(LANGUAGE_STORAGE_KEY, nextLanguage);
     } catch {
       // Ignore storage errors
     }
+
     document.documentElement.lang = nextLanguage;
   }, []);
 

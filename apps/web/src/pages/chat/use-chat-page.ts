@@ -281,6 +281,12 @@ export function useChatPage() {
   const [canStop, setCanStop] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const requestedProjectRef = useRef<string | undefined>(
+    new URLSearchParams(window.location.search).get("project") || undefined
+  );
+
+  const getActiveProjectId = () => requestedProjectRef.current;
+
   const { composerDraftKey, composerEntry, setComposerEntry } =
     useChatComposerDraft({
       draftSessionId: host.draftSessionId,
@@ -1017,6 +1023,8 @@ export function useChatPage() {
       return;
     }
 
+    requestedProjectRef.current =
+      searchParams.get("project")?.trim() || undefined;
     const requestedProfile = searchParams.get("profile")?.trim() || null;
     const targetProfileId = requestedProfile || profileId;
 
@@ -1272,6 +1280,7 @@ export function useChatPage() {
             cognito: cognitoRef.current || undefined,
             model: sessionModel ?? undefined,
             profileId,
+            projectId: cognitoRef.current ? undefined : getActiveProjectId(),
             thinkingEffort: sessionThinkingEffort ?? undefined,
           });
 
@@ -1409,6 +1418,7 @@ export function useChatPage() {
               cognito: cognitoRef.current || undefined,
               model: sessionModel ?? undefined,
               profileId,
+              projectId: cognitoRef.current ? undefined : getActiveProjectId(),
               thinkingEffort: sessionThinkingEffort ?? undefined,
             });
 
@@ -1614,6 +1624,7 @@ export function useChatPage() {
             cognito: cognitoRef.current || undefined,
             model: sessionModel ?? undefined,
             profileId,
+            projectId: cognitoRef.current ? undefined : getActiveProjectId(),
             thinkingEffort: sessionThinkingEffort ?? undefined,
           });
         }

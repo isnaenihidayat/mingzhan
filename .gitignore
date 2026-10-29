@@ -47,3 +47,6 @@ tmp-repro-setup-auth.mjs
 .jscpd-report/
 mingzhan-secrets.env
 .idea
+
+# Local user-provided test documents
+/file_demo/

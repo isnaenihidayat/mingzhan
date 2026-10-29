@@ -84,6 +84,16 @@ const PublicArtifactSharePage = lazyPage(
   "PublicArtifactSharePage"
 );
 
+const PublicConversationSharePage = lazyPage(
+  () => import("@/pages/PublicConversationSharePage"),
+  "PublicConversationSharePage"
+);
+
+const ProjectWorkspacePage = lazyPage(
+  () => import("@/pages/ProjectWorkspacePage"),
+  "ProjectWorkspacePage"
+);
+
 const LlmProvidersPage = lazyPage(
   () => import("@/pages/SettingsPage"),
   "LlmProvidersPage"
@@ -205,6 +215,14 @@ function AppShell() {
               }
               path="/s/:token"
             />
+            <Route
+              element={
+                <RouteBoundary fullScreen>
+                  <PublicConversationSharePage />
+                </RouteBoundary>
+              }
+              path="/c/:token"
+            />
             <Route element={<AuthGuard />}>
               <Route element={<SetupGuard />}>
                 <Route
@@ -286,6 +304,10 @@ function AppShell() {
                   />
                   <Route element={<PluginPage />} path="/plugins/:pluginId" />
                   <Route element={<ProfilesPage />} path="/profiles" />
+                  <Route
+                    element={<ProjectWorkspacePage />}
+                    path="/projects/:projectId"
+                  />
                   <Route
                     element={<ProfileChannelSettingsPage />}
                     path="/profiles/:profileId/channels/:channel"

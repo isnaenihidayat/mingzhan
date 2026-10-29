@@ -22,6 +22,8 @@ export function migrateDatabase(db: Database): void {
   atomic(migrateProfilesTable);
   atomic(migrateAutomationsTable);
   atomic(migrateDropTasksTables);
+  atomic(migrateProjectsTable);
+  atomic(migrateConversationSharesTable);
   atomic(migrateSessionsTable);
   atomic(migrateSessionTree);
   atomic(migrateSessionAppUserId);
@@ -1882,6 +1884,70 @@ export function moveProfileJoinReferences(
   );
 }
 
+function migrateProjectsTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS projects (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      description TEXT DEFAULT '' NOT NULL,
+      custom_instructions TEXT DEFAULT '' NOT NULL,
+      default_profile_id TEXT,
+      icon TEXT DEFAULT 'folder' NOT NULL,
+      color TEXT DEFAULT '#00b2be' NOT NULL,
+      created_by_user_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (org_id) REFERENCES organizations (id) ON DELETE CASCADE,
+      FOREIGN KEY (default_profile_id) REFERENCES profiles (id) ON DELETE SET NULL,
+      FOREIGN KEY (created_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS projects_org_id ON projects (org_id);
+
+    CREATE TABLE IF NOT EXISTS project_files (
+      id TEXT PRIMARY KEY NOT NULL,
+      project_id TEXT NOT NULL,
+      org_id TEXT NOT NULL,
+      filename TEXT NOT NULL,
+      media_type TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL,
+      storage_path TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      created_by_user_id TEXT,
+      FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
+      FOREIGN KEY (org_id) REFERENCES organizations (id) ON DELETE CASCADE,
+      FOREIGN KEY (created_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS project_files_project_id ON project_files (project_id);
+  `);
+
+  addNullableTextColumnIfMissing(db, "projects", "icon");
+  addNullableTextColumnIfMissing(db, "projects", "color");
+}
+
+function migrateConversationSharesTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS conversation_shares (
+      id TEXT PRIMARY KEY NOT NULL,
+      org_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      token_hash TEXT NOT NULL,
+      created_by_user_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      revoked_at TEXT,
+      snapshot_payload TEXT NOT NULL,
+      FOREIGN KEY (org_id) REFERENCES organizations (id) ON DELETE CASCADE,
+      FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE CASCADE,
+      FOREIGN KEY (created_by_user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS conversation_shares_token_hash_unique ON conversation_shares (token_hash);
+    CREATE UNIQUE INDEX IF NOT EXISTS conversation_shares_active_session_unique
+      ON conversation_shares (org_id, session_id)
+      WHERE revoked_at IS NULL;
+  `);
+}
+
 function migrateSessionsTable(db: Database): void {
   const columns = db
     .prepare<
@@ -1949,6 +2015,7 @@ function migrateSessionsTable(db: Database): void {
   }
 
   addNullableTextColumnIfMissing(db, "sessions", "thinking_effort");
+  addNullableTextColumnIfMissing(db, "sessions", "project_id");
 }
 
 function migrateSessionTree(db: Database): void {

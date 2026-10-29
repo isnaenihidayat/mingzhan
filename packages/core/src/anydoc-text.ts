@@ -1,7 +1,15 @@
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import { truncateMailBody } from "./mail/types";
 
 /** Shared with email body truncation (`MAX_EMAIL_BODY_BYTES`). */
 export const ANYDOC_MAX_OUTPUT_BYTES = 256 * 1024;
+
+const extractionCache = new Map<string, string>();
+
+const MAX_CACHED_DOCUMENTS = 32;
 
 const ANYDOC_TIMEOUT_MS = 10_000;
 
@@ -156,22 +164,87 @@ async function acquireAnydocSlot(deadlineAt: number): Promise<void> {
   // Admitted by `releaseAnydocSlot`, which already accounted for this slot.
 }
 
-/**
- * Default converter. The native binding exposes no cancellation, so it
- * cannot be interrupted mid-parse; what bounds such a conversion is the slot
- * it keeps until the native call settles, and no new work is admitted while
- * it holds that slot.
- */
-const convertWithAnydoc: AnydocConvertFn = async (bytes, format) => {
-  const { toMarkdownBytes } = await import("@firecrawl/anydoc");
+/** Run the native parser outside the server so its deadline can stop it. */
+const convertWithAnydoc: AnydocConvertFn = (bytes, format, signal) =>
+  new Promise((resolve, reject) => {
+    let modulePath: string;
 
-  // anydoc's Format const-enum typing is stricter than our string union.
-  // SAFETY: resolveAnydocFormat returns only values accepted by the converter's format contract.
-  return toMarkdownBytes(
-    bytes,
-    format as Parameters<typeof toMarkdownBytes>[1]
-  );
-};
+    try {
+      modulePath = import.meta.resolve("@firecrawl/anydoc");
+    } catch {
+      // Source and server dist live three levels below the repository root.
+      modulePath = createRequire(
+        new URL("../../../packages/core/package.json", import.meta.url)
+      ).resolve("@firecrawl/anydoc");
+    }
+
+    const moduleUrl = modulePath.startsWith("file:")
+      ? modulePath
+      : pathToFileURL(modulePath).href;
+
+    const script = `(async () => {
+      const { toMarkdownBytes } = await import(${JSON.stringify(moduleUrl)});
+      const chunks = [];
+      for await (const chunk of process.stdin) chunks.push(chunk);
+      const text = await toMarkdownBytes(Buffer.concat(chunks), ${JSON.stringify(format)});
+      process.stdout.write(text);
+    })().catch(error => { console.error(error.message); process.exitCode = 1; });`;
+
+    const child = spawn(process.execPath, ["-e", script], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    const chunks: Buffer[] = [];
+    let outputBytes = 0;
+    let limited = false;
+    let errorText = "";
+
+    const abort = () => {
+      child.kill("SIGKILL");
+    };
+
+    signal.addEventListener("abort", abort, { once: true });
+
+    if (signal.aborted) {
+      abort();
+    }
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      const room = ANYDOC_MAX_OUTPUT_BYTES + 8 - outputBytes;
+
+      if (room > 0) {
+        const part = chunk.subarray(0, room);
+        chunks.push(part);
+        outputBytes += part.length;
+      }
+
+      if (outputBytes > ANYDOC_MAX_OUTPUT_BYTES) {
+        limited = true;
+        child.kill("SIGKILL");
+      }
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      errorText = (errorText + chunk.toString()).slice(0, 2000);
+    });
+    // An abort can close stdin before the document has been sent.
+    child.stdin.on("error", () => undefined);
+    child.on("error", (error) => {
+      signal.removeEventListener("abort", abort);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      signal.removeEventListener("abort", abort);
+
+      if (signal.aborted) {
+        reject(signal.reason);
+      } else if (code !== 0 && !limited) {
+        reject(new Error(errorText || "Document parser failed."));
+      } else {
+        resolve(Buffer.concat(chunks).toString("utf8"));
+      }
+    });
+    child.stdin.end(bytes);
+  });
 
 function startConversion(
   convertFn: AnydocConvertFn,
@@ -253,6 +326,20 @@ export async function convertDocumentBytes(
   const timeoutMs = options.timeoutMs ?? ANYDOC_TIMEOUT_MS;
   const maxOutputBytes = options.maxOutputBytes ?? ANYDOC_MAX_OUTPUT_BYTES;
   const input = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+
+  const cacheKey = options.convertFn
+    ? null
+    : `${format}:${createHash("sha256").update(input).digest("hex")}`;
+
+  const cached = cacheKey ? extractionCache.get(cacheKey) : undefined;
+
+  if (cached !== undefined) {
+    extractionCache.delete(cacheKey!);
+    extractionCache.set(cacheKey!, cached);
+
+    return truncateMailBody(cached, maxOutputBytes);
+  }
+
   // The advertised deadline covers queueing and converting, so a caller never
   // spends longer than `timeoutMs` waiting on the parser.
   const deadlineAt = Date.now() + timeoutMs;
@@ -305,6 +392,14 @@ export async function convertDocumentBytes(
 
     if (!trimmed) {
       return { text: "", truncated: false };
+    }
+
+    if (cacheKey) {
+      extractionCache.set(cacheKey, trimmed);
+
+      while (extractionCache.size > MAX_CACHED_DOCUMENTS) {
+        extractionCache.delete(extractionCache.keys().next().value!);
+      }
     }
 
     return truncateMailBody(trimmed, maxOutputBytes);

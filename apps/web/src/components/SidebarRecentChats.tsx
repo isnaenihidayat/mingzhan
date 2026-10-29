@@ -10,6 +10,8 @@ import {
 } from "hugeicons-react";
 import { useEffect, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
+import { ConversationShareDialog } from "@/components/chat/conversation-share-dialog";
+import { MoveChatToProjectDialog } from "@/components/projects/MoveChatToProjectDialog";
 import type { SessionTarget } from "@/components/SidebarRecentChatRow";
 import { useRecentChatTree } from "@/components/SidebarRecentChatTree";
 import { RecentChatsDialogs } from "@/components/sidebar-recents";
@@ -215,6 +217,11 @@ export function RecentChats() {
   const deleteSession = useDeleteSessionMutation();
   const [deleteTarget, setDeleteTarget] = useState<SessionTarget | null>(null);
   const [renameTarget, setRenameTarget] = useState<SessionTarget | null>(null);
+  const [shareTarget, setShareTarget] = useState<SessionTarget | null>(null);
+
+  const [moveTarget, setMoveTarget] = useState<
+    (SessionTarget & { projectId?: string | null }) | null
+  >(null);
 
   const { collapsed, toggle } = useLocalStorageFlag(
     SIDEBAR_RECENTS_COLLAPSED_KEY,
@@ -224,7 +231,14 @@ export function RecentChats() {
   const pinnedSessions = sessions.filter((session) => session.pinned);
 
   const { orderedRecent, renderSession, renderTree, orderError } =
-    useRecentChatTree(profileId, sessions, setRenameTarget, setDeleteTarget);
+    useRecentChatTree(
+      profileId,
+      sessions,
+      setRenameTarget,
+      setDeleteTarget,
+      setShareTarget,
+      setMoveTarget
+    );
 
   const renderList = (rows: typeof sessions, emptyText: string | null) => (
     <div className="no-scrollbar min-h-0 overflow-y-auto">
@@ -253,7 +267,7 @@ export function RecentChats() {
   );
 
   return (
-    <div className="mt-5 flex min-h-0 flex-1 flex-col">
+    <div className="mt-3 flex min-h-0 flex-1 flex-col">
       <PinnedChats renderSession={renderSession} sessions={pinnedSessions} />
       <div className="group mb-1.5 flex shrink-0 items-center gap-1 px-2">
         <button
@@ -349,6 +363,31 @@ export function RecentChats() {
         setDeleteTarget={setDeleteTarget}
         setRenameTarget={setRenameTarget}
       />
+      {shareTarget && (
+        <ConversationShareDialog
+          onOpenChange={(open) => {
+            if (!open) {
+              setShareTarget(null);
+            }
+          }}
+          open={Boolean(shareTarget)}
+          sessionId={shareTarget.id}
+          sessionTitle={shareTarget.title}
+        />
+      )}
+      {moveTarget && (
+        <MoveChatToProjectDialog
+          currentProjectId={moveTarget.projectId}
+          onOpenChange={(open) => {
+            if (!open) {
+              setMoveTarget(null);
+            }
+          }}
+          open={Boolean(moveTarget)}
+          sessionId={moveTarget.id}
+          sessionTitle={moveTarget.title}
+        />
+      )}
     </div>
   );
 }

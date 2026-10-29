@@ -1082,6 +1082,7 @@ export interface CreateSessionRequest {
   cognito?: boolean;
   model?: string;
   profileId?: string;
+  projectId?: string | null;
   /** Overrides the install thinking effort for this session. */
   thinkingEffort?: ThinkingEffort;
 }
@@ -1094,6 +1095,7 @@ export interface UpdateSessionRequest {
   model?: string | null;
   parentSessionId?: null;
   pinned?: boolean;
+  projectId?: string | null;
   /** Null goes back to the install thinking effort. */
   thinkingEffort?: ThinkingEffort | null;
   title?: string;
@@ -1203,6 +1205,7 @@ export interface SessionSummary {
   pinned: boolean;
   preview: string | null;
   profileId: string;
+  projectId?: string | null;
   sortPosition: number | null;
   title: string | null;
   updatedAt: string;
@@ -3592,4 +3595,109 @@ export type XaiOAuthDeviceCompleteRequest = ChatgptOAuthDeviceCompleteRequest;
 export interface XaiOAuthDeviceCompleteResponse {
   models?: CustomModelEntry[];
   xaiOAuth: XaiOAuthCredentials;
+}
+
+export interface ProjectSummary {
+  color?: string;
+  createdAt: string;
+  createdByUserId: string | null;
+  customInstructions: string;
+  defaultProfileId: string | null;
+  description: string;
+  fileCount?: number;
+  icon?: string;
+  id: string;
+  name: string;
+  orgId: string;
+  sessionCount?: number;
+  updatedAt: string;
+}
+
+export interface CreateProjectRequest {
+  color?: string;
+  customInstructions?: string;
+  defaultProfileId?: string | null;
+  description?: string;
+  icon?: string;
+  name: string;
+}
+
+export interface UpdateProjectRequest {
+  color?: string;
+  customInstructions?: string;
+  defaultProfileId?: string | null;
+  description?: string;
+  icon?: string;
+  name?: string;
+}
+
+export interface ListProjectsResponse {
+  projects: ProjectSummary[];
+}
+
+export interface ProjectFileSummary {
+  createdAt: string;
+  createdByUserId: string | null;
+  filename: string;
+  id: string;
+  mediaType: string;
+  orgId: string;
+  projectId: string;
+  sizeBytes: number;
+}
+
+export interface ListProjectFilesResponse {
+  files: ProjectFileSummary[];
+}
+
+export interface UploadProjectFileRequest {
+  data: string;
+  filename: string;
+  mediaType?: string;
+}
+
+export interface ConversationShareStatusResponse {
+  active: boolean;
+  createdAt: string;
+  id: string;
+  sharePath: string;
+  shareUrl: string | null;
+  title: string;
+  webPublicUrlConfigured: boolean;
+}
+
+export interface PublishConversationShareResponse {
+  sharePath: string;
+  shareUrl: string | null;
+  status: ConversationShareStatusResponse;
+  token: string;
+}
+
+export interface RevokeConversationShareResponse {
+  id: string;
+  revoked: boolean;
+}
+
+export interface PublicConversationShareMessage {
+  content: string;
+  createdAt?: string;
+  id: string;
+  role: "user" | "assistant" | "system";
+}
+
+export interface PublicConversationShareResponse {
+  createdAt: string;
+  id: string;
+  messages: PublicConversationShareMessage[];
+  title: string;
+}
+
+export interface SharedLinkSummary {
+  createdAt: string;
+  id: string;
+  kind: "chat" | "artifact";
+  mimeType: string | null;
+  name: string;
+  profileId: string | null;
+  sessionId: string | null;
 }

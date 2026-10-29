@@ -23,10 +23,10 @@ import type {
   WorkflowSqliteInspectResponse,
 } from "@mingzhan/core/contract";
 import { withDisabledFetchIdle } from "@mingzhan/core/fetch-idle";
-import { PluginsClient } from "./client-plugins";
+import { ProjectsClient } from "./client-projects";
 
 /** Automations and workflows. */
-export class AutomationsClient extends PluginsClient {
+export class AutomationsClient extends ProjectsClient {
   async draftAutomation(
     prompt: string,
     channel: AgentChannel

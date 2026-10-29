@@ -177,7 +177,8 @@ async function main() {
   ];
 
   const siteUrl =
-    process.env.MINGZHAN_DOCS_SITE_URL ?? "https://ahmadrosid.github.io/mingzhan";
+    process.env.MINGZHAN_DOCS_SITE_URL ??
+    "https://ahmadrosid.github.io/mingzhan";
 
   const sitemap = `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">

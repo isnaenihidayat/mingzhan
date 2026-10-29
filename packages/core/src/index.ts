@@ -54,6 +54,8 @@ export * from "./config";
 
 export * from "./contract";
 
+export * from "./conversation-shares";
+
 // Explicit Discord exports — omit helpers that collide with telegram-* names
 // (maskBotToken, generateHandshakeCode, normalizeHandshakeInput, parseAllowedUserIds,
 // isHeartbeatAlive, isProcessAlive). Shared implementations live in

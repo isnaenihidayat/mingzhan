@@ -308,7 +308,7 @@ export function ChatPageColumn({
           : "flex-1 px-3 sm:px-6",
         // No room for two columns on a phone, so an open panel takes over.
         attachmentPanel.isOpen &&
-        "max-sm:pointer-events-none max-sm:w-0 max-sm:flex-none max-sm:overflow-hidden max-sm:px-0 max-sm:opacity-0",
+          "max-sm:pointer-events-none max-sm:w-0 max-sm:flex-none max-sm:overflow-hidden max-sm:px-0 max-sm:opacity-0",
         centered && "justify-center"
       )}
     >
@@ -317,7 +317,6 @@ export function ChatPageColumn({
     </div>
   );
 }
-
 
 /**
  * In cognito the pleasantry is the least useful thing on screen, so the slot
@@ -343,13 +342,13 @@ export function AgentMascot({ className }: { className?: string }) {
     <div
       aria-hidden="true"
       className={cn(
-        "relative select-none pointer-events-none transform transition-transform duration-300 hover:scale-105",
+        "pointer-events-none relative transform select-none transition-transform duration-300 hover:scale-105",
         className
       )}
     >
       <img
         alt="Agent Mascot"
-        className="w-24 h-auto sm:w-32 drop-shadow-[0_14px_28px_rgba(0,0,0,0.35)]"
+        className="h-auto w-24 drop-shadow-[0_14px_28px_rgba(0,0,0,0.35)] sm:w-32"
         draggable={false}
         src="/duck-mascot.png"
       />
@@ -357,7 +356,7 @@ export function AgentMascot({ className }: { className?: string }) {
   );
 }
 
-export interface SuggestionCategory {
+interface SuggestionCategory {
   icon: React.ComponentType<{ className?: string }>;
   id: string;
   items: {
@@ -368,131 +367,131 @@ export interface SuggestionCategory {
   label: string;
 }
 
-export const SUGGESTION_CATEGORIES: SuggestionCategory[] = [
+const SUGGESTION_CATEGORIES: SuggestionCategory[] = [
   {
-    id: "sales",
-    label: "Sales & Revenue",
     icon: Target01Icon,
+    id: "sales",
     items: [
       {
         icon: PresentationBarChart01Icon,
-        text: "Penyusunan proposal penawaran media plan billboard & videotron untuk klien korporat.",
         prompt:
           "Buatkan draft proposal penawaran media plan OOH/DOOH untuk brand FMCG, mencakup rekomendasi titik videotron strategis, estimasi traffic impression, dan simulasi paket harga bundling.",
+        text: "Penyusunan proposal penawaran media plan billboard & videotron untuk klien korporat.",
       },
       {
         icon: Location01Icon,
-        text: "Pengecekan ketersediaan (occupancy) dan jadwal slot tayang spot DOOH prime area.",
         prompt:
           "Cek occupancy rate dan ketersediaan slot tayang videotron LED di area Sudirman-Thamrin dan Gatot Subroto untuk periode Q3-Q4.",
+        text: "Pengecekan ketersediaan (occupancy) dan jadwal slot tayang spot DOOH prime area.",
       },
       {
         icon: Coins01Icon,
-        text: "Simulasi rate card diskon progresif berdasarkan durasi sewa spot OOH tahunan.",
         prompt:
           "Hitung simulasi pricing dan margin profit jika klien agency meminta diskon kontrak sewa 12 bulan untuk 3 titik billboard statis dengan pembayaran bertahap.",
+        text: "Simulasi rate card diskon progresif berdasarkan durasi sewa spot OOH tahunan.",
       },
     ],
+    label: "Sales & Revenue",
   },
   {
-    id: "marketing",
-    label: "Marketing",
     icon: Megaphone01Icon,
+    id: "marketing",
     items: [
       {
         icon: Analytics01Icon,
-        text: "Analisis estimasi VAC (Visual Attention Catchers) dan demografi audiens titik DOOH.",
         prompt:
           "Analisis profil demografi audiens, estimasi traffic harian, dan peak hours untuk titik DOOH dekat pusat perbelanjaan dan stasiun MRT guna mendukung pitch deck klien.",
+        text: "Analisis estimasi VAC (Visual Attention Catchers) dan demografi audiens titik DOOH.",
       },
       {
         icon: SparklesIcon,
-        text: "Ide kampanye interaktif DOOH terintegrasi QR code, pDOOH, dan dynamic content trigger.",
         prompt:
           "Berikan 5 konsep ide kampanye pDOOH kreatif (programmatic DOOH) berbasis trigger cuaca real-time dan interaksi mobile untuk brand otomotif.",
+        text: "Ide kampanye interaktif DOOH terintegrasi QR code, pDOOH, dan dynamic content trigger.",
       },
       {
         icon: ChartHistogramIcon,
-        text: "Pembuatan laporan campaign post-buy report dan bukti tayang (Proof of Play) ke advertiser.",
         prompt:
           "Susun kerangka laporan akhir kampanye tayang DOOH (Post-Buy Report), mencakup total play count, share of voice (SOV), foto dokumentasi waktu tayang, dan ringkasan jangkauan audiens.",
+        text: "Pembuatan laporan campaign post-buy report dan bukti tayang (Proof of Play) ke advertiser.",
       },
     ],
+    label: "Marketing",
   },
   {
-    id: "finance",
-    label: "Finance",
     icon: MoneyBag01Icon,
+    id: "finance",
     items: [
       {
         icon: Invoice01Icon,
-        text: "Rekonsiliasi invoice penagihan sewa media OOH & monitoring aging piutang agency.",
         prompt:
           "Bantu buatkan template dan strategi follow-up reminder piutang invoice sewa billboard agency yang jatuh tempo di atas 60 hari beserta perhitungan denda keterlambatan.",
+        text: "Rekonsiliasi invoice penagihan sewa media OOH & monitoring aging piutang agency.",
       },
       {
         icon: Coins01Icon,
-        text: "Kalkulasi proyeksi ROI dan payback period investasi pemasangan konstruksi LED billboard baru.",
         prompt:
           "Hitung proyeksi CAPEX, biaya sewa lahan pemerintah, konsumsi listrik bulanan, serta perkiraan break-even point (BEP) untuk investasi unit videotron LED 8x16 meter di lokasi arteri.",
+        text: "Kalkulasi proyeksi ROI dan payback period investasi pemasangan konstruksi LED billboard baru.",
       },
       {
         icon: Book01Icon,
-        text: "Audit kepatuhan pembayaran Pajak Reklame (BPRD) dan biaya sewa lahan izin titik reklame.",
         prompt:
           "Susun checklist audit kepatuhan pembayaran Pajak Reklame Daerah, retribusi perpanjangan IMB/PBG konstruksi reklame, dan biaya sewa lahan swasta tahun berjalan.",
+        text: "Audit kepatuhan pembayaran Pajak Reklame (BPRD) dan biaya sewa lahan izin titik reklame.",
       },
     ],
+    label: "Finance",
   },
   {
-    id: "it",
-    label: "IT & Operations",
     icon: SourceCodeIcon,
+    id: "it",
     items: [
       {
         icon: SourceCodeIcon,
-        text: "Integrasi CMS videotron, software media player, dan sistem monitoring uptime layar LED.",
         prompt:
           "Rancang arsitektur monitoring IoT dan CMS videotron untuk mendeteksi screen blackout, kegagalan controller receiver card (Novastar/Colorlight), dan alerting otomatis via Webhook/Telegram.",
+        text: "Integrasi CMS videotron, software media player, dan sistem monitoring uptime layar LED.",
       },
       {
         icon: GitBranchIcon,
-        text: "Workflow otomatisasi penjadwalan konten playlist dan verifikasi log Proof of Play (PoP).",
         prompt:
           "Buatkan alur kerja otomatis untuk validasi file video iklan (resolusi, aspect ratio, bitrate, durasi 15s/30s) sebelum di-push ke server media player DOOH.",
+        text: "Workflow otomatisasi penjadwalan konten playlist dan verifikasi log Proof of Play (PoP).",
       },
       {
         icon: Shield01Icon,
-        text: "Protokol keamanan jaringan player videotron publik terhadap ancaman deface konten.",
         prompt:
           "Buatkan panduan hardening keamanan jaringan dan media player mini PC DOOH (isolasi VPN, firewall port, disabled remote USB, proteksi OS) untuk mencegah peretasan tayangan layar publik.",
+        text: "Protokol keamanan jaringan player videotron publik terhadap ancaman deface konten.",
       },
     ],
+    label: "IT & Operations",
   },
   {
-    id: "hr",
-    label: "HR & General Affairs",
     icon: UserGroupIcon,
+    id: "hr",
     items: [
       {
         icon: UserGroupIcon,
-        text: "Kompensasi skema komisi & insentif Account Executive (Sales OOH) berbasis revenue kuartalan.",
         prompt:
           "Rancang struktur KPI dan skema tiering komisi penjualan yang kompetitif untuk tim Sales/Account Executive media OOH berdasarkan pencapaian target gross billing tahunan.",
+        text: "Kompensasi skema komisi & insentif Account Executive (Sales OOH) berbasis revenue kuartalan.",
       },
       {
         icon: Shield01Icon,
-        text: "SOP Keselamatan Kerja (K3) untuk tim maintenance teknisi instalasi reklame ketinggian.",
         prompt:
           "Susun Standard Operating Procedure (SOP) K3 untuk pekerjaan teknisi di ketinggian (working at heights), mencakup izin kerja (SIKA), pemakaian full body harness, dan penanganan kondisi cuaca ekstrem.",
+        text: "SOP Keselamatan Kerja (K3) untuk tim maintenance teknisi instalasi reklame ketinggian.",
       },
       {
         icon: Book01Icon,
-        text: "Program onboarding karyawan baru industri periklanan Out-of-Home & terminologi DOOH.",
         prompt:
           "Buat silabus modul onboarding 2 minggu untuk karyawan baru di perusahaan media OOH, mencakup pemahaman istilah industri (SOV, VAC, traffic count, pDOOH, izin titik reklame).",
+        text: "Program onboarding karyawan baru industri periklanan Out-of-Home & terminologi DOOH.",
       },
     ],
+    label: "HR & General Affairs",
   },
 ];
 
@@ -513,9 +512,11 @@ export function ChatQuickStarters({
       onSelectStarter(prompt);
     } else if (promptCtrl) {
       promptCtrl.textInput.setInput(prompt);
+
       const composer = document.querySelector<HTMLTextAreaElement>(
         'textarea[name="message"]:not(:disabled):not([readonly])'
       );
+
       composer?.focus();
     }
   };
@@ -523,14 +524,15 @@ export function ChatQuickStarters({
   return (
     <div className="w-full rounded-2xl border border-border/80 bg-card/70 p-3 shadow-xs backdrop-blur-md transition-all duration-200">
       {/* Category Tab Pills */}
-      <div className="flex items-center gap-1.5 overflow-x-auto pb-2 scrollbar-none">
+      <div className="scrollbar-none flex items-center gap-1.5 overflow-x-auto pb-2">
         {SUGGESTION_CATEGORIES.map((category) => {
           const Icon = category.icon;
           const isActive = activeTab === category.id;
+
           return (
             <button
               className={cn(
-                "flex shrink-0 items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-all duration-150",
+                "flex shrink-0 items-center gap-1.5 rounded-full px-3 py-1 font-medium text-xs transition-all duration-150",
                 isActive
                   ? "border border-border bg-background text-foreground shadow-2xs"
                   : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
@@ -550,6 +552,7 @@ export function ChatQuickStarters({
       <div className="mt-1 flex flex-col gap-1">
         {currentCategory.items.map((item, idx) => {
           const ItemIcon = item.icon;
+
           return (
             <button
               className="group flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2.5 text-left transition-all duration-150 hover:bg-muted/60 dark:hover:bg-muted/40"
@@ -559,11 +562,11 @@ export function ChatQuickStarters({
             >
               <div className="flex min-w-0 items-center gap-3">
                 <ItemIcon className="size-4 shrink-0 text-muted-foreground transition-colors group-hover:text-foreground" />
-                <span className="truncate text-xs text-foreground/90 font-normal group-hover:text-foreground">
+                <span className="truncate font-normal text-foreground/90 text-xs group-hover:text-foreground">
                   {item.text}
                 </span>
               </div>
-              <ArrowRight01Icon className="size-4 shrink-0 text-muted-foreground opacity-0 transition-all duration-150 -translate-x-1 group-hover:translate-x-0 group-hover:opacity-100 group-hover:text-foreground" />
+              <ArrowRight01Icon className="size-4 shrink-0 -translate-x-1 text-muted-foreground opacity-0 transition-all duration-150 group-hover:translate-x-0 group-hover:text-foreground group-hover:opacity-100" />
             </button>
           );
         })}
@@ -605,12 +608,12 @@ export function ChatWelcome({
                 <div className="flex size-5 items-center justify-center rounded-md border border-border bg-card/80 text-primary shadow-2xs">
                   <SparklesIcon className="size-3" />
                 </div>
-                <span className="text-[11px] font-medium tracking-wider uppercase text-muted-foreground">
+                <span className="font-medium text-[11px] text-muted-foreground uppercase tracking-wider">
                   MingZhan (明战) Workspace
                 </span>
               </div>
 
-              <h2 className="text-2xl font-normal tracking-tight text-foreground sm:text-3xl">
+              <h2 className="font-normal text-2xl text-foreground tracking-tight sm:text-3xl">
                 Turn your ideas into{" "}
                 <span className="font-semibold text-foreground">
                   agents & workflows
@@ -619,7 +622,7 @@ export function ChatWelcome({
 
               <div className="flex flex-wrap items-center gap-2 pt-1">
                 <div className="flex items-center gap-2 rounded-xl border border-border/80 bg-card/60 px-3 py-1 backdrop-blur-xs">
-                  <span className="text-2xs text-muted-foreground font-medium">
+                  <span className="font-medium text-2xs text-muted-foreground">
                     {TRANSLATIONS[language]?.zhanyouLabel ?? "Agent:"}
                   </span>
                   <ChatProfileSwitcher
@@ -632,7 +635,7 @@ export function ChatWelcome({
                   />
                 </div>
                 {profile?.isSuper && (
-                  <span className="inline-flex items-center rounded-lg border border-primary/30 bg-primary/10 px-2 py-0.5 text-2xs font-medium text-primary">
+                  <span className="inline-flex items-center rounded-lg border border-primary/30 bg-primary/10 px-2 py-0.5 font-medium text-2xs text-primary">
                     Super Agent
                   </span>
                 )}

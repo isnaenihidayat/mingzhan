@@ -84,6 +84,7 @@ export function registerSessionRoutes(
       codingWorkspaceRoot: z.string().optional(),
       model: z.string().trim().min(1).optional(),
       profileId: z.string().optional(),
+      projectId: z.string().nullable().optional(),
       thinkingEffort: thinkingEffortSchema.optional(),
     })
     .openapi("CreateSessionRequest");
@@ -201,8 +202,9 @@ export function registerSessionRoutes(
   const updateSessionRequestSchema = z
     .object({
       model: z.string().trim().min(1).nullable().optional(),
-      pinned: z.boolean().optional(),
       parentSessionId: z.null().optional(),
+      pinned: z.boolean().optional(),
+      projectId: z.string().nullable().optional(),
       thinkingEffort: thinkingEffortSchema.nullable().optional(),
       title: z.string().trim().min(1).max(200).optional(),
     })
@@ -211,6 +213,7 @@ export function registerSessionRoutes(
         body.model !== undefined ||
         body.pinned !== undefined ||
         body.parentSessionId !== undefined ||
+        body.projectId !== undefined ||
         body.thinkingEffort !== undefined ||
         body.title !== undefined,
       "At least one session field is required."
@@ -730,6 +733,7 @@ export function registerSessionRoutes(
         isPlatformAdmin: auth.isPlatformAdmin,
         model: body.model,
         orgRole: auth.orgRole,
+        projectId: body.projectId,
         thinkingEffort: body.thinkingEffort,
       }
     );
@@ -869,6 +873,21 @@ export function registerSessionRoutes(
 
       if (!updated) {
         return errorResponse("Session not found", 404);
+      }
+    }
+
+    if (body.projectId !== undefined) {
+      const normalizedProjectId =
+        body.projectId && body.projectId.trim() ? body.projectId.trim() : null;
+
+      const updated = await agent.updateSessionProject(
+        sessionId,
+        orgId,
+        normalizedProjectId
+      );
+
+      if (!updated) {
+        return errorResponse("Session or project not found", 404);
       }
     }
 

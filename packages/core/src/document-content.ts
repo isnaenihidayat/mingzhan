@@ -161,18 +161,14 @@ export async function resolveUserContentForProvider(
   provider: ProviderName
 ): Promise<string | MessageContentPart[]> {
   if (Array.isArray(content)) {
-    const resolved: MessageContentPart[] = [];
-
-    for (const part of content) {
-      if (part.type === "document") {
-        resolved.push(await resolveDocumentPartForProvider(part, provider));
-        continue;
-      }
-
-      resolved.push(part);
-    }
-
-    return resolved;
+    // The shared parser semaphore bounds native work; preserve attachment order.
+    return Promise.all(
+      content.map((part) =>
+        part.type === "document"
+          ? resolveDocumentPartForProvider(part, provider)
+          : part
+      )
+    );
   }
 
   return content;

@@ -1061,6 +1061,7 @@ test.each([false, true])(
       intent: "automation",
       new: "1",
       profile: "profileA",
+      project: "projectA",
     });
 
     if (send) {
@@ -1110,6 +1111,10 @@ test.each([false, true])(
 
       expect(sent).toEqual(send ? [draft] : []);
       expect(createSession).toHaveBeenCalledTimes(send ? 1 : 0);
+
+      if (send) {
+        expect(createSession.mock.calls[0]?.[1]?.projectId).toBe("projectA");
+      }
     } finally {
       await act(async () => root.unmount());
       createSession.mockRestore();

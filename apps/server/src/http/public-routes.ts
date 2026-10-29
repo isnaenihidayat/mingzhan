@@ -35,6 +35,8 @@ export function isPublicRouteRequest(
     (method === "GET" &&
       /^\/v1\/mcp\/oauth\/callback\/[^/]+$/.test(pathname)) ||
     (method === "GET" &&
-      /^\/v1\/public\/artifact-shares\/[^/]+$/.test(pathname))
+      /^\/v1\/public\/artifact-shares\/[^/]+$/.test(pathname)) ||
+    (method === "GET" &&
+      /^\/v1\/public\/conversation-shares\/[^/]+$/.test(pathname))
   );
 }

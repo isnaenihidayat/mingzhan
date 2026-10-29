@@ -44,7 +44,11 @@ export function useRecentChatTree(
   profileId: string,
   sessions: SessionSummary[],
   onRename: (target: SessionTarget) => void,
-  onDelete: (target: SessionTarget) => void
+  onDelete: (target: SessionTarget) => void,
+  onShare?: (target: SessionTarget) => void,
+  onMoveToProject?: (
+    target: SessionTarget & { projectId?: string | null }
+  ) => void
 ) {
   const setSessionOrder = useSetSessionOrderMutation();
   const [localOrder, setLocalOrder] = useState<string[] | null>(null);
@@ -391,8 +395,10 @@ export function useRecentChatTree(
               }
             }
       }
+      onMoveToProject={onMoveToProject}
       onPointerStartDrag={(event) => startDrag(session, event)}
       onRename={onRename}
+      onShare={onShare}
       onTogglePin={() =>
         void updateSession.mutateAsync({
           input: { pinned: !session.pinned },
