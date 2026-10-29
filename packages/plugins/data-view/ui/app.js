@@ -806,6 +806,6 @@ function apply(ctx) {
   ctx.slots.register("page", DataViewPage);
 }
 export {
-  apply,
-  inject
+  inject,
+  apply
 };

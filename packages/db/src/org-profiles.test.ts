@@ -471,3 +471,54 @@ describe("profile ACP agent", () => {
     expect(saved?.acpAgent).toBeNull();
   });
 });
+
+test("new productivity skills reach existing agents while specialist skills stay on Super agents", async () => {
+  const db = createInMemoryDatabaseAdapter();
+  const regular = await seedOrgDefaultProfile(db, "org_skills");
+  const superAgent = await seedOrgSuperMingzhanProfile(db, "org_skills");
+
+  const productivity = [
+    "pdf",
+    "docx",
+    "xlsx",
+    "pptx",
+    "doc-coauthoring",
+    "internal-comms",
+    "brand-guidelines",
+    "theme-factory",
+    "web-artifacts-builder",
+    "canvas-design",
+    "algorithmic-art",
+    "slack-gif-creator",
+  ];
+
+  const specialist = [
+    "frontend-design",
+    "mcp-builder",
+    "webapp-testing",
+    "skill-creator",
+    "claude-api",
+  ];
+
+  for (const name of [...productivity, ...specialist]) {
+    await upsertSkill(db, name);
+  }
+
+  await ensureBundledSkillsAssigned(db);
+  await ensureBundledSkillsAssigned(db);
+
+  const regularNames = (await db.listSkillsForProfile(regular.id)).map(
+    (skill) => skill.name
+  );
+
+  const superNames = (await db.listSkillsForProfile(superAgent.id)).map(
+    (skill) => skill.name
+  );
+
+  expect(regularNames.toSorted()).toEqual(productivity.toSorted());
+  expect(superNames.toSorted()).toEqual(
+    [...productivity, ...specialist].toSorted()
+  );
+  expect(new Set(regularNames).size).toBe(regularNames.length);
+  expect(new Set(superNames).size).toBe(superNames.length);
+});

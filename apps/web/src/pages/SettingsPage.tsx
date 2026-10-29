@@ -22,7 +22,9 @@ import { ImageGenerationSettingsCard } from "@/components/settings/ImageGenerati
 import { MfaSettingsCard } from "@/components/settings/MfaSettingsCard";
 import { PlatformMfaSettingsCard } from "@/components/settings/PlatformMfaSettingsCard";
 import { ProviderSettingsCard } from "@/components/settings/ProviderSettingsCard";
+import { SetupRecommendations } from "@/components/settings/SetupRecommendations";
 import { TranscriptionSettingsCard } from "@/components/settings/TranscriptionSettingsCard";
+import { VersionSettingsRow } from "@/components/settings/VersionSettingsRow";
 import { VisionSettingsCard } from "@/components/settings/VisionSettingsCard";
 import { WebPublicUrlSettingsRow } from "@/components/settings/WebPublicUrlSettingsRow";
 import { WebSearchSettingsCard } from "@/components/settings/WebSearchSettingsCard";
@@ -129,6 +131,7 @@ export function SettingsPage() {
             </div>
 
             <UserContextSettings />
+            <SetupRecommendations />
 
             <div
               className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"
@@ -145,12 +148,10 @@ export function SettingsPage() {
             </div>
 
             {version ? (
-              <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
-                <p className="font-medium text-foreground text-sm">Version</p>
-                <p className="font-mono text-muted-foreground text-sm tabular-nums">
-                  {version}
-                </p>
-              </div>
+              <VersionSettingsRow
+                updateCheckEnabled={health?.updateCheckEnabled === true}
+                version={version}
+              />
             ) : null}
 
             {isPlatformAdmin ? (

@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { saveComposioConfig } from "@mingzhan/core";
 import { createInMemoryDatabaseAdapter } from "@mingzhan/db";
 import { AgentService } from "../../services/agent-service";
 import { AuthService } from "../../services/auth-service";
@@ -52,7 +51,7 @@ function createMockClient(): Pick<
 async function createApp() {
   const configDir = await mkdtemp(join(tmpdir(), "mingzhan-composio-route-"));
   process.env.MINGZHAN_CONFIG_DIR = configDir;
-  await saveComposioConfig({ apiKey: TEST_API_KEY });
+  process.env.COMPOSIO_API_KEY = TEST_API_KEY;
 
   const databaseAdapter = createInMemoryDatabaseAdapter();
   const authService = new AuthService();

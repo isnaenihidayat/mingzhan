@@ -8,7 +8,10 @@ import {
   setErrorSink,
   type ToolContext,
 } from "@mingzhan/core";
-import type { StoredToolRecord } from "@mingzhan/db";
+import {
+  createInMemoryDatabaseAdapter,
+  type StoredToolRecord,
+} from "@mingzhan/db";
 import { waitForExit, waitForPidFile } from "./coding-agent-test-fixtures";
 import {
   CUSTOM_TOOL_HANDLERS,
@@ -18,7 +21,9 @@ import {
   TOOL_RETRYABLE_EXIT_CODE,
   withToolRetries,
 } from "./custom-tool-handlers";
+import { setToolSecrets } from "./custom-tool-shared";
 import { spawnJsonTool } from "./custom-tool-subprocess";
+import { ManagedSecrets } from "./managed-secrets";
 
 function ctx(signal?: AbortSignal): ToolContext {
   return { signal };
@@ -51,6 +56,12 @@ let queueDir = "";
 const realConsoleError = console.error;
 
 beforeEach(async () => {
+  setToolSecrets(
+    new ManagedSecrets(
+      createInMemoryDatabaseAdapter(),
+      Buffer.alloc(32, 1).toString("base64")
+    )
+  );
   // reportError queues before it sends, and that queue is a read-modify-write on
   // one file under MINGZHAN_CONFIG_DIR. Without a temp dir here the suite trims
   // the real queue on whatever machine runs it.
@@ -483,7 +494,10 @@ describe("custom-tool process cleanup", () => {
     test.skipIf(process.platform === "win32")(
       `${mode} stops a descendant that ignores SIGTERM`,
       async () => {
-        const dir = await mkdtemp(path.join(os.tmpdir(), "mingzhan-tool-tree-"));
+        const dir = await mkdtemp(
+          path.join(os.tmpdir(), "mingzhan-tool-tree-")
+        );
+
         const modulePath = path.join(dir, "spawn-child.js");
         const pidFile = path.join(dir, "descendant.pid");
 

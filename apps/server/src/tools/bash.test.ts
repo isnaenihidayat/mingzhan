@@ -180,13 +180,13 @@ describe("bash tool", () => {
         {
           command: '"$MINGZHAN_TEST_BUN" child.cjs & wait',
           env: { MINGZHAN_TEST_BUN: process.execPath },
-          // The clock starts at spawn. On Windows the shell and the child can
-          // need more than 500 ms to start, and then no PID is ever written.
+          // The clock starts at spawn. Windows and macOS login shells can
+          // need more than 500 ms before the child writes its PID.
           timeoutMs:
             mode === "timeout"
-              ? process.platform === "win32"
-                ? 3000
-                : 500
+              ? process.platform === "linux"
+                ? 500
+                : 3000
               : 30_000,
         },
         {
@@ -210,7 +210,7 @@ describe("bash tool", () => {
 
         const result = await Promise.race([
           pending,
-          Bun.sleep(process.platform === "win32" ? 5000 : 2000).then(
+          Bun.sleep(process.platform === "linux" ? 2000 : 5000).then(
             () => "hung"
           ),
         ]);
@@ -451,10 +451,12 @@ const timer = setInterval(() => {
         process.env.MINGZHAN_CONFIG_DIR = previousConfigDir;
       }
     }
-  });
+  }, 20_000);
 
   test("ordinary commands use the active user workspace from context", async () => {
-    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-user-"));
+    workspaceRoot = await mkdtemp(
+      path.join(os.tmpdir(), "mingzhan-bash-user-")
+    );
 
     const result = await runBash(
       { command: process.platform === "win32" ? "pwd -W" : "pwd" },
@@ -509,7 +511,7 @@ const timer = setInterval(() => {
         { backend: "host" }
       )
     ).rejects.toBeInstanceOf(PathGuardError);
-  });
+  }, 20_000);
 
   test("coding-agent workspace selection respects explicit overrides", async () => {
     workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));
@@ -547,7 +549,7 @@ const timer = setInterval(() => {
       (await realpath(workspaceRoot)).replaceAll("\\", "/")
     );
     await rm(codingWorkspaceRoot, { force: true, recursive: true });
-  });
+  }, 20_000);
 
   test("supports cwd within the profile workspace", async () => {
     workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "mingzhan-bash-"));

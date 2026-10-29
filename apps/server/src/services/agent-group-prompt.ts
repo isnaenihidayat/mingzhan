@@ -1,11 +1,8 @@
-import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { extname, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { DocumentAttachment, ProfileSummary } from "@mingzhan/core";
 import {
-  getGroupSharedDir,
   getProfileSoulDir,
-  MíngZhànApiError,
   resolveDocumentPartForProvider,
   SOUL_FILES,
   SOUL_TEMPLATE,
@@ -19,14 +16,16 @@ import {
   validateDocumentAttachments,
   validateImageAttachments,
 } from "@mingzhan/core/message-content";
-import { GROUP_MEMORY_CHARS, readGroupMemory } from "./agent-group-memory";
 import {
-  type GroupDocument,
-  getAgentGroup,
   listAgentGroupMessages,
   listAgentGroupThreadMessages,
   listGroupMessageDocuments,
 } from "./agent-group-store";
+import {
+  groupWorkspace,
+  type PostedDocument,
+  workspaceOfGroup,
+} from "./agent-group-workspace";
 
 const CONTEXT_MESSAGES = 40;
 
@@ -44,15 +43,6 @@ const CHAT_STYLE =
 const ARTIFACT_GUIDANCE =
   "For a file the user asked for (page, report, deck, code, data), save it with save_artifact and name its path, like artifacts/report.html, in your short reply. Never paste the file into the chat.";
 
-/** The group's shared folder, created on first use. */
-export function ensureGroupSharedDir(orgId: string, groupId: string): string {
-  const dir = getGroupSharedDir(orgId, groupId);
-
-  mkdirSync(dir, { recursive: true });
-
-  return dir;
-}
-
 const sharedGuidance = (sharedDir: string) =>
   `The group has a shared folder at ${sharedDir}. Every member can read and write it with the file tools, using absolute paths. Keep files the team builds on (outline, notes, drafts) there and read what others wrote before you answer. When you mention a file to the user, write its path inside the folder, like shared/plan.md, never the full path.`;
 
@@ -69,23 +59,13 @@ export function groupMembers(
 const MEMORY_GUIDANCE =
   "When the user states or agrees to something worth keeping across chats, like a decision, a name or a preference, save it as one short entry with update_group_memory, or fix a wrong entry there. A suggestion from you or a teammate is not a decision until the user agrees to it. Never save secrets.";
 
-/** The group's memory, cut at the cap, and how to add to it. */
+/** The group's memory as members see it, and how to add to it. */
 function memorySection(sharedDir: string): string[] {
-  const memory = readGroupMemory(sharedDir);
-  const head = memory.slice(0, GROUP_MEMORY_CHARS);
-
-  // Cut at the last full line, so no fact is half shown; one line past the cap is cut where it is.
-  const lastLineEnd =
-    memory[GROUP_MEMORY_CHARS] === "\n" ? head.length : head.lastIndexOf("\n");
-
-  const shown =
-    memory.length > GROUP_MEMORY_CHARS
-      ? `${lastLineEnd > 0 ? head.slice(0, lastLineEnd) : head}\n[truncated]`
-      : memory;
+  const memory = groupWorkspace(sharedDir).memory.forPrompt();
 
   return [
-    shown
-      ? `Group memory, kept across every chat in this group:\n${shown}`
+    memory
+      ? `Group memory, kept across every chat in this group:\n${memory}`
       : "The group memory is empty.",
     MEMORY_GUIDANCE,
   ];
@@ -142,7 +122,10 @@ function mayPass(
   );
 
   return (
-    since.length > 1 &&
+    since.some(
+      ({ authorProfileId, content }) =>
+        authorProfileId !== null && content !== ""
+    ) &&
     !since.some(({ authorProfileId, content }) =>
       mentionedMemberIds(
         content,
@@ -190,10 +173,10 @@ export function groupTurn(
   speaker: ProfileSummary,
   handles: Map<string, string>
 ) {
-  const sharedDir = ensureGroupSharedDir(orgId, group.id);
+  const sharedDir = workspaceOfGroup(orgId, group.id).open();
 
   const optional = mayPass(
-    listAgentGroupMessages(orgId, sessionId),
+    listAgentGroupMessages(orgId, sessionId, undefined, false),
     speaker.id,
     handles
   );
@@ -259,7 +242,11 @@ function labelled(
     )
   );
 
-  return messages.map(({ authorProfileId, content, id }) => {
+  return messages.flatMap(({ authorProfileId, content, id }) => {
+    if (authorProfileId !== null && content === "") {
+      return [];
+    }
+
     if (authorProfileId === null) {
       const attached = (documents.get(id) ?? []).map(
         ({ filename, text }) => `[File: ${filename}]\n${text}`
@@ -290,7 +277,7 @@ export function transcript(
 ): string {
   return labelled(
     orgId,
-    listAgentGroupMessages(orgId, sessionId, CONTEXT_MESSAGES),
+    listAgentGroupMessages(orgId, sessionId, CONTEXT_MESSAGES, false),
     handles,
     members
   )
@@ -326,7 +313,8 @@ export function threadTranscript(
   const main = listAgentGroupMessages(
     orgId,
     sessionId,
-    CONTEXT_MESSAGES
+    CONTEXT_MESSAGES,
+    false
   ).filter((message) => message.id <= rootId);
 
   const thread = listAgentGroupThreadMessages(orgId, sessionId, rootId);
@@ -342,45 +330,24 @@ export function threadTranscript(
 
 /**
  * The text of attached documents, read before a message is saved so a bad file
- * fails the send instead of an agent's turn. An image is saved in the group's
- * shared folder, and the agents get its path to open with read_file.
+ * fails the send instead of an agent's turn. Nothing is written here: an image
+ * is saved to the group's folder only once the post is known to be valid.
  */
 export async function readGroupDocuments(
-  orgId: string,
-  userId: string,
-  groupId: string,
   attachments: DocumentAttachment[]
-): Promise<GroupDocument[]> {
+): Promise<PostedDocument[]> {
   const isImage = (attachment: DocumentAttachment) =>
     attachment.mediaType.startsWith("image/");
 
   validateImageAttachments(attachments.filter(isImage));
   validateDocumentAttachments(attachments.filter((a) => !isImage(a)));
 
-  // Checked before an image is written to the group's folder.
-  if (attachments.some(isImage) && !getAgentGroup(orgId, userId, groupId)) {
-    throw new MíngZhànApiError("Group not found", 404);
-  }
-
   return await Promise.all(
     attachments.map(async (document) => {
       const filename = document.filename.trim() || "image";
 
       if (isImage(document)) {
-        const sharedDir = ensureGroupSharedDir(orgId, groupId);
-        const path = `uploads/${randomUUID().slice(0, 8)}${extname(filename) || ".png"}`;
-
-        mkdirSync(join(sharedDir, "uploads"), { recursive: true });
-        writeFileSync(
-          join(sharedDir, path),
-          Buffer.from(document.data, "base64")
-        );
-
-        return {
-          filename,
-          path,
-          text: `Image saved at ${join(sharedDir, path)}. Open it with read_file to see it.`,
-        };
+        return { filename, image: Buffer.from(document.data, "base64") };
       }
 
       // A provider with no native documents always gets them as text.

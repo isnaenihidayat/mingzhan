@@ -7,6 +7,18 @@ export const DEFAULT_BUNDLED_SKILL_NAMES = [
   "artifact-design",
   "composio-integrations",
   "mingzhan-guide",
+  "pdf",
+  "docx",
+  "xlsx",
+  "pptx",
+  "doc-coauthoring",
+  "internal-comms",
+  "brand-guidelines",
+  "theme-factory",
+  "web-artifacts-builder",
+  "canvas-design",
+  "algorithmic-art",
+  "slack-gif-creator",
 ] as const;
 
 export const SUPER_MINGZHAN_BUNDLED_SKILL_NAMES = [
@@ -14,6 +26,11 @@ export const SUPER_MINGZHAN_BUNDLED_SKILL_NAMES = [
   "create-profile",
   "create-skill",
   "coding-agent",
+  "frontend-design",
+  "mcp-builder",
+  "webapp-testing",
+  "skill-creator",
+  "claude-api",
 ] as const;
 
 export const RUNTIME_ONLY_BUNDLED_SKILL_NAMES = [

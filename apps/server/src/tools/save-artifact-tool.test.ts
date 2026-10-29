@@ -1,9 +1,17 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import {
+  access,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   getProfileSoulDir,
+  runDeleteFile,
   runWriteFile,
   type ToolContext,
 } from "@mingzhan/core";
@@ -127,6 +135,48 @@ describe("save_artifact", () => {
       userId: "user_ana",
       userName: "Ana",
     });
+  });
+
+  test("a reserved artifact retains ownership after a binary generator writes it", async () => {
+    const reserved = await runSaveArtifactTool(
+      { content: "Document generation pending.", path: "artifacts/report.pdf" },
+      context,
+      { db }
+    );
+
+    const bytes = new TextEncoder().encode(
+      "%PDF-1.4\n% generated document fixture\n"
+    );
+
+    await writeFile(reserved.path, bytes);
+    const agent = new AgentService(null, null, db);
+
+    const owned = await agent.listProfileArtifacts(
+      "org_a",
+      "profile_a",
+      {},
+      "user_ana"
+    );
+
+    expect(owned.artifacts).toHaveLength(1);
+    expect(owned.artifacts[0]).toMatchObject({
+      filename: "report.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: bytes.byteLength,
+    });
+
+    const downloaded = await agent.readProfileArtifact(
+      "org_a",
+      "profile_a",
+      "report.pdf"
+    );
+
+    expect(downloaded.bytes).toEqual(bytes);
+    expect(downloaded.contentType).toBe("application/pdf");
+    expect(
+      (await agent.listProfileArtifacts("org_a", "profile_a", {}, "user_bo"))
+        .artifacts
+    ).toHaveLength(0);
   });
 
   test("ignores an owner passed in the tool input", async () => {
@@ -335,9 +385,45 @@ describe("write_file under artifacts/", () => {
       runWriteFile({ content: "x", path: "artifacts/a.md" }, scope)
     ).rejects.toThrow();
 
+    const existing = await runWriteFile(
+      { content: "x", path: "artifacts/b.md" },
+      { orgId: "org_a", profileId: "profile_a" }
+    );
+
+    await expect(
+      runWriteFile({ content: "y", path: existing.path }, scope)
+    ).rejects.toThrow();
+
+    expect(await readFile(existing.path, "utf8")).toBe("x");
+
     const other = await runWriteFile({ content: "x", path: "notes.md" }, scope);
 
     expect(await readFile(other.path, "utf8")).toBe("x");
+  });
+
+  test("delete_file is refused under artifacts/ when save_artifact is assigned", async () => {
+    const owner = { orgId: "org_a", profileId: "profile_a" };
+    const scope = { ...owner, forbidArtifactFileWrites: true };
+
+    const artifact = await runWriteFile(
+      { content: "x", path: "artifacts/a.md" },
+      owner
+    );
+
+    await expect(
+      runDeleteFile({ path: "artifacts/a.md" }, scope)
+    ).rejects.toThrow();
+    await expect(
+      runDeleteFile({ path: artifact.path }, scope)
+    ).rejects.toThrow();
+
+    expect(await readFile(artifact.path, "utf8")).toBe("x");
+
+    const other = await runWriteFile({ content: "x", path: "notes.md" }, scope);
+
+    await runDeleteFile({ path: "notes.md" }, scope);
+
+    await expect(access(other.path)).rejects.toThrow();
   });
 
   test("still works when save_artifact is not assigned", async () => {

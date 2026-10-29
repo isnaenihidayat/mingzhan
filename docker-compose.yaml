@@ -1,10 +1,16 @@
 services:
   mingzhan:
-    image: mingzhan:latest
+    image: ${MINGZHAN_IMAGE_REPOSITORY:-mingzhan}:${MINGZHAN_VERSION:-latest}
     ports:
       - "4310:4310"
+    env_file:
+      - mingzhan-secrets.env
     environment:
       - MINGZHAN_CONFIG_DIR=/mingzhan/data
+      # Daily encrypted export, newest 7 kept. Must stay outside the data volume.
+      - MINGZHAN_BACKUP_DIR=/mingzhan/backups
+      # Where the Update button leaves requests for the updater service below.
+      - MINGZHAN_UPDATER_DIR=/mingzhan/updates
       # Optional: skip the browser setup wizard on first boot.
       # All three must be set together or none at all.
       # - MINGZHAN_SEED_ADMIN_EMAIL=admin@example.com
@@ -15,7 +21,33 @@ services:
       # - MINGZHAN_WEB_PUBLIC_URL=https://mingzhan.example.com
     volumes:
       - mingzhan-data:/mingzhan/data
+      - mingzhan-backups:/mingzhan/backups
+      - mingzhan-updates:/mingzhan/updates
+    restart: unless-stopped
+
+  # Optional: the Update button in Settings. Turn it on with
+  # COMPOSE_PROFILES=updater in .env. It holds the Docker socket, which is root
+  # on this host, so it opens no port and only upgrades the mingzhan service.
+  updater:
+    image: docker:29-cli
+    profiles: ["updater"]
+    environment:
+      # The docker:cli image defaults to tcp://docker:2375.
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - MINGZHAN_IMAGE_REPOSITORY=${MINGZHAN_IMAGE_REPOSITORY:-mingzhan}
+      - MINGZHAN_IMAGE=${MINGZHAN_IMAGE_REPOSITORY:-mingzhan}:${MINGZHAN_VERSION:-latest}
+    # The script ships inside the MíngZhàn image, so it updates with MíngZhàn.
+    entrypoint:
+      - sh
+      - -c
+      - docker run --rm --entrypoint cat "$$MINGZHAN_IMAGE" /app/scripts/mingzhan-updater.sh > /tmp/updater.sh && exec sh /tmp/updater.sh
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/compose
+      - mingzhan-updates:/updates
     restart: unless-stopped
 
 volumes:
   mingzhan-data:
+  mingzhan-backups:
+  mingzhan-updates:

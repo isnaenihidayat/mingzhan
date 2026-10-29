@@ -902,6 +902,6 @@ function apply(ctx) {
   ctx.slots.register("page", createPage(ctx));
 }
 export {
-  apply,
-  inject
+  inject,
+  apply
 };

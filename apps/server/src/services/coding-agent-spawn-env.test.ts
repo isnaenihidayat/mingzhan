@@ -90,9 +90,36 @@ describe("coding-agent spawn env", () => {
     expect(modelsJson.providers.mingzhan.baseUrl).toBe(
       "https://custom.example.com/v1"
     );
-    expect(modelsJson.providers.mingzhan.apiKey).toBe("sk-custom-test");
+    expect(modelsJson.providers.mingzhan.apiKey).toBe(
+      "MINGZHAN_HARNESS_API_KEY"
+    );
+    expect(JSON.stringify(modelsJson)).not.toContain("sk-custom-test");
+    expect(env.env.MINGZHAN_HARNESS_API_KEY).toBe("sk-custom-test");
     expect(modelsJson.providers.mingzhan.api).toBe("openai-completions");
     await env.cleanup?.();
+  });
+
+  test("keeps an OpenCode key out of its temporary config", async () => {
+    const spawn = await buildSpawnEnvForHarness(
+      "opencode",
+      activeAnthropicRouting({
+        apiKey: "private-opencode-key",
+        baseUrl: "https://custom.example.com/v1",
+      }),
+      "openai_compatible"
+    );
+
+    const { readFile } = await import("node:fs/promises");
+
+    const config = await readFile(
+      `${spawn.env.XDG_CONFIG_HOME}/opencode/opencode.json`,
+      "utf8"
+    );
+
+    expect(config).toContain("{env:MINGZHAN_HARNESS_API_KEY}");
+    expect(config).not.toContain("private-opencode-key");
+    expect(spawn.env.MINGZHAN_HARNESS_API_KEY).toBe("private-opencode-key");
+    await spawn.cleanup?.();
   });
 
   test("uses mingzhan provider in models.json for anthropic with custom base URL", async () => {
@@ -144,7 +171,10 @@ describe("coding-agent spawn env", () => {
     // Default base URL → override built-in anthropic provider
     expect(modelsJson.providers.anthropic).toBeDefined();
     expect(modelsJson.providers.mingzhan).toBeUndefined();
-    expect(modelsJson.providers.anthropic.apiKey).toBe("sk-ant-test");
+    expect(modelsJson.providers.anthropic.apiKey).toBe(
+      "MINGZHAN_HARNESS_API_KEY"
+    );
+    expect(JSON.stringify(modelsJson)).not.toContain("sk-ant-test");
     await env.cleanup?.();
   });
 
@@ -193,6 +223,30 @@ describe("coding-agent spawn env", () => {
     expect(env.CUSTOM_FLAG).toBe("1");
     expect(env.HOME).toBe("/tmp");
     expect(env).not.toHaveProperty("UNSET_FLAG");
+  });
+
+  test("does not pass managed secrets from the server or caller", () => {
+    const env = mergeCodingAgentSpawnEnv(
+      {
+        EXA_API_KEY_FILE: "/secret",
+        MINGZHAN_SECRETS_KEY: "master",
+        NODE_ENV: "test",
+        PATH: "/bin",
+      },
+      { MINGZHAN_HARNESS_API_KEY: "selected" },
+      {
+        callerEnv: {
+          COMPOSIO_API_KEY: "other",
+          MINGZHAN_EMAIL_PASSWORD: "password",
+        },
+      }
+    );
+
+    expect(env.MINGZHAN_HARNESS_API_KEY).toBe("selected");
+    expect(env.MINGZHAN_SECRETS_KEY).toBeUndefined();
+    expect(env.EXA_API_KEY_FILE).toBeUndefined();
+    expect(env.COMPOSIO_API_KEY).toBeUndefined();
+    expect(env.MINGZHAN_EMAIL_PASSWORD).toBeUndefined();
   });
 
   test("redacts secrets for prompt context", () => {

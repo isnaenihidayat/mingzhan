@@ -40,6 +40,14 @@ export class MíngZhànAuthExpiredError extends MíngZhànApiError {
   }
 }
 
+/** A provider stream broke after it started. One more try can work. */
+export class ProviderStreamInterruptedError extends MíngZhànApiError {
+  constructor(message: string) {
+    super(message, 502);
+    this.name = "ProviderStreamInterruptedError";
+  }
+}
+
 export async function readApiErrorDetails(response: Response): Promise<{
   message: string;
   totpEnabled?: boolean;

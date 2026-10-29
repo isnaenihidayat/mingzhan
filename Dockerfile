@@ -72,7 +72,12 @@ RUN set -eu; \
 FROM oven/bun:1.4.3-slim@sha256:14a223fa35747ec728bce300ef85888bc5f7958164d15bbba6a54b22b52a3288 AS runtime
 WORKDIR /app
 
+# HTML artifact → PDF export (services/html-pdf.ts). WeasyPrint comes from pip:
+# Debian's 62.x drops clamp()/vw sizes, so decks print with default text.
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl sudo python3 python3-venv \
+    python3-pip libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0 fonts-dejavu-core \
+  && PIP_NO_COMPILE=1 pip3 install --no-cache-dir --break-system-packages weasyprint==70.0 \
+  && apt-get purge -y python3-pip && apt-get autoremove -y \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=ffmpeg-binaries /ffmpeg /ffprobe /usr/local/bin/
 
@@ -90,7 +95,9 @@ RUN if [ "$INSTALL_MEET_DEPS" = "true" ]; then \
       && bun install --frozen-lockfile --production --ignore-scripts; \
     fi
 
-RUN mkdir -p /mingzhan/data \
+# A named volume copies this owner on first mount, so uid 1000 can write
+# backups and upgrade requests there.
+RUN mkdir -p /mingzhan/data /mingzhan/backups /mingzhan/updates \
   && if getent group 1000 >/dev/null; then \
        G=$(getent group 1000 | cut -d: -f1); \
        [ "$G" = mingzhan ] || groupmod -n mingzhan "$G"; \
@@ -101,9 +108,10 @@ RUN mkdir -p /mingzhan/data \
        U=$(getent passwd 1000 | cut -d: -f1); \
        usermod -l mingzhan -g mingzhan -d /mingzhan/data "$U"; \
      else useradd --system --uid 1000 --gid mingzhan --home-dir /mingzhan/data --create-home mingzhan; fi \
-  && chown mingzhan:mingzhan /mingzhan/data
+  && chown mingzhan:mingzhan /mingzhan/data /mingzhan/backups /mingzhan/updates
 
 COPY --chown=1000:1000 package.json ./
+COPY --chown=1000:1000 scripts/mingzhan-updater.sh scripts/mingzhan-updater.sh
 COPY --chown=1000:1000 apps/server apps/server
 COPY --chown=1000:1000 packages packages
 COPY --chown=1000:1000 --from=build-assets /app/apps/web/dist apps/web/dist

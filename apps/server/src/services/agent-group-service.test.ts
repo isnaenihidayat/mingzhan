@@ -1,18 +1,111 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { getProfileSoulDir, SOUL_TEMPLATE } from "@mingzhan/core";
+import { memberHandles } from "@mingzhan/core/agent-groups";
 import { setupTestConfigDir } from "../test-config-dir";
 import { groupMemoryTool } from "../tools/group-memory-tool";
-import { GROUP_MEMORY_CHARS, writeGroupMemory } from "./agent-group-memory";
-import { closeAgentGroupDatabases } from "./agent-group-store";
+import { threadTranscript, transcript } from "./agent-group-prompt";
+import {
+  appendAgentGroupMessage,
+  closeAgentGroupDatabases,
+} from "./agent-group-store";
 import { ORG_ID, setup, USER_ID } from "./agent-group-test-setup";
+import { GROUP_MEMORY_CHARS, groupWorkspace } from "./agent-group-workspace";
 
 // Before the config dir cleanup, which Windows refuses while a file is open.
 afterEach(closeAgentGroupDatabases);
 
 setupTestConfigDir("mingzhan-agent-group-service-");
 
+/** Writes the whole memory, as the user's editor would. */
+function seedMemory(sharedDir: string, content: string) {
+  const { memory } = groupWorkspace(sharedDir);
+  memory.replace(content, memory.read());
+}
+
 describe("AgentGroupService", () => {
+  test.each(["reply", "pass", "error"])(
+    "keeps ordered memory changes after %s, including thread replies and reload",
+    async (outcome) => {
+      const { chat, service } = setup(
+        async ({ profileId, sharedDir, onGroupMemoryChange }) => {
+          if (profileId === "a") {
+            return "Answer";
+          }
+
+          for (const input of [
+            { entry: "Yearly is $39.99" },
+            { entry: "Yearly is $49.99", replaces: "Yearly is $39.99" },
+            { entry: "", replaces: "Yearly is $49.99" },
+          ]) {
+            const result = await groupMemoryTool.run(input, { sharedDir });
+
+            if (result.change) {
+              onGroupMemoryChange?.(result.change);
+            }
+          }
+
+          if (outcome === "error") {
+            throw new Error("Provider failed after writing");
+          }
+
+          return outcome === "pass" ? "(pass)" : "Done";
+        }
+      );
+
+      const changes = [
+        { newEntry: "- Yearly is $39.99", oldEntry: null },
+        { newEntry: "- Yearly is $49.99", oldEntry: "- Yearly is $39.99" },
+        { newEntry: null, oldEntry: "- Yearly is $49.99" },
+      ];
+
+      const group = await service.create(ORG_ID, USER_ID, "Team", ["a", "b"]);
+      const sessionId = await chat(group.id, "hello");
+      closeAgentGroupDatabases();
+
+      const messages = service.session(
+        ORG_ID,
+        USER_ID,
+        group.id,
+        sessionId
+      ).messages;
+
+      expect(messages).toHaveLength(3);
+      expect(messages[0]?.memoryChanges).toBeUndefined();
+      expect(messages[1]?.memoryChanges).toBeUndefined();
+      const reply = messages[2]!;
+      expect(reply.authorProfileId).toBe("b");
+      expect(reply.memoryChanges).toEqual(changes);
+
+      if (outcome === "pass") {
+        expect(reply.content).toBe("");
+      }
+
+      await service.postThread(
+        ORG_ID,
+        USER_ID,
+        group.id,
+        sessionId,
+        reply.id,
+        "continue"
+      );
+      closeAgentGroupDatabases();
+
+      const thread = service.thread(
+        ORG_ID,
+        USER_ID,
+        group.id,
+        sessionId,
+        reply.id
+      );
+
+      expect(thread.messages.at(-1)?.memoryChanges).toEqual(changes);
+      expect(
+        service.session(ORG_ID, USER_ID, group.id, sessionId).messages
+      ).toHaveLength(3);
+    }
+  );
+
   test("rejects an agent the user cannot chat with", async () => {
     const { service } = setup(() => "");
 
@@ -156,7 +249,7 @@ describe("AgentGroupService", () => {
 
     const { chat, service } = setup(({ sharedDir, task }) => {
       tasks.push(task);
-      writeGroupMemory(sharedDir!, `- ${"a".repeat(GROUP_MEMORY_CHARS)}-tail`);
+      seedMemory(sharedDir!, `- ${"a".repeat(GROUP_MEMORY_CHARS)}-tail`);
 
       return "ok";
     });
@@ -176,12 +269,13 @@ describe("AgentGroupService", () => {
 
     const { chat, service } = setup(({ sharedDir, task }) => {
       tasks.push(task);
-      writeGroupMemory(sharedDir!, `${first}\n- ${"b".repeat(200)}`);
+      seedMemory(sharedDir!, `${first}\n- ${"b".repeat(200)}`);
 
       return "ok";
     });
 
-    const group = await service.create(ORG_ID, USER_ID, "Team", ["a", "b"]);
+    // The same letters outside memory must not look like a leaked entry.
+    const group = await service.create(ORG_ID, USER_ID, "Team bbb", ["a", "b"]);
 
     await chat(group.id, "@alpha hi");
     await chat(group.id, "@alpha again");
@@ -294,6 +388,156 @@ describe("AgentGroupService", () => {
       "and you?",
       "ok",
     ]);
+  });
+
+  test("a memory-only pass does not become the last speaker", async () => {
+    const { calls, chat, service } = setup(
+      async ({ sharedDir, onGroupMemoryChange, task }) => {
+        if (!task.includes("(pass)")) {
+          return "Answer";
+        }
+
+        const result = await groupMemoryTool.run(
+          { entry: "Yearly is $39.99" },
+          { sharedDir }
+        );
+
+        if (result.change) {
+          onGroupMemoryChange?.(result.change);
+        }
+
+        return "(pass)";
+      }
+    );
+
+    const group = await service.create(ORG_ID, USER_ID, "Team", ["a", "b"]);
+    const sessionId = await chat(group.id, "hello");
+    closeAgentGroupDatabases();
+    await service.post(ORG_ID, USER_ID, group.id, sessionId, "and you?");
+
+    expect(calls).toEqual(["a", "b", "a", "b"]);
+    expect(
+      service.session(ORG_ID, USER_ID, group.id, sessionId).messages[2]
+    ).toMatchObject({
+      authorProfileId: "b",
+      content: "",
+      memoryChanges: [{ newEntry: "- Yearly is $39.99", oldEntry: null }],
+    });
+  });
+
+  test("a memory-only pass cannot answer a message sent during that turn", async () => {
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let held = false;
+
+    const { service } = setup(
+      async ({ profileId, task, sharedDir, onGroupMemoryChange }) => {
+        if (profileId === "b" && !held) {
+          held = true;
+          started.resolve();
+          await release.promise;
+
+          const result = await groupMemoryTool.run(
+            { entry: "Yearly is $39.99" },
+            { sharedDir }
+          );
+
+          if (result.change) {
+            onGroupMemoryChange?.(result.change);
+          }
+        }
+
+        return task.includes("(pass)") ? "(pass)" : "Answer";
+      }
+    );
+
+    const group = await service.create(ORG_ID, USER_ID, "Team", ["a", "b"]);
+    const { run, session } = service.start(ORG_ID, USER_ID, group.id, "hello");
+    await started.promise;
+    await service.post(ORG_ID, USER_ID, group.id, session.id, "new question");
+    release.resolve();
+    await run;
+
+    const messages = service.session(
+      ORG_ID,
+      USER_ID,
+      group.id,
+      session.id
+    ).messages;
+
+    const replies = messages.slice(
+      messages.findLastIndex((message) => message.authorProfileId === null) + 1
+    );
+
+    expect(replies).toMatchObject([
+      {
+        authorProfileId: "b",
+        content: "",
+        memoryChanges: [{ newEntry: "- Yearly is $39.99", oldEntry: null }],
+      },
+      { authorProfileId: "a", content: "Answer" },
+    ]);
+  });
+
+  test("memory-only notices do not consume main or thread context limits", async () => {
+    const { chat, profiles, service } = setup(() => "Answer");
+    const group = await service.create(ORG_ID, USER_ID, "Team", ["a", "b"]);
+    const sessionId = await chat(group.id, "@alpha hello");
+
+    const { session } = service.session(ORG_ID, USER_ID, group.id, sessionId);
+
+    let rootId = 0;
+
+    // 41 spoken messages: the oldest must fall out, but notices must not.
+    for (let index = 0; index < 39; index++) {
+      rootId = appendAgentGroupMessage(
+        ORG_ID,
+        session,
+        index % 2 === 0 ? "a" : null,
+        `History ${index}`
+      ).id;
+    }
+
+    const handles = memberHandles(profiles);
+    const mainBefore = transcript(ORG_ID, sessionId, handles, profiles);
+    expect(mainBefore).not.toContain("@alpha hello");
+    expect(mainBefore).toContain("Answer");
+
+    const threadBefore = threadTranscript(
+      ORG_ID,
+      sessionId,
+      rootId,
+      handles,
+      profiles
+    );
+
+    // More notices than the entire context window must still consume no slots.
+    for (const threadRootId of [
+      ...Array<undefined>(41).fill(undefined),
+      rootId,
+    ]) {
+      appendAgentGroupMessage(
+        ORG_ID,
+        session,
+        "b",
+        "",
+        threadRootId,
+        [],
+        [{ newEntry: "- Saved fact", oldEntry: null }]
+      );
+    }
+
+    expect(transcript(ORG_ID, sessionId, handles, profiles)).toBe(mainBefore);
+    expect(threadTranscript(ORG_ID, sessionId, rootId, handles, profiles)).toBe(
+      threadBefore
+    );
+    expect(
+      service.session(ORG_ID, USER_ID, group.id, sessionId).messages.at(-1)
+        ?.memoryChanges
+    ).toHaveLength(1);
+    expect(
+      service.session(ORG_ID, USER_ID, group.id, sessionId).messages
+    ).toHaveLength(82);
   });
 
   test("a teammate's @mention cannot be passed on", async () => {

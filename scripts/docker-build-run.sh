@@ -6,6 +6,11 @@ CONTAINER_NAME="${MINGZHAN_CONTAINER_NAME:-mingzhan}"
 IMAGE_NAME="${MINGZHAN_IMAGE_NAME:-mingzhan}"
 HOST_PORT="${MINGZHAN_HOST_PORT:-4310}"
 VOLUME_NAME="${MINGZHAN_DATA_VOLUME:-mingzhan-data}"
+SECRETS_ENV_FILE="${MINGZHAN_SECRETS_ENV_FILE:-${HOME}/.mingzhan/docker-secrets.env}"
+if [[ ! -f "${SECRETS_ENV_FILE}" ]]; then
+  mkdir -p "$(dirname "${SECRETS_ENV_FILE}")"
+  (umask 077; printf 'MINGZHAN_SECRETS_KEY=%s\n' "$(openssl rand -base64 32)" > "${SECRETS_ENV_FILE}")
+fi
 
 echo "Building ${IMAGE_NAME}..."
 # buildx handles cross-platform builds; legacy `docker build` fails on Apple Silicon
@@ -25,6 +30,7 @@ docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
 
 echo "Starting ${CONTAINER_NAME}..."
 docker run -d \
+  --env-file "${SECRETS_ENV_FILE}" \
   -p "${HOST_PORT}:4310" \
   -v "${VOLUME_NAME}:/mingzhan/data" \
   --name "${CONTAINER_NAME}" \

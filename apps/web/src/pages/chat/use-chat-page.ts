@@ -1,4 +1,5 @@
 import type { RemoteChatSession } from "@mingzhan/client";
+import { MíngZhànApiError } from "@mingzhan/core/api-error";
 import type {
   AgentChannel,
   AgentQuestionAnswer,
@@ -301,6 +302,14 @@ export function useChatPage() {
   const messageQueueRef = useRef<QueuedSend[]>([]);
   const isSendingRef = useRef(false);
   const skipNextProfileSessionRef = useRef(false);
+
+  const pendingSendRef = useRef<{ profileId: string; text: string } | null>(
+    null
+  );
+
+  // The new-chat link that already queued its send; StrictMode reruns effects.
+  const queuedSendSearchRef = useRef<string | null>(null);
+
   const loadedRouteRef = useRef<string | null>(null);
   const profileIdRef = useRef(profileId);
   const busyRef = useRef(busy);
@@ -310,6 +319,9 @@ export function useChatPage() {
   const sessionLoadRef = useRef(0);
   const sessionOrgRef = useRef<string | null | undefined>(undefined);
   const orgRouteResetRef = useRef(false);
+  // Outlives the composer's own remount when the first send in a new chat
+  // swaps `session` from null to a real id (see PromptInputProvider's key).
+  const promptHistoryRef = useRef<string[]>([]);
 
   /**
    * Hand the current stream back before the page moves to another chat.
@@ -897,6 +909,13 @@ export function useChatPage() {
           return;
         }
 
+        // The chat was deleted: open a new chat instead of an error.
+        if (err instanceof MíngZhànApiError && err.status === 404) {
+          navigate(buildNewChatPath(nextProfileId), { replace: true });
+
+          return;
+        }
+
         setError(formatError(err));
       } finally {
         setBusy((current) => (isCurrentLoad() ? false : current));
@@ -907,7 +926,7 @@ export function useChatPage() {
         }
       }
     },
-    [profileId, releaseActiveStream, setProfileId, syncChatUrl]
+    [navigate, profileId, releaseActiveStream, setProfileId, syncChatUrl]
   );
 
   const handleBranchMessage = useCallback(
@@ -991,7 +1010,10 @@ export function useChatPage() {
   // Layout effect so session is cleared before the syncChatUrl effect can
   // re-push the previous /chat/:profile/:session URL (first-click blink).
   useLayoutEffect(() => {
-    if (searchParams.get("new") !== "1") {
+    if (
+      searchParams.get("new") !== "1" ||
+      queuedSendSearchRef.current === location.search
+    ) {
       return;
     }
 
@@ -1051,11 +1073,20 @@ export function useChatPage() {
         ? AUTOMATION_COMPOSER_PLACEHOLDER
         : undefined;
 
-    if (requestedDraft !== null) {
+    const send =
+      requestedDraft && targetProfileId && searchParams.get("send") === "1";
+
+    if (send) {
+      queuedSendSearchRef.current = location.search;
+      pendingSendRef.current = {
+        profileId: targetProfileId,
+        text: requestedDraft,
+      };
+    } else if (requestedDraft !== null) {
       storeComposerDraft(targetDraftKey, requestedDraft);
     }
 
-    if (requestedDraft !== null || placeholder) {
+    if ((requestedDraft !== null && !pendingSendRef.current) || placeholder) {
       setComposerEntry((current) => ({
         initialInput: requestedDraft ?? current.initialInput,
         placeholder,
@@ -1528,6 +1559,18 @@ export function useChatPage() {
     [executeSend, profileId, readOnlySession]
   );
 
+  // A new chat opened with send=1 sends its draft once its profile is active.
+  useEffect(() => {
+    const pending = pendingSendRef.current;
+
+    if (!pending || pending.profileId !== profileId) {
+      return;
+    }
+
+    pendingSendRef.current = null;
+    sendMessage(pending.text).catch(() => undefined);
+  }, [profileId, sendMessage]);
+
   /**
    * Branch the session at the checkpoint before `prompt`, then send `text` into
    * the branch.
@@ -1729,6 +1772,7 @@ export function useChatPage() {
     messages,
     profileId,
     profiles,
+    promptHistoryRef,
     providerModelGroups,
     queuedMessages,
     readOnlySession,

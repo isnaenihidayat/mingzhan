@@ -77,102 +77,102 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       navItem(
         "chat",
-        "Sesi Tempur",
-        "Mulai percakapan atau sesi kerja baru",
+        "New chat",
+        "Start a new conversation",
         PlusSignSquareIcon
       ),
       navItem(
         "profiles",
-        "Zhànyǒu (Agen)",
-        "Kelola agen AI dan izin persenjataan",
+        "Agent",
+        "Manage bot configs and tool allowlists",
         UserSquareIcon
       ),
       navItem(
         "groups",
-        "Barisan Tim",
-        "Kolaborasi multi-agen bertempur bersama",
+        "Groups",
+        "Group chats where agents talk to each other",
         UserGroupIcon
       ),
       navItem(
         "google-meet",
         "Google Meet",
-        "Transkripsi dan risalah rapat Meet",
+        "Capture and read meeting transcripts",
         SharedWifiIcon
       ),
-      navItem("plugin-management", "Plugins", "Kelola modul plugin", PackageIcon),
+      navItem("plugin-management", "Plugins", "Manage plugins", PackageIcon),
       navItem(
         "composio",
-        "Koneksi Eksternal",
-        "Hubungkan aplikasi dan integrasi pihak ketiga",
+        "Connections",
+        "Connect apps and manage plugins",
         PuzzleIcon
       ),
     ],
-    label: "Sesi",
+    label: "Chat",
   },
   {
     id: "agent",
     items: [
       navItem(
         "automations",
-        "Otomatisasi",
-        "Alur kerja otomatisasi terjadwal",
+        "Automations",
+        "Manage scheduled automations",
         SharedWifiIcon
       ),
       navItem(
         "customize",
-        "Pusat Komando",
-        "Pengaturan sistem, senjata, dan integrasi MíngZhàn",
+        "Settings",
+        "Manage MingZhan settings, tools, and integrations",
         SlidersHorizontalIcon
       ),
     ],
-    label: "Zhànyǒu",
+    label: "Agent",
   },
   {
     id: "organization",
     items: [
       navItem(
         "organization",
-        "Barisan / Organisasi",
-        "Anggota tim, memori kolektif, dan hak akses",
+        "Organization",
+        "Members, memory, and org settings",
         Building03Icon
       ),
     ],
-    label: "Organisasi",
+    label: "Organization",
   },
   {
     collapsible: true,
     id: "system",
     items: [
-      navItem("usage", "Penggunaan Token", "Pantau konsumsi token dan biaya", Coins01Icon),
+      navItem("usage", "Usage", "View token usage and costs", Coins01Icon),
       navItem(
         "files",
-        "Berkas & Artefak",
-        "Kelola artefak dan dokumen hasil kerja",
+        "Browse Files",
+        "Manage profile artifacts",
         Folder01Icon
       ),
       navItem(
         "workers",
-        "Worker Aktif",
-        "Status background worker dan otomasi",
+        "Workers",
+        "Automation and channel workers",
         DashboardSquare01Icon
       ),
-      navItem("tools", "Senjata (Tools)", "Kelola senjata & perkakas yang digunakan agen", LayoutGridIcon),
-      navItem("skills", "Keterampilan (Skills)", "Jelajahi keterampilan dan SOP organisasi", BrainIcon),
-      navItem("mcp", "Protokol MCP", "Kelola server Model Context Protocol", Plug01Icon),
+      navItem("tools", "Tools", "Manage agent tools", LayoutGridIcon),
+      navItem("skills", "Skills", "Browse organization skills", BrainIcon),
+      navItem("mcp", "MCP", "Manage MCP servers", Plug01Icon),
       navItem(
         "providers",
-        "Penyedia AI",
-        "Kelola API keys dan model LLM",
+        "AI Providers",
+        "Manage provider API keys and models",
         BrainIcon
       ),
       navItem(
         "settings",
-        "Pengaturan",
-        "Preferensi tampilan dan tema",
+        "Settings",
+        "Appearance and preferences",
         Settings01Icon
       ),
     ],
-    label: "Sistem",
+    label: "System",
   },
 ];
 
@@ -268,19 +268,41 @@ export function canOpenPage(pageId: PageId, access: PageAccess): boolean {
   return !PLATFORM_ADMIN_PAGE_IDS.has(pageId) || access.isPlatformAdmin;
 }
 
+import { type Language, TRANSLATIONS } from "@/lib/language";
+
 /**
  * Nav groups this user can actually reach, empty groups dropped. The sidebar and
  * the command palette both read this, so the palette cannot offer a destination
  * the sidebar hides.
  */
-export function visibleNavGroups(access: PageAccess): NavGroup[] {
+export function visibleNavGroups(
+  access: PageAccess,
+  language?: Language
+): NavGroup[] {
   const groups: NavGroup[] = [];
+  const t = language ? TRANSLATIONS[language] : undefined;
 
   for (const group of NAV_GROUPS) {
-    const items = group.items.filter((item) => canOpenPage(item.id, access));
+    const items = group.items
+      .filter((item) => canOpenPage(item.id, access))
+      .map((item) => {
+        if (!t?.navItems[item.id]) {
+          return item;
+        }
+
+        return {
+          ...item,
+          description: t.navItems[item.id].description,
+          label: t.navItems[item.id].label,
+        };
+      });
 
     if (items.length > 0) {
-      groups.push({ ...group, items });
+      // SAFETY: This only reads an optional translation; unknown group IDs fall back to the existing label.
+      const groupLabel =
+        t?.navGroups[group.id as keyof typeof t.navGroups] ?? group.label;
+
+      groups.push({ ...group, items, label: groupLabel });
     }
   }
 

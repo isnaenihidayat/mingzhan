@@ -111,7 +111,7 @@ describe("parseStreamingArtifactToolInput", () => {
     expect(
       parseStreamingArtifactToolInput(
         "write_file",
-        '{"path":"artifacts/report.md.nak","content":"{}"}'
+        '{"path":"artifacts/report.md.min","content":"{}"}'
       )
     ).toEqual({
       content: null,

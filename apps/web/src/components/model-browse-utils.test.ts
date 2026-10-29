@@ -9,6 +9,7 @@ describe("capabilityBrowseRowToModelListRow", () => {
     )!;
 
     expect(capabilityBrowseRowToModelListRow(row)).toEqual({
+      contextWindow: 262_144,
       id: "accounts/fireworks/models/kimi-k2p5",
       inputPerMillionUsd: 0.6,
       name: "Kimi K2.5",

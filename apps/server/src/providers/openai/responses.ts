@@ -17,8 +17,10 @@ import {
 import { z } from "zod";
 import {
   buildProviderHttpError,
+  buildProviderResponseError,
   buildTokenUsage,
   normalizeThinkingEffort,
+  notifyToolInputDelta,
   parseJsonRecord,
   readRecord,
   readSseEvents,
@@ -59,6 +61,8 @@ const responsePayloadSchema = z.object({
 const responseEventSchema = z.object({
   delta: z.string().optional(),
   item: responseItemSchema.optional(),
+  item_id: z.string().optional(),
+  output_index: z.number().optional(),
   // Lifecycle events (response.created, response.in_progress) send these as null.
   response: z
     .object({
@@ -162,7 +166,7 @@ export async function generateOpenAIResponsesChat(options: {
 
   if (options.stream) {
     if (!response.body) {
-      throw new Error(`${label} returned an empty stream.`);
+      throw buildProviderResponseError(`${label} returned an empty stream.`);
     }
 
     return readOpenAIResponsesStream(response.body, options.handlers);
@@ -513,6 +517,13 @@ async function readOpenAIResponsesStream(
   const output: ResponseItem[] = [];
   const outputIndex = new Map<string, ResponseItem>();
 
+  // Function calls in flight, keyed by item id (and output index as a
+  // fallback) so argument deltas can be streamed as tool input deltas.
+  const pendingFunctionCalls = new Map<
+    string,
+    { arguments: string; id: string; name: string }
+  >();
+
   await readSseEvents(body, ({ data }) => {
     const payload = responseEventSchema.parse(JSON.parse(data));
     const type = payload.type;
@@ -568,6 +579,36 @@ async function readOpenAIResponsesStream(
 
       if (itemId) {
         outputIndex.set(itemId, item);
+      }
+
+      if (item.type === "function_call") {
+        const call = {
+          arguments: "",
+          // Same id parseResponsesOutput gives the final tool call.
+          id: String(item.call_id ?? item.id ?? ""),
+          name: String(item.name ?? ""),
+        };
+
+        if (itemId) {
+          pendingFunctionCalls.set(itemId, call);
+        }
+
+        if (payload.output_index !== undefined) {
+          pendingFunctionCalls.set(`#${payload.output_index}`, call);
+        }
+      }
+    }
+
+    if (type === "response.function_call_arguments.delta") {
+      const call =
+        pendingFunctionCalls.get(payload.item_id ?? "") ??
+        pendingFunctionCalls.get(`#${payload.output_index}`);
+
+      const delta = payload.delta ?? "";
+
+      if (call && delta) {
+        call.arguments += delta;
+        notifyToolInputDelta(handlers, call, delta);
       }
     }
 

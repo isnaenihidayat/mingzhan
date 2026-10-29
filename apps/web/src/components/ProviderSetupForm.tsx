@@ -1,3 +1,4 @@
+import { resolveCloudflareAccountInput } from "@mingzhan/core/cloudflare-provider-config";
 import type { CreateProviderResponse } from "@mingzhan/core/contract";
 import { defaultDiscoveryBaseUrl } from "@mingzhan/core/discovery-providers";
 import { ollamaRequiresApiKey } from "@mingzhan/core/ollama-provider-config";
@@ -315,7 +316,17 @@ function ShortlistModelFields({
 
   return (
     <ShortlistBrowseProviderModelFields
-      apiKey={form.selectedProvider === "fireworks" ? form.apiKey : undefined}
+      apiKey={
+        form.selectedProvider === "fireworks" ||
+        form.selectedProvider === "cloudflare"
+          ? form.apiKey
+          : undefined
+      }
+      baseUrl={
+        form.selectedProvider === "cloudflare"
+          ? (resolveCloudflareAccountInput(form.baseUrl) ?? undefined)
+          : undefined
+      }
       customModels={form.shortlistModels}
       density={density}
       disabled={form.busy}
@@ -390,7 +401,16 @@ function ProviderSetupExtraFields({
   }
 
   if (form.selectedProvider === "cloudflare") {
-    return <CloudflareAccountIdField density={density} form={form} />;
+    return (
+      <>
+        <CloudflareAccountIdField density={density} form={form} />
+        <ShortlistModelFields
+          canConnect={canConnect}
+          density={density}
+          form={form}
+        />
+      </>
+    );
   }
 
   if (form.selectedProvider === "openai_compatible") {

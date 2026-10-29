@@ -345,9 +345,9 @@ async function run(input, context) {
   }
 }
 export {
-  changedCells,
-  columnLetter,
-  parseCsv,
+  run,
   parseSheetUrl,
-  run
+  parseCsv,
+  columnLetter,
+  changedCells
 };

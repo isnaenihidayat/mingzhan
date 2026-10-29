@@ -129,6 +129,8 @@ export interface HealthResponse {
   composioConfigured: boolean;
   ok: true;
   providerConfigured: boolean;
+  /** `MINGZHAN_DISABLE_UPDATE_CHECK` is not set: platform admins see newer releases. */
+  updateCheckEnabled: boolean;
   userConfigured: boolean;
   /** App version (`MINGZHAN_VERSION` or package.json). Not `apiVersion`. */
   version: string;
@@ -438,6 +440,26 @@ export interface SetupAuthRequest {
 
 export interface UpdateWebPublicUrlRequest {
   webPublicUrl: string;
+}
+
+export interface MíngZhànVersionResponse {
+  current: string;
+  latest: string;
+  releaseUrl: string;
+  updateAvailable: boolean;
+}
+
+export interface MíngZhànUpgradeResponse {
+  /** False until the Compose updater service is running. */
+  available: boolean;
+  /** Versions with an archive of their data, newest first, current excluded. */
+  rollbacks: Array<{ at: string; version: string }>;
+  status: {
+    at: string;
+    message: string;
+    state: "running" | "done" | "failed" | "rolled_back";
+    version: string;
+  } | null;
 }
 
 export interface WebPublicUrlSettingsResponse {
@@ -1100,6 +1122,8 @@ export interface AgentTodo {
 export interface AgentQuestionChoice {
   id: string;
   label: string;
+  /** The agent's suggested answer, listed first. */
+  recommended?: boolean;
 }
 
 export interface AgentQuestionItem {
@@ -1592,6 +1616,8 @@ export interface WebSearchSettingsResponse {
   configured: boolean;
   endpoint: string | null;
   provider: WebSearchProvider | null;
+  savedAvailable?: boolean;
+  source?: "environment" | "settings" | "missing";
 }
 
 export interface UpdateWebSearchSettingsRequest {
@@ -1739,6 +1765,8 @@ export interface ComposioSettingsResponse {
   apiKeyMasked: string | null;
   composioReachable: boolean;
   configured: boolean;
+  savedAvailable?: boolean;
+  source?: "environment" | "settings" | "missing";
 }
 
 export interface UpdateComposioSettingsRequest {
@@ -1841,9 +1869,11 @@ export interface EmailSettingsResponse {
   imapPort: number | null;
   imapSecure: boolean | null;
   passwordMasked: string | null;
+  savedAvailable?: boolean;
   smtpHost: string | null;
   smtpPort: number | null;
   smtpSecure: boolean | null;
+  source?: "environment" | "settings" | "missing";
   username: string | null;
 }
 
@@ -2021,6 +2051,9 @@ export interface ProviderInstanceSummary {
   label: string;
   modelCount: number;
   openRouterRouting?: OpenRouterRoutingSettings;
+  savedSecretAvailable?: boolean;
+  secretEnvName?: string;
+  secretSource?: "environment" | "settings" | "missing";
   type: ProviderName;
   wireApi?: WireApi | null;
 }
@@ -2031,7 +2064,7 @@ export interface ListProvidersResponse {
 }
 
 export interface CreateProviderRequest {
-  apiKey: string;
+  apiKey?: string;
   baseUrl?: string;
   chatgptOAuth?: ChatgptOAuthCredentials;
   customModels?: CustomModelEntry[];
@@ -2088,7 +2121,12 @@ export interface DiscoverModelsRequest {
   baseUrl?: string;
   hostMode?: OllamaHostMode;
   /** When set, discovery uses the matching remote fetch path (Ollama includes `/api/tags` fallback). */
-  provider?: "ollama" | "openai_compatible" | "fireworks" | "netra";
+  provider?:
+    | "ollama"
+    | "openai_compatible"
+    | "fireworks"
+    | "netra"
+    | "cloudflare";
   providerId?: string;
 }
 
@@ -2291,6 +2329,24 @@ export interface InstallSkillRequest {
   zipBase64?: string;
 }
 
+export interface SkillsMarketplaceSkill {
+  installs: number;
+  name: string;
+  skillId: string;
+  source: string;
+}
+
+export interface SkillsMarketplaceResponse {
+  skills: SkillsMarketplaceSkill[];
+}
+
+export interface SkillInstallPreviewResponse {
+  description: string;
+  estimatedTokens: number;
+  files: { executable: boolean; path: string }[];
+  name: string;
+}
+
 export interface PatchSkillRequest {
   body?: string;
   description?: string;
@@ -2373,6 +2429,8 @@ export interface CreateMcpServerRequest {
   name: string;
   /** When testing an existing server, merges blank header/env values with stored secrets. */
   serverId?: string;
+  /** Start the browser sign-in even when the server answers without credentials. */
+  signIn?: boolean;
   transport: McpTransport;
 }
 
@@ -2559,9 +2617,13 @@ export interface ToolCredentialStatus {
     /** Only for non-secret variables. */
     value?: string;
   }[];
+  envName: string;
+  savedAvailable: boolean;
+  source: "environment" | "settings" | "missing";
 }
 
 export interface ToolSetupPlan {
+  createdAt?: string;
   description: string;
   id: string;
   name: string;
@@ -2569,7 +2631,7 @@ export interface ToolSetupPlan {
   profileId?: string;
   requiresApiKey: boolean;
   sessionId: string;
-  status: "pending" | "approved" | "ready";
+  status: "pending" | "approved" | "ready" | "rejected";
   toolId?: string;
 }
 
@@ -3023,6 +3085,11 @@ export interface ChatCompletionResult {
   }>;
   content: string;
   toolCalls: ToolCall[];
+  /**
+   * The provider stopped because the reply reached its output token limit, so
+   * the text or the last tool call may be cut off.
+   */
+  truncated?: boolean;
   usage?: ChatUsage;
 }
 
@@ -3118,9 +3185,9 @@ export interface ToolContext {
   /** Emits concise live status lines while a sub-agent child loop runs (parent web UI). */
   emitSubAgentActivity?: (label: string) => void;
   /**
-   * When true (save_artifact is in the session tool list), write_file refuses paths
-   * under artifacts/ so every saved artifact goes through save_artifact and gets an
-   * owner row.
+   * When true (save_artifact is in the session tool list), write_file and delete_file
+   * refuse paths under artifacts/ so every saved artifact goes through save_artifact
+   * and gets an owner row, and an existing one is never deleted to reuse its name.
    */
   forbidArtifactFileWrites?: boolean;
   /**
@@ -3266,6 +3333,23 @@ export interface ComposioUserConnectionSummary {
   toolkitId: string;
   toolkitSlug: string;
   updatedAt: string;
+}
+
+/** One step a new user can take to get their agent ready for their goal. */
+export type SetupChecklistItem =
+  | { kind: "connect_toolkit"; title: string; toolkitSlug: string }
+  | { kind: "enable_skill"; skillId: string; title: string }
+  | { kind: "write_context"; scope: "org"; title: string };
+
+export interface SetupChecklistRequest {
+  /** The agent the user is about to chat with; skill items target it. */
+  profileId: string;
+}
+
+export interface SetupChecklistResponse {
+  /** USER.md "Help with", or the goal read from the rest of the context. */
+  goal: string | null;
+  items: SetupChecklistItem[];
 }
 
 export interface ComposioCatalogToolkitSummary {

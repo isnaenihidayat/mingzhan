@@ -19,6 +19,7 @@ import { cn } from "@mingzhan/ui/utils";
 import {
   Building03Icon,
   ComputerIcon,
+  Globe02Icon,
   Logout03Icon,
   MoonIcon,
   SparklesIcon,
@@ -30,8 +31,11 @@ import { Link } from "react-router-dom";
 import { UserContextEditorDialog } from "@/components/UserContextCard";
 import { useAppContext } from "@/context/use-app-context";
 import { useAuth } from "@/context/use-auth";
+import { useLanguage } from "@/context/use-language";
 import { useTheme } from "@/context/use-theme";
+import { useMíngZhànVersionQuery } from "@/hooks/use-app-queries";
 import { client, formatError } from "@/lib/client";
+import { LANGUAGE_OPTIONS, TRANSLATIONS } from "@/lib/language";
 import { canAccessOrganizationPage, PAGE_PATHS } from "@/lib/navigation";
 import type { Theme } from "@/lib/theme";
 
@@ -60,9 +64,16 @@ export function SidebarUserMenu() {
   const { user, activeOrg, logout, refreshSession } = useAuth();
   const { health } = useAppContext();
   const { theme, setTheme } = useTheme();
+  const { language, setLanguage } = useLanguage();
   const [profileOpen, setProfileOpen] = useState(false);
   const [personalisationOpen, setPersonalisationOpen] = useState(false);
   const version = health?.version?.trim();
+
+  const canCheckUpdates =
+    user?.isPlatformAdmin === true && health?.updateCheckEnabled === true;
+
+  const updateAvailable =
+    useMíngZhànVersionQuery(canCheckUpdates).data?.updateAvailable === true;
 
   if (!user) {
     return null;
@@ -162,7 +173,9 @@ export function SidebarUserMenu() {
                   <div className="h-px bg-border" />
 
                   <div className="flex items-center justify-between gap-3 px-3.5 py-2">
-                    <span className="text-muted-foreground text-sm">Theme</span>
+                    <span className="text-muted-foreground text-sm">
+                      {TRANSLATIONS[language]?.theme ?? "Theme"}
+                    </span>
                     <div
                       aria-label="Color theme"
                       className="flex gap-0.5 rounded-md bg-muted p-0.5"
@@ -200,6 +213,52 @@ export function SidebarUserMenu() {
 
                   <div className="h-px bg-border" />
 
+                  {/* Choose a Language */}
+                  <div className="flex flex-col gap-1.5 px-3.5 py-2">
+                    <div className="flex items-center gap-1.5 text-muted-foreground text-sm">
+                      <Globe02Icon aria-hidden className="size-3.5 shrink-0" />
+                      <span>
+                        {TRANSLATIONS[language]?.chooseLanguage ??
+                          "Choose a language"}
+                      </span>
+                    </div>
+                    <div
+                      aria-label="Choose a language"
+                      className="grid grid-cols-3 gap-1 rounded-md bg-muted p-0.5"
+                      role="group"
+                    >
+                      {LANGUAGE_OPTIONS.map((opt) => {
+                        const selected = language === opt.id;
+
+                        return (
+                          <button
+                            aria-label={opt.label}
+                            aria-pressed={selected}
+                            className={cn(
+                              "flex flex-col items-center justify-center rounded-sm px-1.5 py-1 text-center transition-colors hover:text-foreground",
+                              selected
+                                ? "bg-background font-medium text-foreground shadow-sm"
+                                : "text-muted-foreground"
+                            )}
+                            key={opt.id}
+                            onClick={() => setLanguage(opt.id)}
+                            title={opt.label}
+                            type="button"
+                          >
+                            <span className="font-semibold text-xs leading-none">
+                              {opt.code}
+                            </span>
+                            <span className="mt-0.5 truncate text-[10px] leading-tight opacity-80">
+                              {opt.nativeLabel}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="h-px bg-border" />
+
                   <div className="p-1">
                     <DropdownMenuItem
                       className="px-2.5 py-1.5"
@@ -216,9 +275,24 @@ export function SidebarUserMenu() {
                   {version ? (
                     <>
                       <div className="h-px bg-border" />
-                      <p className="px-3.5 py-2 font-mono text-2xs text-muted-foreground tabular-nums">
-                        MíngZhàn {version}
-                      </p>
+                      {canCheckUpdates ? (
+                        <DropdownMenuItem
+                          className="rounded-none px-3.5 py-2 font-mono text-2xs text-muted-foreground tabular-nums"
+                          render={<Link to={PAGE_PATHS.settings} />}
+                        >
+                          MíngZhàn {version}
+                          {updateAvailable ? (
+                            <span className="text-primary">
+                              {" "}
+                              · Update available
+                            </span>
+                          ) : null}
+                        </DropdownMenuItem>
+                      ) : (
+                        <p className="px-3.5 py-2 font-mono text-2xs text-muted-foreground tabular-nums">
+                          MíngZhàn {version}
+                        </p>
+                      )}
                     </>
                   ) : null}
                 </DropdownMenuContent>

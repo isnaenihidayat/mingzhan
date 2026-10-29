@@ -56,7 +56,6 @@ export async function writeCodexConfigToml(
   );
 
   const baseUrl = routing.baseUrl ?? "";
-  const apiKey = routing.apiKey ?? "";
 
   const contents = [
     'model_provider = "mingzhan"',
@@ -66,8 +65,7 @@ export async function writeCodexConfigToml(
     `base_url = "${baseUrl}"`,
     `wire_api = "responses"`,
     "",
-    "[model_providers.mingzhan.env]",
-    `OPENAI_API_KEY = "${apiKey.replace(/"/g, '\\"')}"`,
+    'env_key = "MINGZHAN_HARNESS_API_KEY"',
     "",
     "[profiles.mingzhan]",
     'model_provider = "mingzhan"',
@@ -97,20 +95,16 @@ export async function writeOpenCodeConfig(
 
   const providerKey = resolveOpenCodeProviderKey(providerType);
 
-  const providerConfig = {
-    models: model ? { [model]: { name: model } } : undefined,
-    options: {
-      apiKey: routing.apiKey,
-      baseURL: routing.baseUrl,
-    },
-  };
-
   const config = {
     $schema: "https://opencode.ai/config.json",
     model: model ? `${providerKey}/${model}` : undefined,
     provider: {
       [providerKey]: {
-        ...providerConfig,
+        models: model ? { [model]: { name: model } } : undefined,
+        options: {
+          apiKey: "{env:MINGZHAN_HARNESS_API_KEY}",
+          baseURL: routing.baseUrl,
+        },
       },
     },
   };
@@ -231,7 +225,6 @@ export async function writePiModelsJson(
 ): Promise<string> {
   const configPath = path.join(configDir, "models.json");
   const baseUrl = routing.baseUrl ?? "";
-  const apiKey = routing.apiKey ?? "";
 
   const providers: Record<string, PiProviderConfig> = {};
 
@@ -241,7 +234,7 @@ export async function writePiModelsJson(
     // openai-responses, openai-completions, etc).
     const providerId = resolvePiProviderId(providerType);
     providers[providerId] = {
-      apiKey,
+      apiKey: "MINGZHAN_HARNESS_API_KEY",
       baseUrl,
     };
   } else {
@@ -255,7 +248,7 @@ export async function writePiModelsJson(
 
     providers["mingzhan"] = {
       api: "openai-completions",
-      apiKey,
+      apiKey: "MINGZHAN_HARNESS_API_KEY",
       baseUrl,
       models: [
         {

@@ -17,6 +17,7 @@ import {
 } from "@/lib/chat-stream-workflow";
 import { addChatUsage } from "@/lib/chat-usage";
 import { createClientId } from "@/lib/client-id";
+import type { DisplayDocument } from "@/lib/pasted-text";
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- This parser accepts untrusted provider or tool output and decodes it at this boundary.
 function formatBashToolResult(result: unknown): string | null {
@@ -950,7 +951,7 @@ type OutgoingMessageOptions = {
 function buildOutgoingUserMessage(
   text: string,
   images: Array<{ mediaType: string; url: string }> = [],
-  documents: Array<{ filename: string; mediaType: string }> = [],
+  documents: DisplayDocument[] = [],
   options: OutgoingMessageOptions = {}
 ): ChatListItem {
   return {
@@ -985,7 +986,7 @@ export function appendOutgoingMessages(
   setMessages: Dispatch<SetStateAction<ChatListItem[]>>,
   text: string,
   images: Array<{ mediaType: string; url: string }> = [],
-  documents: Array<{ filename: string; mediaType: string }> = [],
+  documents: DisplayDocument[] = [],
   options: OutgoingMessageOptions = {}
 ): void {
   setMessages((current) => [
@@ -1029,8 +1030,8 @@ export function composerShelfPanelClass(
 
 export const composerShellClass = cn(
   composerInputGroupBase,
-  "[&_[data-slot=input-group]]:rounded-xl [&_[data-slot=input-group]]:border [&_[data-slot=input-group]]:border-border [&_[data-slot=input-group]]:shadow-xs [&_[data-slot=input-group]]:transition-[box-shadow,border-color]"
+  "[&_[data-slot=input-group]]:rounded-2xl [&_[data-slot=input-group]]:border [&_[data-slot=input-group]]:border-border/80 [&_[data-slot=input-group]]:bg-card/70 [&_[data-slot=input-group]]:shadow-xs [&_[data-slot=input-group]]:backdrop-blur-md [&_[data-slot=input-group]]:transition-[box-shadow,border-color]"
 );
 
 export const composerShellCompactClass =
-  "[&_[data-slot=input-group]]:h-auto [&_[data-slot=input-group]]:flex-col [&_[data-slot=input-group]]:items-stretch [&_[data-slot=input-group]]:gap-0 [&_[data-slot=input-group]]:rounded-xl [&_[data-slot=input-group]]:border-border [&_[data-slot=input-group]]:p-2.5 [&_[data-slot=input-group]]:shadow-xs [&_[data-slot=input-group]]:transition-[box-shadow,border-color]";
+  "[&_[data-slot=input-group]]:h-auto [&_[data-slot=input-group]]:flex-col [&_[data-slot=input-group]]:items-stretch [&_[data-slot=input-group]]:gap-0 [&_[data-slot=input-group]]:rounded-2xl [&_[data-slot=input-group]]:border [&_[data-slot=input-group]]:border-border/80 [&_[data-slot=input-group]]:bg-card/70 [&_[data-slot=input-group]]:backdrop-blur-md [&_[data-slot=input-group]]:p-2.5 [&_[data-slot=input-group]]:shadow-xs [&_[data-slot=input-group]]:transition-[box-shadow,border-color]";

@@ -485,7 +485,7 @@ export class PluginService {
     };
   }
 
-  /** Super MíngZhàn's handoff: validates its own draft without approving it. */
+  /** An agent's handoff: validates its own draft without approving it. */
   async describeLocalPlugin(draft: LocalPluginDraftRequest) {
     const inspected = await this.inspectLocalPlugin(draft);
 
@@ -622,13 +622,7 @@ export class PluginService {
     const org = await this.db.getOrganizationById(draft.orgId);
     const profile = await this.db.getProfile(draft.profileId);
 
-    if (
-      !org ||
-      org.archivedAt ||
-      !profile ||
-      profile.orgId !== draft.orgId ||
-      !profile.isSuper
-    ) {
+    if (!org || org.archivedAt || !profile || profile.orgId !== draft.orgId) {
       throw new PluginHostError("not_found");
     }
 
@@ -674,7 +668,7 @@ export class PluginService {
 
     const { id, minMíngZhànVersion } = validated.manifest;
 
-    // HTTP maps only the code; the reason lets Super MíngZhàn fix its own draft.
+    // HTTP maps only the code; the reason lets the agent fix its own draft.
     const failures: Array<[boolean, string]> = [
       [
         packageJson.version !== validated.manifest.version,
@@ -683,7 +677,10 @@ export class PluginService {
       [id !== draft.draftId, "id_must_match_draft_folder"],
       [
         getMíngZhànVersion() === "dev" ||
-          !Bun.semver.satisfies(getMíngZhànVersion(), `>=${minMíngZhànVersion}`),
+          !Bun.semver.satisfies(
+            getMíngZhànVersion(),
+            `>=${minMíngZhànVersion}`
+          ),
         "unsupported_mingzhan_version",
       ],
       [OFFICIAL_PLUGINS.has(id) || id === "google-meet", "official_plugin_id"],
@@ -3486,6 +3483,16 @@ export async function quarantineInvalidPluginReleases(
       }
 
       const version = entry.name.slice(0, -".integrity".length);
+      const integrityPath = join(pluginDir, entry.name);
+      const releaseDir = getPluginReleaseDir(plugin.name, version, configDir);
+
+      if (!(await pathExists(releaseDir))) {
+        // An orphan marker (restored from an export whose release dir was
+        // empty) has nothing to hash; hashing it crashes restore finalization.
+        await rm(integrityPath, { force: true });
+        quarantined.push(`${plugin.name}@${version}`);
+        continue;
+      }
 
       if (
         await pluginReleaseIntegrityMatches(plugin.name, version, configDir)
@@ -3493,12 +3500,8 @@ export async function quarantineInvalidPluginReleases(
         continue;
       }
 
-      const releaseDir = getPluginReleaseDir(plugin.name, version, configDir);
-
-      if (await pathExists(releaseDir)) {
-        await rename(releaseDir, `${releaseDir}.unavailable`);
-        quarantined.push(`${plugin.name}@${version}`);
-      }
+      await rename(releaseDir, `${releaseDir}.unavailable`);
+      quarantined.push(`${plugin.name}@${version}`);
     }
   }
 

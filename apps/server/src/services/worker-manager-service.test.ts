@@ -1,10 +1,27 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readWorkerDesiredState, setWorkerDesiredRunning } from "@mingzhan/core";
+import {
+  readWorkerDesiredState,
+  setWorkerDesiredRunning,
+} from "@mingzhan/core";
+import { getChannelConfigDir } from "@mingzhan/core/channel-config-shared";
 import { saveWhatsAppConfig } from "@mingzhan/core/whatsapp-config";
 import { WorkerManagerService } from "./worker-manager-service";
+
+interface Pm2Common {
+  prepareAppConf(
+    options: { cwd: string },
+    app: Parameters<Pm2Client["start"]>[0]
+  ): { env: Record<string, string | undefined> };
+}
+
+// SAFETY: pm2 ships no types for this module; this is its exported shape.
+const { prepareAppConf } = createRequire(import.meta.url)(
+  "pm2/lib/Common.js"
+) as Pm2Common;
 
 type Pm2Client = NonNullable<
   ConstructorParameters<typeof WorkerManagerService>[1]
@@ -71,42 +88,26 @@ describe("WorkerManagerService", () => {
     }
   });
 
-  test("isolates agent processes, desired state, and recovery", async () => {
-    const first = { orgId: "org_a", profileId: "agent_a" };
-    const second = { orgId: "org_a", profileId: "agent_b" };
-    await saveWhatsAppConfig({}, first);
-    await saveWhatsAppConfig({}, second);
+  test("recovery starts a worker whose old heartbeat pid now names another process", async () => {
+    const owner = { orgId: "org_a", profileId: "agent_a" };
+    const dir = getChannelConfigDir("telegram", owner);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "config.ini"), "bot_token=1:token\n");
+
+    // After a VM restart the old worker's pid can belong to any live process.
+    await writeFile(
+      join(dir, "worker-heartbeat.json"),
+      JSON.stringify({ pid: process.pid, updatedAt: new Date().toISOString() })
+    );
+
+    await setWorkerDesiredRunning("telegram", true, owner);
     await setWorkerDesiredRunning("automation", false);
     const pm2 = createMockPm2();
-    const service = new WorkerManagerService(projectRoot, pm2);
-    await service.startWorker("whatsapp", first);
-    await service.startWorker("whatsapp", second);
+    await new WorkerManagerService(projectRoot, pm2).recoverDesiredWorkers();
     // SAFETY: The test fixture matches the contract used by this test.
-    const calls = (pm2.start as ReturnType<typeof mock>).mock.calls;
-    const token = await service.getWhatsAppContextToken();
-    expect(
-      await new WorkerManagerService(
-        projectRoot,
-        createMockPm2()
-      ).getWhatsAppContextToken()
-    ).toBe(token);
-    expect(calls[0][0].env.MINGZHAN_WHATSAPP_CONTEXT_TOKEN).toBe(token);
-    expect(await service.verifyWhatsAppContextToken(token)).toBe(true);
-    expect(await service.verifyWhatsAppContextToken("forged")).toBe(false);
-    expect(calls[0][0].name).not.toBe(calls[1][0].name);
-    expect(calls[0][0].env.MINGZHAN_CHANNEL_PROFILE_ID).toBe(first.profileId);
-    await service.stopWorker("whatsapp", first);
-    expect((await readWorkerDesiredState(first)).whatsapp).toBe(false);
-    expect((await readWorkerDesiredState(second)).whatsapp).toBe(true);
-    // SAFETY: The test fixture matches the contract used by this test.
-    (pm2.start as ReturnType<typeof mock>).mockClear();
-    await service.recoverDesiredWorkers();
-    expect(pm2.start).toHaveBeenCalledTimes(1);
-    expect(
-      // SAFETY: The test fixture matches the contract used by this test.
-      (pm2.start as ReturnType<typeof mock>).mock.calls[0][0].env
-        .MINGZHAN_CHANNEL_PROFILE_ID
-    ).toBe(second.profileId);
+    const starts = (pm2.start as ReturnType<typeof mock>).mock.calls;
+    expect(starts).toHaveLength(1);
+    expect(starts[0][0].env.MINGZHAN_CHANNEL_PROFILE_ID).toBe(owner.profileId);
   });
 
   describe("isValidWorker", () => {
@@ -201,6 +202,42 @@ describe("WorkerManagerService", () => {
       expect(opts.script).toBe("bun");
       expect(opts.args).toContain("apps/platform/whatsapp/src/index.ts");
       expect(opts.interpreter).toBeUndefined();
+    });
+
+    test("keeps secrets out of the worker environment", async () => {
+      const secrets = [
+        "MINGZHAN_SECRETS_KEY",
+        "MINGZHAN_SECRETS_KEY_NEXT",
+        "MINGZHAN_EMAIL_PASSWORD",
+        "OPENAI_API_KEY",
+      ];
+
+      for (const key of secrets) {
+        process.env[key] = "server-only-secret";
+      }
+
+      process.env.MINGZHAN_WORKER_TEST_PLAIN = "kept";
+
+      try {
+        const mockPm2 = createMockPm2();
+        const service = new WorkerManagerService(projectRoot, mockPm2);
+
+        await service.startWorker("telegram");
+
+        // SAFETY: The test fixture matches the contract used by this test.
+        const opts = (mockPm2.start as ReturnType<typeof mock>).mock
+          .calls[0][0];
+
+        const app = prepareAppConf({ cwd: projectRoot }, { ...opts });
+
+        expect(secrets.filter((key) => key in app.env)).toEqual([]);
+        expect(app.env.MINGZHAN_WORKER_TEST_PLAIN).toBe("kept");
+        expect(app.env.MINGZHAN_CONFIG_DIR).toBe(configDir ?? undefined);
+      } finally {
+        for (const key of [...secrets, "MINGZHAN_WORKER_TEST_PLAIN"]) {
+          delete process.env[key];
+        }
+      }
     });
 
     test("rejects an unscoped whatsapp worker when org accounts exist", async () => {

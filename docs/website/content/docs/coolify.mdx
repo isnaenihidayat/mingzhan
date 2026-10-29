@@ -8,8 +8,9 @@ description: "Deploy MíngZhàn on Coolify using Docker Compose — one-click se
 ## Deploy
 
 1. In your Coolify project, create a new resource → **Docker Compose Empty**.
-2. Paste the compose file below (or point Coolify at the repository's `docker-compose.yaml` directly).
-3. Click **Deploy**.
+2. Paste the compose file below. If you use the repository's `docker-compose.yaml`, remove its `env_file` lines.
+3. Set `MINGZHAN_SECRETS_KEY` in Coolify's Environment Variables before deployment.
+4. Click **Deploy**.
 
 ```yaml
 services:
@@ -42,12 +43,14 @@ Set these in the Coolify UI under **Environment Variables**:
 
 | Variable | Required | Purpose |
 |---|---|---|
+| `MINGZHAN_SECRETS_KEY` | Yes for Settings keys | A random 32-byte key in base64; keep it separate from the data volume and backups |
 | `MINGZHAN_SEED_ADMIN_EMAIL` | Together with the other two | Admin email — skips setup wizard |
 | `MINGZHAN_SEED_ADMIN_NAME` | Together with the other two | Admin display name |
 | `MINGZHAN_SEED_ADMIN_PASSWORD` | Together with the other two | Admin password (min 8 chars) |
 | `MINGZHAN_WEB_PUBLIC_URL` | Recommended | Public URL Coolify assigns, e.g. `https://mingzhan.example.com` |
 
 Set `MINGZHAN_WEB_PUBLIC_URL` to the domain Coolify routes to your service. MíngZhàn uses it for OAuth callbacks and shared links.
+Generate `MINGZHAN_SECRETS_KEY` with `openssl rand -base64 32` and back it up outside Coolify's MíngZhàn volume.
 
 ## SSE and reverse proxy
 

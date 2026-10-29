@@ -16,7 +16,10 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
-import { getPluginReleaseDir, PLUGIN_MANIFEST_API_VERSION } from "@mingzhan/core";
+import {
+  getPluginReleaseDir,
+  PLUGIN_MANIFEST_API_VERSION,
+} from "@mingzhan/core";
 import { createInMemoryDatabaseAdapter } from "@mingzhan/db";
 import {
   approvedPluginPackage,
@@ -405,7 +408,7 @@ describe("PluginService", () => {
     }
   });
 
-  test("local review requires platform authority and a Super MíngZhàn in the named organization", async () => {
+  test("local review requires platform authority and a profile in the named organization", async () => {
     const { draft, service, actor } = await localDraft();
     await expect(
       service.previewLocalPlugin(draft, { ...actor, isPlatformAdmin: false })
@@ -756,10 +759,14 @@ describe("PluginService", () => {
     expect(existsSync(SIDE_EFFECT_MARKER)).toBe(false);
   });
 
-  test("local review rejects ordinary profiles and reads large output in bounded chunks", async () => {
+  test("local review accepts ordinary profiles and reads large output in bounded chunks", async () => {
     const { db, draft, directory, service, actor } = await localDraft();
     const profile = (await db.getProfile(draft.profileId))!;
     await db.upsertProfile({ ...profile, isSuper: false });
+    await expect(
+      service.previewLocalPlugin(draft, actor)
+    ).resolves.toBeDefined();
+    await db.upsertProfile({ ...profile, orgId: "other" });
     await expect(
       service.previewLocalPlugin(draft, actor)
     ).rejects.toMatchObject({ code: "not_found" });

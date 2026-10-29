@@ -25,7 +25,11 @@ import {
   createSlackWorkerHeartbeat,
   isHeartbeatAlive,
 } from "@mingzhan/core/slack-worker";
-import { createChatHandler, type SlackApi } from "./chat-handler";
+import {
+  createChatHandler,
+  createSlackEventHandler,
+  type SlackApi,
+} from "./chat-handler";
 import { connectSlackSocket } from "./socket";
 
 installErrorHandlers("worker:slack");
@@ -146,7 +150,8 @@ try {
   spawnedChild = child;
 
   const client = new MíngZhànClient({
-    authToken: (await loadLocalAuthToken("slack@mingzhan.internal")) ?? undefined,
+    authToken:
+      (await loadLocalAuthToken("slack@mingzhan.internal")) ?? undefined,
     baseUrl: serverUrl,
     clientOrigin: resolveWebPublicUrl(),
   });
@@ -164,28 +169,20 @@ try {
 
   await sessionStore.load();
 
+  const slack = createSlackApi(config.botToken);
+
   const handleEvent = createChatHandler({
     botTeamId: identity.team_id,
     botUserId: identity.user_id,
     client,
     owner,
     sessionStore,
-    slack: createSlackApi(config.botToken),
+    slack,
   });
 
   closeSocket = connectSlackSocket({
     appToken: config.appToken,
-    onEvent: (event) => {
-      if (process.env.MINGZHAN_CH_DEBUG === "1") {
-        console.log(
-          `[slack] ${event.type} channel_type=${event.channel_type} subtype=${event.subtype ?? "-"} user=${event.user ?? "-"} thread=${event.thread_ts ? "yes" : "no"}`
-        );
-      }
-
-      handleEvent(event).catch((error) => {
-        console.error("Slack message handler error:", error);
-      });
-    },
+    onEvent: createSlackEventHandler({ handleEvent, slack }),
     onStatus: (next) => {
       connected = next;
       void heartbeat.write(connected);

@@ -318,8 +318,8 @@ describe("POST /v1/skills/install", () => {
 
         return new Response(
           zipSync({
-            "agent-skills-main/pdf/SKILL.md": new TextEncoder().encode(
-              VALID_SKILL.replace("github-weather", "pdf")
+            "agent-skills-main/remote-pdf/SKILL.md": new TextEncoder().encode(
+              VALID_SKILL.replace("github-weather", "remote-pdf")
             ),
           })
         );
@@ -340,7 +340,7 @@ describe("POST /v1/skills/install", () => {
     const response = await app.fetch(
       new Request(`${BASE}/v1/skills/install`, {
         body: JSON.stringify({
-          command: "npx skills add vercel-labs/agent-skills --skill pdf",
+          command: "npx skills add vercel-labs/agent-skills --skill remote-pdf",
           profileId,
         }),
         headers: adminSession.headers(

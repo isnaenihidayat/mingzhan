@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, readFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { discoverSkillDirectory } from "../discover";
@@ -37,6 +37,48 @@ describe("ensureBundledSkillFiles", () => {
     expect(created).toContain("coding-backend-pi");
     expect(created).toContain("coding-backend-cursor");
   });
+
+  test.each([
+    ["pdf", "Tolong gabung PDF ini"],
+    ["docx", "Buat proposal DOCX"],
+    ["xlsx", "Buat rumus Excel"],
+    ["pptx", "Buat presentasi PowerPoint"],
+    ["doc-coauthoring", "Susun spesifikasi teknis"],
+    ["internal-comms", "Tulis laporan progres"],
+    ["brand-guidelines", "Gunakan identitas visual organisasi"],
+    ["theme-factory", "Terapkan tema laporan"],
+    ["frontend-design", "Perbaiki desain frontend"],
+    ["web-artifacts-builder", "Buat prototipe React"],
+    ["canvas-design", "Buat desain poster"],
+    ["algorithmic-art", "Buat seni generatif"],
+    ["slack-gif-creator", "Buat GIF animasi Slack"],
+    ["mcp-builder", "Membuat server MCP"],
+    ["webapp-testing", "Lakukan pengujian aplikasi web"],
+    ["skill-creator", "Lakukan evaluasi skill"],
+    ["claude-api", "Buat integrasi API Claude"],
+  ])(
+    "installs and discovers %s for a relevant request",
+    async (name, message) => {
+      await ensureBundledSkillFiles();
+      const directory = join(configDir, "agent", "skills", name);
+      const discovered = await discoverSkillDirectory(directory);
+      expect(discovered).not.toBeNull();
+      expect(discovered?.scriptIssues).toEqual([]);
+      expect(discovered?.disableModelInvocation).toBe(false);
+      expect(
+        matchSkillsForMessage(discovered ? [discovered] : [], message).map(
+          (skill) => skill.name
+        )
+      ).toEqual([name]);
+
+      // Referenced procedures must survive installation beside SKILL.md.
+      for (const match of discovered?.body.matchAll(
+        /\]\((references\/[^)]+)\)/g
+      ) ?? []) {
+        await access(join(directory, match[1]!));
+      }
+    }
+  );
 
   test("installs the create-plugin scaffold that writes a built draft", async () => {
     await ensureBundledSkillFiles();

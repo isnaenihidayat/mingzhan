@@ -23,6 +23,7 @@ import type {
 } from "@mingzhan/core";
 import {
   getUserConfigDir,
+  isSecretEnvKey,
   type PlatformWorkerName,
   type PluginWorkerContribution,
   readRuntimeServerUrl,
@@ -33,6 +34,7 @@ import {
 import {
   assertChannelPath,
   type ChannelConfigScope,
+  ChannelIdentityInUseError,
   type ChannelOwner,
   type ChannelPlatform,
   claimChannelIdentity,
@@ -45,9 +47,10 @@ import { resolveDiscordApplicationId } from "@mingzhan/core/discord-config";
 import { parseIni, readTextOrNull, writeTextFile } from "@mingzhan/core/fs";
 import { listWhatsAppConfigOrgIds } from "@mingzhan/core/whatsapp-config";
 import {
-  createWorkerHeartbeatStore,
-  isProcessAlive,
-} from "@mingzhan/core/worker-heartbeat";
+  readWhatsAppHostChannels,
+  writeWhatsAppHostChannels,
+} from "@mingzhan/core/whatsapp-worker";
+import { createWorkerHeartbeatStore } from "@mingzhan/core/worker-heartbeat";
 import type { DatabaseAdapter } from "@mingzhan/db";
 
 const WORKER_SCRIPTS = new Map(
@@ -72,12 +75,35 @@ const WORKER_DIST_SCRIPTS = new Map(
 
 const VALID_WORKERS = [...WORKER_SCRIPTS.keys()];
 
+/** One pm2 process runs the WhatsApp number of every agent connection. */
+const WHATSAPP_HOST_PROCESS = "whatsapp-host";
+
+function isWhatsAppHostChannel(channel: ChannelOwner, owner: ChannelOwner) {
+  return channel.orgId === owner.orgId && channel.profileId === owner.profileId;
+}
+
 /**
  * pm2 stops Windows processes with `taskkill /F`, so no signal handler runs.
  * A "shutdown" message lets the worker clean up before pm2 escalates.
+ *
+ * pm2 copies the server's environment into every worker. `filter_env` keeps
+ * the same secrets the bash tool drops out of channel and plugin workers.
  */
-const PM2_SHUTDOWN_OPTIONS =
-  process.platform === "win32" ? { shutdown_with_message: true } : {};
+function pm2StartOptions(): Pick<
+  WorkerStartOptions,
+  "filter_env" | "shutdown_with_message"
+> {
+  const options: Pick<
+    WorkerStartOptions,
+    "filter_env" | "shutdown_with_message"
+  > = { filter_env: Object.keys(process.env).filter(isSecretEnvKey) };
+
+  if (process.platform === "win32") {
+    options.shutdown_with_message = true;
+  }
+
+  return options;
+}
 
 export interface PluginWorkerRegistration {
   configDir?: string;
@@ -95,6 +121,7 @@ type WorkerProcessEnv = {
   MINGZHAN_CONFIG_DIR?: string;
   MINGZHAN_SERVER_URL?: string;
   MINGZHAN_WHATSAPP_CONTEXT_TOKEN?: string;
+  MINGZHAN_WHATSAPP_HOST?: string;
   MINGZHAN_WHATSAPP_ORG_ID?: string;
   NODE_ENV: string;
 };
@@ -104,6 +131,7 @@ interface WorkerStartOptions {
   cwd: string;
   env: WorkerProcessEnv;
   error?: string;
+  filter_env?: string[];
   name: string;
   output?: string;
   script?: string;
@@ -224,9 +252,8 @@ export class WorkerManagerService {
       this.deletePluginProcess(pm2, this.processName(platform, scope))
     );
     const heartbeat = createWorkerHeartbeatStore({ getDir: () => source });
-    const running = await heartbeat.read();
 
-    if (running && isProcessAlive(running.pid)) {
+    if (await heartbeat.isLeaseHeld()) {
       throw new Error(
         "Stop the manually started legacy worker before claiming its connection"
       );
@@ -295,11 +322,7 @@ export class WorkerManagerService {
       } catch (error) {
         if (
           platform !== "whatsapp" ||
-          !(
-            error instanceof Error &&
-            error.message ===
-              "This channel account is already in use by another agent."
-          )
+          !(error instanceof ChannelIdentityInUseError)
         ) {
           throw error;
         }
@@ -885,7 +908,7 @@ export class WorkerManagerService {
             name,
             output: join(worker.directory, "stdout.log"),
             script: process.env.MINGZHAN_BUN_BIN ?? "bun",
-            ...PM2_SHUTDOWN_OPTIONS,
+            ...pm2StartOptions(),
           },
           (error) => cb(error)
         )
@@ -992,6 +1015,18 @@ export class WorkerManagerService {
         await this.removeWorkerFromPm2(pm2, processName);
       }
 
+      if (name === "whatsapp" && isChannelOwner(scope)) {
+        // A start restarts the channel, so the host must see it leave first.
+        await this.stopWhatsAppHostChannel(pm2, scope);
+        await writeWhatsAppHostChannels([
+          ...(await readWhatsAppHostChannels()),
+          scope,
+        ]);
+        await this.ensureWhatsAppHost(pm2, script, whatsappContextToken);
+
+        return;
+      }
+
       const env = this.workerProcessEnv();
 
       if (isChannelOwner(scope)) {
@@ -1012,7 +1047,7 @@ export class WorkerManagerService {
         env,
         name: processName,
         script: "bun",
-        ...PM2_SHUTDOWN_OPTIONS,
+        ...pm2StartOptions(),
       };
 
       if (isChannelOwner(scope)) {
@@ -1025,6 +1060,102 @@ export class WorkerManagerService {
         pm2.start(startOptions, (error) => cb(error))
       );
     });
+  }
+
+  private async ensureWhatsAppHost(
+    pm2: Pm2Client,
+    script: string,
+    whatsappContextToken: string | null
+  ): Promise<void> {
+    const [host] = await promisifyPm2<Pm2ProcessDescription[]>((cb) =>
+      pm2.describe(WHATSAPP_HOST_PROCESS, cb)
+    );
+
+    if (host?.pm2_env?.status === "online") {
+      return;
+    }
+
+    await this.deletePluginProcess(pm2, WHATSAPP_HOST_PROCESS);
+    const env = this.workerProcessEnv();
+    env.MINGZHAN_WHATSAPP_HOST = "1";
+
+    if (whatsappContextToken) {
+      env.MINGZHAN_WHATSAPP_CONTEXT_TOKEN = whatsappContextToken;
+    }
+
+    await promisifyPm2<void>((cb) =>
+      pm2.start(
+        {
+          args: ["run", script],
+          cwd: this.projectRoot,
+          env,
+          name: WHATSAPP_HOST_PROCESS,
+          script: "bun",
+          ...pm2StartOptions(),
+        },
+        (error) => cb(error)
+      )
+    );
+  }
+
+  /** Removes the channel from the host and waits until its socket is closed. */
+  private async stopWhatsAppHostChannel(
+    pm2: Pm2Client,
+    owner: ChannelOwner
+  ): Promise<void> {
+    const channels = await readWhatsAppHostChannels();
+
+    const remaining = channels.filter(
+      (channel) => !isWhatsAppHostChannel(channel, owner)
+    );
+
+    if (remaining.length === channels.length) {
+      return;
+    }
+
+    await writeWhatsAppHostChannels(remaining);
+
+    if (!remaining.length) {
+      // Deleting the host stops its last channel before pm2 returns.
+      await this.deletePluginProcess(pm2, WHATSAPP_HOST_PROCESS);
+
+      return;
+    }
+
+    const [host] = await promisifyPm2<Pm2ProcessDescription[]>((cb) =>
+      pm2.describe(WHATSAPP_HOST_PROCESS, cb)
+    );
+
+    if (!(host?.pid && host.pm2_env?.status === "online")) {
+      return;
+    }
+
+    const heartbeat = createWorkerHeartbeatStore({
+      getDir: () => getChannelConfigDir("whatsapp", owner),
+    });
+
+    const deadline = Date.now() + 20_000;
+
+    while ((await heartbeat.read())?.pid === host.pid) {
+      if (Date.now() > deadline) {
+        throw new Error("The WhatsApp connection did not stop in time.");
+      }
+
+      await Bun.sleep(200);
+    }
+  }
+
+  private async whatsappHostInfo(
+    list: Pm2ProcessDescription[],
+    owner: ChannelOwner
+  ): Promise<WorkerProcessInfo> {
+    const listed = (await readWhatsAppHostChannels()).some((channel) =>
+      isWhatsAppHostChannel(channel, owner)
+    );
+
+    return this.pm2ProcessToInfo(
+      listed ? list.find((p) => p.name === WHATSAPP_HOST_PROCESS) : undefined
+    );
   }
 
   async getWhatsAppContextToken(): Promise<string> {
@@ -1120,6 +1251,10 @@ export class WorkerManagerService {
             pm2.delete(processName, (error) => cb(error))
           );
         }
+
+        if (name === "whatsapp") {
+          await this.stopWhatsAppHostChannel(pm2, orgId);
+        }
       } else {
         await promisifyPm2<void>((cb) =>
           pm2.stop(processName, (error) => cb(error))
@@ -1132,11 +1267,11 @@ export class WorkerManagerService {
 
       if (!pluginWorker) {
         if (isChannelOwner(orgId)) {
-          const heartbeat = await createWorkerHeartbeatStore({
+          const heartbeat = createWorkerHeartbeatStore({
             getDir: () => getChannelConfigDir(readChannelPlatform(name), orgId),
-          }).read();
+          });
 
-          if (heartbeat && isProcessAlive(heartbeat.pid)) {
+          if (await heartbeat.isLeaseHeld()) {
             throw new Error("Stop the manually started agent worker first");
           }
         }
@@ -1181,6 +1316,13 @@ export class WorkerManagerService {
       "slack",
     ] as const) {
       for (const owner of await listChannelOwners(platform)) {
+        if (platform === "whatsapp") {
+          // Numbers moved into the shared host; a per-number process would hold the same login.
+          await this.withPm2((pm2) =>
+            this.deletePluginProcess(pm2, this.processName(platform, owner))
+          );
+        }
+
         if (!(await readWorkerDesiredState(owner))[platform]) {
           continue;
         }
@@ -1191,11 +1333,12 @@ export class WorkerManagerService {
           continue;
         }
 
-        const heartbeat = await createWorkerHeartbeatStore({
-          getDir: () => getChannelConfigDir(platform, owner),
-        }).read();
-
-        if (heartbeat && isProcessAlive(heartbeat.pid)) {
+        // A pid in an old heartbeat may now belong to another process.
+        if (
+          await createWorkerHeartbeatStore({
+            getDir: () => getChannelConfigDir(platform, owner),
+          }).isLeaseHeld()
+        ) {
           continue;
         }
 
@@ -1315,6 +1458,11 @@ export class WorkerManagerService {
 
     try {
       const list = await this.listAllPm2Processes();
+
+      if (name === "whatsapp" && isChannelOwner(orgId)) {
+        return await this.whatsappHostInfo(list, orgId);
+      }
+
       const match = list.find((p) => p.name === this.processName(name, orgId));
 
       return this.pm2ProcessToInfo(match);
@@ -1329,8 +1477,16 @@ export class WorkerManagerService {
     try {
       const list = await this.listAllPm2Processes();
 
+      const whatsapp = isChannelOwner(orgId)
+        ? await this.whatsappHostInfo(list, orgId)
+        : null;
+
       return Object.fromEntries(
         [...VALID_WORKERS, ...this.pluginWorkers.keys()].map((name) => {
+          if (name === "whatsapp" && whatsapp) {
+            return [name, whatsapp];
+          }
+
           const match = list.find(
             (p) => p.name === this.processName(name, orgId)
           );

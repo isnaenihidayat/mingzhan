@@ -23,7 +23,12 @@ import { formatSessionChannelLabel } from "@/lib/chat-history";
 import { sumChatUsage } from "@/lib/chat-usage";
 import { extractModelId } from "@/lib/models";
 import { shouldShowCognitoControl } from "@/pages/chat/chat-page.shared";
-import { ChatPageColumn, ChatWelcome } from "@/pages/chat/chat-page-layout";
+import {
+  AgentMascot,
+  ChatPageColumn,
+  ChatQuickStarters,
+  ChatWelcome,
+} from "@/pages/chat/chat-page-layout";
 import type { ChatPageState } from "@/pages/chat/use-chat-page";
 
 const ProviderSetupForm = lazy(async () => ({
@@ -80,6 +85,7 @@ export function ChatPageContent({
     stopStreaming,
     agentTodos,
     agentQuestionnaire,
+    promptHistoryRef,
   } = state;
 
   const [providerDialogOpen, setProviderDialogOpen] = useState(false);
@@ -149,13 +155,14 @@ export function ChatPageContent({
         primarySupportsVision={activeModelSupportsVision}
         profileId={profileId}
         profileModelId={extractModelId(currentModelSelection)}
+        promptHistoryRef={promptHistoryRef}
         providerConfigured={health?.providerConfigured}
         providerModelGroups={providerModelGroups}
         queuedMessages={queuedMessages}
         renderModelLabel={renderModelLabel}
         sessionUsage={sessionUsage}
         showOfflineHint={showOfflineHint}
-        showTips={isEmptyState}
+        showTips={false}
         thinkingEffort={thinkingEffort}
         thinkingEffortDisabled={thinkingEffortDisabled}
         thinkingEffortOptions={thinkingEffortOptions}
@@ -171,7 +178,7 @@ export function ChatPageContent({
     <ChatAttachmentPanelProvider below={below} key={session?.id ?? "new"}>
       <ChatPageColumn centered cognito={cognitoSurface}>
         {cognitoControl}
-        <div className="mx-auto mb-12 flex w-full max-w-3xl flex-col gap-1">
+        <div className="mx-auto mb-8 flex w-full max-w-2xl flex-col gap-2.5">
           <ChatWelcome
             cognito={cognito}
             onProfileSwitch={handleProfileSwitch}
@@ -180,7 +187,15 @@ export function ChatPageContent({
             profileSwitchDisabled={busy}
             profiles={profiles}
           />
-          {composer}
+          <div className="relative w-full">
+            {!cognito && (
+              <div className="pointer-events-none absolute -top-24 right-1 z-20 sm:-top-29 sm:right-2">
+                <AgentMascot />
+              </div>
+            )}
+            {composer}
+          </div>
+          {!cognito && <ChatQuickStarters />}
         </div>
       </ChatPageColumn>
     </ChatAttachmentPanelProvider>

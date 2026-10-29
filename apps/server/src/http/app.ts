@@ -49,6 +49,7 @@ import { registerSetupImportRoutes } from "./routes/setup-import";
 import { registerSkillProposalRoutes } from "./routes/skill-proposals";
 import { registerSkillSuggestionRoutes } from "./routes/skill-suggestions";
 import { registerSkillRoutes } from "./routes/skills";
+import { registerSkillsMarketplaceRoutes } from "./routes/skills-marketplace";
 import {
   ARTIFACT_FRAME_CSP,
   ARTIFACT_FRAME_PATH,
@@ -69,7 +70,7 @@ import type { HonoApp } from "./types";
  * the two drift, which is the only thing keeping this constant honest.
  */
 const THEME_BOOTSTRAP_SCRIPT_HASH =
-  "sha256-ccmZA+DQW+fCYJWBEiKXptNNdt/GBPFOLMhetVtPmLA=";
+  "sha256-JzkYwVkMD7btf0RxFtSD5DJQQ/9d6MMLwkQAZ6Rg6Lk=";
 
 // Regular JSON can carry a 5 MiB attachment after base64 expansion. Full-data
 // imports accept a 100 MiB archive, which expands to roughly 134 MiB as base64.
@@ -404,6 +405,7 @@ export function createHonoApp(options: ServerOptions) {
   registerProfilePortabilityRoutes(app, options);
   registerArtifactShareRoutes(app, options);
   registerMcpRoutes(app, options);
+  registerSkillsMarketplaceRoutes(app);
   registerSkillRoutes(app, options);
   registerToolRoutes(app, options);
   registerPluginRoutes(app, options);

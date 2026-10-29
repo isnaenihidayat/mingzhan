@@ -20,7 +20,7 @@ describe("desktop release metadata", () => {
     expect(output.files[0]).toEqual({
       sha512: "checksum",
       size: 42,
-      url: "https://github.com/mingpromotion/mingzhan/releases/download/desktop-v0.2.0/MíngZhàn-0.2.0-arm64-mac.zip",
+      url: "https://github.com/mingpromotion/mingzhan/releases/download/desktop-v0.2.0/M%C3%ADngZh%C3%A0n-0.2.0-arm64-mac.zip",
     });
     expect(output.path).toBe(output.files[0].url);
     expect(output.sha512).toBe("checksum");
@@ -36,7 +36,7 @@ describe("desktop release metadata", () => {
       updateManifest({ ...manifest, files }, "desktop-v0.2.0").files[1]
     ).toEqual({
       sha512: "dmg-checksum",
-      url: "https://github.com/mingpromotion/mingzhan/releases/download/desktop-v0.2.0/MíngZhàn-0.2.0-arm64.dmg",
+      url: "https://github.com/mingpromotion/mingzhan/releases/download/desktop-v0.2.0/M%C3%ADngZh%C3%A0n-0.2.0-arm64.dmg",
     });
     expect(() =>
       updateManifest({ ...manifest, files: files.slice(1) }, "desktop-v0.2.0")
@@ -70,7 +70,7 @@ test("Windows metadata accepts only the exact versioned installer", () => {
   };
 
   expect(updateManifest(manifest, "desktop-v0.2.0", "windows").path).toEndWith(
-    "/MíngZhàn-0.2.0-x64-Setup.exe"
+    `/${encodeURIComponent("MíngZhàn-0.2.0-x64-Setup.exe")}`
   );
 
   for (const path of [

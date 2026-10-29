@@ -360,6 +360,7 @@ export class ComposioService {
     this.apiClientCache = null;
     this.reachabilityCache = null;
     this.reachabilityInflight = null;
+    this.profileSessionCache.clear();
   }
 
   /**
@@ -1054,7 +1055,10 @@ export class ComposioService {
     this.assertProfileOrg(profile, orgId);
 
     if (await this.databaseAdapter.getSharedAgentInstance(orgId, profile.id)) {
-      throw new MíngZhànApiError("Shared agent configuration is read-only.", 403);
+      throw new MíngZhànApiError(
+        "Shared agent configuration is read-only.",
+        403
+      );
     }
 
     const request: UpdateProfileComposioToolkitsRequest =
@@ -1329,6 +1333,7 @@ export class ComposioService {
     return JSON.stringify({
       allowedToolsByToolkit,
       connectedAccountsByToolkit,
+      key: this.apiClientCache?.key,
       toolkits: [...enabledToolkits].sort(),
     });
   }
@@ -1397,7 +1402,10 @@ export class ComposioService {
 
   private assertProfileOrg(profile: StoredProfileRecord, orgId: string): void {
     if (profile.orgId !== orgId) {
-      throw new MíngZhànApiError("Profile not found for this organization.", 404);
+      throw new MíngZhànApiError(
+        "Profile not found for this organization.",
+        404
+      );
     }
   }
 }

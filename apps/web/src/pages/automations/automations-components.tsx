@@ -29,7 +29,6 @@ import { Textarea } from "@mingzhan/ui/textarea";
 import { cn } from "@mingzhan/ui/utils";
 import {
   ArrowDown01Icon,
-  ArrowRight01Icon,
   Cancel01Icon,
   CancelCircleIcon,
   CheckmarkCircle01Icon,
@@ -51,6 +50,7 @@ import {
 import {
   automationRunMessages,
   formatRunDuration,
+  HOURLY_INTERVALS,
   previewAutomationSchedule,
   readSchedulePreset,
   runPreviewText,
@@ -220,6 +220,10 @@ const TIME_OPTIONS = Array.from({ length: 96 }, (_, index) => {
     value: `${String(hour).padStart(2, "0")}:${minute}`,
   };
 });
+
+function hoursLabel(hours: string) {
+  return hours === "1" ? "1 hour" : `${hours} hours`;
+}
 
 const WEEKDAYS = [
   "Sunday",
@@ -428,6 +432,7 @@ function AutomationScheduleFields({
           {(
             [
               ["manual", "Only when I ask"],
+              ["hourly", "Hourly"],
               ["daily", "Every day"],
               ["weekdays", "Weekdays"],
               ["weekly", "Weekly"],
@@ -477,6 +482,60 @@ function AutomationScheduleFields({
               </SelectContent>
             </Select>
           </Field>
+        ) : null}
+        {preset?.frequency === "hourly" && scheduleTrigger ? (
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="Every">
+              <Select
+                disabled={busy}
+                onValueChange={(value) =>
+                  onChange({
+                    trigger: {
+                      ...scheduleTrigger,
+                      cron: `${preset.minute} ${value === "1" ? "*" : `*/${value}`} * * *`,
+                    },
+                  })
+                }
+                value={preset.everyHours}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue>{hoursLabel(preset.everyHours)}</SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {HOURLY_INTERVALS.map((hours) => (
+                    <SelectItem key={hours} value={hours}>
+                      {hoursLabel(hours)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </Field>
+            <Field label="At minute">
+              <Select
+                disabled={busy}
+                onValueChange={(value) =>
+                  onChange({
+                    trigger: {
+                      ...scheduleTrigger,
+                      cron: `${value} ${preset.hour} * * *`,
+                    },
+                  })
+                }
+                value={preset.minute}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue>:{preset.minute.padStart(2, "0")}</SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {Array.from({ length: 60 }, (_, index) => (
+                    <SelectItem key={index} value={String(index)}>
+                      :{String(index).padStart(2, "0")}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </Field>
+          </div>
         ) : null}
         {preset?.frequency === "monthly" && scheduleTrigger ? (
           <Field label="Day of the month">
@@ -592,7 +651,7 @@ function AutomationTimeFields({
 
   return (
     <>
-      {preset ? (
+      {preset && preset.frequency !== "hourly" ? (
         <fieldset className="min-w-0">
           <legend className="mb-2 font-semibold text-sm">What time?</legend>
           <div className="grid grid-cols-2 gap-2">
@@ -730,165 +789,64 @@ export function AutomationDetailSkeleton() {
   );
 }
 
-const AUTOMATION_EXAMPLES = [
-  {
-    getLines: [
-      "Three emails need a reply today",
-      "Design review moved to 14:00",
-      "One invoice is waiting for approval",
-    ],
-    getTime: "Weekdays 8:30",
-    getTitle: "Today at a glance",
-    name: "Morning briefing",
-    prompt:
-      "Read my unread email and today's calendar. Tell me what needs a reply first.",
-    when: "Weekdays at 8:30",
-  },
-  {
-    getLines: [
-      "Merged: the new billing page and two fixes",
-      "Closed: the older login issues",
-      "Still open: the slow export",
-    ],
-    getTime: "Friday 16:00",
-    getTitle: "Report for this week",
-    name: "Weekly team report",
-    prompt:
-      "List the pull requests we merged and the issues we closed this week. Write a short report for the team.",
-    when: "Fridays at 16:00",
-  },
-  {
-    getLines: [
-      "Competitor A changed its pricing page",
-      "Competitor B announced a new integration",
-      "No news from Competitor C",
-    ],
-    getTime: "Monday 9:00",
-    getTitle: "What changed this week",
-    name: "Competitor watch",
-    prompt:
-      "Search the web for news about our main competitors. Send me only the changes that matter.",
-    when: "Mondays at 9:00",
-  },
-  {
-    getLines: [
-      "Two emails need a reply now",
-      "Five can wait until later",
-      "Eight are safe to ignore",
-    ],
-    getTime: "Every hour",
-    getTitle: "New email, sorted",
-    name: "Inbox triage",
-    prompt:
-      "Sort new email into reply, read later and ignore. Draft a reply for the urgent ones.",
-    when: "Every hour",
-  },
-  {
-    getLines: [
-      "Changelog is ready",
-      "Docs page is not updated yet",
-      "Tests pass on main",
-    ],
-    getTime: "When you run it",
-    getTitle: "Before you ship",
-    name: "Release checklist",
-    prompt:
-      "Go through the release checklist. Tell me what is missing before we ship.",
-    when: "Manual",
-  },
+const AUTOMATION_IDEAS = [
+  "Every weekday at 8:30, read my email and calendar. Tell me what is important today.",
+  "Every hour, check my new email. Show me only the emails I need to answer.",
+  "Every Friday at 16:00, write a short report of what my team did this week.",
+  "Every Monday at 9:00, search the web for news about our competitors. Tell me what changed.",
 ];
 
 export function AutomationExample({
   onUse,
-  onStartFromScratch,
 }: {
   onUse: (draft: string) => void;
-  onStartFromScratch: () => void;
 }) {
-  const [index, setIndex] = useState(0);
-  const example = AUTOMATION_EXAMPLES[index];
+  const [text, setText] = useState("");
+  const task = text.trim();
 
   return (
-    <div className="flex w-full flex-col items-center gap-6">
-      <h2 className="font-semibold text-3xl text-foreground">
-        What could your agent do for you?
-      </h2>
-      <div className="flex flex-wrap justify-center gap-2">
-        {AUTOMATION_EXAMPLES.map((item, i) => (
+    <form
+      className="flex w-full max-w-2xl flex-col gap-5 text-left"
+      onSubmit={(event) => {
+        event.preventDefault();
+
+        if (task) {
+          onUse(`Create an automation. ${task}`);
+        }
+      }}
+    >
+      <label
+        className="text-center font-semibold text-3xl text-foreground"
+        htmlFor="automation-idea"
+      >
+        What do you need help with?
+      </label>
+      <Textarea
+        className="min-h-28 text-base"
+        id="automation-idea"
+        onChange={(event) => setText(event.target.value)}
+        placeholder="For example: Every morning, tell me which emails I need to answer."
+        value={text}
+      />
+      <div className="flex flex-col gap-2">
+        <p className="font-medium text-muted-foreground text-sm">
+          Or tap an idea:
+        </p>
+        {AUTOMATION_IDEAS.map((idea) => (
           <button
-            aria-pressed={i === index}
-            className={cn(
-              "rounded-full border px-3 py-1.5 text-sm transition-colors",
-              i === index
-                ? "border-foreground bg-foreground text-background"
-                : "border-border text-foreground/80 hover:bg-muted"
-            )}
-            key={item.name}
-            onClick={() => setIndex(i)}
+            className="rounded-lg border border-border bg-muted/30 px-4 py-3 text-left text-foreground text-sm transition-colors hover:bg-muted"
+            key={idea}
+            onClick={() => setText(idea)}
             type="button"
           >
-            {item.name}
+            {idea}
           </button>
         ))}
       </div>
-      <div className="flex w-full max-w-3xl flex-col items-stretch gap-3 lg:flex-row">
-        <div className="flex min-w-0 flex-1 basis-0 flex-col gap-3 rounded-xl border border-border bg-muted/30 p-5 text-left">
-          <div className="flex items-center justify-between gap-3">
-            <span className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-              You set
-            </span>
-            <span className="rounded-full border border-border bg-background px-2.5 py-1 text-foreground/80 text-xs">
-              {example.when}
-            </span>
-          </div>
-          <p className="font-semibold text-base text-foreground">
-            {example.name}
-          </p>
-          <p className="text-foreground/80 text-sm leading-relaxed">
-            {example.prompt}
-          </p>
-        </div>
-        <div className="flex shrink-0 items-center justify-center">
-          <ArrowRight01Icon
-            aria-hidden
-            className="size-5 text-primary max-lg:rotate-90"
-          />
-        </div>
-        <div className="flex min-w-0 flex-1 basis-0 flex-col gap-3 rounded-xl border border-border bg-background p-5 text-left">
-          <div className="flex items-center justify-between gap-3">
-            <span className="font-medium text-primary text-xs uppercase tracking-wide">
-              You get
-            </span>
-            <span className="text-muted-foreground text-xs">
-              {example.getTime}
-            </span>
-          </div>
-          <p className="font-semibold text-base text-foreground">
-            {example.getTitle}
-          </p>
-          <ul className="list-disc space-y-2 pl-5 text-foreground/80 text-sm leading-relaxed marker:text-primary">
-            {example.getLines.map((line) => (
-              <li key={line}>{line}</li>
-            ))}
-          </ul>
-        </div>
-      </div>
-      <div className="flex gap-3">
-        <Button
-          onClick={() =>
-            onUse(
-              `Create an automation. Run it: ${example.when}. ${example.prompt}`
-            )
-          }
-          type="button"
-        >
-          Use this example
-        </Button>
-        <Button onClick={onStartFromScratch} type="button" variant="outline">
-          Start from scratch
-        </Button>
-      </div>
-    </div>
+      <Button disabled={!task} size="lg" type="submit">
+        Continue
+      </Button>
+    </form>
   );
 }
 

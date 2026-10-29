@@ -8,6 +8,7 @@ import { GroupRecents } from "@/components/agent-groups/group-recents";
 import { OrgSwitcher } from "@/components/OrgSwitcher";
 import { RecentChats } from "@/components/SidebarRecentChats";
 import { useAuth } from "@/context/use-auth";
+import { useLanguage } from "@/context/use-language";
 import { usePrefetchAppData } from "@/hooks/use-app-queries";
 import { useAutomationUnreadTotal } from "@/hooks/use-automations";
 import { useOrgPlugins } from "@/hooks/use-plugins";
@@ -44,13 +45,22 @@ export function AppSidebar({
   const { user, activeOrg } = useAuth();
   const prefetchAppData = usePrefetchAppData();
   const { data: automationUnreadTotal = 0 } = useAutomationUnreadTotal();
-  const { collapsed: shellCollapsed, toggle } = useSidebarCollapsed();
+
+  const { collapsed: shellCollapsed, toggle } = useSidebarCollapsed({
+    shortcut: variant === "shell",
+  });
+
   const collapsed = variant === "shell" && shellCollapsed;
 
-  const items = visibleNavGroups({
-    isPlatformAdmin: user?.isPlatformAdmin === true,
-    orgRole: activeOrg?.role,
-  })
+  const { language } = useLanguage();
+
+  const items = visibleNavGroups(
+    {
+      isPlatformAdmin: user?.isPlatformAdmin === true,
+      orgRole: activeOrg?.role,
+    },
+    language
+  )
     .flatMap((group) => group.items)
     .filter((item) => SIDEBAR_PAGE_IDS.includes(item.id));
 

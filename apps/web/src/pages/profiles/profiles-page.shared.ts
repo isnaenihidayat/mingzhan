@@ -1,7 +1,7 @@
 export const sectionClass = "rounded-md border border-border bg-card";
 
 export const profilesTagline =
-  "Konfigurasi jiwa (soul), senjata (tools), dan keterampilan untuk setiap Zhànyǒu.";
+  "Configure prompts, tools, and skills for each agent.";
 
 export const profileTextSaveDelayMs = 1000;
 

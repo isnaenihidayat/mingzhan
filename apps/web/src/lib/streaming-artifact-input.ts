@@ -4,9 +4,9 @@ const ARTIFACT_META_SUFFIX = ".mingzhan-meta.json";
 
 /**
  * Shortest distinctive prefix of the meta suffix we reject while the path is
- * still streaming (e.g. `report.md.nak` before `.mingzhan-meta.json` completes).
+ * still streaming (e.g. `report.md.min` before `.mingzhan-meta.json` completes).
  */
-const ARTIFACT_META_PREFIX = ".nak";
+const ARTIFACT_META_PREFIX = ".min";
 
 const ARTIFACT_WRITE_TOOLS = new Set([
   "save_artifact",
@@ -35,7 +35,7 @@ function isArtifactMetaRelativePath(relativePath: string): boolean {
     return true;
   }
 
-  // While path is still streaming, reject prefixes like `.nak` / `.mingzhan-m`.
+  // While path is still streaming, reject prefixes like `.min` / `.mingzhan-m`.
   for (
     let length = ARTIFACT_META_PREFIX.length;
     length < ARTIFACT_META_SUFFIX.length;

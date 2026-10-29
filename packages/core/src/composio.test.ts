@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,7 +9,6 @@ import {
 import {
   composioOrgUserId,
   composioUserId,
-  getComposioConfigPath,
   isComposioConfigured,
   isComposioConfiguredAsync,
   loadComposioConfigFile,
@@ -31,7 +30,10 @@ describe("composio-config", () => {
   });
 
   test("resolveComposioApiKey reads a mounted secret file", async () => {
-    const configDir = await mkdtemp(join(tmpdir(), "mingzhan-composio-secret-"));
+    const configDir = await mkdtemp(
+      join(tmpdir(), "mingzhan-composio-secret-")
+    );
+
     const secretPath = join(configDir, "api-key");
     await writeFile(secretPath, "  ck-mounted\n");
 
@@ -69,21 +71,23 @@ describe("composio-config", () => {
     expect(composioUserId("usr_123")).toBe("mingzhan:user:usr_123");
   });
 
-  test("saveComposioConfig writes config.ini", async () => {
-    const configDir = await mkdtemp(join(tmpdir(), "mingzhan-composio-config-"));
+  test("Composio reads an environment key without writing config.ini", async () => {
+    const configDir = await mkdtemp(
+      join(tmpdir(), "mingzhan-composio-config-")
+    );
+
     const previous = process.env.MINGZHAN_CONFIG_DIR;
+    const previousKey = process.env.COMPOSIO_API_KEY;
     process.env.MINGZHAN_CONFIG_DIR = configDir;
+    process.env.COMPOSIO_API_KEY = "ck_test_secret";
 
     try {
-      const saved = await saveComposioConfig({ apiKey: "ck_test_secret" });
-      expect(saved.configured).toBe(true);
-      expect(saved.apiKeyMasked).toBeTruthy();
+      await expect(
+        saveComposioConfig({ apiKey: "ck_test_secret" })
+      ).rejects.toThrow();
 
       const loaded = await loadComposioConfigFile();
       expect(loaded?.apiKey).toBe("ck_test_secret");
-
-      const raw = await readFile(getComposioConfigPath(), "utf8");
-      expect(raw).toContain("api_key=ck_test_secret");
 
       expect(await isComposioConfiguredAsync()).toBe(true);
       expect((await loadComposioSettingsPublic()).configured).toBe(true);
@@ -92,6 +96,12 @@ describe("composio-config", () => {
         delete process.env.MINGZHAN_CONFIG_DIR;
       } else {
         process.env.MINGZHAN_CONFIG_DIR = previous;
+      }
+
+      if (previousKey === undefined) {
+        delete process.env.COMPOSIO_API_KEY;
+      } else {
+        process.env.COMPOSIO_API_KEY = previousKey;
       }
     }
   });

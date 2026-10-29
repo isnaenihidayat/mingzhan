@@ -34,9 +34,12 @@ import { cn } from "@mingzhan/ui/utils";
 import {
   Add01Icon,
   Alert02Icon,
+  ArrowDown01Icon,
   ArrowExpand01Icon,
   ArrowShrink02Icon,
   ArrowUp02Icon,
+  Attachment01Icon,
+  AudioWave01Icon,
   Cancel01Icon,
   CommandLineIcon,
   File01Icon,
@@ -45,11 +48,13 @@ import {
   Plug01Icon,
   PuzzleIcon,
   Settings01Icon,
+  SparklesIcon,
   WifiOff01Icon,
 } from "hugeicons-react";
 import {
   createContext,
   type ReactNode,
+  type RefObject,
   useCallback,
   useContext,
   useEffect,
@@ -152,6 +157,11 @@ interface ChatComposerBaseProps {
   onStop?: () => void;
   onSubmit: (text: string, files: FileUIPart[]) => void;
   placeholder?: string;
+  /**
+   * Owned by the caller so it survives the composer remounting when the
+   * first send in a new chat changes `session` from null to a real id.
+   */
+  promptHistoryRef?: RefObject<string[]>;
   queuedMessages?: QueuedComposerMessage[];
   todos?: AgentTodo[];
 }
@@ -698,6 +708,16 @@ const ConnectorsContext = createContext<{
 /** True when `/btw` is offered: only the composer that can open a side chat. */
 const BtwCommandContext = createContext(false);
 
+const PromptHistoryContext = createContext<{
+  promptHistoryRef: RefObject<string[]>;
+  historyPointer: number | null;
+  setHistoryPointer: (pointer: number | null) => void;
+}>({
+  historyPointer: null,
+  promptHistoryRef: { current: [] },
+  setHistoryPointer: () => undefined,
+});
+
 const CommandPrefixContext = createContext<{
   prefix: string | null;
   setPrefix: (prefix: string | null) => void;
@@ -774,6 +794,14 @@ function useOpenPluginContext(profileId: string | null) {
 export function ChatComposer(props: ChatComposerProps) {
   const { activeOrg, updateOrg, user } = useAuth();
   const { textInput } = usePromptInputController();
+  const ownPromptHistoryRef = useRef<string[]>([]);
+  const promptHistoryRef = props.promptHistoryRef ?? ownPromptHistoryRef;
+  const [historyPointer, setHistoryPointer] = useState<number | null>(null);
+
+  const promptHistoryContext = useMemo(
+    () => ({ historyPointer, promptHistoryRef, setHistoryPointer }),
+    [historyPointer, promptHistoryRef]
+  );
 
   const [addDialog, setAddDialog] = useState<ComposerAddCommandAction | null>(
     null
@@ -872,6 +900,8 @@ export function ChatComposer(props: ChatComposerProps) {
         return;
       }
 
+      promptHistoryRef.current.push(text);
+      setHistoryPointer(null);
       clearDraft();
       props.onSubmit(text, files);
     },
@@ -912,41 +942,43 @@ export function ChatComposer(props: ChatComposerProps) {
       <BtwCommandContext.Provider value={Boolean(onBtw)}>
         <OpenPluginContext.Provider value={pluginsMenuContext}>
           <ConnectorsContext.Provider value={connectorsContext}>
-            <div className={cn("w-full shrink-0", props.className)}>
-              {layout.showOfflineHint && isFullComposer(props) ? (
-                <ChatComposerOfflineHint
-                  onConnectProvider={props.onConnectProvider}
+            <PromptHistoryContext.Provider value={promptHistoryContext}>
+              <div className={cn("w-full shrink-0", props.className)}>
+                {layout.showOfflineHint && isFullComposer(props) ? (
+                  <ChatComposerOfflineHint
+                    onConnectProvider={props.onConnectProvider}
+                  />
+                ) : null}
+                <ChatComposerMain
+                  displayError={displayError}
+                  layout={layout}
+                  onAddCommand={openAddCommand}
+                  props={composerProps}
+                  setAttachmentError={setAttachmentError}
                 />
-              ) : null}
-              <ChatComposerMain
-                displayError={displayError}
-                layout={layout}
-                onAddCommand={openAddCommand}
-                props={composerProps}
-                setAttachmentError={setAttachmentError}
-              />
-              {addProfileId ? (
-                <ChatAddCapabilitiesDialogs
-                  mcpOpen={addDialog === "add-mcp"}
-                  onMcpOpenChange={(open) => {
-                    setAddDialog(open ? "add-mcp" : null);
-                  }}
-                  onPluginOpenChange={(open) =>
-                    setAddDialog(open ? "add-plugin" : null)
-                  }
-                  onSkillOpenChange={(open) => {
-                    setAddDialog(open ? "add-skill" : null);
-                  }}
-                  onToolOpenChange={(open) => {
-                    setAddDialog(open ? "add-tool" : null);
-                  }}
-                  pluginOpen={addDialog === "add-plugin"}
-                  profileId={addProfileId}
-                  skillOpen={addDialog === "add-skill"}
-                  toolOpen={addDialog === "add-tool"}
-                />
-              ) : null}
-            </div>
+                {addProfileId ? (
+                  <ChatAddCapabilitiesDialogs
+                    mcpOpen={addDialog === "add-mcp"}
+                    onMcpOpenChange={(open) => {
+                      setAddDialog(open ? "add-mcp" : null);
+                    }}
+                    onPluginOpenChange={(open) =>
+                      setAddDialog(open ? "add-plugin" : null)
+                    }
+                    onSkillOpenChange={(open) => {
+                      setAddDialog(open ? "add-skill" : null);
+                    }}
+                    onToolOpenChange={(open) => {
+                      setAddDialog(open ? "add-tool" : null);
+                    }}
+                    pluginOpen={addDialog === "add-plugin"}
+                    profileId={addProfileId}
+                    skillOpen={addDialog === "add-skill"}
+                    toolOpen={addDialog === "add-tool"}
+                  />
+                ) : null}
+              </div>
+            </PromptHistoryContext.Provider>
           </ConnectorsContext.Provider>
         </OpenPluginContext.Provider>
       </BtwCommandContext.Provider>
@@ -1102,6 +1134,10 @@ function ChatComposerTextarea({
   );
 
   const { prefix, setPrefix } = useContext(CommandPrefixContext);
+
+  const { promptHistoryRef, historyPointer, setHistoryPointer } =
+    useContext(PromptHistoryContext);
+
   const value = controller.textInput.value;
   const setInput = controller.textInput.setInput;
 
@@ -1137,6 +1173,10 @@ function ChatComposerTextarea({
         disabled={disabled}
         longPasteWordThreshold={longPasteWordThreshold}
         onChange={(event) => {
+          if (historyPointer !== null) {
+            setHistoryPointer(null);
+          }
+
           updateSlashRange(
             event.currentTarget.value,
             event.currentTarget.selectionStart
@@ -1158,6 +1198,39 @@ function ChatComposerTextarea({
             if (event.key === "Escape" && prefix) {
               event.preventDefault();
               setPrefix(null);
+            }
+
+            if (
+              event.currentTarget.selectionStart === 0 &&
+              event.currentTarget.selectionEnd === 0
+            ) {
+              if (event.key === "ArrowUp") {
+                if (promptHistoryRef.current.length === 0) {
+                  return;
+                }
+
+                const nextPointer =
+                  historyPointer === null
+                    ? promptHistoryRef.current.length - 1
+                    : Math.max(historyPointer - 1, 0);
+
+                event.preventDefault();
+                setHistoryPointer(nextPointer);
+                setInput(promptHistoryRef.current[nextPointer]);
+              }
+
+              if (event.key === "ArrowDown" && historyPointer !== null) {
+                event.preventDefault();
+
+                if (historyPointer >= promptHistoryRef.current.length - 1) {
+                  setHistoryPointer(null);
+                  setInput("");
+                } else {
+                  const nextPointer = historyPointer + 1;
+                  setHistoryPointer(nextPointer);
+                  setInput(promptHistoryRef.current[nextPointer]);
+                }
+              }
             }
 
             return;
@@ -1364,12 +1437,14 @@ function ChatModelPicker({
       >
         <PopoverTrigger
           aria-label="Select model and effort"
-          className="flex h-7 max-w-full items-center overflow-hidden rounded-full bg-muted px-2.5 font-medium text-foreground text-xs transition-[background-color,opacity] hover:bg-muted/70 focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 aria-expanded:bg-accent"
+          className="flex h-8 max-w-full items-center gap-1.5 overflow-hidden rounded-full border border-border/70 bg-card/60 px-3 font-medium text-foreground text-xs shadow-2xs transition-colors hover:border-border hover:bg-muted/70 focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 aria-expanded:bg-accent"
           disabled={disabled || !(hasModels || effort)}
           title={triggerLabel}
           type="button"
         >
+          <SparklesIcon className="size-3.5 shrink-0 text-primary" />
           <span className="min-w-0 truncate">{triggerLabel}</span>
+          <ArrowDown01Icon className="size-3 shrink-0 text-muted-foreground" />
         </PopoverTrigger>
         <PopoverContent
           align="start"
@@ -1503,10 +1578,9 @@ function ChatComposerFullFooter({
   );
 }
 
-/** Visible 32px face; ≥40px hit via pseudo. Keep transform in transition for press scale. */
 const composerSubmitButtonClassName = cn(
   composerHitTargetClass,
-  "size-8 shrink-0 rounded-full bg-primary text-primary-foreground shadow-none transition-[color,background-color,transform,opacity] hover:bg-primary/90 active:scale-[0.96] disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100"
+  "h-8 min-w-8 shrink-0 rounded-full bg-foreground px-2.5 text-background shadow-none transition-all duration-200 hover:opacity-90 active:scale-[0.96] disabled:bg-muted disabled:text-muted-foreground disabled:opacity-80"
 );
 
 const composerAttachmentRemoveClassName = cn(
@@ -1562,7 +1636,7 @@ function ChatComposerSubmitButton({
           disabled
           status={chatStatus}
         >
-          <ArrowUp02Icon className="size-4" />
+          <AudioWave01Icon className="size-4" />
         </PromptInputSubmit>
       )
     );
@@ -1758,7 +1832,7 @@ function ChatAttachmentButton({ disabled }: { disabled: boolean }) {
                   aria-label="Add attachment"
                   className={cn(
                     composerIconButtonClass,
-                    "size-8 bg-transparent text-foreground hover:bg-muted"
+                    "size-8 rounded-full border border-border/70 bg-card/60 text-muted-foreground shadow-2xs transition-colors hover:border-border hover:bg-muted/70 hover:text-foreground"
                   )}
                   disabled={disabled}
                   ref={triggerRef}
@@ -1766,7 +1840,7 @@ function ChatAttachmentButton({ disabled }: { disabled: boolean }) {
                   type="button"
                   variant="ghost"
                 >
-                  <Add01Icon className="size-4" />
+                  <Attachment01Icon className="size-4 -rotate-45" />
                 </Button>
               }
             />

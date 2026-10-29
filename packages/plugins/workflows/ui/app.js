@@ -3101,6 +3101,6 @@ function apply(ctx) {
   ctx.slots.register("page", WorkflowsPage);
 }
 export {
-  apply,
-  inject
+  inject,
+  apply
 };

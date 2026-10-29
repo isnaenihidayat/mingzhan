@@ -136,6 +136,24 @@ describe("ACP provider", () => {
     );
   });
 
+  test("keeps MíngZhàn secrets out of the agent process env", async () => {
+    process.env.MINGZHAN_SECRETS_KEY = "test-master-key";
+    process.env.MINGZHAN_PROVIDER_API_KEY_OPENAI = "test-provider-key";
+    process.env.ANTHROPIC_API_KEY = "test-agent-login";
+
+    try {
+      const provider = createProvider(nextSessionKey());
+      const result = await provider.generateChat(chatInput("env check"));
+
+      // The agent still needs its own login key; only MíngZhàn's secrets are cut.
+      expect(result.content).toBe("env: ANTHROPIC_API_KEY");
+    } finally {
+      delete process.env.MINGZHAN_SECRETS_KEY;
+      delete process.env.MINGZHAN_PROVIDER_API_KEY_OPENAI;
+      delete process.env.ANTHROPIC_API_KEY;
+    }
+  });
+
   test("sends the system prompt on the first turn only", async () => {
     const provider = createProvider(nextSessionKey());
 

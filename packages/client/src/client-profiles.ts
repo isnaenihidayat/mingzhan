@@ -24,7 +24,9 @@ import type {
   RunToolResponse,
   SkillFileResponse,
   SkillFilesResponse,
+  SkillInstallPreviewResponse,
   SkillResponse,
+  SkillsMarketplaceResponse,
   SuggestToolParamsRequest,
   SuggestToolParamsResponse,
   SyncSkillsResponse,
@@ -183,6 +185,12 @@ export class ProfilesClient extends SettingsClient {
     });
   }
 
+  async rejectToolSetup(setupId: string): Promise<ToolSetupPlan> {
+    return this.request(`/v1/tool-setups/${encodeURIComponent(setupId)}`, {
+      method: "DELETE",
+    });
+  }
+
   async saveToolCredential(
     toolId: string,
     apiKey: string
@@ -191,6 +199,16 @@ export class ProfilesClient extends SettingsClient {
       body: JSON.stringify({ apiKey }),
       method: "PUT",
     });
+  }
+
+  async manageToolCredential(
+    toolId: string,
+    action: "clear" | "use-stored"
+  ): Promise<ToolCredentialStatus> {
+    return this.request(
+      `/v1/tools/${encodeURIComponent(toolId)}/credentials${action === "use-stored" ? "/use-stored" : ""}`,
+      { method: action === "clear" ? "DELETE" : "POST" }
+    );
   }
 
   async saveToolEnv(
@@ -441,6 +459,23 @@ export class ProfilesClient extends SettingsClient {
       body: JSON.stringify(request),
       method: "POST",
     });
+  }
+
+  async searchSkillsMarketplace(
+    query: string
+  ): Promise<SkillsMarketplaceResponse> {
+    return this.request<SkillsMarketplaceResponse>(
+      `/v1/skills/marketplace?${new URLSearchParams({ q: query })}`
+    );
+  }
+
+  async previewSkillInstall(
+    command: string
+  ): Promise<SkillInstallPreviewResponse> {
+    return this.request<SkillInstallPreviewResponse>(
+      "/v1/skills/install/preview",
+      { body: JSON.stringify({ command }), method: "POST" }
+    );
   }
 
   async getSkill(skillId: string): Promise<SkillResponse> {

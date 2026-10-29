@@ -43,7 +43,7 @@ export function formatImageMentionContext(
 
   return toolNames.includes(GENERATE_IMAGE_TOOL_NAME)
     ? `The user tagged @image, so this turn is an image request. Call ${GENERATE_IMAGE_TOOL_NAME} right away with a detailed prompt built from their message (leave out the @image tag), then reply briefly. Do not answer with text only.`
-    : `The user tagged @image, but the ${GENERATE_IMAGE_TOOL_NAME} tool is not assigned to this agent. Tell them image generation is off here: assign the ${GENERATE_IMAGE_TOOL_NAME} tool to this agent and a platform admin must pick an image generation model in Control center → AI Providers (/customize/providers#image-generation).`;
+    : `The user tagged @image, but the ${GENERATE_IMAGE_TOOL_NAME} tool is not assigned to this agent. Tell them the image tool is not enabled for this agent and an administrator can assign it in the agent tools settings. Do not claim the image model is missing: tool assignment and workspace model configuration are independent. If generation later reports a missing or invalid model, direct a platform admin to Control center → AI Providers (/customize/providers#image-generation).`;
 }
 
 interface GenerateImageToolSuccess {

@@ -133,3 +133,25 @@ describe("looksLikeUtf8Text", () => {
     expect(looksLikeUtf8Text(new Uint8Array([0xff, 0xfe, 0xfd]))).toBe(false);
   });
 });
+
+test.each([
+  [
+    "report.docx",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ],
+  [
+    "report.xlsx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ],
+  ["report.xlsm", "application/vnd.ms-excel.sheet.macroEnabled.12"],
+  [
+    "report.pptx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ],
+  ["report.pdf", "application/pdf"],
+])(
+  "document artifact %s has the correct download type",
+  (filename, mimeType) => {
+    expect(inferArtifactMimeType(filename)).toBe(mimeType);
+  }
+);

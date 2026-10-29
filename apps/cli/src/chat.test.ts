@@ -135,6 +135,7 @@ describe("formatStatusLines", () => {
     composioConfigured: false,
     ok: true,
     providerConfigured: true,
+    updateCheckEnabled: true,
     userConfigured: true,
     version: "0.4.10",
   };

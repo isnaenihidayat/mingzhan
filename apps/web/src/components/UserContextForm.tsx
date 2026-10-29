@@ -1,10 +1,13 @@
-import { parseUserContext, renderUserContext } from "@mingzhan/core/user-context";
+import {
+  parseUserContext,
+  renderUserContext,
+} from "@mingzhan/core/user-context";
 import { FormField } from "@mingzhan/ui/form-field";
 import { Input } from "@mingzhan/ui/input";
 import { Textarea } from "@mingzhan/ui/textarea";
 import { cn } from "@mingzhan/ui/utils";
 import { type ReactNode, useState } from "react";
-import { helpSuggestionsForContext } from "@/components/user-context-presets";
+import { GOAL_SUGGESTIONS } from "@/components/user-context-presets";
 
 function useAnswers(value: string, onChange: (next: string) => void) {
   const parsed = parseUserContext(value);
@@ -64,7 +67,7 @@ interface UserContextFormProps {
   value: string;
 }
 
-/** A free-form introduction with an optional, context-shaped follow-up. */
+/** A free-form introduction with optional goals. */
 export function UserContextForm({
   value,
   onChange,
@@ -76,13 +79,12 @@ export function UserContextForm({
   const [introDraft, setIntroDraft] = useState<string | null>(null);
   const [customHelpOpen, setCustomHelpOpen] = useState<boolean | null>(null);
 
-  const suggestions = helpSuggestionsForContext(
-    [extra, answers.role, answers.projects].filter(Boolean).join(" ")
-  );
-
   const help = answers.help ?? "";
   const selected = new Set(splitList(help));
-  const suggestionSet = new Set(suggestions);
+
+  // Goals saved before this list existed stay visible as picked chips.
+  const suggestions = [...new Set([...GOAL_SUGGESTIONS, ...selected])];
+  const suggestionSet = new Set<string>(GOAL_SUGGESTIONS);
 
   const showCustomHelp =
     customHelpOpen ??
@@ -119,50 +121,48 @@ export function UserContextForm({
         />
       </FormField>
 
-      {suggestions.length > 0 || help !== "" ? (
-        <div className="space-y-3">
-          <div
-            aria-label="What would you like help with? (optional)"
-            className="space-y-2"
-            role="group"
-          >
-            <p className="font-medium text-sm">
-              What would you like help with?{" "}
-              <span className="font-normal text-muted-foreground">
-                (optional)
-              </span>
-            </p>
-            <div className="flex flex-wrap gap-2">
-              {suggestions.map((suggestion) => (
-                <Chip
-                  disabled={disabled}
-                  key={suggestion}
-                  onClick={() => toggleHelp(suggestion)}
-                  selected={selected.has(suggestion)}
-                >
-                  {suggestion}
-                </Chip>
-              ))}
+      <div className="space-y-3">
+        <div
+          aria-label="What is your goal? (optional)"
+          className="space-y-2"
+          role="group"
+        >
+          <p className="font-medium text-sm">
+            What is your goal?{" "}
+            <span className="font-normal text-muted-foreground">
+              (optional)
+            </span>
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {suggestions.map((suggestion) => (
               <Chip
                 disabled={disabled}
-                onClick={() => setCustomHelpOpen(!showCustomHelp)}
-                selected={showCustomHelp}
+                key={suggestion}
+                onClick={() => toggleHelp(suggestion)}
+                selected={selected.has(suggestion)}
               >
-                Something else
+                {suggestion}
               </Chip>
-            </div>
-          </div>
-          {showCustomHelp ? (
-            <Input
-              aria-label="What would you like help with?"
+            ))}
+            <Chip
               disabled={disabled}
-              onChange={(event) => setAnswer("help", event.target.value)}
-              placeholder="Tell us in your own words"
-              value={help}
-            />
-          ) : null}
+              onClick={() => setCustomHelpOpen(!showCustomHelp)}
+              selected={showCustomHelp}
+            >
+              Something else
+            </Chip>
+          </div>
         </div>
-      ) : null}
+        {showCustomHelp ? (
+          <Input
+            aria-label="What is your goal?"
+            disabled={disabled}
+            onChange={(event) => setAnswer("help", event.target.value)}
+            placeholder="Tell us in your own words"
+            value={help}
+          />
+        ) : null}
+      </div>
 
       <details className="space-y-3">
         <summary className="cursor-pointer rounded-sm text-sm focus-visible:outline-ring">

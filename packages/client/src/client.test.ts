@@ -149,7 +149,8 @@ const authScopeRequests = [
     response: authScopeUser,
   },
   {
-    call: (client: MíngZhànClient) => client.acceptOrgInvite({ token: "invite" }),
+    call: (client: MíngZhànClient) =>
+      client.acceptOrgInvite({ token: "invite" }),
     method: "POST",
     path: "/v1/auth/accept-invite",
     response: {
@@ -1028,7 +1029,10 @@ test("data import helpers upload base64 archive data", async () => {
 });
 
 test("non-browser clients reload the local auth token once after a 401", async () => {
-  const configDir = await mkdtemp(join(tmpdir(), "mingzhan-client-auth-reload-"));
+  const configDir = await mkdtemp(
+    join(tmpdir(), "mingzhan-client-auth-reload-")
+  );
+
   process.env.MINGZHAN_CONFIG_DIR = configDir;
 
   try {
@@ -1452,4 +1456,26 @@ test("tool detail scope overrides one request and preserves the client default",
     "default-org",
   ]);
   expect(requests.map((request) => request.method)).toEqual(["GET", "GET"]);
+});
+
+test("setup recommendations use the active organization and selected agent", async () => {
+  const requests: Request[] = [];
+  const response = { goal: "Reports", items: [] };
+
+  const client = new MíngZhànClient({
+    baseUrl: "http://localhost",
+    fetch: async (input, init) => {
+      requests.push(new Request(input, init));
+
+      return Response.json(response);
+    },
+    orgId: "team-a",
+  });
+
+  expect(await client.getSetupChecklist("agent-a")).toEqual(response);
+  expect(requests).toHaveLength(1);
+  expect(new URL(requests[0]!.url).pathname).toBe("/v1/user/setup-checklist");
+  expect(requests[0]!.method).toBe("POST");
+  expect(requests[0]!.headers.get("X-Org-Id")).toBe("team-a");
+  expect(await requests[0]!.json()).toEqual({ profileId: "agent-a" });
 });

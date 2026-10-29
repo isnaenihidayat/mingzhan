@@ -1,6 +1,5 @@
 import { createRoute, z } from "@hono/zod-openapi";
 import {
-  getGroupSharedDir,
   listGroupFiles,
   MíngZhànApiError,
   readGroupFile,
@@ -16,16 +15,13 @@ import type {
   ListRailPinsResponse,
 } from "@mingzhan/core/agent-groups";
 import type { Context } from "hono";
+import { readGroupDocuments } from "../../services/agent-group-prompt";
+import { AgentGroupService } from "../../services/agent-group-service";
+import { listRailPins, setRailPin } from "../../services/agent-group-store";
 import {
   GROUP_MEMORY_CHARS,
-  readGroupMemory,
-  replaceGroupMemory,
-} from "../../services/agent-group-memory";
-import {
-  AgentGroupService,
-  readGroupDocuments,
-} from "../../services/agent-group-service";
-import { listRailPins, setRailPin } from "../../services/agent-group-store";
+  workspaceOfGroup,
+} from "../../services/agent-group-workspace";
 import type { ServerOptions } from "../context";
 import {
   requireActiveOrgIdFromContext,
@@ -348,7 +344,7 @@ export function registerAgentGroupRoutes(
     const group = service.get(orgId, auth.user.id, c.req.param("groupId"));
 
     return json<AgentGroupMemory>({
-      content: readGroupMemory(getGroupSharedDir(orgId, group.id)),
+      content: workspaceOfGroup(orgId, group.id).memory.read(),
       limit: GROUP_MEMORY_CHARS,
     });
   });
@@ -360,11 +356,7 @@ export function registerAgentGroupRoutes(
     const { base, content } = await readJson(c.req.raw, memorySchema);
 
     return json<AgentGroupMemory>({
-      content: replaceGroupMemory(
-        getGroupSharedDir(orgId, group.id),
-        content,
-        base
-      ),
+      content: workspaceOfGroup(orgId, group.id).memory.replace(content, base),
       limit: GROUP_MEMORY_CHARS,
     });
   });
@@ -396,7 +388,7 @@ export function registerAgentGroupRoutes(
       auth.user.id,
       groupId,
       content,
-      await readGroupDocuments(orgId, auth.user.id, groupId, documents)
+      await readGroupDocuments(documents)
     );
 
     // The reply run outlives the request; the page polls the session for it.
@@ -464,7 +456,7 @@ export function registerAgentGroupRoutes(
           groupId,
           c.req.param("sessionId"),
           content,
-          await readGroupDocuments(orgId, auth.user.id, groupId, documents)
+          await readGroupDocuments(documents)
         )
         .catch(logRunFailure(groupId));
 
@@ -529,7 +521,7 @@ export function registerAgentGroupRoutes(
           t.sessionId,
           t.messageId,
           content,
-          await readGroupDocuments(t.orgId, t.userId, t.groupId, documents)
+          await readGroupDocuments(documents)
         )
         .catch(logRunFailure(t.groupId));
 

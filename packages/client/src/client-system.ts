@@ -13,6 +13,8 @@ import type {
   HealthResponse,
   ListProvidersResponse,
   ModelsResponse,
+  MíngZhànUpgradeResponse,
+  MíngZhànVersionResponse,
   PluginWorkerStatus,
   PreviewDataImportRequest,
   ProfilePackImportRequest,
@@ -89,6 +91,24 @@ export class SystemClient extends MíngZhànClientCore {
     );
   }
 
+  async getMíngZhànVersion(): Promise<MíngZhànVersionResponse> {
+    return this.request<MíngZhànVersionResponse>("/v1/system/version");
+  }
+
+  async getMíngZhànUpgrade(): Promise<MíngZhànUpgradeResponse> {
+    return this.request<MíngZhànUpgradeResponse>("/v1/system/upgrade");
+  }
+
+  async startMíngZhànUpgrade(
+    version: string,
+    rollback = false
+  ): Promise<MíngZhànUpgradeResponse> {
+    return this.request<MíngZhànUpgradeResponse>("/v1/system/upgrade", {
+      body: JSON.stringify({ rollback, version }),
+      method: "POST",
+    });
+  }
+
   async getWebPublicUrl(): Promise<WebPublicUrlSettingsResponse> {
     return this.request<WebPublicUrlSettingsResponse>(
       "/v1/system/web-public-url"
@@ -115,7 +135,8 @@ export class SystemClient extends MíngZhànClientCore {
     return {
       data: await response.arrayBuffer(),
       filename:
-        readContentDispositionFilename(response.headers) ?? "mingzhan-export.zip",
+        readContentDispositionFilename(response.headers) ??
+        "mingzhan-export.zip",
     };
   }
 
@@ -373,7 +394,12 @@ export class SystemClient extends MíngZhànClientCore {
     baseUrl?: string;
     apiKey?: string;
     providerId?: string;
-    provider?: "ollama" | "openai_compatible" | "fireworks" | "netra";
+    provider?:
+      | "ollama"
+      | "openai_compatible"
+      | "fireworks"
+      | "netra"
+      | "cloudflare";
     hostMode?: "local" | "cloud";
   }): Promise<ModelsResponse> {
     return this.request<ModelsResponse>("/v1/models/discover", {
@@ -405,6 +431,26 @@ export class SystemClient extends MíngZhànClientCore {
         body: JSON.stringify(request),
         method: "PATCH",
       }
+    );
+  }
+
+  async setProviderSecret(
+    providerId: string,
+    apiKey: string
+  ): Promise<UpdateProviderResponse> {
+    return this.request<UpdateProviderResponse>(
+      `/v1/providers/${encodeURIComponent(providerId)}/secret`,
+      { body: JSON.stringify({ apiKey }), method: "PUT" }
+    );
+  }
+
+  async manageProviderSecret(
+    providerId: string,
+    action: "clear" | "use-stored"
+  ): Promise<UpdateProviderResponse> {
+    return this.request<UpdateProviderResponse>(
+      `/v1/providers/${encodeURIComponent(providerId)}/secret${action === "use-stored" ? "/use-stored" : ""}`,
+      { method: action === "clear" ? "DELETE" : "POST" }
     );
   }
 

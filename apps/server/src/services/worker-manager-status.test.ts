@@ -2,9 +2,13 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readWorkerDesiredState, setWorkerDesiredRunning } from "@mingzhan/core";
+import {
+  readWorkerDesiredState,
+  setWorkerDesiredRunning,
+} from "@mingzhan/core";
 import { getChannelConfigDir } from "@mingzhan/core/channel-config-shared";
 import { saveWhatsAppConfig } from "@mingzhan/core/whatsapp-config";
+import { createWorkerHeartbeatStore } from "@mingzhan/core/worker-heartbeat";
 import { WorkerManagerService } from "./worker-manager-service";
 
 type Pm2Client = NonNullable<
@@ -250,17 +254,20 @@ describe("WorkerManagerService", () => {
       await saveWhatsAppConfig({}, owner);
       await setWorkerDesiredRunning("automation", false);
       await setWorkerDesiredRunning("whatsapp", true, owner);
-      await writeFile(
-        join(getChannelConfigDir("whatsapp", owner), "worker-heartbeat.json"),
-        JSON.stringify({
-          pid: process.pid,
-          updatedAt: new Date().toISOString(),
-        })
-      );
+
+      const manualWorker = createWorkerHeartbeatStore({
+        getDir: () => getChannelConfigDir("whatsapp", owner),
+      });
+
+      await manualWorker.acquire();
       const mockPm2 = createMockPm2();
       const service = new WorkerManagerService(projectRoot, mockPm2);
 
-      await service.recoverDesiredWorkers();
+      try {
+        await service.recoverDesiredWorkers();
+      } finally {
+        await manualWorker.clear();
+      }
 
       expect((await readWorkerDesiredState(owner)).whatsapp).toBe(true);
       expect(mockPm2.start).not.toHaveBeenCalled();

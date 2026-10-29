@@ -32,7 +32,9 @@ For a single-container deployment:
 
 ```bash
 docker pull ghcr.io/mingpromotion/mingzhan:latest
-docker run -d -p 4310:4310 -v mingzhan-data:/mingzhan/data --name mingzhan ghcr.io/mingpromotion/mingzhan:latest
+umask 077
+printf 'MINGZHAN_SECRETS_KEY=%s\n' "$(openssl rand -base64 32)" > mingzhan-secrets.env
+docker run -d -p 4310:4310 -v mingzhan-data:/mingzhan/data --env-file mingzhan-secrets.env --name mingzhan ghcr.io/mingpromotion/mingzhan:latest
 ```
 
 Open `http://localhost:4310`. See [Docker](/docker) for build-from-source, volumes, and production notes.

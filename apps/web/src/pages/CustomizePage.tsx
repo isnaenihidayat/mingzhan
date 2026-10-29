@@ -280,6 +280,14 @@ export function SkillsPage() {
                         </span>
                       )}
                     </div>
+                    {skill.description.trim() ? (
+                      <p
+                        className="mt-1 line-clamp-2 break-words text-muted-foreground text-xs"
+                        title={skill.description}
+                      >
+                        {skill.description}
+                      </p>
+                    ) : null}
                   </div>
                   <ArrowRight01Icon
                     aria-hidden

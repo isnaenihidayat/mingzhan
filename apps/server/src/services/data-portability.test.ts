@@ -15,7 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { MíngZhànApiError } from "@mingzhan/core";
-import { createDatabase } from "@mingzhan/db";
+import { createDatabase, createSqliteDatabase } from "@mingzhan/db";
 import * as fflate from "fflate";
 import {
   createMíngZhànDataExport,
@@ -32,6 +32,7 @@ import {
   retireAppUserData,
 } from "./data-portability";
 import { MeetingStore } from "./google-meet/store";
+import { ManagedSecrets } from "./managed-secrets";
 
 let rootDir = "";
 
@@ -671,6 +672,47 @@ describe("MíngZhàn data portability", () => {
     expect(await readFile(join(target, "MEMORY.md"), "utf8")).toBe("secret");
   });
 
+  test("retirement skips stray files where org or profile directories are expected", async () => {
+    const profile = join(
+      rootDir,
+      "orgs",
+      "o",
+      "profiles",
+      "p",
+      "users",
+      "alice"
+    );
+
+    await mkdir(profile, { recursive: true });
+    await writeFile(join(profile, "MEMORY.md"), "secret");
+    // Finder drops regular files into walked directories; neither may crash boot.
+    await writeFile(join(rootDir, "orgs", ".DS_Store"), "finder metadata");
+    await writeFile(
+      join(rootDir, "orgs", "o", "profiles", ".DS_Store"),
+      "finder metadata"
+    );
+
+    await retireAppUserData(rootDir, null);
+
+    expect(
+      await readFile(
+        join(
+          rootDir,
+          "retired-app-users",
+          "o",
+          "p",
+          "users",
+          "alice",
+          "MEMORY.md"
+        ),
+        "utf8"
+      )
+    ).toBe("secret");
+    expect(await readFile(join(rootDir, "orgs", ".DS_Store"), "utf8")).toBe(
+      "finder metadata"
+    );
+  });
+
   test("legacy restore sanitation failure leaves live data and runtime untouched", async () => {
     await writeFile(join(rootDir, "config.ini"), "live");
 
@@ -695,6 +737,77 @@ describe("MíngZhàn data portability", () => {
     ).rejects.toThrow();
     expect(stopped).toBe(false);
     expect(await readFile(join(rootDir, "config.ini"), "utf8")).toBe("live");
+  });
+
+  test("legacy restore encrypts file keys and rejects a wrong backup key before replacement", async () => {
+    const previousKey = process.env.MINGZHAN_SECRETS_KEY;
+    const key = Buffer.alloc(32, 2).toString("base64");
+    process.env.MINGZHAN_SECRETS_KEY = key;
+
+    try {
+      await writeFile(join(rootDir, "config.ini"), "live");
+
+      const base = await createMíngZhànDataExport({
+        databasePath: null,
+        rootDir,
+      });
+
+      const archive = fflate.zipSync({
+        ...fflate.unzipSync(base.data),
+        "config.ini": Buffer.from(
+          "[provider.provider-a]\ntype=openai\napi_key=legacy-key\n"
+        ),
+      });
+
+      await restoreMíngZhànDataImport(archive, {
+        confirm: true,
+        databasePath: null,
+        rootDir,
+      });
+      expect(await readFile(join(rootDir, "config.ini"), "utf8")).not.toContain(
+        "legacy-key"
+      );
+      const databasePath = join(rootDir, "sqlite", "mingzhan.sqlite");
+      const database = await createSqliteDatabase(`file:${databasePath}`);
+
+      try {
+        expect(
+          (
+            await new ManagedSecrets(database.adapter, key).resolve(
+              "global",
+              "provider:provider-a"
+            )
+          ).value
+        ).toBe("legacy-key");
+      } finally {
+        database.release();
+      }
+
+      const backup = await createMíngZhànDataExport({ databasePath, rootDir });
+      const liveConfig = await readFile(join(rootDir, "config.ini"), "utf8");
+      process.env.MINGZHAN_SECRETS_KEY = Buffer.alloc(32, 3).toString("base64");
+      let replacementStarted = false;
+      await expect(
+        restoreMíngZhànDataImport(backup.data, {
+          beforeReplace: () => {
+            replacementStarted = true;
+          },
+          confirm: true,
+          databasePath,
+          rootDir,
+        })
+      ).rejects.toThrow();
+      expect(replacementStarted).toBe(false);
+      expect(await readFile(join(rootDir, "config.ini"), "utf8")).toBe(
+        liveConfig
+      );
+    } finally {
+      if (previousKey === undefined) {
+        delete process.env.MINGZHAN_SECRETS_KEY;
+      } else {
+        process.env.MINGZHAN_SECRETS_KEY = previousKey;
+      }
+    }
   });
 
   test("built-in Meet snapshots round-trip saved transcripts while excluding temporary audio", async () => {
@@ -865,7 +978,9 @@ describe("MíngZhàn data portability", () => {
 
     const preview = await previewMíngZhànDataImport(result.data, { rootDir });
 
-    expect(result.filename).toBe("mingzhan-export-2026-07-01T10-00-00-000Z.zip");
+    expect(result.filename).toBe(
+      "mingzhan-export-2026-07-01T10-00-00-000Z.zip"
+    );
     expect(result.manifest.kind).toBe("mingzhan-export");
     expect(result.manifest.topLevelPaths).toEqual([
       "config.ini",
@@ -1232,7 +1347,10 @@ describe("MíngZhàn data portability", () => {
   test("restore disables plugins in the configured live database", async () => {
     // The restore routes pass no databasePath, so the desktop app's
     // sqlite/mingzhan.sqlite comes only from DATABASE_URL.
-    const sourceRoot = await mkdtemp(join(tmpdir(), "mingzhan-desktop-source-"));
+    const sourceRoot = await mkdtemp(
+      join(tmpdir(), "mingzhan-desktop-source-")
+    );
+
     const previousDatabaseUrl = process.env.DATABASE_URL;
 
     try {
@@ -1310,11 +1428,15 @@ describe("MíngZhàn data portability", () => {
     ).rejects.toThrow("Invalid ZIP archive.");
 
     const unsafe = buildUnsafeZip();
-    await expect(previewMíngZhànDataImport(unsafe, { rootDir })).rejects.toThrow(
-      "Archive entry escapes restore root"
+    await expect(
+      previewMíngZhànDataImport(unsafe, { rootDir })
+    ).rejects.toThrow("Archive entry escapes restore root");
+
+    const reserved = buildZipWithEntry(
+      ".mingzhan-backup-evil/secret.txt",
+      "{}"
     );
 
-    const reserved = buildZipWithEntry(".mingzhan-backup-evil/secret.txt", "{}");
     await expect(
       previewMíngZhànDataImport(reserved, { rootDir })
     ).rejects.toThrow("Archive entry uses a reserved restore path");
@@ -1449,7 +1571,10 @@ describe("MíngZhàn data portability", () => {
       async (from, to) => {
         const toPath = String(to);
 
-        if (toPath.includes(".mingzhan-backup-") && toPath.endsWith("move.ini")) {
+        if (
+          toPath.includes(".mingzhan-backup-") &&
+          toPath.endsWith("move.ini")
+        ) {
           throw Object.assign(new Error("simulated backup failure"), {
             code: "EIO",
           });
@@ -1501,9 +1626,9 @@ describe("MíngZhàn data portability", () => {
       },
     ]);
 
-    await expect(previewMíngZhànDataImport(archive, { rootDir })).rejects.toThrow(
-      /big\.bin exceeds/
-    );
+    await expect(
+      previewMíngZhànDataImport(archive, { rootDir })
+    ).rejects.toThrow(/big\.bin exceeds/);
   });
 
   test("rejects an archive with more entries than the entry-count cap", async () => {
@@ -1514,9 +1639,9 @@ describe("MíngZhàn data portability", () => {
       }))
     );
 
-    await expect(previewMíngZhànDataImport(archive, { rootDir })).rejects.toThrow(
-      /entry limit/
-    );
+    await expect(
+      previewMíngZhànDataImport(archive, { rootDir })
+    ).rejects.toThrow(/entry limit/);
   });
 
   test("rejects an archive whose entries add up past the total cap", async () => {
@@ -1531,9 +1656,9 @@ describe("MíngZhàn data portability", () => {
       }))
     );
 
-    await expect(previewMíngZhànDataImport(archive, { rootDir })).rejects.toThrow(
-      /uncompressed limit/
-    );
+    await expect(
+      previewMíngZhànDataImport(archive, { rootDir })
+    ).rejects.toThrow(/uncompressed limit/);
   });
 });
 
