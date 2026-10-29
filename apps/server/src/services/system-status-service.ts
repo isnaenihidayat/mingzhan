@@ -314,7 +314,7 @@ function isString<T>(value: T): value is T & string {
 }
 
 const LATEST_RELEASE_URL =
-  "https://api.github.com/repos/mingpromotion/mingzhan/releases/latest";
+  "https://api.github.com/repos/isnaenihidayat/mingzhan/releases/latest";
 
 const RELEASE_CACHE_MS = 10 * 60 * 1000;
 
@@ -323,8 +323,11 @@ const releaseSchema = z.object({
   tag_name: z.string(),
 });
 
-let cachedRelease: { at: number; latest: string; releaseUrl: string } | null =
-  null;
+let cachedRelease: {
+  at: number;
+  latest: string | null;
+  releaseUrl: string;
+} | null = null;
 
 function versionParts(version: string): number[] | null {
   const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(version.trim());
@@ -356,26 +359,35 @@ export async function checkMíngZhànVersion(
       signal: AbortSignal.timeout(10_000),
     }).catch(() => null);
 
-    const parsed = releaseSchema.safeParse(
-      response?.ok ? await response.json() : null
-    );
+    // GitHub returns 404 when the repository has no published releases.
+    if (response?.status === 404) {
+      cachedRelease = {
+        at: now,
+        latest: null,
+        releaseUrl: "https://github.com/isnaenihidayat/mingzhan/releases",
+      };
+    } else {
+      const parsed = releaseSchema.safeParse(
+        response?.ok ? await response.json() : null
+      );
 
-    if (!parsed.success) {
-      throw new MíngZhànApiError("Could not reach GitHub releases.", 502);
+      if (!parsed.success) {
+        throw new MíngZhànApiError("Could not reach GitHub releases.", 502);
+      }
+
+      cachedRelease = {
+        at: now,
+        latest: parsed.data.tag_name.replace(/^v/i, ""),
+        releaseUrl: parsed.data.html_url,
+      };
     }
-
-    cachedRelease = {
-      at: now,
-      latest: parsed.data.tag_name.replace(/^v/i, ""),
-      releaseUrl: parsed.data.html_url,
-    };
   }
 
   return {
     current,
-    latest: cachedRelease.latest,
+    latest: cachedRelease.latest ?? current,
     releaseUrl: cachedRelease.releaseUrl,
-    updateAvailable: isNewer(cachedRelease.latest, current),
+    updateAvailable: isNewer(cachedRelease.latest ?? current, current),
   };
 }
 

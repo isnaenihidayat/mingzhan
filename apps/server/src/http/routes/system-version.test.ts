@@ -53,7 +53,7 @@ describe("GET /v1/system/version", () => {
       mock(async () =>
         Response.json({
           html_url:
-            "https://github.com/mingpromotion/mingzhan/releases/tag/v999.0.0",
+            "https://github.com/isnaenihidayat/mingzhan/releases/tag/v999.0.0",
           tag_name: "v999.0.0",
         })
       )
@@ -66,7 +66,7 @@ describe("GET /v1/system/version", () => {
       current: getMíngZhànVersion(),
       latest: "999.0.0",
       releaseUrl:
-        "https://github.com/mingpromotion/mingzhan/releases/tag/v999.0.0",
+        "https://github.com/isnaenihidayat/mingzhan/releases/tag/v999.0.0",
       updateAvailable: true,
     });
 
@@ -135,6 +135,30 @@ describe("GET /v1/system/version", () => {
     );
 
     expect(updates).toEqual([false, true, true, false, false]);
+  });
+
+  test("a repository without releases returns no update and caches the result", async () => {
+    const github = mock(
+      async (_input: RequestInfo | URL) =>
+        new Response("Not Found", { status: 404 })
+    );
+
+    globalThis.fetch = asTestFetch(github);
+    const later = Date.now() + 3 * 60 * 60 * 1000;
+
+    expect(await checkMíngZhànVersion("1.0.0", later)).toEqual({
+      current: "1.0.0",
+      latest: "1.0.0",
+      releaseUrl: "https://github.com/isnaenihidayat/mingzhan/releases",
+      updateAvailable: false,
+    });
+    expect(github.mock.calls[0]?.[0]).toBe(
+      "https://api.github.com/repos/isnaenihidayat/mingzhan/releases/latest"
+    );
+    expect((await checkMíngZhànVersion("1.1.0", later + 1)).latest).toBe(
+      "1.1.0"
+    );
+    expect(github).toHaveBeenCalledTimes(1);
   });
 
   test("the Update button hands a newer version to a running updater, platform admins only, not org admins or members", async () => {
