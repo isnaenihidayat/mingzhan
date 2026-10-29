@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import { truncateMailBody } from "./mail/types";
 
 /** Shared with email body truncation (`MAX_EMAIL_BODY_BYTES`). */
@@ -165,10 +167,23 @@ async function acquireAnydocSlot(deadlineAt: number): Promise<void> {
 /** Run the native parser outside the server so its deadline can stop it. */
 const convertWithAnydoc: AnydocConvertFn = (bytes, format, signal) =>
   new Promise((resolve, reject) => {
-    const modulePath = import.meta.resolve("@firecrawl/anydoc");
+    let modulePath: string;
+
+    try {
+      modulePath = import.meta.resolve("@firecrawl/anydoc");
+    } catch {
+      // Source and server dist live three levels below the repository root.
+      modulePath = createRequire(
+        new URL("../../../packages/core/package.json", import.meta.url)
+      ).resolve("@firecrawl/anydoc");
+    }
+
+    const moduleUrl = modulePath.startsWith("file:")
+      ? modulePath
+      : pathToFileURL(modulePath).href;
 
     const script = `(async () => {
-      const { toMarkdownBytes } = await import(${JSON.stringify(modulePath)});
+      const { toMarkdownBytes } = await import(${JSON.stringify(moduleUrl)});
       const chunks = [];
       for await (const chunk of process.stdin) chunks.push(chunk);
       const text = await toMarkdownBytes(Buffer.concat(chunks), ${JSON.stringify(format)});
