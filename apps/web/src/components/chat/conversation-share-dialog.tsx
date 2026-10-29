@@ -42,6 +42,7 @@ export function ConversationShareDialog({
     if (!(open && sessionId)) {
       return;
     }
+
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -103,6 +104,7 @@ export function ConversationShareDialog({
     if (!shareId) {
       return;
     }
+
     setRevoking(true);
     setError(null);
 

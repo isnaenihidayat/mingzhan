@@ -284,6 +284,7 @@ export function useChatPage() {
   const requestedProjectRef = useRef<string | undefined>(
     new URLSearchParams(window.location.search).get("project") || undefined
   );
+
   const getActiveProjectId = () => requestedProjectRef.current;
 
   const { composerDraftKey, composerEntry, setComposerEntry } =

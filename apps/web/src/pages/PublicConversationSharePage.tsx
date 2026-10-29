@@ -17,9 +17,11 @@ import { client, formatError } from "@/lib/client";
 
 export function PublicConversationSharePage() {
   const { token } = useParams<{ token: string }>();
+
   const [data, setData] = useState<PublicConversationShareResponse | null>(
     null
   );
+
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -28,6 +30,7 @@ export function PublicConversationSharePage() {
     if (!token) {
       return;
     }
+
     setLoading(true);
     setError(null);
 
