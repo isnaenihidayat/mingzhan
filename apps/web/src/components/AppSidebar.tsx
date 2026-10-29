@@ -6,6 +6,7 @@ import type { ElementType } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { GroupRecents } from "@/components/agent-groups/group-recents";
 import { OrgSwitcher } from "@/components/OrgSwitcher";
+import { SidebarProjects } from "@/components/SidebarProjects";
 import { RecentChats } from "@/components/SidebarRecentChats";
 import { useAuth } from "@/context/use-auth";
 import { useLanguage } from "@/context/use-language";
@@ -149,7 +150,10 @@ export function AppSidebar({
         {collapsed ? null : groupRoute ? (
           <GroupRecents groupId={groupRoute.groupId} key={groupRoute.groupId} />
         ) : (
-          <RecentChats />
+          <div className="no-scrollbar flex min-h-0 flex-1 flex-col overflow-y-auto">
+            <SidebarProjects />
+            <RecentChats />
+          </div>
         )}
       </nav>
     </aside>

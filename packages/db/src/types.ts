@@ -154,6 +154,7 @@ export interface StoredSessionRecord {
   parentSessionId?: string | null;
   pinned?: boolean;
   profileId: string;
+  projectId?: string | null;
   /** Null uses the install thinking effort. */
   thinkingEffort?: ThinkingEffort | null;
   title: string | null;
@@ -203,9 +204,58 @@ export interface StoredSessionSummaryRecord {
   position: number;
   preview: string | null;
   profileId: string;
+  projectId?: string | null;
   sortPosition: number | null;
   title: string | null;
   updatedAt: string;
+}
+
+export interface StoredProjectRecord {
+  color?: string | null;
+  created_at: string;
+  created_by_user_id: string | null;
+  custom_instructions: string;
+  default_profile_id: string | null;
+  description: string;
+  icon?: string | null;
+  id: string;
+  name: string;
+  org_id: string;
+  updated_at: string;
+}
+
+export interface StoredProjectFileRecord {
+  created_at: string;
+  created_by_user_id: string | null;
+  filename: string;
+  id: string;
+  media_type: string;
+  org_id: string;
+  project_id: string;
+  size_bytes: number;
+  storage_path: string;
+}
+
+export interface StoredSharedLinkRecord {
+  createdAt: string;
+  id: string;
+  kind: "chat" | "artifact";
+  mimeType: string | null;
+  name: string;
+  profileId: string | null;
+  sessionId: string | null;
+}
+
+export interface StoredConversationShareRecord {
+  created_at: string;
+  created_by_user_id: string;
+  id: string;
+  org_id: string;
+  revoked_at: string | null;
+  session_id: string;
+  snapshot_payload: string;
+  title: string;
+  token_hash: string;
 }
 
 export interface StoredLlmUsageStatsRecord {
@@ -910,6 +960,8 @@ export interface DatabaseAdapter {
     profileId?: string
   ): Promise<number>;
   countProfileMcpAssignments(): Promise<number>;
+  countProjectFiles(projectId: string): Promise<number>;
+  countProjectSessions(projectId: string): Promise<number>;
   countUnreadAutomationRunsByOrg(
     userId: string,
     orgId: string
@@ -922,6 +974,7 @@ export interface DatabaseAdapter {
   createAuditEvent(record: StoredAuditEvent): Promise<void>;
 
   createBrowserSession(record: StoredBrowserSessionRecord): Promise<void>;
+  createConversationShare(record: StoredConversationShareRecord): Promise<void>;
   createMfaBackupCode(record: StoredMfaBackupCode): Promise<void>;
 
   createOrgInvite(record: StoredOrgInviteRecord): Promise<void>;
@@ -943,6 +996,10 @@ export interface DatabaseAdapter {
    * allocation and insertion stay atomic for concurrent callers.
    */
   createProfileIfAbsent(record: StoredProfileRecord): Promise<boolean>;
+  createProject(record: StoredProjectRecord): Promise<StoredProjectRecord>;
+  createProjectFile(
+    record: StoredProjectFileRecord
+  ): Promise<StoredProjectFileRecord>;
   createSharedAgentInstance(
     teamOrgId: string,
     publicationId: string,
@@ -991,6 +1048,12 @@ export interface DatabaseAdapter {
   ): Promise<boolean>;
   /** Org-scoped delete: resolves to `false` when the profile belongs elsewhere. */
   deleteProfileForOrg(id: string, orgId: string): Promise<boolean>;
+  deleteProject(orgId: string, id: string): Promise<boolean>;
+  deleteProjectFile(
+    orgId: string,
+    projectId: string,
+    id: string
+  ): Promise<boolean>;
   deleteSession(id: string): Promise<boolean>;
   deleteSkill(id: string): Promise<boolean>;
   deleteTool(id: string): Promise<boolean>;
@@ -1021,6 +1084,10 @@ export interface DatabaseAdapter {
   getActiveAutomationRun(
     automationId: string
   ): Promise<StoredAutomationRunRecord | null>;
+  getActiveConversationShareBySession(
+    orgId: string,
+    sessionId: string
+  ): Promise<StoredConversationShareRecord | null>;
   getArtifactShareById(
     orgId: string,
     profileId: string,
@@ -1056,6 +1123,9 @@ export interface DatabaseAdapter {
   getComposioUserConnectionById(
     id: string
   ): Promise<StoredComposioUserConnectionRecord | null>;
+  getConversationShareByTokenHash(
+    tokenHash: string
+  ): Promise<StoredConversationShareRecord | null>;
   getDefaultProfileForOrg(orgId: string): Promise<StoredProfileRecord | null>;
 
   getLlmUsageStats(orgId: string): Promise<StoredLlmUsageStatsRecord | null>;
@@ -1140,6 +1210,12 @@ export interface DatabaseAdapter {
     id: string,
     orgId: string
   ): Promise<StoredProfileRecord | null>;
+  getProject(orgId: string, id: string): Promise<StoredProjectRecord | null>;
+  getProjectFile(
+    orgId: string,
+    projectId: string,
+    id: string
+  ): Promise<StoredProjectFileRecord | null>;
   getSession(id: string): Promise<StoredSessionRecord | null>;
   getSessionQuestionnaire(
     sessionId: string
@@ -1327,6 +1403,10 @@ export interface DatabaseAdapter {
   listOrgSharedResources(
     orgId: string
   ): Promise<StoredOrgSharedResourceRecord[]>;
+  listOwnedSharedLinks(
+    orgId: string,
+    userId: string
+  ): Promise<StoredSharedLinkRecord[]>;
   listPasskeys(userId: string): Promise<StoredPasskeyRecord[]>;
 
   listPlatformAdminUsers(): Promise<StoredUserRecord[]>;
@@ -1345,6 +1425,11 @@ export interface DatabaseAdapter {
   listProfiles(): Promise<StoredProfileRecord[]>;
   listProfilesForMcpServer(serverId: string): Promise<StoredProfileRecord[]>;
   listProfilesForOrg(orgId: string): Promise<StoredProfileRecord[]>;
+  listProjectFiles(
+    orgId: string,
+    projectId: string
+  ): Promise<StoredProjectFileRecord[]>;
+  listProjects(orgId: string): Promise<StoredProjectRecord[]>;
   /**
    * Newest first, pinned ahead. `after` is the last row of the previous page;
    * `sessionId` narrows the list to that one session. `userId` keeps the
@@ -1484,6 +1569,17 @@ export interface DatabaseAdapter {
     sessionId: string | null,
     revokedAt: string
   ): Promise<number>;
+  revokeConversationShare(
+    orgId: string,
+    shareId: string,
+    revokedAt: string
+  ): Promise<boolean>;
+  revokeOwnedSharedLinks(
+    orgId: string,
+    userId: string,
+    kind?: "chat" | "artifact",
+    id?: string
+  ): Promise<number>;
   setFilePinned(
     orgId: string,
     userId: string,
@@ -1559,12 +1655,32 @@ export interface DatabaseAdapter {
     credentialId: string,
     counter: number
   ): Promise<void>;
+  updateProject(
+    orgId: string,
+    id: string,
+    updates: Partial<
+      Pick<
+        StoredProjectRecord,
+        | "name"
+        | "description"
+        | "custom_instructions"
+        | "default_profile_id"
+        | "icon"
+        | "color"
+        | "updated_at"
+      >
+    >
+  ): Promise<StoredProjectRecord | null>;
   updateSessionModel(sessionId: string, model: string | null): Promise<boolean>;
   updateSessionParent(
     sessionId: string,
     parentSessionId: string | null
   ): Promise<boolean>;
   updateSessionPinned(sessionId: string, pinned: boolean): Promise<boolean>;
+  updateSessionProject(
+    sessionId: string,
+    projectId: string | null
+  ): Promise<boolean>;
   updateSessionQuestionnaire(
     sessionId: string,
     questionnaire: AgentQuestionnaire | null

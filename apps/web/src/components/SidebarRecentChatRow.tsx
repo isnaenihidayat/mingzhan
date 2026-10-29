@@ -15,12 +15,14 @@ import {
   ArrowMoveUpLeftIcon,
   ArrowUp02Icon,
   Delete02Icon,
+  Folder01Icon,
   Link01Icon,
   LinkSquare02Icon,
   MoreHorizontalIcon,
   PencilEdit02Icon,
   PinIcon,
   PinOffIcon,
+  Share04Icon,
 } from "hugeicons-react";
 import { Link, useLocation } from "react-router-dom";
 import { buildChatPath } from "@/lib/chat-history";
@@ -32,8 +34,13 @@ type RecentChatMenuProps = {
   pinned: boolean;
   title: string;
   href: string;
+  projectId?: string | null;
   onRename: (target: SessionTarget) => void;
   onDelete: (target: SessionTarget) => void;
+  onShare?: (target: SessionTarget) => void;
+  onMoveToProject?: (
+    target: SessionTarget & { projectId?: string | null }
+  ) => void;
   onTogglePin: () => void;
   onDetach?: () => void;
   onMove?: (direction: "up" | "down") => void;
@@ -47,8 +54,11 @@ function RecentChatMenuItems({
   pinned,
   title,
   href,
+  projectId,
   onRename,
   onDelete,
+  onShare,
+  onMoveToProject,
   onTogglePin,
   onDetach,
   onMove,
@@ -76,6 +86,26 @@ function RecentChatMenuItems({
         <Link01Icon aria-hidden="true" className="size-4" />
         Copy link
       </DropdownMenuItem>
+      {onShare ? (
+        <DropdownMenuItem onClick={() => onShare({ id, title })}>
+          <Share04Icon aria-hidden="true" className="size-4" />
+          Bagikan
+        </DropdownMenuItem>
+      ) : null}
+      {onMoveToProject ? (
+        <DropdownMenuItem
+          onClick={() =>
+            onMoveToProject({
+              id,
+              projectId,
+              title,
+            })
+          }
+        >
+          <Folder01Icon aria-hidden="true" className="size-4" />
+          Pindahkan ke Proyek
+        </DropdownMenuItem>
+      ) : null}
       <DropdownMenuSeparator />
       <DropdownMenuItem onClick={() => onRename({ id, title })}>
         <PencilEdit02Icon aria-hidden="true" className="size-4" />
@@ -179,6 +209,8 @@ export function RecentChatRow({
   profileId,
   onRename,
   onDelete,
+  onShare,
+  onMoveToProject,
   onTogglePin,
   depth = 0,
   onDetach,
@@ -192,6 +224,10 @@ export function RecentChatRow({
   profileId: string;
   onRename: (target: SessionTarget) => void;
   onDelete: (target: SessionTarget) => void;
+  onShare?: (target: SessionTarget) => void;
+  onMoveToProject?: (
+    target: SessionTarget & { projectId?: string | null }
+  ) => void;
   onTogglePin: () => void;
   depth?: number;
   onDetach?: () => void;
@@ -213,9 +249,12 @@ export function RecentChatRow({
     onDelete,
     onDetach,
     onMove,
+    onMoveToProject,
     onRename,
+    onShare,
     onTogglePin,
     pinned: Boolean(session.pinned),
+    projectId: session.projectId,
     title,
   };
 

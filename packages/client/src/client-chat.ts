@@ -5,11 +5,15 @@ import type {
   BranchSessionRequest,
   BranchSessionResponse,
   CompactionResponse,
+  ConversationShareStatusResponse,
   CreateSessionRequest,
   CreateSessionResponse,
   DraftAutomationResponse,
   InitUserContextResponse,
   ListSessionsResponse,
+  PublicConversationShareResponse,
+  PublishConversationShareResponse,
+  RevokeConversationShareResponse,
   SendMessageRequest,
   SendMessageResponse,
   SessionBrowserResponse,
@@ -18,6 +22,7 @@ import type {
   SessionSummary,
   SetupChecklistRequest,
   SetupChecklistResponse,
+  SharedLinkSummary,
   UpdateSessionRequest,
   UpdateUserContextRequest,
   UserContextStatusResponse,
@@ -41,6 +46,21 @@ import type {
 
 /** Chat sessions, their stream, and the user context. */
 export class ChatClient extends ProfileFilesClient {
+  async listSharedLinks(): Promise<{ links: SharedLinkSummary[] }> {
+    return this.request("/v1/shared-links");
+  }
+
+  async revokeSharedLinks(
+    link?: Pick<SharedLinkSummary, "id" | "kind">
+  ): Promise<{ revoked: number }> {
+    return this.request(
+      link
+        ? `/v1/shared-links/${link.kind}/${encodeURIComponent(link.id)}`
+        : "/v1/shared-links",
+      { method: "DELETE" }
+    );
+  }
+
   async createSession(
     channel: AgentChannel,
     options: Omit<CreateSessionRequest, "channel"> = {}
@@ -407,5 +427,46 @@ export class ChatClient extends ProfileFilesClient {
         options?: SendStreamOptions
       ) => this.subscribeSessionStream(sessionId, handler, options),
     };
+  }
+
+  async publishConversationShare(
+    sessionId: string,
+    options?: { clientOrigin?: string }
+  ): Promise<PublishConversationShareResponse> {
+    return this.request<PublishConversationShareResponse>(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/share`,
+      {
+        body: JSON.stringify(options ?? {}),
+        method: "POST",
+      }
+    );
+  }
+
+  async getConversationShareStatus(
+    sessionId: string
+  ): Promise<ConversationShareStatusResponse | null> {
+    return this.request<ConversationShareStatusResponse | null>(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/share/status`
+    );
+  }
+
+  async revokeConversationShare(
+    sessionId: string,
+    shareId: string
+  ): Promise<RevokeConversationShareResponse> {
+    return this.request<RevokeConversationShareResponse>(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/share/${encodeURIComponent(shareId)}`,
+      {
+        method: "DELETE",
+      }
+    );
+  }
+
+  async getPublicConversationShare(
+    token: string
+  ): Promise<PublicConversationShareResponse> {
+    return this.request<PublicConversationShareResponse>(
+      `/v1/public/conversation-shares/${encodeURIComponent(token)}`
+    );
   }
 }

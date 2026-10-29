@@ -129,7 +129,9 @@
 
   <rect class="src" height="56" rx="8" width="180" x="250" y="32" />
   <text class="title" text-anchor="middle" x="340" y="55">Official plugin</text>
-  <text class="sub" text-anchor="middle" x="340" y="74">Ships with MíngZhàn</text>
+  <text class="sub" text-anchor="middle" x="340" y="74">
+    Ships with MíngZhàn
+  </text>
 
   <rect class="src" height="56" rx="8" width="180" x="460" y="32" />
   <text class="title" text-anchor="middle" x="550" y="55">

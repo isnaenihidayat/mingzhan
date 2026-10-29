@@ -23,6 +23,7 @@ import { MfaSettingsCard } from "@/components/settings/MfaSettingsCard";
 import { PlatformMfaSettingsCard } from "@/components/settings/PlatformMfaSettingsCard";
 import { ProviderSettingsCard } from "@/components/settings/ProviderSettingsCard";
 import { SetupRecommendations } from "@/components/settings/SetupRecommendations";
+import { SharedLinksSettingsRow } from "@/components/settings/SharedLinksSettingsRow";
 import { TranscriptionSettingsCard } from "@/components/settings/TranscriptionSettingsCard";
 import { VersionSettingsRow } from "@/components/settings/VersionSettingsRow";
 import { VisionSettingsCard } from "@/components/settings/VisionSettingsCard";
@@ -130,6 +131,7 @@ export function SettingsPage() {
               <ThemeToggle />
             </div>
 
+            <SharedLinksSettingsRow />
             <UserContextSettings />
             <SetupRecommendations />
 

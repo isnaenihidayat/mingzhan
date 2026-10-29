@@ -378,6 +378,7 @@ import {
   soulFieldFromKey,
 } from "./profile-change-history";
 import { ProfileService } from "./profile-service";
+import { ProjectService } from "./project-service";
 import {
   applyProviderInstanceUpdate,
   buildProviderInstanceFromCreateRequest,
@@ -443,6 +444,7 @@ export interface CreateSessionOptions {
   isPlatformAdmin?: boolean;
   model?: string | null;
   orgRole?: OrgRole | null;
+  projectId?: string | null;
   thinkingEffort?: ThinkingEffort | null;
 }
 
@@ -2557,6 +2559,19 @@ export class AgentService {
     const modelOverride = this.normalizeSessionModelOverride(options?.model);
     const cognito = options?.cognito;
 
+    if (options?.projectId) {
+      if (cognito) {
+        throw new MíngZhànApiError(
+          "Temporary chats cannot belong to a project.",
+          400
+        );
+      }
+
+      if (!(await this.db.getProject(orgId, options.projectId))) {
+        throw new MíngZhànApiError("Project not found", 404);
+      }
+    }
+
     const record: StoredSessionRecord = {
       agentQuestionnaire: null,
       agentTodos: [],
@@ -2565,6 +2580,7 @@ export class AgentService {
       id: sessionId,
       model: modelOverride,
       profileId: resolvedProfileId,
+      projectId: options?.projectId ?? null,
       thinkingEffort: options?.thinkingEffort ?? null,
       title: null,
       userId: userId ?? null,
@@ -2944,6 +2960,7 @@ export class AgentService {
       model: record.model,
       parentSessionId: sessionId,
       profileId: record.profileId,
+      projectId: record.projectId ?? null,
       thinkingEffort: record.thinkingEffort ?? null,
       title: null,
       userId: record.userId ?? null,
@@ -3352,6 +3369,49 @@ export class AgentService {
     }
 
     return this.db.updateSessionPinned(sessionId, pinned);
+  }
+
+  async invalidateProjectSessions(
+    orgId: string,
+    projectId: string
+  ): Promise<void> {
+    const profiles = new Set(
+      (await this.db.listProfilesForOrg(orgId)).map((profile) => profile.id)
+    );
+
+    for (const session of await this.db.listSessions()) {
+      if (session.projectId === projectId && profiles.has(session.profileId)) {
+        this.sessions.delete(session.id);
+      }
+    }
+  }
+
+  async updateSessionProject(
+    sessionId: string,
+    orgId: string,
+    projectId: string | null
+  ): Promise<boolean> {
+    const record = await this.getSessionRecordForOrg(sessionId, orgId);
+
+    if (!record) {
+      return false;
+    }
+
+    if (projectId) {
+      const project = await this.db.getProject(orgId, projectId);
+
+      if (!project) {
+        return false;
+      }
+    }
+
+    const updated = await this.db.updateSessionProject(sessionId, projectId);
+
+    if (updated) {
+      this.sessions.delete(sessionId);
+    }
+
+    return updated;
   }
 
   async detachSession(sessionId: string, orgId: string): Promise<boolean> {
@@ -6319,9 +6379,34 @@ export class AgentService {
       false
     );
 
-    const resolvedSystemPrompt = profile.isSuper
-      ? `${systemPrompt.trim()}\n\n${SUPER_MINGZHAN_TOOL_AUTHORING_RULES}\n\n${SUPER_MINGZHAN_TEAM_RULES}`
-      : systemPrompt;
+    let projectInstructions = "";
+
+    if (sessionId) {
+      try {
+        const storedSession = await this.db.getSession(sessionId);
+
+        if (storedSession?.projectId) {
+          const project = await this.db.getProject(
+            orgId,
+            storedSession.projectId
+          );
+
+          if (project?.custom_instructions?.trim()) {
+            projectInstructions = `\n\n## Project Context: ${project.name}\nThese instructions apply only to this project and override general style preferences, never platform safety rules.\n${project.custom_instructions.trim()}`;
+          }
+
+          projectInstructions += `\n\n${await new ProjectService(this.db).buildSourceContext(orgId, storedSession.projectId)}`;
+        }
+      } catch {
+        // Ignore project instruction lookup failures
+      }
+    }
+
+    const resolvedSystemPrompt = `${
+      profile.isSuper
+        ? `${systemPrompt.trim()}\n\n${SUPER_MINGZHAN_TOOL_AUTHORING_RULES}\n\n${SUPER_MINGZHAN_TEAM_RULES}`
+        : systemPrompt
+    }${projectInstructions}`;
 
     // A cognito session has nothing stored to load. On a model change it is
     // handed the live history instead, so the conversation survives the
@@ -7133,6 +7218,7 @@ function toSessionSummary(session: StoredSessionSummaryRecord): SessionSummary {
     pinned: session.pinned,
     preview: session.preview,
     profileId: session.profileId,
+    projectId: session.projectId ?? null,
     sortPosition: session.sortPosition,
     title: session.title,
     updatedAt: session.updatedAt,

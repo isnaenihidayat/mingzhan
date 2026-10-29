@@ -209,6 +209,7 @@ interface SessionRow {
   parent_session_id: string | null;
   pinned: number;
   profile_id: string;
+  project_id?: string | null;
   thinking_effort?: string | null;
   title: string | null;
   updated_at?: string | null;
@@ -249,9 +250,48 @@ interface SessionSummaryRow {
   pinned: number;
   position: number;
   profile_id: string;
+  project_id?: string | null;
   sort_position: number | null;
   title: string | null;
   updated_at: string;
+}
+
+interface ProjectRow {
+  color?: string | null;
+  created_at: string;
+  created_by_user_id: string | null;
+  custom_instructions: string;
+  default_profile_id: string | null;
+  description: string;
+  icon?: string | null;
+  id: string;
+  name: string;
+  org_id: string;
+  updated_at: string;
+}
+
+interface ProjectFileRow {
+  created_at: string;
+  created_by_user_id: string | null;
+  filename: string;
+  id: string;
+  media_type: string;
+  org_id: string;
+  project_id: string;
+  size_bytes: number;
+  storage_path: string;
+}
+
+interface ConversationShareRow {
+  created_at: string;
+  created_by_user_id: string;
+  id: string;
+  org_id: string;
+  revoked_at: string | null;
+  session_id: string;
+  snapshot_payload: string;
+  title: string;
+  token_hash: string;
 }
 
 interface LlmUsageStatsRow {
@@ -1409,14 +1449,15 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
 
   // org_id follows the profile's org. The profile move path keeps it in sync.
   const upsertSessionStmt = db.prepare(`
-    INSERT INTO sessions (id, profile_id, channel, created_at, updated_at, app_user_id, user_id, model, org_id, pinned, parent_session_id, branch_message_index, thinking_effort)
-    VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO sessions (id, profile_id, channel, created_at, updated_at, app_user_id, user_id, model, org_id, pinned, parent_session_id, branch_message_index, thinking_effort, project_id)
+    VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       profile_id = excluded.profile_id,
       channel = excluded.channel,
       user_id = COALESCE(excluded.user_id, sessions.user_id),
       model = excluded.model,
-      org_id = excluded.org_id
+      org_id = excluded.org_id,
+      project_id = COALESCE(excluded.project_id, sessions.project_id)
     WHERE sessions.app_user_id IS NULL
   `);
 
@@ -1613,6 +1654,7 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       SELECT
         s.id,
         s.profile_id,
+        s.project_id,
         s.channel,
         s.created_at,
         s.title,
@@ -3607,6 +3649,108 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
     WHERE id = ? AND revoked_at IS NULL
   `);
 
+  const createConversationShareStmt = db.prepare(`
+    INSERT INTO conversation_shares (
+      id, org_id, session_id, title, token_hash, created_by_user_id, created_at, revoked_at, snapshot_payload
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const getConversationShareByTokenHashStmt = db.prepare<
+    ConversationShareRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, session_id, title, token_hash, created_by_user_id, created_at, revoked_at, snapshot_payload
+    FROM conversation_shares
+    WHERE token_hash = ? AND revoked_at IS NULL
+    LIMIT 1
+  `);
+
+  const getActiveConversationShareBySessionStmt = db.prepare<
+    ConversationShareRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      id, org_id, session_id, title, token_hash, created_by_user_id, created_at, revoked_at, snapshot_payload
+    FROM conversation_shares
+    WHERE org_id = ? AND session_id = ? AND revoked_at IS NULL
+    LIMIT 1
+  `);
+
+  const revokeConversationShareStmt = db.prepare(`
+    UPDATE conversation_shares
+    SET revoked_at = ?
+    WHERE org_id = ? AND id = ? AND revoked_at IS NULL
+  `);
+
+  const createProjectStmt = db.prepare(`
+    INSERT INTO projects (
+      id, org_id, name, description, custom_instructions, default_profile_id, icon, color, created_by_user_id, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const getProjectStmt = db.prepare<ProjectRow, SQLQueryBindings[]>(`
+    SELECT id, org_id, name, description, custom_instructions, default_profile_id, icon, color, created_by_user_id, created_at, updated_at
+    FROM projects
+    WHERE org_id = ? AND id = ?
+    LIMIT 1
+  `);
+
+  const listProjectsStmt = db.prepare<ProjectRow, SQLQueryBindings[]>(`
+    SELECT id, org_id, name, description, custom_instructions, default_profile_id, icon, color, created_by_user_id, created_at, updated_at
+    FROM projects
+    WHERE org_id = ?
+    ORDER BY updated_at DESC
+  `);
+
+  const deleteProjectStmt = db.prepare(`
+    DELETE FROM projects
+    WHERE org_id = ? AND id = ?
+  `);
+
+  const createProjectFileStmt = db.prepare(`
+    INSERT INTO project_files (
+      id, project_id, org_id, filename, media_type, size_bytes, storage_path, created_at, created_by_user_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const getProjectFileStmt = db.prepare<ProjectFileRow, SQLQueryBindings[]>(`
+    SELECT id, project_id, org_id, filename, media_type, size_bytes, storage_path, created_at, created_by_user_id
+    FROM project_files
+    WHERE org_id = ? AND project_id = ? AND id = ?
+    LIMIT 1
+  `);
+
+  const listProjectFilesStmt = db.prepare<ProjectFileRow, SQLQueryBindings[]>(`
+    SELECT id, project_id, org_id, filename, media_type, size_bytes, storage_path, created_at, created_by_user_id
+    FROM project_files
+    WHERE org_id = ? AND project_id = ?
+    ORDER BY created_at DESC
+  `);
+
+  const deleteProjectFileStmt = db.prepare(`
+    DELETE FROM project_files
+    WHERE org_id = ? AND project_id = ? AND id = ?
+  `);
+
+  const countProjectFilesStmt = db.prepare<
+    { count: number },
+    SQLQueryBindings[]
+  >(`
+    SELECT COUNT(*) as count FROM project_files WHERE project_id = ?
+  `);
+
+  const countProjectSessionsStmt = db.prepare<
+    { count: number },
+    SQLQueryBindings[]
+  >(`
+    SELECT COUNT(*) as count FROM sessions WHERE project_id = ?
+  `);
+
+  const updateSessionProjectStmt = db.prepare(`
+    UPDATE sessions SET project_id = ? WHERE id = ? AND app_user_id IS NULL
+  `);
+
   const getOrgMemberStmt = db.prepare<
     {
       org_id: string;
@@ -4529,6 +4673,18 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       return row?.count ?? 0;
     },
 
+    async countProjectFiles(projectId) {
+      const row = countProjectFilesStmt.get(projectId);
+
+      return row?.count ?? 0;
+    },
+
+    async countProjectSessions(projectId) {
+      const row = countProjectSessionsStmt.get(projectId);
+
+      return row?.count ?? 0;
+    },
+
     async countUnreadAutomationRunsByOrg(userId, orgId) {
       return countUnreadAutomationRunsByOrgStmt
         .all(userId, orgId, orgId)
@@ -4589,6 +4745,20 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
         record.revokedAt,
         record.lastUsedAt,
         record.activeOrgId ?? null
+      );
+    },
+
+    async createConversationShare(record) {
+      createConversationShareStmt.run(
+        record.id,
+        record.org_id,
+        record.session_id,
+        record.title,
+        record.token_hash,
+        record.created_by_user_id,
+        record.created_at,
+        record.revoked_at,
+        record.snapshot_payload
       );
     },
     async createMfaBackupCode(record) {
@@ -4688,6 +4858,38 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       );
 
       return result.changes > 0;
+    },
+    async createProject(record) {
+      createProjectStmt.run(
+        record.id,
+        record.org_id,
+        record.name,
+        record.description,
+        record.custom_instructions,
+        record.default_profile_id,
+        record.icon ?? "folder",
+        record.color ?? "#00b2be",
+        record.created_by_user_id,
+        record.created_at,
+        record.updated_at
+      );
+
+      return record;
+    },
+    async createProjectFile(record) {
+      createProjectFileStmt.run(
+        record.id,
+        record.project_id,
+        record.org_id,
+        record.filename,
+        record.media_type,
+        record.size_bytes,
+        record.storage_path,
+        record.created_at,
+        record.created_by_user_id
+      );
+
+      return record;
     },
 
     async createSharedAgentInstance(
@@ -4864,6 +5066,14 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       return result.changes > 0;
     },
 
+    async deleteProject(orgId, id) {
+      return deleteProjectStmt.run(orgId, id).changes > 0;
+    },
+
+    async deleteProjectFile(orgId, projectId, id) {
+      return deleteProjectFileStmt.run(orgId, projectId, id).changes > 0;
+    },
+
     async deleteSession(id) {
       return db.transaction(() => {
         db.prepare(
@@ -4951,6 +5161,12 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       return row ? toAutomationRunRecord(row) : null;
     },
 
+    async getActiveConversationShareBySession(orgId, sessionId) {
+      const row = getActiveConversationShareBySessionStmt.get(orgId, sessionId);
+
+      return row ? toConversationShareRecord(row) : null;
+    },
+
     async getArtifactShareById(orgId, profileId, shareId) {
       const row = getArtifactShareByIdStmt.get(orgId, profileId, shareId);
 
@@ -5019,6 +5235,12 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       const row = getComposioUserConnectionByIdStmt.get(id);
 
       return row ? toComposioUserConnectionRecord(row) : null;
+    },
+
+    async getConversationShareByTokenHash(tokenHash) {
+      const row = getConversationShareByTokenHashStmt.get(tokenHash);
+
+      return row ? toConversationShareRecord(row) : null;
     },
 
     async getDefaultProfileForOrg(orgId) {
@@ -5209,6 +5431,18 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       const row = getProfileForOrgStmt.get(id, orgId);
 
       return row ? toProfileRecord(row) : null;
+    },
+
+    async getProject(orgId, id) {
+      const row = getProjectStmt.get(orgId, id);
+
+      return row ? toProjectRecord(row) : null;
+    },
+
+    async getProjectFile(orgId, projectId, id) {
+      const row = getProjectFileStmt.get(orgId, projectId, id);
+
+      return row ? toProjectFileRecord(row) : null;
     },
 
     async getSession(id) {
@@ -5752,6 +5986,22 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
     async listOrgSharedResources(orgId) {
       return listOrgSharedResourcesStmt.all(orgId);
     },
+    async listOwnedSharedLinks(orgId, userId) {
+      return db
+        .query<
+          import("../types").StoredSharedLinkRecord,
+          [string, string, string, string]
+        >(`
+        SELECT c.id, 'chat' AS kind, c.title AS name, c.created_at AS createdAt, c.session_id AS sessionId, s.profile_id AS profileId, NULL AS mimeType
+        FROM conversation_shares c LEFT JOIN sessions s ON s.id = c.session_id
+        WHERE c.org_id = ? AND c.created_by_user_id = ? AND c.revoked_at IS NULL
+        UNION ALL
+        SELECT id, 'artifact' AS kind, filename AS name, created_at AS createdAt, NULL AS sessionId, profile_id AS profileId, mime_type AS mimeType
+        FROM artifact_shares WHERE org_id = ? AND created_by_user_id = ? AND revoked_at IS NULL
+        ORDER BY createdAt DESC
+      `)
+        .all(orgId, userId, orgId, userId);
+    },
     async listPasskeys(userId) {
       return listPasskeysStmt.all(userId).map((row) => toPasskeyRecord(row));
     },
@@ -5805,6 +6055,18 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       return listProfilesForOrgStmt
         .all(orgId)
         .map((row) => toProfileRecord(row));
+    },
+
+    async listProjectFiles(orgId, projectId) {
+      const rows = listProjectFilesStmt.all(orgId, projectId);
+
+      return rows.map(toProjectFileRecord);
+    },
+
+    async listProjects(orgId) {
+      const rows = listProjectsStmt.all(orgId);
+
+      return rows.map(toProjectRecord);
     },
 
     async listSessionSummaries(profileId, channels, options = {}) {
@@ -6081,6 +6343,38 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
 
       return result.changes;
     },
+
+    async revokeConversationShare(orgId, shareId, revokedAt) {
+      const result = revokeConversationShareStmt.run(revokedAt, orgId, shareId);
+
+      return result.changes > 0;
+    },
+
+    async revokeOwnedSharedLinks(orgId, userId, kind, id) {
+      const now = new Date().toISOString();
+
+      return db.transaction(() => {
+        let count = 0;
+
+        if (!kind || kind === "chat") {
+          count += db
+            .query(
+              "UPDATE conversation_shares SET revoked_at = ? WHERE org_id = ? AND created_by_user_id = ? AND revoked_at IS NULL AND (? IS NULL OR id = ?)"
+            )
+            .run(now, orgId, userId, id ?? null, id ?? null).changes;
+        }
+
+        if (!kind || kind === "artifact") {
+          count += db
+            .query(
+              "UPDATE artifact_shares SET revoked_at = ? WHERE org_id = ? AND created_by_user_id = ? AND revoked_at IS NULL AND (? IS NULL OR id = ?)"
+            )
+            .run(now, orgId, userId, id ?? null, id ?? null).changes;
+        }
+
+        return count;
+      })();
+    },
     async setFilePinned(orgId, userId, profileId, path, pinned) {
       if (pinned) {
         db.query(
@@ -6209,6 +6503,38 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       updatePasskeyCounterStmt.run(counter, userId, credentialId);
     },
 
+    async updateProject(orgId, id, updates) {
+      const existing = getProjectStmt.get(orgId, id);
+
+      if (!existing) {
+        return null;
+      }
+
+      const updated: StoredProjectRecord = {
+        ...toProjectRecord(existing),
+        ...updates,
+        updated_at: updates.updated_at ?? new Date().toISOString(),
+      };
+
+      db.prepare(`
+        UPDATE projects
+        SET name = ?, description = ?, custom_instructions = ?, default_profile_id = ?, icon = ?, color = ?, updated_at = ?
+        WHERE org_id = ? AND id = ?
+      `).run(
+        updated.name,
+        updated.description,
+        updated.custom_instructions,
+        updated.default_profile_id,
+        updated.icon ?? "folder",
+        updated.color ?? "#00b2be",
+        updated.updated_at,
+        orgId,
+        id
+      );
+
+      return updated;
+    },
+
     async updateSessionModel(sessionId, model) {
       const result = updateSessionModelStmt.run(model, sessionId);
 
@@ -6221,6 +6547,11 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
     },
     async updateSessionPinned(sessionId, pinned) {
       const result = updateSessionPinnedStmt.run(pinned ? 1 : 0, sessionId);
+
+      return result.changes > 0;
+    },
+    async updateSessionProject(sessionId, projectId) {
+      const result = updateSessionProjectStmt.run(projectId, sessionId);
 
       return result.changes > 0;
     },
@@ -6447,7 +6778,8 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
         record.pinned ? 1 : 0,
         record.parentSessionId ?? null,
         record.branchMessageIndex ?? null,
-        record.thinkingEffort ?? null
+        record.thinkingEffort ?? null,
+        record.projectId ?? null
       );
     },
     async upsertSkill(record) {
@@ -6960,6 +7292,7 @@ function toSessionRecord(row: SessionRow): StoredSessionRecord {
     parentSessionId: row.parent_session_id,
     pinned: row.pinned === 1,
     profileId: row.profile_id,
+    projectId: row.project_id ?? null,
     thinkingEffort: parseThinkingEffort(row.thinking_effort),
     title: row.title ?? null,
     userId: row.user_id ?? null,
@@ -7038,9 +7371,56 @@ function toSessionSummaryRecord(
     position: row.position,
     preview: previewFromFirstUserPayload(row.first_user_payload),
     profileId: row.profile_id,
+    projectId: row.project_id ?? null,
     sortPosition: row.sort_position,
     title: row.title ?? null,
     updatedAt: row.updated_at,
+  };
+}
+
+function toProjectRecord(row: ProjectRow): StoredProjectRecord {
+  return {
+    color: row.color ?? "#00b2be",
+    created_at: row.created_at,
+    created_by_user_id: row.created_by_user_id,
+    custom_instructions: row.custom_instructions,
+    default_profile_id: row.default_profile_id,
+    description: row.description,
+    icon: row.icon ?? "folder",
+    id: row.id,
+    name: row.name,
+    org_id: row.org_id,
+    updated_at: row.updated_at,
+  };
+}
+
+function toProjectFileRecord(row: ProjectFileRow): StoredProjectFileRecord {
+  return {
+    created_at: row.created_at,
+    created_by_user_id: row.created_by_user_id,
+    filename: row.filename,
+    id: row.id,
+    media_type: row.media_type,
+    org_id: row.org_id,
+    project_id: row.project_id,
+    size_bytes: row.size_bytes,
+    storage_path: row.storage_path,
+  };
+}
+
+function toConversationShareRecord(
+  row: ConversationShareRow
+): StoredConversationShareRecord {
+  return {
+    created_at: row.created_at,
+    created_by_user_id: row.created_by_user_id,
+    id: row.id,
+    org_id: row.org_id,
+    revoked_at: row.revoked_at,
+    session_id: row.session_id,
+    snapshot_payload: row.snapshot_payload,
+    title: row.title,
+    token_hash: row.token_hash,
   };
 }
 

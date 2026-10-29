@@ -29,6 +29,7 @@ import {
   registerComposioOAuthRoutes,
   registerComposioRoutes,
 } from "./routes/composio";
+import { registerConversationShareRoutes } from "./routes/conversation-shares";
 import { registerDataPortabilityRoutes } from "./routes/data-portability";
 import { registerGoogleMeetRoutes } from "./routes/google-meet";
 import { registerInternalAutomationRoutes } from "./routes/internal-automations";
@@ -44,6 +45,7 @@ import { registerPlatformOrgRoutes } from "./routes/platform-orgs";
 import { registerPluginRoutes } from "./routes/plugins";
 import { registerProfilePortabilityRoutes } from "./routes/profile-portability";
 import { registerProfileRoutes } from "./routes/profiles";
+import { registerProjectRoutes } from "./routes/projects";
 import { registerSessionRoutes } from "./routes/sessions";
 import { registerSetupImportRoutes } from "./routes/setup-import";
 import { registerSkillProposalRoutes } from "./routes/skill-proposals";
@@ -404,6 +406,8 @@ export function createHonoApp(options: ServerOptions) {
   registerProfileRoutes(app, options);
   registerProfilePortabilityRoutes(app, options);
   registerArtifactShareRoutes(app, options);
+  registerConversationShareRoutes(app, options);
+  registerProjectRoutes(app, options);
   registerMcpRoutes(app, options);
   registerSkillsMarketplaceRoutes(app);
   registerSkillRoutes(app, options);

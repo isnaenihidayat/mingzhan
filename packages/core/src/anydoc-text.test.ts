@@ -291,3 +291,37 @@ describe("convertDocumentBytes", () => {
     await Promise.allSettled(blockers);
   });
 });
+
+test("a real parser timeout does not prevent subsequent documents from completing", async () => {
+  await expect(
+    convertDocumentBytes(Buffer.from("deadline_probe\n1\n"), {
+      format: "csv",
+      timeoutMs: 1,
+    })
+  ).rejects.toThrow();
+
+  const results = await Promise.all(
+    ["alpha", "beta", "gamma"].map((value) =>
+      convertDocumentBytes(Buffer.from(`name\n${value}\n`), {
+        format: "csv",
+        timeoutMs: 5000,
+      })
+    )
+  );
+
+  expect(results).toHaveLength(3);
+  expect(results[0]?.text).toContain("alpha");
+  expect(results[2]?.text).toContain("gamma");
+});
+
+test("successful extraction can be reused without starting another timed parser", async () => {
+  const bytes = Buffer.from("cache_probe\nreusable\n");
+  const first = await convertDocumentBytes(bytes, { format: "csv" });
+
+  const second = await convertDocumentBytes(bytes, {
+    format: "csv",
+    timeoutMs: 1,
+  });
+
+  expect(second).toEqual(first);
+});
