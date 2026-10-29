@@ -142,6 +142,7 @@ describe("GET /v1/system/version", () => {
       async (_input: RequestInfo | URL) =>
         new Response("Not Found", { status: 404 })
     );
+
     globalThis.fetch = asTestFetch(github);
     const later = Date.now() + 3 * 60 * 60 * 1000;
 
