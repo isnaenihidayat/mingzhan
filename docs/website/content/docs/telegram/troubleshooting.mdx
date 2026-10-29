@@ -13,8 +13,6 @@ When the bot is silent or behaving wrong, the fastest clue is the bridge worker'
 
 The stderr stream shows what the bridge worker could not do. For example, a bad or expired bot token shows up as a repeated `401: Unauthorized` from Telegram:
 
-![The Stderr tab in the worker logs dialog shows Telegram API errors](/screenshots/telegram-worker-logs.png)
-
 Common things you will spot here:
 
 - `Call to 'getMe' failed! (401: Unauthorized)` — the bot token is wrong, expired, or was revoked in `@BotFather`. Paste a fresh token and **Save**.

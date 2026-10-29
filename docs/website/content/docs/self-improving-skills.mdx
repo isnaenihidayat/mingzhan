@@ -86,19 +86,13 @@ Org admins: **Control center → Workspace → Organization → How bots learn s
 
 Agent owners can also flip **Ask me before saving a skill** for their own agent under **Agent → your agent → Behavior**.
 
-![Enable the org-wide Ask me before a bot saves a skill switch and optional per-profile overrides](/screenshots/skill-write-approval-gate.png)
-
 When the gate is **off**, nothing changes — agents update skills directly, as before.
 
 ### Review proposals
 
 When approval is required, agents still *propose* skill changes during chat. Those proposals appear under **Proposals** on the same card (or via a notification link).
 
-![Pending skill proposals on the Proposals tab](/screenshots/skill-write-approval-proposals.png)
-
 Open **Review** to see the full skill content (or the before/after for an edit). **Approve** applies the change; **Reject** discards it with no effect on live skills.
-
-![Review dialog — preview skill content and approve or reject](/screenshots/skill-write-approval-review.png)
 
 MíngZhàn flags suspicious patterns in proposals the same way it does for org memory — worth a closer look before approving.
 
@@ -114,10 +108,6 @@ Org admins: **Control center → Workspace → Organization → How bots learn s
 
 - Default is **off** (no extra review pass).
 - Optionally override per profile: flip that profile's switch. **Use org default** follows the org again.
-
-![Learn from chats switch on an agent settings page](/screenshots/learn-after-a-turn-profile.png)
-
-![Bots learn from chats org switch and per-profile overrides](/screenshots/learn-after-a-turn-org.png)
 
 When enabled, after a **successful** turn in an interactive chat (web, CLI, Discord, Telegram, WhatsApp, or Slack) that looks complex (many tool calls, or a tool error recovery) — and only if the agent did **not** already save a skill that turn — MíngZhàn runs a lightweight background review. Chat is not blocked while that runs. It uses an extra model call on eligible turns, so leave it off unless you want the safety net.
 

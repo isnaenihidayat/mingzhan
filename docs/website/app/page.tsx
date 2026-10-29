@@ -8,11 +8,9 @@ import {
   SparklesIcon,
 } from "hugeicons-react";
 import type { Metadata } from "next";
-import Image from "next/image";
 import Link from "next/link";
 import { HeroPaperBackground } from "@/components/hero-paper-background";
 import { UseCaseRows } from "@/components/use-case-rows";
-import { withBasePath } from "@/lib/base-path";
 import { SITE_DESCRIPTION, SITE_NAME } from "@/lib/site-meta";
 
 export const metadata: Metadata = {
@@ -161,37 +159,6 @@ export default function HomePage() {
                 </div>
               </div>
             </div>
-          </div>
-        </section>
-
-        <section
-          aria-label="Dashboard preview"
-          className="hero-preview mx-auto mt-4 w-[calc(100%_-_3rem)] max-w-6xl sm:mt-6"
-        >
-          <div className="overflow-hidden rounded-xl border border-black/10 bg-stone-50 shadow-2xl shadow-black/10 dark:border-white/10 dark:bg-[#0d0d0f]">
-            <div className="flex items-center gap-1.5 border-stone-200 border-b px-3 py-2.5 dark:border-white/8">
-              <span className="size-2.5 rounded-full bg-stone-300 dark:bg-white/15" />
-              <span className="size-2.5 rounded-full bg-stone-300 dark:bg-white/15" />
-              <span className="size-2.5 rounded-full bg-stone-300 dark:bg-white/15" />
-              <span className="ml-2 text-[11px] text-stone-500 dark:text-white/35">
-                mingzhan · dashboard
-              </span>
-            </div>
-            <Image
-              alt="MíngZhàn chat preview"
-              className="block h-auto w-full dark:hidden"
-              height={800}
-              src={withBasePath("/screenshots/chat-light.png")}
-              width={1280}
-            />
-            <Image
-              alt=""
-              aria-hidden
-              className="hidden h-auto w-full dark:block"
-              height={800}
-              src={withBasePath("/screenshots/chat-dark.png")}
-              width={1280}
-            />
           </div>
         </section>
 

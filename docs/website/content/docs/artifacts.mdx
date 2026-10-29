@@ -15,15 +15,11 @@ Open **Chat → Browse Files**. The **Files** page is the primary surface for fi
 - **Artifacts** lists saved output in folders. Search, type filters, and list or grid view work in this view.
 - **Knowledge** manages documents that `knowledge_base_search` can use, including organization documents attached to the profile. Upload and manage knowledge-base documents here.
 
-![The Browse Files page, with a markdown artifact open in the preview panel](/screenshots/artifact-markdown-toc.png)
-
 The page follows your active chat profile. If that profile isn't available, it selects the organization default. Platform administrators see all three views. Org members and org admins see only **Artifacts**, and only the files they made with the agent; they can preview, download, share, and delete those files. Members can't browse workspace files or knowledge documents.
 
 **All files** and **Artifacts** show one folder at a time. Artifact search searches all artifacts and shows full paths. The dashboard initially renders 30 folders and files, then **Show more** reveals another 30. Its API request returns the full matching metadata list rather than sending `limit` or `offset`; an API caller that supplies `limit` must use 1–100 with a non-negative `offset`.
 
 The **Knowledge** view accepts TXT, Markdown, CSV, and PDF files up to 20 MB each. Duplicate filenames require you to skip or replace the existing document. A platform administrator can attach shared organization documents to a profile; deleting an attached organization document detaches it rather than deleting the organization's source file.
-
-![The Browse Files page grouping nested coding-agent-runs logs into a folder](/screenshots/files-artifacts-after-folders.png)
 
 Each file shows its inferred type, size, last modified time, and, in the list view, who created it. **Created by** is empty for files saved before MíngZhàn recorded owners and for files written by `bash` or a coding agent. MíngZhàn infers type from the extension. Files with unknown extensions are checked for valid UTF-8 when previewed, so a `Dockerfile` or `notes.abc` can preview as text instead of being treated as binary.
 
@@ -48,15 +44,9 @@ The **All files** view loads raw images, video, PDF, and text previews only when
 
 A markdown artifact with two or more headings gets a collapsible **Contents** list above the rendered body, built from its h1 to h3 headings. Clicking an entry scrolls to that heading.
 
-![Clicking a Contents entry scrolls the preview to that section](/screenshots/artifact-toc-jump.png)
-
 Entries are matched back to their heading by text plus occurrence, so a script that repeats "Hook" jumps to the right one rather than the first. Clicking the second **Hook** below lands on the 8:40 beat, not the 0:18 one.
 
-![Clicking the second Hook entry lands on the 8:40 beat rather than the first Hook](/screenshots/artifact-toc-duplicate-heading.png)
-
 Below two headings nothing renders, so a one-paragraph note keeps the preview it has today.
-
-![A one-heading note previews with no Contents list](/screenshots/artifact-toc-short-note.png)
 
 The list lives in the shared artifact body, so the chat panel, the Files preview, and the public share page all show it.
 
@@ -64,11 +54,7 @@ The list lives in the shared artifact body, so the chat panel, the Files preview
 
 An artifact's actions menu provides **Rename**, **Download**, **Delete**, and artifact sharing actions. The artifact preview also lets organization members edit Markdown and delimited spreadsheet source in place. Editing is limited to those source formats; a `.docx` can't be overwritten with the Markdown produced by its preview.
 
-![The artifact actions menu with Rename, Download, Delete, and sharing actions](/screenshots/artifact-actions-menu.png)
-
 Saving an edit returns to the preview and refreshes its timestamp. A failed save keeps the editor contents open so you can retry.
-
-![Editing the Markdown source in place](/screenshots/artifact-markdown-editor.png)
 
 The **Files** management page and its listing, rename, delete, and knowledge controls are platform-admin-only. The separate artifact preview editor requires organization membership when opened from an authorized chat attachment.
 
@@ -77,8 +63,6 @@ Authorized active-organization members can still read artifact content through c
 ## Publish a public share
 
 **Share artifact** publishes the file at a tokenized URL that needs no login, and gives you a link to copy.
-
-![The published artifact on its public share page](/screenshots/artifact-public-share.png)
 
 A published share serves a **snapshot** taken at publish time, not the live file. Saving an artifact edit refreshes the snapshot. An agent rewrite does not; use **Update snapshot** to catch up the published copy.
 

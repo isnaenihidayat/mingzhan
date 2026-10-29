@@ -28,8 +28,6 @@ Take the **project API key**. Composio also has an *MCP consumer key* that start
 
 **2. Paste it into MíngZhàn.** As a platform admin, open **Control center → Integrations → Composio**, paste the key in the **Project API key** box, and press **Save**. The project key is shared by every organization on this installation.
 
-![The Composio page in MíngZhàn before a key is saved, with the Project API key box and a link to the dashboard](/screenshots/composio-api-key.png)
-
 MíngZhàn checks the key against Composio right then. A wrong key fails on the spot with the reason, so you never have to wonder whether it took. A good one turns the badge in the corner to connected.
 
 For a container or secrets manager, keep the key outside MíngZhàn's data directory. Mount it as a readable file and set:
@@ -44,15 +42,9 @@ You can also set `COMPOSIO_API_KEY` directly. The direct value takes priority ov
 
 The list opens on the apps teams ask for most. If yours is not there, search for it, or press **Show all 200 apps**.
 
-![The SaaS toolkits list showing Gmail enabled and the popular apps below it](/screenshots/composio-toolkit-list.png)
-
 **4. Connect your account.** Press **Connect** on that app. A Composio page opens, you sign in to the app the normal way, and you land back in MíngZhàn. The tools appear on their own, there is nothing to refresh.
 
-![A Gmail row enabled for the org and not yet connected, with the Connect button](/screenshots/composio-connect.png)
-
 **5. Give the app to an agent.** Enabling already gave it to your default agent, so there is nothing to do unless you want another one. Press the **profiles** button on the app's row and tick whichever agents should have it.
-
-![The profile picker listing Default Bot as able to use the toolkit and Super MíngZhàn as not assigned](/screenshots/composio-profiles.png)
 
 An agent can only use apps that were given to it, which is what makes it work in chat.
 
