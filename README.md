@@ -4,8 +4,6 @@
 
 MingZhan adalah workspace AI untuk percakapan, agen, dokumen, dan automasi. Setiap agen dapat memiliki identitas, instruksi, memori, tools, serta skills sesuai tugasnya. Workspace mendukung organisasi dan peran anggota agar akses data tetap terpisah.
 
-Proyek ini dikembangkan dari [Nakama](https://github.com/ahmadrosid/nakama), dengan penyesuaian identitas MingZhan, terminologi Indonesia, skills bawaan, dan pembaruan fitur upstream.
-
 ## Fitur utama
 
 | Bagian | Kemampuan |
@@ -91,4 +89,4 @@ Lihat [CONTRIBUTING.md](CONTRIBUTING.md) untuk alur kontribusi dan [ARCHITECTURE
 
 ## Lisensi dan atribusi
 
-MingZhan menggunakan [lisensi MIT](LICENSE). Atribusi dan pemberitahuan hak cipta upstream tetap dipertahankan. Terima kasih kepada pengembang [Nakama](https://github.com/ahmadrosid/nakama) dan kontributor dependensi open-source yang digunakan proyek ini.
+MingZhan menggunakan [lisensi MIT](LICENSE). Atribusi dan pemberitahuan hak cipta upstream tetap dipertahankan. Terima kasih kepada seluruh kontributor dan pengembang dependensi open-source yang digunakan proyek ini.
