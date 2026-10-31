@@ -59,6 +59,7 @@ import {
   DOCS_SCRIPT_URL,
   registerSystemRoutes,
 } from "./routes/system";
+import { registerTeamsRoutes } from "./routes/teams";
 import { registerToolRoutes } from "./routes/tools";
 import { registerUserContextRoutes } from "./routes/user-context";
 import { registerWorkerRoutes } from "./routes/workers";
@@ -401,6 +402,7 @@ export function createHonoApp(options: ServerOptions) {
   registerSetupImportRoutes(app, options);
   registerWorkerRoutes(app, options);
   registerModelRoutes(app, options);
+  registerTeamsRoutes(app, options);
   registerUserContextRoutes(app, options);
   registerSessionRoutes(app, options);
   registerProfileRoutes(app, options);

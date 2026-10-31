@@ -13,7 +13,10 @@ import {
   type ToolDefinition,
   type UpdateProfileRequest,
 } from "@mingzhan/core";
-import type { AgentGroup } from "@mingzhan/core/agent-groups";
+import {
+  type AgentGroup,
+  agentGroupInputSchema,
+} from "@mingzhan/core/agent-groups";
 import { z } from "zod";
 import { modelSupportsVision } from "../providers/models";
 import {
@@ -372,14 +375,7 @@ export function createSuperMingzhanTools(
           throw new Error("Creating groups needs a signed-in user.");
         }
 
-        const parsed = z
-          .object({
-            brief: z.string().trim().max(4000).default(""),
-            memberIds: z.array(z.string().min(1)).min(2).max(12),
-            name: z.string().trim().min(1).max(80),
-          })
-          .strict()
-          .parse(input);
+        const parsed = agentGroupInputSchema.strict().parse(input);
 
         const group = await services.createGroup(
           orgId,

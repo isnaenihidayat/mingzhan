@@ -1,0 +1,178 @@
+import { describe, expect, spyOn, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import * as core from "@mingzhan/core";
+import { createInMemoryDatabaseAdapter } from "@mingzhan/db";
+import { AgentService } from "./agent-service";
+import { createDefaultProfile } from "./agent-service-test-fixtures";
+
+const ORG_ID = "org_test";
+
+describe("AgentService CLI coding workspace", () => {
+  test("keeps the CLI coding workspace root when it rebuilds a session from the DB", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    await db.upsertProfile(createDefaultProfile());
+    const service = new AgentService(null, null, db);
+    const repo = mkdtempSync(path.join(tmpdir(), "mingzhan-cli-repo-"));
+
+    using buildContext = spyOn(core, "buildToolExecutionContext");
+
+    try {
+      const sessionId = await service.createSession(
+        ORG_ID,
+        "cli",
+        "profile_default",
+        undefined,
+        { codingWorkspaceRoot: repo }
+      );
+
+      await db.replaceMessagesForSession(sessionId, [
+        {
+          createdAt: new Date().toISOString(),
+          id: "msg_1",
+          payload: { content: "hi", role: "user" },
+          seq: 0,
+          sessionId,
+        },
+      ]);
+
+      await service.sessions.get(sessionId, ORG_ID);
+      service.sessions.invalidateAll();
+      await service.sessions.get(sessionId, ORG_ID);
+      const branch = await service.branchSession(sessionId, 0, ORG_ID);
+
+      const childId = await service.createChildSession(
+        sessionId,
+        ORG_ID,
+        "child",
+        { isPlatformAdmin: true }
+      );
+
+      await service.sessions.get(branch?.sessionId ?? "", ORG_ID);
+      await service.sessions.get(childId, ORG_ID);
+
+      const roots = buildContext.mock.calls.map(
+        ([input]) => input.codingWorkspaceRoot
+      );
+
+      expect(roots.length).toBeGreaterThanOrEqual(4);
+      expect(new Set(roots)).toEqual(new Set([repo]));
+      expect((await db.getSession(childId))?.codingWorkspaceRoot).toBe(repo);
+      expect(
+        branch && (await db.getSession(branch.sessionId))?.codingWorkspaceRoot
+      ).toBe(repo);
+    } finally {
+      rmSync(repo, { force: true, recursive: true });
+    }
+  });
+
+  test("child and branch chats keep the MingZhan project context", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    await db.upsertProfile(createDefaultProfile());
+    const now = new Date().toISOString();
+    await db.createProject({
+      color: "#00b2be",
+      created_at: now,
+      created_by_user_id: "user_test",
+      custom_instructions: "Use the project sources",
+      default_profile_id: null,
+      description: "",
+      icon: "folder",
+      id: "project_test",
+      name: "Project",
+      org_id: ORG_ID,
+      updated_at: now,
+    });
+    const service = new AgentService(null, null, db);
+
+    const parent = await service.createSession(
+      ORG_ID,
+      "web",
+      "profile_default",
+      undefined,
+      { projectId: "project_test" }
+    );
+
+    await db.replaceMessagesForSession(parent, [
+      {
+        createdAt: now,
+        id: "message",
+        payload: { content: "Start", role: "user" },
+        seq: 0,
+        sessionId: parent,
+      },
+    ]);
+
+    const child = await service.createChildSession(parent, ORG_ID, "Research", {
+      isPlatformAdmin: true,
+    });
+
+    const branch = await service.branchSession(parent, 0, ORG_ID);
+    expect((await db.getSession(child))?.projectId).toBe("project_test");
+    expect(branch && (await db.getSession(branch.sessionId))?.projectId).toBe(
+      "project_test"
+    );
+  });
+
+  test("falls back to the profile workspace when the stored CLI folder is gone", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    await db.upsertProfile(createDefaultProfile());
+    const service = new AgentService(null, null, db);
+    const repo = mkdtempSync(path.join(tmpdir(), "mingzhan-cli-repo-"));
+
+    const sessionId = await service.createSession(
+      ORG_ID,
+      "cli",
+      "profile_default",
+      undefined,
+      { codingWorkspaceRoot: repo }
+    );
+
+    await service.sessions.get(sessionId, ORG_ID);
+    rmSync(repo, { force: true, recursive: true });
+    service.sessions.invalidateAll();
+
+    using buildContext = spyOn(core, "buildToolExecutionContext");
+    await service.sessions.get(sessionId, ORG_ID);
+
+    expect(buildContext).toHaveBeenCalled();
+    expect(
+      buildContext.mock.calls.every(
+        ([input]) => input.codingWorkspaceRoot === undefined
+      )
+    ).toBe(true);
+  });
+
+  test("only the local CLI can run turns in a chat with a stored CLI folder", async () => {
+    const db = createInMemoryDatabaseAdapter();
+    await db.upsertProfile(createDefaultProfile());
+    const service = new AgentService(null, null, db);
+
+    const sessionId = await service.createSession(
+      ORG_ID,
+      "cli",
+      "profile_default",
+      undefined,
+      { codingWorkspaceRoot: tmpdir() }
+    );
+
+    const access = { isPlatformAdmin: true };
+
+    await expect(
+      service.assertSessionProfileAccess(sessionId, ORG_ID, access, {
+        localClient: false,
+      })
+    ).rejects.toMatchObject({ status: 403 });
+
+    await expect(
+      service.assertSessionProfileAccess(sessionId, ORG_ID, access, {
+        localClient: true,
+      })
+    ).resolves.toBeUndefined();
+
+    await expect(
+      service.assertSessionProfileAccess(sessionId, ORG_ID, access)
+    ).resolves.toBeUndefined();
+  });
+});

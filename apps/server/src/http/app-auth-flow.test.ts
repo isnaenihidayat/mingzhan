@@ -74,9 +74,11 @@ function createServerOptions() {
       }),
       listSkills: async () => ({ skills: [] }),
       providerConfigured: true,
-      resolveSession: async () => ({
-        send: async (input: { message: string }) => `reply:${input.message}`,
-      }),
+      sessions: {
+        get: async () => ({
+          send: async (input: { message: string }) => `reply:${input.message}`,
+        }),
+      },
     } as any,
     authService,
     automationService: {} as any,
@@ -449,7 +451,9 @@ describe("createHonoApp", () => {
     // The host-bound pair is Secure by definition and is cleared too, so a
     // session survives neither scheme on the same browser.
     expect(
-      clearCookies.some((cookie) => cookie.startsWith("__Host-mingzhan_session="))
+      clearCookies.some((cookie) =>
+        cookie.startsWith("__Host-mingzhan_session=")
+      )
     ).toBe(true);
     expect(
       clearCookies.some((cookie) => cookie.startsWith("__Host-mingzhan_csrf="))

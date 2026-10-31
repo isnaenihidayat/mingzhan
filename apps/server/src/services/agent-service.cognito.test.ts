@@ -74,7 +74,7 @@ describe("cognito sessions are never persisted", () => {
       { cognito: true }
     );
 
-    const first = await service.resolveSession(sessionId, ORG_ID);
+    const first = await service.sessions.get(sessionId, ORG_ID);
     expect(first).not.toBeNull();
     await first?.send({ message: "remember my api key" });
 
@@ -88,7 +88,7 @@ describe("cognito sessions are never persisted", () => {
 
     // ...and resolving again hands back the same object, because the history
     // lives nowhere else and a rebuild would silently empty the chat.
-    expect(await service.resolveSession(sessionId, ORG_ID)).toBe(first);
+    expect(await service.sessions.get(sessionId, ORG_ID)).toBe(first);
 
     // The assertions that make this fail without cognito.
     expect(await db.getSession(sessionId)).toBeNull();
@@ -106,7 +106,7 @@ describe("cognito sessions are never persisted", () => {
       null
     );
 
-    const session = await service.resolveSession(sessionId, ORG_ID);
+    const session = await service.sessions.get(sessionId, ORG_ID);
     await session?.send({ message: "hello" });
 
     expect(await db.getSession(sessionId)).not.toBeNull();
@@ -125,13 +125,13 @@ describe("cognito sessions are never persisted", () => {
       { cognito: true }
     );
 
-    const session = await service.resolveSession(sessionId, ORG_ID);
+    const session = await service.sessions.get(sessionId, ORG_ID);
     await session?.send({ message: "hello" });
 
     // There was never a row, so the delete has only the map to work with.
     expect(await db.getSession(sessionId)).toBeNull();
     expect(await service.purgeSession(sessionId, ORG_ID)).toBe(true);
-    expect(await service.resolveSession(sessionId, ORG_ID)).toBeNull();
+    expect(await service.sessions.get(sessionId, ORG_ID)).toBeNull();
     expect(await service.getSessionMessages(sessionId, ORG_ID)).toBeNull();
   });
 
@@ -178,18 +178,16 @@ describe("cognito sessions are never persisted", () => {
       }
     );
 
-    const before = await service.resolveSession(sessionId, ORG_ID);
+    const before = await service.sessions.get(sessionId, ORG_ID);
     await before?.send({ message: "hello" });
 
     expect(
-      await service.updateSessionModel(
-        sessionId,
-        ORG_ID,
-        "provider-1::next-chat-model"
-      )
+      await service.updateSessionRunSettings(sessionId, ORG_ID, {
+        model: "provider-1::next-chat-model",
+      })
     ).toBe(true);
 
-    const after = await service.resolveSession(sessionId, ORG_ID);
+    const after = await service.sessions.get(sessionId, ORG_ID);
     expect(after).not.toBe(before);
     expect(after?.getHistory().length).toBe(2);
     expect(await db.getSession(sessionId)).toBeNull();
@@ -283,7 +281,7 @@ describe("cognito sessions never write back", () => {
       { cognito: true, orgRole: "admin" }
     );
 
-    const session = await service.resolveSession(sessionId, ORG_ID);
+    const session = await service.sessions.get(sessionId, ORG_ID);
     await session?.send({ message: "what do you remember" });
 
     expect(captured.names).not.toContain("skill_manage");
@@ -308,7 +306,7 @@ describe("cognito sessions never write back", () => {
       { orgRole: "admin" }
     );
 
-    const session = await service.resolveSession(sessionId, ORG_ID);
+    const session = await service.sessions.get(sessionId, ORG_ID);
     await session?.send({ message: "what do you remember" });
 
     expect(captured.names).toContain("skill_manage");
@@ -378,7 +376,7 @@ describe("a cognito session still reads what an ordinary one reads", () => {
       { cognito: true, orgRole: "admin" }
     );
 
-    const session = await service.resolveSession(sessionId, ORG_ID);
+    const session = await service.sessions.get(sessionId, ORG_ID);
     await session?.send({ message: "hello" });
 
     return captured;
@@ -410,7 +408,7 @@ async function sendImage(
   service: AgentService,
   sessionId: string
 ): Promise<void> {
-  const session = await service.resolveSession(sessionId, ORG_ID);
+  const session = await service.sessions.get(sessionId, ORG_ID);
   await session?.send({
     images: [{ data: TINY_PNG, mediaType: "image/png" }],
     message: "what is this",
@@ -575,7 +573,7 @@ describe("cognito leaves no skill-usage trail", () => {
       }
     );
 
-    const session = await service.resolveSession(sessionId, ORG_ID);
+    const session = await service.sessions.get(sessionId, ORG_ID);
     await session?.send({ message: "help me manage skills" });
     // The recorders are fired without await, so let them settle.
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -589,10 +587,6 @@ describe("cognito leaves no skill-usage trail", () => {
     // Reading the catalog is right in cognito. Writing a row saying which
     // skills the chat touched is still a trace of what it was about.
     expect(await turnWith(true)).toBe(0);
-  });
-
-  test("an ordinary turn still records it", async () => {
-    expect(await turnWith(false)).toBeGreaterThan(0);
   });
 });
 

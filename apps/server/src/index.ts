@@ -10,6 +10,10 @@ import {
 import type { Server } from "bun";
 import { ensureProcessPath } from "./lib/ensure-process-path";
 import { createPluginAgentHost } from "./services/plugin-agent-host";
+import {
+  assertBackupDirOutsideRoot,
+  startScheduledBackups,
+} from "./services/scheduled-backup";
 
 ensureProcessPath();
 
@@ -72,11 +76,14 @@ import { ComposioService } from "./services/composio-service";
 import { claimLegacyCustomTools } from "./services/custom-tool-handlers";
 import { setToolSecrets } from "./services/custom-tool-shared";
 
-import { retireAppUserData } from "./services/data-portability";
+import {
+  createMíngZhànDataExport,
+  retireAppUserData,
+} from "./services/data-portability";
 import { openaiProviderKey } from "./services/google-meet/actions";
 import { GoogleMeetService } from "./services/google-meet/service";
 import { LlmUsageTracker } from "./services/llm-usage-tracker";
-import { ManagedSecrets } from "./services/managed-secrets";
+import { decodeSecretsKey, ManagedSecrets } from "./services/managed-secrets";
 import { McpClientManager } from "./services/mcp-client-manager";
 import {
   createMcpAwareEmailOutboundAdapter,
@@ -436,6 +443,27 @@ const pluginService = new PluginService(database.adapter, getUserConfigDir(), {
 });
 
 await googleMeetService.initialize();
+
+const backupDir = process.env.MINGZHAN_BACKUP_DIR?.trim();
+
+if (backupDir) {
+  try {
+    assertBackupDirOutsideRoot(backupDir, getUserConfigDir());
+    await startScheduledBackups({
+      dir: backupDir,
+      exportZip: async () =>
+        (await googleMeetService.withSnapshot(() => createMíngZhànDataExport()))
+          .data,
+      key: decodeSecretsKey(process.env.MINGZHAN_SECRETS_KEY ?? ""),
+    });
+  } catch (error) {
+    console.error(
+      `MíngZhàn cannot start backups: ${error instanceof Error ? error.message : String(error)}`
+    );
+    database.release();
+    process.exit(1);
+  }
+}
 
 try {
   await pluginService.recoverInterruptedPluginOperations();

@@ -141,6 +141,7 @@ export function ChatPageContent({
         currentModelSelection={currentModelSelection}
         disabled={composerDisabled}
         draftStorageKey={composerDraftKey}
+        enableDictation
         error={error}
         headerNotice={skillReviewBanner}
         onBtw={onBtw}
@@ -268,8 +269,15 @@ function ChatConversation({
     turnStartedAt,
   } = state;
 
+  // Cognito chats are not kept, so neither is their open panel.
+  const rememberId = session && !state.cognito ? session.id : undefined;
+
   return (
-    <ChatAttachmentPanelProvider below={below} key={session?.id ?? "new"}>
+    <ChatAttachmentPanelProvider
+      below={below}
+      key={session?.id ?? "new"}
+      rememberId={rememberId}
+    >
       <ArtifactStreamingPanelBridge messages={messages} profileId={profileId} />
       <BrowserLiveViewPanelBridge messages={messages} sessionId={session?.id} />
       <ChatPageColumn cognito={cognitoSurface}>

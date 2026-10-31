@@ -994,7 +994,8 @@ describe("plugin lifecycle", () => {
           workers: [{ entry: "worker.js", key: "index", name: "Indexer" }],
         })
       ),
-      "worker.js": `await Bun.write(process.env.MINGZHAN_PLUGIN_DATA_DIR + "/started", process.env.MINGZHAN_ORG_ID); setInterval(() => {}, 1000);`,
+      // Write then rename: a kill mid-write must not leave an empty marker.
+      "worker.js": `const marker = process.env.MINGZHAN_PLUGIN_DATA_DIR + "/started"; await Bun.write(marker + "." + process.pid, process.env.MINGZHAN_ORG_ID); (await import("node:fs")).renameSync(marker + "." + process.pid, marker); setInterval(() => {}, 1000);`,
     });
 
     try {

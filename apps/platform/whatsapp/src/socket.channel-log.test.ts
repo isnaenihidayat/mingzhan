@@ -12,12 +12,10 @@ describe("isChannelDebugEnabled", () => {
     }
   });
 
-  test("is off by default", () => {
+  test("is off by default and on when MINGZHAN_CH_DEBUG=1", () => {
     delete process.env.MINGZHAN_CH_DEBUG;
     expect(isChannelDebugEnabled()).toBe(false);
-  });
 
-  test("is on when MINGZHAN_CH_DEBUG=1", () => {
     process.env.MINGZHAN_CH_DEBUG = "1";
     expect(isChannelDebugEnabled()).toBe(true);
   });

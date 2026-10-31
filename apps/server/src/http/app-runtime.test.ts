@@ -60,9 +60,11 @@ function createServerOptions() {
       }),
       listSkills: async () => ({ skills: [] }),
       providerConfigured: true,
-      resolveSession: async () => ({
-        send: async (input: { message: string }) => `reply:${input.message}`,
-      }),
+      sessions: {
+        get: async () => ({
+          send: async (input: { message: string }) => `reply:${input.message}`,
+        }),
+      },
     } as any,
     authService,
     automationService: {} as any,
@@ -412,7 +414,10 @@ describe("createHonoApp", () => {
   });
 
   test("resolves org context for bearer auth without X-Org-Id", async () => {
-    const configDir = await mkdtemp(join(tmpdir(), "mingzhan-bearer-auth-org-"));
+    const configDir = await mkdtemp(
+      join(tmpdir(), "mingzhan-bearer-auth-org-")
+    );
+
     process.env.MINGZHAN_CONFIG_DIR = configDir;
 
     try {

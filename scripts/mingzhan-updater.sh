@@ -41,7 +41,11 @@ running_version() {
 counts() {
   in_mingzhan '
 const { Database } = require("bun:sqlite");
-const db = new Database("/mingzhan/data/sqlite/mingzhan.sqlite", { readonly: true });
+const { isAbsolute, resolve } = require("node:path");
+const url = (process.env.DATABASE_URL ?? "file:data/sqlite/mingzhan.sqlite").trim();
+const file = url.startsWith("file:") ? url.slice(5) : url;
+const databasePath = isAbsolute(file) ? file : resolve(process.env.MINGZHAN_CONFIG_DIR ?? "/mingzhan/data", file);
+const db = new Database(databasePath, { readonly: true });
 for (const { name } of db.query("select name from sqlite_master where type = ? and name not like ?").all("table", "sqlite_%")) {
   console.log(name, db.query(`select count(*) as n from "${name}"`).get().n);
 }

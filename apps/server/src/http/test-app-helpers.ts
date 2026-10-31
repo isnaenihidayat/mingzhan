@@ -2,6 +2,7 @@ import {
   createInMemoryDatabaseAdapter,
   type DatabaseAdapter,
 } from "@mingzhan/db";
+import { AgentGroupService } from "../services/agent-group-service";
 import { AuthService } from "../services/auth-service";
 import { OrgService } from "../services/org-service";
 import { SkillCuratorService } from "../services/skill-curator-service";
@@ -55,9 +56,20 @@ export function createMinimalHonoApp(
       new SkillsService(databaseAdapter)
     );
 
+  const agent = overrides.agent ?? { ...defaultAgent };
+
+  // Group routes read the agent's one group service; a stub without one gets
+  // a service on itself, so replies use the stub.
+  if (!("groups" in agent)) {
+    // SAFETY: Route tests stub the agent methods their group requests call.
+    Object.assign(agent, {
+      groups: new AgentGroupService(databaseAdapter, agent as never),
+    });
+  }
+
   // SAFETY: Route tests provide every service method their requests call.
   const app = createHonoApp({
-    agent: (overrides.agent ?? defaultAgent) as ServerOptions["agent"],
+    agent: agent as ServerOptions["agent"],
     authService,
     automationService: (overrides.automationService ??
       {}) as ServerOptions["automationService"],

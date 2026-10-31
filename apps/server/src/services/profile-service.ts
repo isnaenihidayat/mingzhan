@@ -198,7 +198,10 @@ function readKnowledgeZip(zipBase64: string): Record<string, Uint8Array> {
           const normalized = path.normalize("NFC");
 
           if (names.has(normalized)) {
-            throw new MíngZhànApiError("ZIP file contains duplicate paths.", 400);
+            throw new MíngZhànApiError(
+              "ZIP file contains duplicate paths.",
+              400
+            );
           }
 
           names.add(normalized);
@@ -553,7 +556,10 @@ export class ProfileService {
           ([name, content]) => name !== "MEMORY.md" && content !== undefined
         ))
     ) {
-      throw new MíngZhànApiError("Shared agent configuration is read-only.", 403);
+      throw new MíngZhànApiError(
+        "Shared agent configuration is read-only.",
+        403
+      );
     }
 
     validateGeneratedSoulFiles(request.soulFiles);
@@ -666,6 +672,7 @@ export class ProfileService {
       "discord",
       "whatsapp",
       "slack",
+      "teams",
     ] as const) {
       if (
         (await listChannelOwners(platform)).some(
@@ -688,7 +695,10 @@ export class ProfileService {
     const target = await this.db.getOrganizationById(destination);
 
     if (!target || target.archivedAt) {
-      throw new MíngZhànApiError("Destination organization is unavailable.", 404);
+      throw new MíngZhànApiError(
+        "Destination organization is unavailable.",
+        404
+      );
     }
 
     if (destination === orgId) {
@@ -1808,7 +1818,10 @@ export class ProfileService {
     const profile = await this.requireProfile(orgId, profileId);
 
     if (await this.db.getSharedAgentInstance(orgId, profileId)) {
-      throw new MíngZhànApiError("Shared agent configuration is read-only.", 403);
+      throw new MíngZhànApiError(
+        "Shared agent configuration is read-only.",
+        403
+      );
     }
 
     return profile;

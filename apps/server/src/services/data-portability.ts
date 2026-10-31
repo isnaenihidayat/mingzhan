@@ -49,13 +49,14 @@ import {
   resolveDatabasePath,
 } from "@mingzhan/db";
 import { unzipSync, zipSync } from "fflate";
-import { ManagedSecrets } from "./managed-secrets";
+import { decodeSecretsKey, ManagedSecrets } from "./managed-secrets";
 import {
   PluginExportBarrierError,
   quarantineInvalidPluginReleases,
   runWithPluginExportBarrier,
   vacuumPluginDatabaseInto,
 } from "./plugin-service";
+import { decryptBackup, isEncryptedBackup } from "./scheduled-backup";
 
 export const MINGZHAN_EXPORT_MANIFEST = "mingzhan-export.json";
 
@@ -768,7 +769,7 @@ export async function createMíngZhànOrgDataExport(
     profileIds.has(session.profileId)
   );
 
-  for (const session of orgSessions) {
+  for (const { codingWorkspaceRoot: _hostPath, ...session } of orgSessions) {
     const attachments = [];
 
     for (const attachment of await databaseAdapter.listAttachmentsForSession(
@@ -953,7 +954,23 @@ export function decodeArchiveRequestData(data: string): Buffer {
     throw new MíngZhànApiError("Import archive data is required.", 400);
   }
 
-  return Buffer.from(trimmed, "base64");
+  const archive = Buffer.from(trimmed, "base64");
+
+  if (!isEncryptedBackup(archive)) {
+    return archive;
+  }
+
+  try {
+    return decryptBackup(
+      archive,
+      decodeSecretsKey(process.env.MINGZHAN_SECRETS_KEY ?? "")
+    );
+  } catch {
+    throw new MíngZhànApiError(
+      "Cannot decrypt this backup with MINGZHAN_SECRETS_KEY.",
+      400
+    );
+  }
 }
 
 function megabytes(bytes: number): string {

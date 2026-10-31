@@ -18,3 +18,8 @@ data/automations/*
 data/logs/*
 !data/logs/.gitkeep
 apps/cli/dist
+
+file_demo/
+mingzhan-secrets.env
+
+!**/SKILL.md

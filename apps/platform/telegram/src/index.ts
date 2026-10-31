@@ -15,10 +15,7 @@ import {
 import { loadLocalAuthToken } from "@mingzhan/core/local-auth";
 import { resolveWebPublicUrl } from "@mingzhan/core/runtime";
 import { getTelegramConfigDir } from "@mingzhan/core/telegram-config";
-import {
-  createTelegramWorkerHeartbeat,
-  isHeartbeatAlive,
-} from "@mingzhan/core/telegram-worker";
+import { createTelegramWorkerHeartbeat } from "@mingzhan/core/telegram-worker";
 import { TelegramAuthStore } from "./auth-store";
 import { createBot } from "./bot";
 import { loadTelegramIdentities, type TelegramBridgeConfig } from "./config";
@@ -146,17 +143,22 @@ async function startIdentity(
     config.owner ?? config.orgId ?? null
   );
 
-  const existing = await heartbeat.read();
+  // Only the lock decides. After a restart the heartbeat pid can belong to
+  // another process.
+  try {
+    await heartbeat.acquire();
+  } catch (error) {
+    if (!(await heartbeat.isLeaseHeld())) {
+      throw error;
+    }
 
-  if (existing && existing.pid !== process.pid && isHeartbeatAlive(existing)) {
     console.error(
-      `Another MíngZhàn Telegram bridge already runs the ${label} bot (pid ${existing.pid}). Skipping it.`
+      `Another MíngZhàn Telegram bridge already runs the ${label} bot. Skipping it.`
     );
 
     return null;
   }
 
-  await heartbeat.acquire();
   const configDir = getTelegramConfigDir(config.owner ?? config.orgId ?? null);
 
   const client = new MíngZhànClient({

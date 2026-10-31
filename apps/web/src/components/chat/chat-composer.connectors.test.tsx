@@ -147,3 +147,70 @@ test("the Connectors submenu assigns an org MCP server to the chat's agent", asy
 
   expect(assign).toHaveBeenCalledWith("agent-a", { serverId: "drive" });
 });
+
+test.each([false, true])(
+  "microphone visibility follows the dictation setting: %s",
+  async (enabled) => {
+    const settings = spyOn(
+      client,
+      "getTranscriptionSettings"
+    ).mockResolvedValue({ model: "whisper-1" });
+
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    cleanups.push(async () => {
+      await act(async () => root.unmount());
+      queryClient.clear();
+      settings.mockRestore();
+      container.remove();
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AuthContext.Provider value={auth}>
+              <PromptInputProvider>
+                <ChatComposer
+                  busy={false}
+                  canStop={false}
+                  chatStatus="ready"
+                  currentModelSelection={null}
+                  enableDictation={enabled}
+                  error={null}
+                  onModelChange={() => undefined}
+                  onSubmit={() => undefined}
+                  providerModelGroups={[]}
+                  renderModelLabel={() => null}
+                />
+              </PromptInputProvider>
+            </AuthContext.Provider>
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+    });
+
+    if (enabled) {
+      await waitFor(() =>
+        Boolean(
+          container.querySelector(
+            'button[aria-label="Dictate with microphone"]'
+          )
+        )
+      );
+    }
+
+    expect(
+      Boolean(
+        container.querySelector('button[aria-label="Dictate with microphone"]')
+      )
+    ).toBe(enabled);
+    expect(settings.mock.calls.length > 0).toBe(enabled);
+  }
+);
