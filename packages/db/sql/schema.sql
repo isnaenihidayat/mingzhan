@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   agent_todos TEXT DEFAULT '[]' NOT NULL,
   agent_questionnaire TEXT,
   project_id TEXT,
+  closed_at TEXT,
+  coding_workspace_root TEXT,
   FOREIGN KEY (profile_id) REFERENCES profiles (id) ON DELETE CASCADE,
   FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL
 );

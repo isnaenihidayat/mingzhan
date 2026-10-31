@@ -101,6 +101,7 @@ const install = Bun.spawn(
       "whatsapp",
       "discord",
       "slack",
+      "teams",
     ].flatMap((name) => ["--filter", `@mingzhan/${name}`]),
   ],
   { cwd: output, stderr: "inherit", stdout: "inherit" }

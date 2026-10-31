@@ -25,6 +25,7 @@ import {
   isChannelOwner,
 } from "@mingzhan/core/channel-config-shared";
 import { getSlackWorkerStatus } from "@mingzhan/core/slack-worker";
+import { getTeamsWorkerStatus } from "@mingzhan/core/teams-worker";
 import type { DatabaseAdapter } from "@mingzhan/db";
 import { z } from "zod";
 import type { AgentService } from "./agent-service";
@@ -107,6 +108,15 @@ export class SystemStatusService {
       slackStatus.running = slackProcess.status === "online";
     }
 
+    const teamsProcess = statuses.teams;
+
+    const teamsStatus = await getTeamsWorkerStatus(orgId);
+
+    if (isChannelOwner(orgId) && teamsProcess?.managed) {
+      teamsStatus.process = teamsProcess;
+      teamsStatus.running = teamsProcess.status === "online";
+    }
+
     return {
       automationWorker: {
         activeRuns: this.automationRunner.getActiveRunCount(),
@@ -137,6 +147,7 @@ export class SystemStatusService {
         : { assignedProfileCount: 0, connectedCount: 0, serverCount: 0 },
       server: await this.getServerStatus(),
       slackWorker: slackStatus,
+      teamsWorker: teamsStatus,
       telegramWorker: telegramStatus,
       whatsappWorker: await this.nameWhatsAppLinkOwner(
         whatsappStatus,

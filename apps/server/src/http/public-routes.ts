@@ -37,6 +37,8 @@ export function isPublicRouteRequest(
     (method === "GET" &&
       /^\/v1\/public\/artifact-shares\/[^/]+$/.test(pathname)) ||
     (method === "GET" &&
-      /^\/v1\/public\/conversation-shares\/[^/]+$/.test(pathname))
+      /^\/v1\/public\/conversation-shares\/[^/]+$/.test(pathname)) ||
+    (method === "POST" &&
+      /^\/v1\/channels\/teams\/[^/]+\/messages$/.test(pathname))
   );
 }

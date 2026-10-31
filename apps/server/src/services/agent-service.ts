@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   type AgentChatSession,
@@ -305,6 +306,7 @@ import {
   buildSubAgentResult,
   DEFAULT_SUB_AGENT_TIMEOUT_MS,
   failSubAgentResult,
+  type GroupTurnRunInput,
   MAX_SUB_AGENT_TIMEOUT_MS,
   type SubAgentRunInput,
   type SubAgentRunResult,
@@ -347,10 +349,7 @@ import {
   customToolTypesLabel,
   getCustomToolHandler,
 } from "./custom-tool-handlers";
-import {
-  type EphemeralSession,
-  EphemeralSessionStore,
-} from "./ephemeral-session-store";
+import type { EphemeralSession } from "./ephemeral-session-store";
 import {
   generateImageWithOpenAI,
   IMAGE_MODEL_REQUIRED_MESSAGE,
@@ -401,6 +400,12 @@ import {
   loadSessionHistory,
   wrapPersistedSession,
 } from "./session-persistence";
+import {
+  type ChatBuildContext,
+  inheritFrom,
+  SessionRuntime,
+  sessionKind,
+} from "./session-runtime";
 import { SessionTitleService } from "./session-title-service";
 import { sessionTurnRegistry } from "./session-turn-registry";
 import { SkillPostTurnReviewService } from "./skill-post-turn-review-service";
@@ -415,27 +420,7 @@ import {
 } from "./tool-resolver";
 import type { WorkerManagerService } from "./worker-manager-service";
 
-interface StoredSession {
-  channel: AgentChannel;
-  pluginRevision: string;
-  profileId: string;
-  session: AgentChatSession;
-  sharedCapabilityRevision?: string;
-}
-
-/**
- * Every opened session used to stay in memory with its history until a
- * restart, which is most of a long-lived instance's RAM growth. An evicted
- * session is rebuilt from SQLite on its next turn, as after a restart.
- */
-const MAX_CACHED_SESSIONS = 50;
-
 export type { SubAgentRunInput, SubAgentRunResult };
-
-interface CognitoSessionOptions {
-  /** Seeds a rebuild (model change) with the history held in memory. */
-  initialHistory?: ChatMessage[];
-}
 
 export interface CreateSessionOptions {
   codingWorkspaceRoot?: string;
@@ -444,9 +429,19 @@ export interface CreateSessionOptions {
   isPlatformAdmin?: boolean;
   model?: string | null;
   orgRole?: OrgRole | null;
+  parentSessionId?: string;
   projectId?: string | null;
   thinkingEffort?: ThinkingEffort | null;
 }
+
+type SessionRunSettings = Pick<StoredSessionRecord, "model" | "thinkingEffort">;
+
+const MAX_CHILD_SESSIONS = 5;
+
+const SUB_AGENT_INSTRUCTIONS = [
+  "You are running as a focused sub-agent delegated from a parent conversation.",
+  "Complete the assigned task and return a clear final answer.",
+];
 
 type ChatProfileAccess = Pick<
   CreateSessionOptions,
@@ -460,6 +455,7 @@ type ChatProfileAccess = Pick<
 const SHARED_HISTORY_CHANNELS: readonly AgentChannel[] = [
   "discord",
   "slack",
+  "teams",
   "telegram",
   "whatsapp",
 ];
@@ -487,6 +483,7 @@ function assertSessionOwner(
 export class AgentService {
   private userConfig: UserConfig | null;
   private readonly db: DatabaseAdapter;
+  readonly groups: AgentGroupService;
   private readonly profileService: ProfileService;
   private readonly superMingzhanSessionState = new SuperMingzhanSessionState();
   private readonly agentTodoState: AgentTodoState;
@@ -517,10 +514,18 @@ export class AgentService {
   private orgMemoryService: OrgMemoryService | null = null;
   private orgService: OrgService | null = null;
   private readonly memoryBackend: MemoryBackendService;
-  private readonly sessions = new Map<string, StoredSession>();
-  private readonly ephemeralSessions = new EphemeralSessionStore((entry) =>
-    this.purgeEphemeralAttachments(entry)
-  );
+  readonly sessions = new SessionRuntime({
+    accessFor: (orgId, userId) => this.resolveSessionAccess(orgId, userId),
+    build: (record, context) => this.buildChatSession(record, context),
+    loadRecord: (sessionId, orgId) =>
+      this.getSessionRecordForOrg(sessionId, orgId),
+    onCognitoEnd: (entry) => this.purgeEphemeralAttachments(entry),
+    revisionFor: async (orgId, profileId) =>
+      JSON.stringify([
+        await this.capabilityRevisionForProfile(orgId, profileId),
+        await this.pluginCapabilityRevision(orgId),
+      ]),
+  });
   private readonly sessionTitleService: SessionTitleService;
   private readonly orgUsageQuotaService: OrgUsageQuotaService;
   private skillPostTurnReviewService: SkillPostTurnReviewService;
@@ -540,6 +545,7 @@ export class AgentService {
   ) {
     this.userConfig = userConfig;
     this.db = db;
+    this.groups = new AgentGroupService(db, this);
     this.memoryBackend = new MemoryBackendService(db);
     this.profileService = new ProfileService(db);
     this.orgUsageQuotaService = new OrgUsageQuotaService(db);
@@ -587,13 +593,7 @@ export class AgentService {
         assignSkill: (orgId, profileId, request, meta) =>
           this.assignSkill(orgId, profileId, request, meta),
         createGroup: (orgId, userId, name, memberIds, brief) =>
-          new AgentGroupService(this.db, this).create(
-            orgId,
-            userId,
-            name,
-            memberIds,
-            brief
-          ),
+          this.groups.create(orgId, userId, name, memberIds, brief),
         getModels: () => this.getModels(),
         listSkills: (orgId) => this.listSkills(orgId),
       }
@@ -669,7 +669,7 @@ export class AgentService {
 
   setAutomationTools(tools: ToolDefinition[]): void {
     this.automationTools = tools;
-    this.sessions.clear();
+    this.sessions.invalidateAll();
   }
 
   setServerTools(tools: ServerToolOverrides): void {
@@ -686,7 +686,7 @@ export class AgentService {
 
   setMcpClientManager(manager: McpClientManager): void {
     this.mcpClientManager = manager;
-    this.sessions.clear();
+    this.sessions.invalidateAll();
   }
 
   setMcpService(service: McpService): void {
@@ -699,12 +699,12 @@ export class AgentService {
 
   setPluginService(service: PluginService | null): void {
     this.pluginService = service;
-    this.sessions.clear();
+    this.sessions.invalidateAll();
   }
 
   setSkillsService(service: SkillsService): void {
     this.skillsService = service;
-    this.sessions.clear();
+    this.sessions.invalidateAll();
   }
 
   setOrgService(service: OrgService): void {
@@ -838,7 +838,7 @@ export class AgentService {
       };
     }
 
-    this.sessions.clear();
+    this.sessions.invalidateAll();
 
     return { thinking };
   }
@@ -893,7 +893,7 @@ export class AgentService {
       };
     }
 
-    this.sessions.clear();
+    this.sessions.invalidateAll();
 
     return { vision };
   }
@@ -1787,7 +1787,7 @@ export class AgentService {
 
     // Sessions cache their resolved tool list, so the swap between hosted and
     // custom search only takes effect once they are rebuilt.
-    this.sessions.clear();
+    this.sessions.invalidateAll();
 
     return this.getWebSearchSettings();
   }
@@ -1816,7 +1816,7 @@ export class AgentService {
     }
 
     await this.managedSecrets.save("global", `web-search:${provider}`, apiKey);
-    this.sessions.clear();
+    this.sessions.invalidateAll();
 
     return this.getWebSearchSettings();
   }
@@ -1864,7 +1864,7 @@ export class AgentService {
     }
 
     if (kind === "web-search") {
-      this.sessions.clear();
+      this.sessions.invalidateAll();
 
       return this.getWebSearchSettings();
     }
@@ -2320,7 +2320,62 @@ export class AgentService {
     }
   }
 
-  async runSubAgentPrompt(input: SubAgentRunInput): Promise<SubAgentRunResult> {
+  runSubAgentPrompt(input: SubAgentRunInput): Promise<SubAgentRunResult> {
+    return this.runOneShotTurn(input, {
+      instructions: SUB_AGENT_INSTRUCTIONS,
+      log: "sub_agent",
+      tools: () => [],
+    });
+  }
+
+  /** One member's turn in an agent group chat; `signal` stops it mid-reply. */
+  runGroupTurn(input: GroupTurnRunInput): Promise<SubAgentRunResult> {
+    return this.runOneShotTurn(input, {
+      instructions: [
+        "You are taking a turn in a group chat with the user and other agents.",
+        "Follow the turn's instructions and reply as yourself.",
+      ],
+      log: "group_turn",
+      tools: (turnActive) => [
+        {
+          ...groupMemoryTool,
+          async run(
+            toolInput: Parameters<typeof groupMemoryTool.run>[0],
+            context: ToolContext
+          ) {
+            // The reply is already saved, so a late write would lose its notice.
+            if (!turnActive()) {
+              throw new Error("This group turn has ended.");
+            }
+
+            const result = await groupMemoryTool.run(toolInput, context);
+
+            if (result.change) {
+              input.onGroupMemoryChange?.(result.change);
+            }
+
+            return result;
+          },
+        },
+      ],
+    });
+  }
+
+  /**
+   * A single tool-using turn outside a chat session, for a sub-agent or a group
+   * member. It ends on a reply, on the timeout, or when `input.signal` aborts,
+   * which rejects with the abort reason.
+   */
+  private async runOneShotTurn(
+    input: SubAgentRunInput &
+      Partial<Pick<GroupTurnRunInput, "sharedDir" | "signal">>,
+    mode: {
+      instructions: string[];
+      log: string;
+      /** Extra tools for this kind of turn, told whether the turn still runs. */
+      tools: (turnActive: () => boolean) => ToolDefinition[];
+    }
+  ): Promise<SubAgentRunResult> {
     const startedAt = Date.now();
 
     if (!this._providerConfigured) {
@@ -2340,7 +2395,9 @@ export class AgentService {
       input.profileId
     );
 
-    let groupTurnActive = true;
+    // Tools may refuse work once the turn has ended, as with a provider that
+    // ignores the abort and keeps calling them.
+    let turnActive = true;
 
     const tools: ToolDefinition[] = [
       ...(await this.resolveProfileTools(profile, {
@@ -2350,32 +2407,7 @@ export class AgentService {
         includeTodoTools: false,
         userId: input.userId,
       })),
-      // Only a group turn carries a shared folder, and with it a group memory.
-      ...(input.sharedDir
-        ? [
-            {
-              ...groupMemoryTool,
-              async run(
-                toolInput: Parameters<typeof groupMemoryTool.run>[0],
-                context: ToolContext
-              ) {
-                // A timed-out provider can still call tools. Its message is already
-                // saved, so refuse new writes rather than losing their notices.
-                if (!groupTurnActive) {
-                  throw new Error("This group turn has ended.");
-                }
-
-                const result = await groupMemoryTool.run(toolInput, context);
-
-                if (result.change) {
-                  input.onGroupMemoryChange?.(result.change);
-                }
-
-                return result;
-              },
-            },
-          ]
-        : []),
+      ...mode.tools(() => turnActive),
     ];
 
     const { systemPrompt, soulActive } = await this.resolveProfileSystemPrompt(
@@ -2388,8 +2420,7 @@ export class AgentService {
     const childSystemPrompt = [
       systemPrompt.trim(),
       "",
-      "You are running as a focused sub-agent delegated from a parent conversation.",
-      "Complete the assigned task and return a clear final answer.",
+      ...mode.instructions,
       "Do not spawn sub-agents.",
     ].join("\n");
 
@@ -2446,8 +2477,15 @@ export class AgentService {
 
     emitActivity("Starting…");
 
-    const sendPromise = session
-      .sendStream(prompt, {
+    const timeout = AbortSignal.timeout(timeoutMs);
+
+    const signal = input.signal
+      ? AbortSignal.any([input.signal, timeout])
+      : timeout;
+
+    const sent = session.sendStream(
+      prompt,
+      {
         onChunk: (chunk) => {
           input.onText?.(chunk);
 
@@ -2469,37 +2507,50 @@ export class AgentService {
         onToolStart: (event) => {
           emitActivity(formatToolActivityLabel(event.tool, event.input));
         },
-      })
-      .then((reply) => ({
-        kind: "success" as const,
-        reply: reply.trim(),
-      }));
-
-    const timeoutPromise = new Promise<{ kind: "timeout" }>((resolve) => {
-      setTimeout(() => resolve({ kind: "timeout" }), timeoutMs);
-    });
-
-    // A timed-out sub-agent's ACP process is stopped here too, not left running.
-    const outcome = await Promise.race([sendPromise, timeoutPromise]).finally(
-      () => {
-        groupTurnActive = false;
-        endOneShotAcp(acpKey);
-      }
+      },
+      { signal }
     );
 
-    const durationMs = Date.now() - startedAt;
+    // A harness that ignores the signal is not waited for.
+    const aborted = new Promise<never>((_, reject) => {
+      if (signal.aborted) {
+        reject(signal.reason);
+      }
 
-    if (outcome.kind === "timeout") {
+      signal.addEventListener("abort", () => reject(signal.reason), {
+        once: true,
+      });
+    });
+
+    // The loser of the race below settles later with no one listening.
+    sent.catch(() => undefined);
+    aborted.catch(() => undefined);
+
+    let reply: string;
+
+    try {
+      // A stopped or timed-out turn's ACP process is stopped here too, not left running.
+      reply = (await Promise.race([sent, aborted])).trim();
+    } catch (error) {
+      if (!timeout.aborted) {
+        throw error;
+      }
+
       console.info(
-        `[sub_agent] timeout org=${input.orgId} profile=${input.profileId} durationMs=${durationMs}`
+        `[${mode.log}] timeout org=${input.orgId} profile=${input.profileId} durationMs=${Date.now() - startedAt}`
       );
 
       return buildSubAgentResult("timeout", "", "Sub-agent timed out.");
+    } finally {
+      turnActive = false;
+      endOneShotAcp(acpKey);
     }
 
-    if (!outcome.reply) {
+    const durationMs = Date.now() - startedAt;
+
+    if (!reply) {
       console.info(
-        `[sub_agent] fail org=${input.orgId} profile=${input.profileId} durationMs=${durationMs} reason=empty_reply`
+        `[${mode.log}] fail org=${input.orgId} profile=${input.profileId} durationMs=${durationMs} reason=empty_reply`
       );
 
       return buildSubAgentResult(
@@ -2510,10 +2561,10 @@ export class AgentService {
     }
 
     console.info(
-      `[sub_agent] success org=${input.orgId} profile=${input.profileId} durationMs=${durationMs}`
+      `[${mode.log}] success org=${input.orgId} profile=${input.profileId} durationMs=${durationMs}`
     );
 
-    return buildSubAgentResult("success", outcome.reply);
+    return buildSubAgentResult("success", reply);
   }
 
   async runAutomation(automationId: string) {
@@ -2550,11 +2601,6 @@ export class AgentService {
       user: userId ? { id: userId } : undefined,
     });
 
-    const sharedCapabilityRevision = await this.capabilityRevisionForProfile(
-      orgId,
-      resolvedProfileId
-    );
-
     const sessionId = nanoid();
     const modelOverride = this.normalizeSessionModelOverride(options?.model);
     const cognito = options?.cognito;
@@ -2576,9 +2622,11 @@ export class AgentService {
       agentQuestionnaire: null,
       agentTodos: [],
       channel,
+      codingWorkspaceRoot: options?.codingWorkspaceRoot ?? null,
       createdAt: new Date().toISOString(),
       id: sessionId,
       model: modelOverride,
+      parentSessionId: options?.parentSessionId ?? null,
       profileId: resolvedProfileId,
       projectId: options?.projectId ?? null,
       thinkingEffort: options?.thinkingEffort ?? null,
@@ -2601,47 +2649,85 @@ export class AgentService {
       );
     }
 
-    const session = await this.buildChatSession(
-      channel,
-      orgId,
-      resolvedProfileId,
-      sessionId,
-      modelOverride,
-      userId ?? null,
-      options?.orgRole,
-      options?.isPlatformAdmin,
-      options?.codingWorkspaceRoot,
-      cognito ? {} : undefined,
-      record.thinkingEffort
-    );
-
+    // A stored chat is built on its first use, from this row.
     if (cognito) {
-      await this.ephemeralSessions.set({
-        attachmentIds: new Set(),
-        lastActiveAt: Date.now(),
-        record,
-        session,
-        sharedCapabilityRevision,
-      });
-
-      return sessionId;
+      await this.sessions.openCognito(record, orgId);
     }
 
-    this.cacheSession(sessionId, {
-      channel,
-      pluginRevision: await this.pluginCapabilityRevision(orgId),
-      profileId: resolvedProfileId,
-      session,
-      sharedCapabilityRevision,
-    });
-
     return sessionId;
+  }
+
+  /**
+   * A chat a sub_agent run happens in, nested under the chat that started it
+   * so the user can open and continue it. One level deep, like sub_agent.
+   */
+  async createChildSession(
+    parentSessionId: string,
+    orgId: string,
+    title: string,
+    access: Pick<CreateSessionOptions, "isPlatformAdmin" | "orgRole">
+  ): Promise<string> {
+    if (this.sessions.isCognito(parentSessionId)) {
+      throw new MíngZhànApiError(
+        "A cognito chat cannot start other chats.",
+        400
+      );
+    }
+
+    const parent = await this.getSessionRecordForOrg(parentSessionId, orgId);
+
+    if (!parent) {
+      throw new MíngZhànApiError("Session not found.", 404);
+    }
+
+    if (sessionKind(parent) === "child") {
+      throw new MíngZhànApiError(
+        "A chat started from another chat cannot start more chats.",
+        400
+      );
+    }
+
+    const siblings = parent.userId
+      ? await this.db.listSessionsForUser(parent.userId)
+      : await this.db.listSessions();
+
+    if (
+      siblings.filter((session) => session.parentSessionId === parentSessionId)
+        .length >= MAX_CHILD_SESSIONS
+    ) {
+      throw new MíngZhànApiError(
+        `This chat already started ${MAX_CHILD_SESSIONS} chats.`,
+        400
+      );
+    }
+
+    const inherited = inheritFrom(parent, "child");
+
+    const childId = await this.createSession(
+      orgId,
+      parseAgentChannel(inherited.channel) ?? "web",
+      inherited.profileId,
+      inherited.userId,
+      {
+        ...access,
+        codingWorkspaceRoot: inherited.codingWorkspaceRoot ?? undefined,
+        model: inherited.model,
+        parentSessionId,
+        projectId: parent.projectId ?? null,
+        thinkingEffort: inherited.thinkingEffort,
+      }
+    );
+
+    await this.db.renameSessionTitle(childId, title);
+
+    return childId;
   }
 
   async assertSessionProfileAccess(
     sessionId: string,
     orgId: string,
-    access: ChatProfileAccess
+    access: ChatProfileAccess,
+    options: { localClient?: boolean } = {}
   ): Promise<void> {
     const record = await this.getSessionRecordForOrg(sessionId, orgId);
 
@@ -2652,6 +2738,14 @@ export class AgentService {
         access
       );
       assertSessionOwner(record, access);
+
+      // Only the local CLI can set this folder, so only it can run tools there.
+      if (options.localClient === false && record.codingWorkspaceRoot) {
+        throw new MíngZhànApiError(
+          "This chat runs in a local folder. Continue it from the CLI.",
+          403
+        );
+      }
     }
   }
 
@@ -2677,7 +2771,7 @@ export class AgentService {
 
     const sessionRecord = record.sessionId
       ? await this.getSessionRecordForOrg(record.sessionId, orgId)
-      : this.ephemeralSessions.findByAttachmentId(attachmentId)?.record;
+      : this.sessions.cognitoByAttachment(attachmentId);
 
     if (!sessionRecord) {
       return null;
@@ -2741,53 +2835,6 @@ export class AgentService {
       );
       await this.db.deleteAttachment(attachment.id);
     }
-  }
-
-  /**
-   * A model change needs a new provider, which means a new session object. The
-   * conversation only exists in the old one, so it is carried across by hand.
-   */
-  private async rebuildEphemeralSession(
-    entry: EphemeralSession,
-    orgId: string,
-    model: string | null
-  ): Promise<boolean> {
-    const channel = parseAgentChannel(entry.record.channel);
-
-    if (!channel) {
-      return false;
-    }
-
-    const { isPlatformAdmin, orgRole } = await this.resolveSessionAccess(
-      orgId,
-      entry.record.userId
-    );
-
-    const sharedCapabilityRevision = await this.capabilityRevisionForProfile(
-      orgId,
-      entry.record.profileId
-    );
-
-    const session = await this.buildChatSession(
-      channel,
-      orgId,
-      entry.record.profileId,
-      entry.record.id,
-      model,
-      entry.record.userId ?? null,
-      orgRole,
-      isPlatformAdmin,
-      undefined,
-      { initialHistory: [...entry.session.getHistory()] },
-      entry.record.thinkingEffort
-    );
-
-    entry.record.model = model;
-    entry.session = session;
-    entry.sharedCapabilityRevision = sharedCapabilityRevision;
-    await this.ephemeralSessions.set(entry);
-
-    return true;
   }
 
   /**
@@ -2863,12 +2910,12 @@ export class AgentService {
     // Live history is the only history a cognito session has, so it answers
     // here whether or not a turn is in flight.
     if (
-      this.ephemeralSessions.has(sessionId) ||
+      this.sessions.isCognito(sessionId) ||
       (!options?.persistedOnly && sessionTurnRegistry.isActive(sessionId))
     ) {
       const liveSession =
-        this.ephemeralSessions.get(sessionId)?.session ??
-        (await this.resolveSession(sessionId, orgId));
+        this.sessions.peek(sessionId) ??
+        (await this.sessions.get(sessionId, orgId));
 
       if (liveSession) {
         const history = liveSession.getHistory();
@@ -2894,13 +2941,13 @@ export class AgentService {
     }
 
     const storedMessages = await this.db.listMessagesForSession(sessionId);
-    const cached = this.sessions.get(sessionId)?.session;
+    const cached = this.sessions.peek(sessionId);
 
     const contextUsage = options?.persistedOnly
       ? null
       : cached
         ? cached.getContextUsage()
-        : ((await this.resolveSession(sessionId, orgId))?.getContextUsage() ??
+        : ((await this.sessions.get(sessionId, orgId))?.getContextUsage() ??
           null);
 
     return {
@@ -2950,21 +2997,20 @@ export class AgentService {
       ? `${sourceTitle} (Branch)`
       : "Untitled (Branch)";
 
-    await this.db.upsertSession({
+    const branchRecord: StoredSessionRecord = {
+      ...inheritFrom(record, "branch"),
       agentQuestionnaire: null,
       agentTodos: [],
       branchMessageIndex: messageIndex,
-      channel: record.channel,
       createdAt: new Date().toISOString(),
       id: nextSessionId,
-      model: record.model,
       parentSessionId: sessionId,
-      profileId: record.profileId,
       projectId: record.projectId ?? null,
-      thinkingEffort: record.thinkingEffort ?? null,
       title: null,
       userId: record.userId ?? null,
-    });
+    };
+
+    await this.db.upsertSession(branchRecord);
 
     await copySessionHistoryArchive(this.db, orgId, sessionId, nextSessionId);
     await this.db.replaceMessagesForSession(
@@ -2977,40 +3023,6 @@ export class AgentService {
       }))
     );
     await this.db.updateSessionTitle(nextSessionId, branchTitle);
-
-    const channel = parseAgentChannel(record.channel);
-
-    if (!channel) {
-      throw new Error("Session channel is invalid.");
-    }
-
-    const { orgId: profileOrgId } = await this.requireProfileRecord(
-      record.profileId
-    );
-
-    const { isPlatformAdmin: branchIsPlatformAdmin, orgRole: branchOrgRole } =
-      await this.resolveSessionAccess(profileOrgId, record.userId);
-
-    const session = await this.buildChatSession(
-      channel,
-      profileOrgId,
-      record.profileId,
-      nextSessionId,
-      record.model,
-      record.userId ?? null,
-      branchOrgRole,
-      branchIsPlatformAdmin,
-      undefined,
-      undefined,
-      record.thinkingEffort
-    );
-
-    this.cacheSession(nextSessionId, {
-      channel,
-      pluginRevision: await this.pluginCapabilityRevision(profileOrgId),
-      profileId: record.profileId,
-      session,
-    });
 
     return { sessionId: nextSessionId };
   }
@@ -3085,7 +3097,7 @@ export class AgentService {
   scheduleSessionTitleGeneration(sessionId: string): void {
     // A cognito session has no row to title, and generating one would spend a
     // turn summarising a conversation that is meant to leave no trace.
-    if (this.ephemeralSessions.has(sessionId)) {
+    if (this.sessions.isCognito(sessionId)) {
       return;
     }
 
@@ -3102,7 +3114,7 @@ export class AgentService {
   schedulePostTurnSkillReview(sessionId: string): void {
     // The review writes skill suggestions, which is exactly the write-back a
     // cognito session promises not to do.
-    if (this.ephemeralSessions.has(sessionId)) {
+    if (this.sessions.isCognito(sessionId)) {
       return;
     }
 
@@ -3120,13 +3132,14 @@ export class AgentService {
       return false;
     }
 
-    if (await this.ephemeralSessions.delete(sessionId)) {
+    if (this.sessions.isCognito(sessionId)) {
+      await this.sessions.end(sessionId);
+
       return true;
     }
 
     discardInFlightSessionWrites(sessionId);
-    this.sessions.get(sessionId)?.session.clear();
-    this.sessions.delete(sessionId);
+    await this.sessions.end(sessionId);
     this.superMingzhanSessionState.clearSession(sessionId);
     this.agentTodoState.clearSession(sessionId);
     this.agentQuestionnaireState.clearSession(sessionId);
@@ -3147,200 +3160,146 @@ export class AgentService {
     return true;
   }
 
-  async resolveSession(
+  /**
+   * Changes the settings a chat is built with. It waits for the running turn,
+   * because the next turn needs a chat built with the new settings.
+   */
+  async updateSessionRunSettings(
     sessionId: string,
     orgId: string,
-    forNewTurn = false
-  ): Promise<AgentChatSession | null> {
+    changes: Partial<SessionRunSettings>
+  ): Promise<boolean> {
     const record = await this.getSessionRecordForOrg(sessionId, orgId);
 
     if (!record) {
-      return null;
+      return false;
     }
 
-    if (forNewTurn && record.model) {
-      this.normalizeSessionModelOverride(record.model);
+    const turn = sessionTurnRegistry.beginTurn(sessionId);
+
+    if (!turn.started) {
+      throw new MíngZhànApiError(
+        "Wait for the current response before changing chat settings.",
+        409
+      );
     }
 
-    const ephemeral = this.ephemeralSessions.get(sessionId);
-    const stored = this.sessions.get(sessionId);
+    try {
+      const next: Partial<SessionRunSettings> = {};
 
-    if (sessionTurnRegistry.isActive(sessionId) && !forNewTurn) {
-      const active = ephemeral?.session ?? stored?.session;
+      if (changes.model !== undefined) {
+        const model = this.normalizeSessionModelOverride(changes.model);
 
-      if (active) {
-        return active;
+        if (model !== record.model) {
+          next.model = model;
+        }
       }
-    }
 
-    const sharedCapabilityRevision = await this.capabilityRevisionForProfile(
-      orgId,
-      record.profileId
-    );
-
-    if (ephemeral) {
       if (
-        (ephemeral.sharedCapabilityRevision ?? "") !==
-          sharedCapabilityRevision &&
-        !(await this.rebuildEphemeralSession(ephemeral, orgId, record.model))
+        changes.thinkingEffort !== undefined &&
+        changes.thinkingEffort !== (record.thinkingEffort ?? null)
       ) {
-        throw new MíngZhànApiError("Session refresh failed. Try again.", 503);
+        next.thinkingEffort = changes.thinkingEffort;
       }
 
-      return ephemeral.session;
+      if (next.model === undefined && next.thinkingEffort === undefined) {
+        return true;
+      }
+
+      if (this.sessions.isCognito(sessionId)) {
+        await this.sessions.runSettingsChanged(sessionId, orgId, next);
+
+        return true;
+      }
+
+      let updated = true;
+
+      try {
+        if (next.model !== undefined) {
+          updated = await this.db.updateSessionModel(sessionId, next.model);
+        }
+
+        if (updated && next.thinkingEffort !== undefined) {
+          updated = await this.db.updateSessionThinkingEffort(
+            sessionId,
+            next.thinkingEffort
+          );
+        }
+      } finally {
+        // One write can land before the next fails. The chat is dropped either
+        // way, so the next turn is built from the stored row.
+        await this.sessions.runSettingsChanged(sessionId, orgId, next);
+      }
+
+      return updated;
+    } finally {
+      sessionTurnRegistry.cancelTurn(sessionId);
+    }
+  }
+
+  /**
+   * Takes a chat out of Recents and stops its running turn. Search and its
+   * link still reach it, and its next message brings it back.
+   */
+  async closeSession(
+    sessionId: string,
+    orgId: string,
+    access: ChatProfileAccess
+  ): Promise<boolean> {
+    if (this.sessions.isCognito(sessionId)) {
+      throw new MíngZhànApiError("An incognito chat cannot be closed.", 400);
     }
 
-    const pluginRevision = await this.pluginCapabilityRevision(orgId);
+    const record = await this.getSessionRecordForOrg(sessionId, orgId);
 
+    if (!record) {
+      return false;
+    }
+
+    this.assertChatProfileAccess(
+      await this.requireProfile(orgId, record.profileId),
+      access
+    );
+
+    // Everyone on the agent can read a messaging-app chat, but stopping its
+    // turn hits the person who started it, so closing needs the owner or an admin.
     if (
-      stored &&
-      stored.pluginRevision === pluginRevision &&
-      (stored.sharedCapabilityRevision ?? "") === sharedCapabilityRevision
+      !(
+        access.isPlatformAdmin ||
+        access.orgRole === "admin" ||
+        (access.user && record.userId === access.user.id)
+      )
     ) {
-      this.cacheSession(sessionId, stored);
-
-      return stored.session;
+      throw new MíngZhànApiError("Session not found", 404);
     }
 
-    const channel = parseAgentChannel(record.channel);
+    const closedAt = new Date().toISOString();
 
-    if (!channel) {
-      return null;
-    }
-
-    const { orgId: profileOrgId } = await this.requireProfileRecord(
-      record.profileId
-    );
-
-    const { isPlatformAdmin: resumeIsPlatformAdmin, orgRole: resumeOrgRole } =
-      await this.resolveSessionAccess(profileOrgId, record.userId);
-
-    const session = await this.buildChatSession(
-      channel,
-      profileOrgId,
-      record.profileId,
-      sessionId,
-      record.model,
-      record.userId ?? null,
-      resumeOrgRole,
-      resumeIsPlatformAdmin,
-      undefined,
-      undefined,
-      record.thinkingEffort
-    );
-
-    this.cacheSession(sessionId, {
-      channel,
-      pluginRevision,
-      profileId: record.profileId,
-      session,
-      sharedCapabilityRevision,
-    });
-
-    return session;
-  }
-
-  async updateSessionModel(
-    sessionId: string,
-    orgId: string,
-    model: string | null
-  ): Promise<boolean> {
-    const record = await this.getSessionRecordForOrg(sessionId, orgId);
-
-    if (!record) {
+    // Write first: a row the update cannot reach must keep its turn running.
+    if (!(await this.db.updateSessionClosedAt(sessionId, closedAt))) {
       return false;
     }
 
-    const turn = sessionTurnRegistry.beginTurn(sessionId);
+    sessionTurnRegistry.stopTurn(sessionId);
 
-    if (!turn.started) {
-      throw new MíngZhànApiError(
-        "Wait for the current response before changing models.",
-        409
-      );
+    // Chats sub_agent started here go with it, or Recents keeps them without
+    // their parent. A branch has a parent too but stays: it is its own chat.
+    const sessions = record.userId
+      ? await this.db.listSessionsForUser(record.userId)
+      : await this.db.listSessions();
+
+    for (const child of sessions) {
+      if (
+        child.parentSessionId === sessionId &&
+        sessionKind(child) === "child" &&
+        !child.closedAt &&
+        (await this.db.updateSessionClosedAt(child.id, closedAt))
+      ) {
+        sessionTurnRegistry.stopTurn(child.id);
+      }
     }
 
-    try {
-      const normalizedModel = this.normalizeSessionModelOverride(model);
-
-      if (record.model === normalizedModel) {
-        return true;
-      }
-
-      const ephemeral = this.ephemeralSessions.get(sessionId);
-
-      if (ephemeral) {
-        return await this.rebuildEphemeralSession(
-          ephemeral,
-          orgId,
-          normalizedModel
-        );
-      }
-
-      const updated = await this.db.updateSessionModel(
-        sessionId,
-        normalizedModel
-      );
-
-      if (updated) {
-        this.sessions.delete(sessionId);
-      }
-
-      return updated;
-    } finally {
-      sessionTurnRegistry.cancelTurn(sessionId);
-    }
-  }
-  async updateSessionThinkingEffort(
-    sessionId: string,
-    orgId: string,
-    effort: ThinkingEffort | null
-  ): Promise<boolean> {
-    const record = await this.getSessionRecordForOrg(sessionId, orgId);
-
-    if (!record) {
-      return false;
-    }
-
-    const turn = sessionTurnRegistry.beginTurn(sessionId);
-
-    if (!turn.started) {
-      throw new MíngZhànApiError(
-        "Wait for the current response before changing thinking effort.",
-        409
-      );
-    }
-
-    try {
-      if ((record.thinkingEffort ?? null) === effort) {
-        return true;
-      }
-
-      const ephemeral = this.ephemeralSessions.get(sessionId);
-
-      if (ephemeral) {
-        ephemeral.record.thinkingEffort = effort;
-
-        return await this.rebuildEphemeralSession(
-          ephemeral,
-          orgId,
-          ephemeral.record.model
-        );
-      }
-
-      const updated = await this.db.updateSessionThinkingEffort(
-        sessionId,
-        effort
-      );
-
-      if (updated) {
-        this.sessions.delete(sessionId);
-      }
-
-      return updated;
-    } finally {
-      sessionTurnRegistry.cancelTurn(sessionId);
-    }
+    return true;
   }
 
   async renameSession(
@@ -3381,7 +3340,7 @@ export class AgentService {
 
     for (const session of await this.db.listSessions()) {
       if (session.projectId === projectId && profiles.has(session.profileId)) {
-        this.sessions.delete(session.id);
+        this.sessions.invalidateSession(session.id);
       }
     }
   }
@@ -3408,7 +3367,7 @@ export class AgentService {
     const updated = await this.db.updateSessionProject(sessionId, projectId);
 
     if (updated) {
-      this.sessions.delete(sessionId);
+      this.sessions.invalidateSession(sessionId);
     }
 
     return updated;
@@ -3465,13 +3424,19 @@ export class AgentService {
     }
 
     try {
+      if (record.closedAt) {
+        await this.db.updateSessionClosedAt(sessionId, null);
+      }
+
       await this.resolveSharedAgentProfile(orgId, record.profileId);
 
-      if (
-        this.sessions.has(sessionId) ||
-        this.ephemeralSessions.has(sessionId)
-      ) {
-        await this.resolveSession(sessionId, orgId, true);
+      // A held chat may be out of date; one not held is built fresh anyway.
+      if (this.sessions.peek(sessionId)) {
+        if (record.model) {
+          this.normalizeSessionModelOverride(record.model);
+        }
+
+        await this.sessions.get(sessionId, orgId, { forNewTurn: true });
       }
 
       return true;
@@ -3490,7 +3455,8 @@ export class AgentService {
 
     // Clearing a cognito session is the same as ending it: there is no
     // durable copy to keep the id pointing at.
-    if (await this.ephemeralSessions.delete(sessionId)) {
+    if (this.sessions.isCognito(sessionId)) {
+      await this.sessions.end(sessionId);
       await this.agentQuestionnaireState.clear(sessionId);
 
       return true;
@@ -3501,8 +3467,7 @@ export class AgentService {
     // database instead of showing what the turn wrote after the clear. The
     // turn lock is left alone and is released when the turn ends.
     discardInFlightSessionWrites(sessionId);
-    this.sessions.get(sessionId)?.session.clear();
-    this.sessions.delete(sessionId);
+    await this.sessions.end(sessionId);
 
     await deleteSessionHistoryArchive(orgId, sessionId);
     await this.db.deleteMessagesForSession(sessionId);
@@ -3653,7 +3618,7 @@ export class AgentService {
     options: { force?: boolean } = {},
     orgId: string
   ): Promise<CompactionResponse | null> {
-    const session = await this.resolveSession(sessionId, orgId);
+    const session = await this.sessions.get(sessionId, orgId);
 
     if (!session) {
       return null;
@@ -4507,7 +4472,7 @@ export class AgentService {
     const provider = createProviderFromActiveConfig(this.userConfig);
     this._providerConfigured =
       isProviderConfigured(this.userConfig) && provider !== null;
-    this.sessions.clear();
+    this.sessions.invalidateAll();
   }
 
   private async refreshManagedProviderKeys(): Promise<void> {
@@ -4521,7 +4486,7 @@ export class AgentService {
       this.secretFingerprint !== null &&
       fingerprint !== this.secretFingerprint
     ) {
-      this.sessions.clear();
+      this.sessions.invalidateAll();
       this.composioService?.reloadConfiguration();
     }
 
@@ -4703,7 +4668,7 @@ export class AgentService {
     this.userConfig = await loadUserConfig();
     await this.refreshManagedProviderKeys();
     this.refreshProviderConfig();
-    this.ephemeralSessions.clear();
+    this.sessions.invalidateAll({ cognito: true });
     this.composioService?.reloadConfiguration();
     this.visionSettingsPromise = null;
     this.transcriptionSettingsPromise = null;
@@ -4796,11 +4761,7 @@ export class AgentService {
     );
 
     if (request.model !== undefined) {
-      for (const [sessionId, record] of this.sessions.entries()) {
-        if (record.profileId === profileId) {
-          this.sessions.delete(sessionId);
-        }
-      }
+      this.sessions.invalidateProfile(profileId);
     }
 
     return response;
@@ -4817,11 +4778,7 @@ export class AgentService {
       request
     );
 
-    for (const [sessionId, record] of this.sessions) {
-      if (record.profileId === profileId) {
-        this.sessions.delete(sessionId);
-      }
-    }
+    this.sessions.invalidateProfile(profileId);
 
     return result;
   }
@@ -4829,12 +4786,7 @@ export class AgentService {
   async deleteProfile(orgId: string, profileId: string): Promise<void> {
     await this.profileService.deleteProfile(orgId, profileId);
 
-    for (const [sessionId, record] of this.sessions) {
-      if (record.profileId === profileId) {
-        record.session.clear();
-        this.sessions.delete(sessionId);
-      }
-    }
+    this.sessions.invalidateProfile(profileId, { clear: true });
   }
 
   async listTools(orgId: string): Promise<ListToolsResponse> {
@@ -5738,11 +5690,12 @@ export class AgentService {
     sessionId: string,
     orgId: string
   ): Promise<StoredSessionRecord | null> {
-    // Cognito sessions have no row, so the map answers first. Everything that
-    // reaches a session funnels through here, which is why the rest of the
-    // file needs no branch of its own.
-    const ephemeral = this.ephemeralSessions.get(sessionId);
-    const record = ephemeral?.record ?? (await this.db.getSession(sessionId));
+    // Cognito sessions have no row, so the runtime answers first. Everything
+    // that reaches a session funnels through here, which is why the rest of
+    // the file needs no branch of its own.
+    const record =
+      this.sessions.cognitoRecord(sessionId) ??
+      (await this.db.getSession(sessionId));
 
     if (!record) {
       return null;
@@ -5872,18 +5825,6 @@ export class AgentService {
     }
 
     return profile;
-  }
-
-  private async requireProfileRecord(
-    profileId: string
-  ): Promise<StoredProfileRecord & { orgId: string }> {
-    const profile = await this.db.getProfile(profileId);
-
-    if (!profile?.orgId) {
-      throw new Error("Profile not found.");
-    }
-
-    return { ...profile, orgId: profile.orgId };
   }
 
   private async resolveSessionProfile(
@@ -6315,30 +6256,45 @@ export class AgentService {
   }
 
   private async buildChatSession(
-    channel: AgentChannel,
-    orgId: string,
-    profileId: string,
-    sessionId: string,
-    modelOverride: string | null,
-    userId?: string | null,
-    orgRole?: OrgRole | null,
-    isPlatformAdmin?: boolean,
-    codingWorkspaceRoot?: string,
-    cognito?: CognitoSessionOptions,
-    thinkingEffort?: ThinkingEffort | null
+    record: StoredSessionRecord,
+    {
+      channel,
+      initialHistory: cognitoHistory,
+      isPlatformAdmin,
+      kind,
+      orgId,
+      orgRole,
+    }: ChatBuildContext
   ): Promise<AgentChatSession> {
+    const { id: sessionId, model: modelOverride, profileId, userId } = record;
+    const cognito = kind === "cognito";
     await this.refreshManagedProviderKeys();
     await this.ensureVisionSettingsLoaded();
     const profile = await this.requireExecutionProfile(orgId, profileId);
+
+    // A stored CLI folder can be moved or deleted after the chat started.
+    // Then the chat goes back to the profile workspace.
+    const { codingWorkspaceRoot } = record;
+
+    const codingRoot =
+      codingWorkspaceRoot && existsSync(codingWorkspaceRoot)
+        ? codingWorkspaceRoot
+        : undefined;
+
     // skill_manage writes skills and expands /learn, both of which outlive the
     // chat, so a cognito session never gets it whatever the channel allows.
     const includeSkillManageTools = !cognito && SKILL_MANAGE_CHANNELS[channel];
+
+    // A chat sub_agent started runs with nobody watching, so it gets the same
+    // limits as the in-memory sub-agent run.
+    const subAgentChat = kind === "child";
 
     const pluginOrgRole =
       channel === "telegram" ||
       channel === "whatsapp" ||
       channel === "discord" ||
-      channel === "slack"
+      channel === "slack" ||
+      channel === "teams"
         ? "member"
         : orgRole;
 
@@ -6347,8 +6303,12 @@ export class AgentService {
         pluginOrgRole === "admin" || pluginOrgRole === "member"
           ? pluginOrgRole
           : undefined,
+      includeAutomationTools: !subAgentChat,
       includeMemoryWriteTools: !cognito,
-      includeSkillManageTools,
+      includeQuestionTools: !subAgentChat,
+      includeSkillManageTools: includeSkillManageTools && !subAgentChat,
+      includeSubAgentTool: !subAgentChat,
+      includeTodoTools: !subAgentChat,
       mcpDiscovery:
         process.env.MINGZHAN_MCP_TOOL_DISCOVERY === "1" && !profile.acpAgent,
       userId,
@@ -6402,17 +6362,26 @@ export class AgentService {
       }
     }
 
-    const resolvedSystemPrompt = `${
+    const basePrompt = `${
       profile.isSuper
         ? `${systemPrompt.trim()}\n\n${SUPER_MINGZHAN_TOOL_AUTHORING_RULES}\n\n${SUPER_MINGZHAN_TEAM_RULES}`
         : systemPrompt
     }${projectInstructions}`;
 
+    const resolvedSystemPrompt = subAgentChat
+      ? [
+          basePrompt.trim(),
+          "",
+          ...SUB_AGENT_INSTRUCTIONS,
+          "Do not spawn sub-agents.",
+        ].join("\n")
+      : basePrompt;
+
     // A cognito session has nothing stored to load. On a model change it is
     // handed the live history instead, so the conversation survives the
     // rebuild that a new provider needs.
     const initialHistory = cognito
-      ? (cognito.initialHistory ?? [])
+      ? (cognitoHistory ?? [])
       : await loadSessionHistory(this.db, sessionId);
 
     const userTimezone = await this.getUserTimezone();
@@ -6434,7 +6403,7 @@ export class AgentService {
       undefined,
       {
         ...workspaceThinking,
-        effort: thinkingEffort ?? workspaceThinking.effort,
+        effort: record.thinkingEffort ?? workspaceThinking.effort,
       }
     );
 
@@ -6460,7 +6429,7 @@ export class AgentService {
 
     const trackEphemeralAttachment = cognito
       ? (attachmentId: string) =>
-          this.ephemeralSessions.trackAttachment(sessionId, attachmentId)
+          this.sessions.trackAttachment(sessionId, attachmentId)
       : undefined;
 
     const saveAttachment: SaveInlineAttachment = trackEphemeralAttachment
@@ -6480,10 +6449,11 @@ export class AgentService {
     const hasSkillManage = tools.some((tool) => tool.name === "skill_manage");
 
     const toolContext = buildToolExecutionContext({
+      agentDepth: subAgentChat ? 1 : undefined,
       assertCanStartLlmTurn: this.llmTurnQuotaCheckerFor(orgId),
       channel,
       ...this.knowledgeToolContext(orgId, profileId),
-      codingWorkspaceRoot,
+      codingWorkspaceRoot: codingRoot,
       forbidArtifactFileWrites: tools.some(
         (tool) => tool.name === SAVE_ARTIFACT_TOOL_NAME
       ),
@@ -6492,7 +6462,7 @@ export class AgentService {
       isPlatformAdmin: isPlatformAdmin || undefined,
       loadAttachment,
       onSkillCatalogChange: () => {
-        this.sessions.delete(sessionId);
+        this.sessions.invalidateSession(sessionId);
       },
       openTodosReminder: async () => {
         const plan = await this.agentTodoState.formatForPrompt(sessionId);
@@ -6517,7 +6487,7 @@ export class AgentService {
 
     const session = createAgentChatSession(harness, {
       archiveHistory: (history) => {
-        if (this.sessions.get(sessionId)?.session !== persistedSession) {
+        if (this.sessions.peek(sessionId) !== persistedSession) {
           throw new Error("Session changed during compaction. Try again.");
         }
 
@@ -6684,7 +6654,7 @@ export class AgentService {
                       await this.formatCodingDelegationContext(
                         orgId,
                         profileId,
-                        codingWorkspaceRoot
+                        codingRoot
                       )
                     );
                   }
@@ -7067,22 +7037,6 @@ export class AgentService {
     }
 
     throw new Error("No profile available for playground execution.");
-  }
-
-  /** Least recently used first out; a session mid-turn is never evicted. */
-  private cacheSession(sessionId: string, stored: StoredSession): void {
-    this.sessions.delete(sessionId);
-    this.sessions.set(sessionId, stored);
-
-    for (const id of this.sessions.keys()) {
-      if (this.sessions.size <= MAX_CACHED_SESSIONS) {
-        break;
-      }
-
-      if (!sessionTurnRegistry.isActive(id)) {
-        this.sessions.delete(id);
-      }
-    }
   }
 
   private resolveCompactionConfig(

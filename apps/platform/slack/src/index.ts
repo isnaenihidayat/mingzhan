@@ -21,10 +21,7 @@ import {
   loadSlackConfigFile,
   type SlackMember,
 } from "@mingzhan/core/slack-config";
-import {
-  createSlackWorkerHeartbeat,
-  isHeartbeatAlive,
-} from "@mingzhan/core/slack-worker";
+import { createSlackWorkerHeartbeat } from "@mingzhan/core/slack-worker";
 import {
   createChatHandler,
   createSlackEventHandler,
@@ -130,13 +127,7 @@ function createSlackApi(botToken: string): SlackApi {
 }
 
 try {
-  const existing = await heartbeat.read();
-
-  if (existing && existing.pid !== process.pid && isHeartbeatAlive(existing)) {
-    throw new Error(
-      `Another MíngZhàn Slack bridge already runs this connection (pid ${existing.pid}).`
-    );
-  }
+  await heartbeat.acquire();
 
   const config = await loadSlackConfigFile(owner);
 

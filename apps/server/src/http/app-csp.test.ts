@@ -58,9 +58,11 @@ function createServerOptions() {
       }),
       listSkills: async () => ({ skills: [] }),
       providerConfigured: true,
-      resolveSession: async () => ({
-        send: async (input: { message: string }) => `reply:${input.message}`,
-      }),
+      sessions: {
+        get: async () => ({
+          send: async (input: { message: string }) => `reply:${input.message}`,
+        }),
+      },
     } as any,
     authService,
     automationService: {} as any,
@@ -367,7 +369,9 @@ describe("createHonoApp", () => {
   });
 
   test("local-token requests without X-Org-Id resolve only with a single membership", async () => {
-    const configDir = await mkdtemp(join(tmpdir(), "mingzhan-local-token-orgs-"));
+    const configDir = await mkdtemp(
+      join(tmpdir(), "mingzhan-local-token-orgs-")
+    );
 
     process.env.MINGZHAN_CONFIG_DIR = configDir;
 

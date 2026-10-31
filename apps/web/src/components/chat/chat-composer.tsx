@@ -143,6 +143,7 @@ import {
 import { THINKING_EFFORT_OPTIONS } from "@/lib/thinking-settings";
 import { PluginView } from "@/pages/PluginPage";
 import { composerActions } from "./chat-composer.shared";
+import { ChatDictationButton } from "./chat-dictation-button";
 import { ChatComposerError, ChatTips } from "./chat-tips";
 
 interface ChatComposerBaseProps {
@@ -152,6 +153,7 @@ interface ChatComposerBaseProps {
   className?: string;
   disabled?: boolean;
   draftStorageKey?: string | null;
+  enableDictation?: boolean;
   error: string | null;
   footerClassName?: string;
   onStop?: () => void;
@@ -341,6 +343,8 @@ function ChatComposerStackedPrompt({
   showTips: boolean;
   skillPickerKey: string;
 }) {
+  const [dictationActive, setDictationActive] = useState(false);
+
   return (
     <>
       <ChatComposerNotice
@@ -357,6 +361,10 @@ function ChatComposerStackedPrompt({
         multiple
         onError={(attachmentErr) => setAttachmentError(attachmentErr.message)}
         onSubmit={({ text, files }) => {
+          if (dictationActive) {
+            return;
+          }
+
           setAttachmentError(null);
           onSubmit(text.trim(), files);
         }}
@@ -387,7 +395,9 @@ function ChatComposerStackedPrompt({
             busy={busy}
             canStop={canStop}
             chatStatus={chatStatus}
+            dictationActive={dictationActive}
             disabled={disabled}
+            onDictationActiveChange={setDictationActive}
             onStop={onStop}
             props={props}
           />
@@ -436,6 +446,8 @@ function ChatComposerBarePrompt({
   showTips: boolean;
   skillPickerKey: string;
 }) {
+  const [dictationActive, setDictationActive] = useState(false);
+
   return (
     <>
       <ChatComposerNotice
@@ -456,6 +468,10 @@ function ChatComposerBarePrompt({
             : (attachmentErr) => setAttachmentError(attachmentErr.message)
         }
         onSubmit={({ text, files }) => {
+          if (dictationActive) {
+            return;
+          }
+
           setAttachmentError(null);
           onSubmit(text.trim(), files);
         }}
@@ -490,20 +506,31 @@ function ChatComposerBarePrompt({
         >
           {isMinimal || !fullProps ? (
             <div className="ml-auto flex shrink-0 items-center gap-1.5">
-              <ChatComposerSubmitButton
-                busy={busy}
-                canStop={canStop}
-                chatStatus={chatStatus}
-                disabled={disabled}
-                onStop={onStop}
-              />
+              {fullProps?.enableDictation ? (
+                <ChatDictationButton
+                  disabled={disabled}
+                  onActiveChange={setDictationActive}
+                />
+              ) : null}
+
+              {dictationActive && !canStop ? null : (
+                <ChatComposerSubmitButton
+                  busy={busy}
+                  canStop={canStop}
+                  chatStatus={chatStatus}
+                  disabled={disabled}
+                  onStop={onStop}
+                />
+              )}
             </div>
           ) : (
             <ChatComposerFullFooter
               busy={busy}
               canStop={canStop}
               chatStatus={chatStatus}
+              dictationActive={dictationActive}
               disabled={disabled}
+              onDictationActiveChange={setDictationActive}
               onStop={onStop}
               props={fullProps}
             />
@@ -1527,6 +1554,8 @@ function ChatComposerFullFooter({
   canStop,
   disabled,
   onStop,
+  dictationActive,
+  onDictationActiveChange,
 }: {
   props: ChatComposerFullProps;
   chatStatus: ChatStatus;
@@ -1534,6 +1563,8 @@ function ChatComposerFullFooter({
   canStop: boolean;
   disabled: boolean;
   onStop?: () => void;
+  dictationActive: boolean;
+  onDictationActiveChange: (active: boolean) => void;
 }) {
   return (
     <>
@@ -1566,13 +1597,22 @@ function ChatComposerFullFooter({
           />
         ) : null}
 
-        <ChatComposerSubmitButton
-          busy={busy}
-          canStop={canStop}
-          chatStatus={chatStatus}
-          disabled={disabled}
-          onStop={onStop}
-        />
+        {props.enableDictation ? (
+          <ChatDictationButton
+            disabled={disabled}
+            onActiveChange={onDictationActiveChange}
+          />
+        ) : null}
+
+        {dictationActive && !canStop ? null : (
+          <ChatComposerSubmitButton
+            busy={busy}
+            canStop={canStop}
+            chatStatus={chatStatus}
+            disabled={disabled}
+            onStop={onStop}
+          />
+        )}
       </div>
     </>
   );

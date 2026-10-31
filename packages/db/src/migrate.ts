@@ -2016,6 +2016,8 @@ function migrateSessionsTable(db: Database): void {
 
   addNullableTextColumnIfMissing(db, "sessions", "thinking_effort");
   addNullableTextColumnIfMissing(db, "sessions", "project_id");
+  addNullableTextColumnIfMissing(db, "sessions", "closed_at");
+  addNullableTextColumnIfMissing(db, "sessions", "coding_workspace_root");
 }
 
 function migrateSessionTree(db: Database): void {

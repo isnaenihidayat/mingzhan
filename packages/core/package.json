@@ -56,6 +56,8 @@
     "./discord-worker": "./src/discord-worker.ts",
     "./slack-config": "./src/slack-config.ts",
     "./slack-worker": "./src/slack-worker.ts",
+    "./teams-config": "./src/teams-config.ts",
+    "./teams-worker": "./src/teams-worker.ts",
     "./whatsapp-config": "./src/whatsapp-config.ts",
     "./whatsapp-phones": "./src/whatsapp-phones.ts",
     "./whatsapp-worker": "./src/whatsapp-worker.ts",
@@ -68,7 +70,10 @@
     "./tools/protected": "./src/tools/protected.ts",
     "./tools/email": "./src/tools/email.ts",
     "./tools/custom-web-search": "./src/tools/custom-web-search.ts",
-    "./mcp/preinstalled": "./src/mcp/preinstalled.ts"
+    "./tools/paths": "./src/tools/paths.ts",
+    "./mcp/preinstalled": "./src/mcp/preinstalled.ts",
+    "./anydoc-text": "./src/anydoc-text.ts",
+    "./user-config": "./src/user-config.ts"
   },
   "scripts": {
     "build": "bun build ./src/index.ts --outdir dist --target bun",

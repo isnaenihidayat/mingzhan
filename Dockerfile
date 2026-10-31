@@ -6,7 +6,7 @@
 # Verify each proposed multi-arch digest with: docker buildx imagetools inspect <image>
 
 # --- Build architecture-independent web and JavaScript bundles once ---
-FROM --platform=$BUILDPLATFORM oven/bun:1.4.3-slim@sha256:14a223fa35747ec728bce300ef85888bc5f7958164d15bbba6a54b22b52a3288 AS web-builder
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4 AS web-builder
 WORKDIR /app
 
 COPY package.json bun.lock ./
@@ -15,14 +15,16 @@ COPY patches patches
 COPY apps apps
 COPY packages packages
 
-RUN bun install --frozen-lockfile --ignore-scripts \
-  && bun run --filter @mingzhan/web build \
+RUN --mount=type=cache,target=/root/.bun/install/cache bun install --frozen-lockfile --ignore-scripts
+
+RUN bun run --filter @mingzhan/web build \
   && bun run --filter @mingzhan/server build \
   && bun run --filter @mingzhan/automation build \
   && bun run --filter @mingzhan/telegram build \
   && bun run --filter @mingzhan/whatsapp build \
   && bun run --filter @mingzhan/discord build \
-  && bun run --filter @mingzhan/slack build
+  && bun run --filter @mingzhan/slack build \
+  && bun run --filter @mingzhan/teams build
 
 FROM scratch AS build-assets
 COPY --from=web-builder /app/apps/web/dist /app/apps/web/dist
@@ -32,11 +34,12 @@ COPY --from=web-builder /app/apps/platform/telegram/dist /app/apps/platform/tele
 COPY --from=web-builder /app/apps/platform/whatsapp/dist /app/apps/platform/whatsapp/dist
 COPY --from=web-builder /app/apps/platform/discord/dist /app/apps/platform/discord/dist
 COPY --from=web-builder /app/apps/platform/slack/dist /app/apps/platform/slack/dist
+COPY --from=web-builder /app/apps/platform/teams/dist /app/apps/platform/teams/dist
 
 # Production runtime dependencies are installed from a committed manifest and
 # lockfile. Re-resolving version ranges at image build time let two builds of
 # the same commit ship different transitive bytes, so the lockfile is the input.
-FROM oven/bun:1.4.3-slim@sha256:14a223fa35747ec728bce300ef85888bc5f7958164d15bbba6a54b22b52a3288 AS runtime-deps
+FROM oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4 AS runtime-deps
 WORKDIR /runtime-deps
 
 # The Codex and Claude Code binaries are about 670 MB, half the image. The
@@ -69,7 +72,7 @@ RUN set -eu; \
   chmod +x /ffmpeg /ffprobe
 
 # --- Production runtime (server + workspace packages + built static assets) ---
-FROM oven/bun:1.4.3-slim@sha256:14a223fa35747ec728bce300ef85888bc5f7958164d15bbba6a54b22b52a3288 AS runtime
+FROM oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4 AS runtime
 WORKDIR /app
 
 # HTML artifact → PDF export (services/html-pdf.ts). WeasyPrint comes from pip:
@@ -121,6 +124,7 @@ COPY --chown=1000:1000 --from=build-assets /app/apps/platform/telegram/dist apps
 COPY --chown=1000:1000 --from=build-assets /app/apps/platform/whatsapp/dist apps/platform/whatsapp/dist
 COPY --chown=1000:1000 --from=build-assets /app/apps/platform/discord/dist apps/platform/discord/dist
 COPY --chown=1000:1000 --from=build-assets /app/apps/platform/slack/dist apps/platform/slack/dist
+COPY --chown=1000:1000 --from=build-assets /app/apps/platform/teams/dist apps/platform/teams/dist
 COPY --chown=1000:1000 --from=runtime-deps /runtime-deps/node_modules node_modules
 
 RUN test -f apps/server/src/services/javascript-tool-runner.js \

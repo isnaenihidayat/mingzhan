@@ -147,6 +147,10 @@ export interface StoredSessionRecord {
   agentTodos: AgentTodo[];
   branchMessageIndex?: number | null;
   channel: string;
+  /** Set while the chat is hidden from Recents; the next message clears it. */
+  closedAt?: string | null;
+  /** Local CLI launch folder for bash and coding agents. Never sent to clients. */
+  codingWorkspaceRoot?: string | null;
   createdAt: string;
   id: string;
   model: string | null;
@@ -944,11 +948,12 @@ export interface DatabaseAdapter {
     type: PasskeyChallengeType,
     consumedAt: string
   ): Promise<boolean>;
+  /** Returns the id of the user whose password changed, or null. */
   consumePasswordResetToken(
     tokenHash: string,
     passwordHash: string,
     consumedAt: string
-  ): Promise<boolean>;
+  ): Promise<string | null>;
   /** Users excluding the auto-created CLI bearer-auth identity. */
   countHumanUsers(): Promise<number>;
   countOrgMemoryProposals(
@@ -1408,6 +1413,10 @@ export interface DatabaseAdapter {
     userId: string
   ): Promise<StoredSharedLinkRecord[]>;
   listPasskeys(userId: string): Promise<StoredPasskeyRecord[]>;
+  listPendingOrgInvites(
+    orgId: string,
+    now: string
+  ): Promise<StoredOrgInviteRecord[]>;
 
   listPlatformAdminUsers(): Promise<StoredUserRecord[]>;
 
@@ -1574,6 +1583,11 @@ export interface DatabaseAdapter {
     shareId: string,
     revokedAt: string
   ): Promise<boolean>;
+  revokeOrgInvite(
+    orgId: string,
+    id: string,
+    revokedAt: string
+  ): Promise<boolean>;
   revokeOwnedSharedLinks(
     orgId: string,
     userId: string,
@@ -1671,6 +1685,10 @@ export interface DatabaseAdapter {
       >
     >
   ): Promise<StoredProjectRecord | null>;
+  updateSessionClosedAt(
+    sessionId: string,
+    closedAt: string | null
+  ): Promise<boolean>;
   updateSessionModel(sessionId: string, model: string | null): Promise<boolean>;
   updateSessionParent(
     sessionId: string,

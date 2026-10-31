@@ -1,11 +1,9 @@
-import type { ProfileSummary } from "@mingzhan/core";
-import {
-  ALL_MEMBERS_ID,
-  mentionRanges,
-  mentionSuggestions,
-} from "@mingzhan/core/agent-groups";
+import { ALL_MEMBERS_ID, type GroupRoster } from "@mingzhan/core/agent-groups";
 import type { DocumentAttachment } from "@mingzhan/core/contract";
-import { MAX_DOCUMENT_BYTES, parseDataUrl } from "@mingzhan/core/message-content";
+import {
+  MAX_DOCUMENT_BYTES,
+  parseDataUrl,
+} from "@mingzhan/core/message-content";
 import { Button } from "@mingzhan/ui/button";
 import { toast } from "@mingzhan/ui/toast";
 import { cn } from "@mingzhan/ui/utils";
@@ -71,14 +69,14 @@ interface GroupComposerProps {
   /** Shows the attach button and takes pasted images and documents. */
   allowDocuments?: boolean;
   busy: boolean;
-  handles: Map<string, string>;
   /** Text to start with, such as a message whose send failed. */
   initialInput?: string;
-  members: ProfileSummary[];
   onSend: (content: string, documents?: DocumentAttachment[]) => Promise<void>;
   onStop: () => void;
   /** Shown in the empty field; the group wording by default. */
   placeholder?: string;
+  /** Who can be @mentioned; a thread is with one agent, so it has none. */
+  roster: GroupRoster;
   stopping: boolean;
 }
 
@@ -97,11 +95,10 @@ export function GroupComposer(props: GroupComposerProps) {
 function GroupComposerForm({
   allowDocuments = false,
   busy,
-  handles,
-  members,
   onSend,
   onStop,
   placeholder = "Message the group, @mention an agent or @all",
+  roster,
   stopping,
 }: GroupComposerProps) {
   const { attachments, textInput } = usePromptInputController();
@@ -120,10 +117,9 @@ function GroupComposerForm({
 
   const mention = findActiveSkillSlashRange(draft, caret, "@");
 
-  // A thread is with one agent, so it has nobody to mention.
   const suggestions =
-    mention && handles.size > 0
-      ? mentionSuggestions(mention.query, handles)
+    mention && roster.members.length > 0
+      ? roster.suggestions(mention.query)
       : [];
 
   const [active, setActive] = useState(0);
@@ -135,9 +131,9 @@ function GroupComposerForm({
     setActive(0);
   }, [query]);
 
-  const ranges = mentionRanges(draft, handles).map(
-    ({ end, handle, start }) => ({ end, name: handle, start })
-  );
+  const ranges = roster
+    .ranges(draft)
+    .map(({ end, handle, start }) => ({ end, name: handle, start }));
 
   function insertMention(handle: string) {
     if (!mention) {
@@ -163,8 +159,8 @@ function GroupComposerForm({
           role="listbox"
         >
           {suggestions.map((handle, index) => {
-            const id = mentionRanges(`@${handle}`, handles)[0]?.id;
-            const member = members.find((m) => m.id === id);
+            const id = roster.idOf(handle);
+            const member = roster.members.find((m) => m.id === id);
 
             return (
               <button
