@@ -116,6 +116,23 @@ jobs:
           pattern: desktop-*
           path: installers
           merge-multiple: true
+      - name: Normalize installer names before computing checksums
+        working-directory: installers
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import unicodedata
+
+          for path in Path('.').iterdir():
+              name = ''.join(char for char in unicodedata.normalize('NFKD', path.name) if not unicodedata.combining(char))
+              if not name.isascii():
+                  raise ValueError(f'Unsupported installer filename: {path.name}')
+              if name != path.name:
+                  target = path.with_name(name)
+                  if target.exists():
+                      raise FileExistsError(name)
+                  path.rename(target)
+          PY
       - name: Check all installer formats and create checksums
         shell: bash
         run: |
