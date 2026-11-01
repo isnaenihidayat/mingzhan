@@ -38,7 +38,7 @@ import {
   ConversationStickinessProvider,
 } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
-import { VisualQuestionSubmitContext } from "@/components/ai-elements/visual-block";
+import { VisualQuestionSubmitContext } from "@/components/ai-elements/visual-block.shared";
 import {
   AgentQuestionnaireAnswers,
   AgentQuestionnairePanel,

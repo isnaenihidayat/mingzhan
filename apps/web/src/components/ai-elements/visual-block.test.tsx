@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { parseVisualBlock } from "./visual-block";
+import { parseVisualBlock } from "./visual-block.shared";
 
 test("visual accepts inline charts and nested table/stat compositions", () => {
   expect(
@@ -34,9 +34,8 @@ test("questions send actual selected answers and remain read-only without a chat
   const { act } = await import("react");
   const { createRoot } = await import("react-dom/client");
 
-  const { QuestionsBlock, VisualQuestionSubmitContext } = await import(
-    "./visual-block"
-  );
+  const { QuestionsBlock } = await import("./visual-block");
+  const { VisualQuestionSubmitContext } = await import("./visual-block.shared");
 
   const host = document.createElement("div");
   document.body.append(host);
