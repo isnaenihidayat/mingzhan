@@ -149,28 +149,49 @@ function McpServerDialogCreateForm({
 
 type CreateView = "apps" | "connect" | "custom";
 
+function initialCreateView(preset?: PopularServer, custom = false): CreateView {
+  if (preset) {
+    return preset.auth === "token" ? "custom" : "connect";
+  }
+
+  return custom ? "custom" : "apps";
+}
+
 function McpCreateBody({
   availableServers,
+  initialPreset,
+  initialCustom,
   busy,
   onAssign,
   onOpenChange,
   state,
 }: {
   availableServers?: McpServerSummary[];
+  initialPreset?: PopularServer;
+  initialCustom?: boolean;
   busy: boolean;
   onAssign?: (serverId: string) => void;
   onOpenChange: (open: boolean) => void;
   state: McpServerDialogState;
 }) {
-  const [view, setView] = useState<CreateView>("apps");
-  const [preset, setPreset] = useState<PopularServer | null>(null);
+  const [view, setView] = useState<CreateView>(() =>
+    initialCreateView(initialPreset, initialCustom)
+  );
+
+  const [preset, setPreset] = useState<PopularServer | null>(
+    initialPreset ?? null
+  );
+
   const [query, setQuery] = useState("");
 
   // Every server in the org, assigned or not, so a preset never duplicates one.
   const { data: orgServers } = useMcpServersQuery();
 
-  function startForm(name: string, url: string) {
-    state.selectKind("signin");
+  function startForm(name: string, url: string, token = false) {
+    state.selectKind(token ? "http" : "signin");
+    state.setHeaders(
+      token ? [{ key: "Authorization", value: "" }] : [{ key: "", value: "" }]
+    );
     state.setName(name);
     state.setUrl(url);
   }
@@ -209,6 +230,21 @@ function McpCreateBody({
         onImport={state.openImportDialog}
         onKindChange={state.selectKind}
       >
+        {preset?.authHelp ? (
+          <p className="px-6 text-muted-foreground text-sm">
+            {preset.authHelp}{" "}
+            {preset.docsUrl ? (
+              <a
+                className="underline"
+                href={preset.docsUrl}
+                rel="noreferrer"
+                target="_blank"
+              >
+                Setup guide
+              </a>
+            ) : null}
+          </p>
+        ) : null}
         <McpServerDialogCreateForm
           busy={busy}
           onOpenChange={onOpenChange}
@@ -226,8 +262,8 @@ function McpCreateBody({
       onAssign={onAssign}
       onConnect={(item) => {
         setPreset(item);
-        startForm(item.name, item.url);
-        setView("connect");
+        startForm(item.name, item.url, item.auth === "token");
+        setView(item.auth === "token" ? "custom" : "connect");
       }}
       onCustom={() => {
         setPreset(null);
@@ -247,6 +283,8 @@ export function McpServerDialog({
   busy,
   server,
   availableServers,
+  initialPreset,
+  initialCustom,
   error = null,
   onOpenChange,
   onSubmit,
@@ -256,6 +294,8 @@ export function McpServerDialog({
   busy: boolean;
   server?: McpServerSummary | null;
   availableServers?: McpServerSummary[];
+  initialPreset?: PopularServer;
+  initialCustom?: boolean;
   error?: string | null;
   onOpenChange: (open: boolean) => void;
   onSubmit: (
@@ -263,7 +303,13 @@ export function McpServerDialog({
   ) => Promise<McpServerResponse | void>;
   onAssign?: (serverId: string) => void;
 }) {
-  const state = useMcpServerDialogState({ busy, onSubmit, open, server });
+  const state = useMcpServerDialogState({
+    busy,
+    initialPreset,
+    onSubmit,
+    open,
+    server,
+  });
 
   return (
     <>
@@ -305,6 +351,8 @@ export function McpServerDialog({
               <McpCreateBody
                 availableServers={availableServers}
                 busy={busy}
+                initialCustom={initialCustom}
+                initialPreset={initialPreset}
                 onAssign={onAssign}
                 onOpenChange={onOpenChange}
                 state={state}

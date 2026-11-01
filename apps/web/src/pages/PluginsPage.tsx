@@ -6,10 +6,9 @@ import {
   DropdownMenuTrigger,
 } from "@mingzhan/ui/dropdown-menu";
 import { Input } from "@mingzhan/ui/input";
-import { Add01Icon, ArrowDown01Icon, Search01Icon } from "hugeicons-react";
+import { ArrowDown01Icon, Search01Icon } from "hugeicons-react";
 import { useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { IntegrationsTabs } from "@/components/IntegrationsTabs";
 import { useAuth } from "@/context/use-auth";
 import {
   isNewerPluginVersion,
@@ -24,7 +23,8 @@ import { PluginAgentAccessDialog } from "@/pages/plugins/plugin-agent-access-dia
 import { PluginConfirmDialog } from "@/pages/plugins/plugin-confirm-dialog";
 import { PluginRow } from "@/pages/plugins/plugin-row";
 import {
-  groupPluginIds,
+  type PluginFilter,
+  pluginMatchesFilter,
   pluginMatchesQuery,
   usePluginCatalog,
   usePluginManagement,
@@ -68,6 +68,7 @@ export function PluginsPage() {
   const agentAccess = usePluginAgentAccess();
   const accessData = isPlatformAdmin ? agentAccess.data : undefined;
   const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<PluginFilter>("All");
   const [folderOpen, setFolderOpen] = useState(false);
 
   if (isLoading && plugins.length === 0) {
@@ -82,8 +83,10 @@ export function PluginsPage() {
 
   const visiblePluginIds = selectedPluginId
     ? pluginIds.filter((id) => id === selectedPluginId)
-    : pluginIds.filter((id) =>
-        pluginMatchesQuery(id, needle, { official, plugins, releases })
+    : pluginIds.filter(
+        (id) =>
+          pluginMatchesQuery(id, needle, { official, plugins, releases }) &&
+          pluginMatchesFilter(id, filter, plugins, releases)
       );
 
   const renderRow = (pluginId: string) => {
@@ -210,17 +213,15 @@ export function PluginsPage() {
     );
   };
 
-  const groups = selectedPluginId
-    ? [{ ids: visiblePluginIds, title: null }]
-    : groupPluginIds(visiblePluginIds, official, releases);
-
   return (
-    <div className="mx-auto min-w-0 max-w-4xl space-y-6">
+    <div className="mx-auto min-w-0 max-w-6xl space-y-8">
       <PluginPageHeader
         busy={busy}
         canInstall={canInstallHere}
         detail={Boolean(selectedPluginId)}
         error={dialog ? null : errorMessage}
+        filter={filter}
+        onFilterChange={setFilter}
         onInstall={(target) => {
           rememberFocus(target);
           setActionError(null);
@@ -246,24 +247,15 @@ export function PluginsPage() {
           loading={catalogLoading}
         />
       ) : (
-        groups.map((group) => (
-          <section className="space-y-2.5" key={group.title ?? "all"}>
-            {group.title ? (
-              <h2 className="font-medium text-muted-foreground text-xs uppercase tracking-wider">
-                {group.title}
-              </h2>
-            ) : null}
-            <ul
-              className={
-                selectedPluginId
-                  ? "min-w-0"
-                  : "divide-y divide-border overflow-hidden rounded-xl border border-border bg-card text-card-foreground"
-              }
-            >
-              {group.ids.map(renderRow)}
-            </ul>
-          </section>
-        ))
+        <ul
+          className={
+            selectedPluginId
+              ? "min-w-0"
+              : "grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2"
+          }
+        >
+          {visiblePluginIds.map(renderRow)}
+        </ul>
       )}
 
       {isPlatformAdmin && accessDialog?.orgId === orgId ? (
@@ -317,6 +309,8 @@ function PluginPageHeader({
   onInstall,
   onInstallFromFolder,
   onQueryChange,
+  filter,
+  onFilterChange,
   query,
 }: {
   busy: boolean;
@@ -327,6 +321,8 @@ function PluginPageHeader({
   onInstallFromFolder(): void;
   onQueryChange(query: string): void;
   query: string;
+  filter: PluginFilter;
+  onFilterChange(filter: PluginFilter): void;
 }) {
   const installRef = useRef<HTMLButtonElement | null>(null);
 
@@ -340,41 +336,82 @@ function PluginPageHeader({
           ← Back to plugins
         </Link>
       ) : (
-        <IntegrationsTabs>
-          <div className="relative w-full sm:w-72">
-            <Search01Icon
-              aria-hidden="true"
-              className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground"
-            />
-            <Input
-              aria-label="Search plugins"
-              className="pl-9"
-              onChange={(event) => onQueryChange(event.target.value)}
-              placeholder="Search plugins"
-              type="search"
-              value={query}
-            />
+        <>
+          <div className="flex items-start justify-between gap-4 pt-3">
+            <div className="min-w-0 space-y-2">
+              <h1 className="font-semibold text-2xl tracking-tight">Plugins</h1>
+              <p className="max-w-3xl text-muted-foreground text-sm leading-relaxed">
+                Browse, install, and manage plugins for your workspace.
+              </p>
+            </div>
+            {canInstall ? (
+              <DropdownMenu>
+                <DropdownMenuTrigger
+                  render={
+                    <Button
+                      className="h-10 shrink-0 rounded-xl"
+                      disabled={busy}
+                      ref={installRef}
+                      variant="outline"
+                    />
+                  }
+                >
+                  Add plugin
+                  <ArrowDown01Icon aria-hidden="true" className="size-4" />
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-52">
+                  <DropdownMenuItem onClick={onInstallFromFolder}>
+                    Made by an agent
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onClick={() => onInstall(installRef.current)}
+                  >
+                    From npm package
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : null}
           </div>
-          {canInstall ? (
-            <DropdownMenu>
-              <DropdownMenuTrigger
-                render={<Button disabled={busy} ref={installRef} />}
-              >
-                <Add01Icon aria-hidden="true" className="size-4" />
-                Install plugin
-                <ArrowDown01Icon aria-hidden="true" className="size-4" />
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-52">
-                <DropdownMenuItem onClick={onInstallFromFolder}>
-                  Made by an agent
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => onInstall(installRef.current)}>
-                  From npm package
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          ) : null}
-        </IntegrationsTabs>
+          <div className="flex flex-col gap-3 pt-4 lg:flex-row">
+            <div className="relative min-w-0 flex-1">
+              <Search01Icon
+                aria-hidden="true"
+                className="pointer-events-none absolute top-1/2 left-4 size-5 -translate-y-1/2 text-muted-foreground"
+              />
+              <Input
+                aria-label="Search plugins"
+                className="h-12 rounded-xl bg-muted/30 pl-12"
+                onChange={(event) => onQueryChange(event.target.value)}
+                placeholder="Search plugins by name, description, or source"
+                type="search"
+                value={query}
+              />
+            </div>
+            <div
+              aria-label="Filter plugins"
+              className="flex items-center gap-1 rounded-xl border border-border bg-muted/30 p-1"
+              role="group"
+            >
+              {(["All", "Installed", "Available", "Local"] as const).map(
+                (item) => (
+                  <Button
+                    aria-pressed={filter === item}
+                    className={
+                      filter === item
+                        ? "h-10 flex-1 rounded-lg bg-muted text-foreground lg:flex-none"
+                        : "h-10 flex-1 rounded-lg text-muted-foreground lg:flex-none"
+                    }
+                    key={item}
+                    onClick={() => onFilterChange(item)}
+                    variant="ghost"
+                  >
+                    {item}
+                  </Button>
+                )
+              )}
+            </div>
+          </div>
+        </>
       )}
       {error ? (
         <p

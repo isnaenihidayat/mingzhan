@@ -19,22 +19,32 @@ export const SUB_AGENT_TOOL_NAME = "sub_agent";
 export type SubAgentToolOutput = SubAgentRunResult & { sessionId?: string };
 
 const SubAgentInputSchema = z.object({
+  action: z.enum(["run", "wait", "stop"]).optional(),
   background: z.boolean().optional().catch(undefined),
   context: z.string().optional().catch(undefined),
+  model: z.string().optional(),
+  profileId: z.string().optional(),
   sessionId: z.string().optional().catch(undefined),
   task: z.string().optional().catch(undefined),
+  thinkingEffort: z.enum(["low", "medium", "high"]).optional(),
   timeoutMs: z.number().optional().catch(undefined),
 });
 
 export function createSubAgentTool(agentService: AgentService): ToolDefinition {
   return {
     description:
-      "Delegate work to a same-profile sub-agent (research, review, planning, debugging). Each run happens in its own chat under this one, shown in Recents, so the user can open and continue it. By default the call waits and returns status, summary, output, and the chat's sessionId for you to synthesize; several can run in parallel. Set background=true whenever the user asks for separate or new chats, or for work they will open later: the call returns the sessionId at once without waiting. Sub-agents cannot nest sub-agents. For repo coding work, use bash with coding-agent instead.",
+      "Delegate work to an accessible agent profile in this organization (research, review, planning, debugging). Each run happens in its own chat under this one, shown in Recents, so the user can open and continue it. By default the call waits and returns status, summary, output, and the chat's sessionId for you to synthesize; several can run in parallel. Set background=true whenever the user asks for separate or new chats, or for work they will open later: the call returns the sessionId at once without waiting. Sub-agents cannot nest sub-agents. For repo coding work, use bash with coding-agent instead.",
     name: SUB_AGENT_TOOL_NAME,
     parallelSafe: true,
     parameters: {
       additionalProperties: false,
       properties: {
+        action: {
+          description:
+            "Run a task (default), wait for a background child, or request stopping a child chat this parent created. Wait/stop require sessionId.",
+          enum: ["run", "wait", "stop"],
+          type: "string",
+        },
         background: {
           description:
             "Return at once instead of waiting for the answer. Up to 5 sub-agent chats per chat. Read the reply later with read_profile_session.",
@@ -44,6 +54,16 @@ export function createSubAgentTool(agentService: AgentService): ToolDefinition {
           description: "Optional scoped background the sub-agent should know.",
           type: "string",
         },
+        model: {
+          description:
+            "Optional model override for a new child chat; does not change the profile default.",
+          type: "string",
+        },
+        profileId: {
+          description:
+            "Optional accessible profile in this organization for a new child chat. Uses that profile's configured backend and tools.",
+          type: "string",
+        },
         sessionId: {
           description:
             "Send the task to a sub-agent chat this one started earlier, instead of a new chat.",
@@ -51,6 +71,11 @@ export function createSubAgentTool(agentService: AgentService): ToolDefinition {
         },
         task: {
           description: "Clear instruction for the sub-agent to complete.",
+          type: "string",
+        },
+        thinkingEffort: {
+          description: "Optional thinking effort for a new child chat.",
+          enum: ["low", "medium", "high"],
           type: "string",
         },
         timeoutMs: {
@@ -92,6 +117,116 @@ export async function runSubAgentTool(
     return failSubAgentResult("orgId and profileId are required.");
   }
 
+  if (input.action === "stop" || input.action === "wait") {
+    const childId = input.sessionId?.trim();
+
+    if (!(context.sessionId && childId)) {
+      return failSubAgentResult(
+        "Waiting or stopping requires parent and child session ids."
+      );
+    }
+
+    const child = await agentService.getSessionSummary(childId, orgId);
+
+    if (child?.parentSessionId !== context.sessionId) {
+      return failSubAgentResult("This chat did not start that child session.");
+    }
+
+    await agentService.assertSessionProfileAccess(childId, orgId, {
+      isPlatformAdmin: context.isPlatformAdmin,
+      orgRole: context.orgRole,
+      user: context.userId ? { id: context.userId } : undefined,
+    });
+
+    if (input.action === "wait") {
+      if (!sessionTurnRegistry.isActive(childId)) {
+        return {
+          output: `Child is not running. Read its persisted reply with read_profile_session for ${childId}.`,
+          sessionId: childId,
+          status: "success",
+          summary: "Child is idle",
+        };
+      }
+
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      let subscription:
+        | ReturnType<typeof sessionTurnRegistry.subscribe>
+        | undefined;
+
+      let abort: (() => void) | undefined;
+
+      const terminal = await new Promise<StreamEvent | null>((resolve) => {
+        timer = setTimeout(
+          () => resolve(null),
+          Math.min(readTimeoutMs(input.timeoutMs ?? null), 60_000)
+        );
+        subscription = sessionTurnRegistry.subscribe(childId, (event) => {
+          if (event.type === "done" || event.type === "error") {
+            resolve(event);
+          }
+        });
+        abort = () => resolve(null);
+        context.signal?.addEventListener("abort", abort, { once: true });
+
+        if (!sessionTurnRegistry.isActive(childId) || context.signal?.aborted) {
+          resolve(null);
+        }
+      }).finally(() => {
+        clearTimeout(timer);
+        subscription?.unsubscribe();
+
+        if (abort) {
+          context.signal?.removeEventListener("abort", abort);
+        }
+      });
+
+      if (terminal?.type === "done") {
+        return {
+          ...buildSubAgentResult("success", terminal.reply),
+          sessionId: childId,
+        };
+      }
+
+      if (terminal?.type === "error") {
+        return {
+          ...buildSubAgentResult("fail", "", terminal.error),
+          sessionId: childId,
+        };
+      }
+
+      const running = sessionTurnRegistry.isActive(childId);
+
+      return {
+        output: running
+          ? "Wait ended; the background child continues. Wait again or inspect its chat."
+          : `Read the persisted reply with read_profile_session for ${childId}.`,
+        sessionId: childId,
+        status: running ? "timeout" : "success",
+        summary: running ? "Child still running" : "Child is idle",
+      };
+    }
+
+    sessionTurnRegistry.stopTurn(childId);
+
+    return {
+      output:
+        "Stop requested. Read the child chat to verify its final status; history is preserved.",
+      sessionId: childId,
+      status: "success",
+      summary: "Stop requested",
+    };
+  }
+
+  if (
+    (input.profileId || input.model || input.thinkingEffort) &&
+    (!context.sessionId || input.sessionId)
+  ) {
+    return failSubAgentResult(
+      "Profile, model and effort can only be selected when creating a saved child chat."
+    );
+  }
+
   const task = input.task?.trim();
 
   if (!task) {
@@ -131,9 +266,12 @@ export async function runSubAgentTool(
       {
         background: input.background === true,
         childSessionId: input.sessionId?.trim(),
+        model: input.model?.trim() || undefined,
         parentSessionId: context.sessionId,
+        profileId: input.profileId?.trim() || undefined,
         prompt: buildSubAgentPrompt(task, scopedContext),
         task,
+        thinkingEffort: input.thinkingEffort,
         timeoutMs,
       },
       { ...context, orgId },
@@ -149,9 +287,12 @@ export async function runSubAgentTool(
 interface ChildRun {
   background: boolean;
   childSessionId?: string;
+  model?: string;
   parentSessionId: string;
+  profileId?: string;
   prompt: string;
   task: string;
+  thinkingEffort?: "low" | "medium" | "high";
   timeoutMs: number;
 }
 
@@ -188,7 +329,12 @@ async function runInChildSession(
       run.parentSessionId,
       context.orgId,
       run.task.slice(0, 80),
-      { isPlatformAdmin: context.isPlatformAdmin, orgRole: context.orgRole }
+      { isPlatformAdmin: context.isPlatformAdmin, orgRole: context.orgRole },
+      {
+        model: run.model,
+        profileId: run.profileId,
+        thinkingEffort: run.thinkingEffort,
+      }
     );
   }
 

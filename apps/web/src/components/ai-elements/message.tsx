@@ -15,6 +15,10 @@ import {
 import { ExternalLinkSafetyModal } from "@/components/ai-elements/external-link-safety-modal";
 import { createLazyMermaidPlugin } from "@/components/ai-elements/lazy-mermaid-plugin";
 import { MarkdownA } from "@/components/ai-elements/markdown-a";
+import {
+  QuestionsBlock,
+  VisualBlock,
+} from "@/components/ai-elements/visual-block";
 import { useTheme } from "@/context/use-theme";
 import type { UIMessage } from "@/lib/ai-ui-types";
 
@@ -88,7 +92,16 @@ const lazyMermaidPlugin = createLazyMermaidPlugin(
   () => import("@streamdown/mermaid")
 );
 
-const streamdownPlugins = { cjk, code, math, mermaid: lazyMermaidPlugin };
+const streamdownPlugins = {
+  cjk,
+  code,
+  math,
+  mermaid: lazyMermaidPlugin,
+  renderers: [
+    { component: VisualBlock, language: "visual" },
+    { component: QuestionsBlock, language: "questions" },
+  ],
+};
 
 function renderExternalLinkSafetyModal(props: LinkSafetyModalProps) {
   return <ExternalLinkSafetyModal {...props} />;

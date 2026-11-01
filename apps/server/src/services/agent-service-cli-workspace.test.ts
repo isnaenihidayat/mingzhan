@@ -176,3 +176,138 @@ describe("AgentService CLI coding workspace", () => {
     ).resolves.toBeUndefined();
   });
 });
+
+test("child delegation selects an accessible profile and isolated run settings", async () => {
+  const db = createInMemoryDatabaseAdapter();
+  await db.upsertProfile(createDefaultProfile());
+  await db.upsertProfile({
+    ...createDefaultProfile(),
+    id: "reviewer",
+    isDefault: false,
+    name: "Reviewer",
+  });
+
+  const { getModelsForProvider } = await import("../providers");
+  const models = getModelsForProvider("openai");
+  expect(models.length).toBeGreaterThan(1);
+  const parentModel = `openai-test::${models[0]!.id}`;
+  const childModel = `openai-test::${models[1]!.id}`;
+
+  const service = new AgentService(
+    {
+      defaultProviderId: "openai-test",
+      providers: [
+        {
+          apiKey: "test-only",
+          createdAt: new Date().toISOString(),
+          id: "openai-test",
+          label: "Test",
+          type: "openai",
+        },
+      ],
+    },
+    null,
+    db
+  );
+
+  const parent = await service.createSession(
+    ORG_ID,
+    "web",
+    "profile_default",
+    undefined,
+    { model: parentModel, thinkingEffort: "low" }
+  );
+
+  const child = await service.createChildSession(
+    parent,
+    ORG_ID,
+    "Review",
+    { isPlatformAdmin: true },
+    {
+      model: childModel,
+      profileId: "reviewer",
+      thinkingEffort: "high",
+    }
+  );
+
+  expect(await db.getSession(child)).toMatchObject({
+    model: childModel,
+    parentSessionId: parent,
+    profileId: "reviewer",
+    thinkingEffort: "high",
+  });
+  expect(await db.getSession(parent)).toMatchObject({
+    model: parentModel,
+    profileId: "profile_default",
+    thinkingEffort: "low",
+  });
+});
+
+test("cross-profile delegation cannot reach another organization or private profile", async () => {
+  const db = createInMemoryDatabaseAdapter();
+  await db.upsertProfile(createDefaultProfile());
+  await db.upsertProfile({
+    ...createDefaultProfile(),
+    id: "foreign",
+    isDefault: false,
+    orgId: "org_other",
+  });
+  await db.upsertProfile({
+    ...createDefaultProfile(),
+    id: "private",
+    isDefault: false,
+    ownerUserId: "someone_else",
+    sharedWithTeam: false,
+  });
+  const service = new AgentService(null, null, db);
+  const parent = await service.createSession(ORG_ID, "web", "profile_default");
+  await expect(
+    service.createChildSession(
+      parent,
+      ORG_ID,
+      "Foreign",
+      { orgRole: "member" },
+      { profileId: "foreign" }
+    )
+  ).rejects.toThrow();
+  await expect(
+    service.createChildSession(
+      parent,
+      ORG_ID,
+      "Private",
+      { orgRole: "member" },
+      { profileId: "private" }
+    )
+  ).rejects.toThrow("private");
+});
+
+test("closing a child frees a coordinator slot without deleting its chat", async () => {
+  const db = createInMemoryDatabaseAdapter();
+  await db.upsertProfile(createDefaultProfile());
+  const service = new AgentService(null, null, db);
+  const parent = await service.createSession(ORG_ID, "web", "profile_default");
+  const children: string[] = [];
+
+  for (let i = 0; i < 5; i++) {
+    children.push(
+      await service.createChildSession(parent, ORG_ID, `Task ${i}`, {
+        isPlatformAdmin: true,
+      })
+    );
+  }
+
+  await expect(
+    service.createChildSession(parent, ORG_ID, "Extra", {
+      isPlatformAdmin: true,
+    })
+  ).rejects.toThrow();
+  await service.closeSession(children[0]!, ORG_ID, { isPlatformAdmin: true });
+  expect((await db.getSession(children[0]!))?.closedAt).toBeTruthy();
+
+  const replacement = await service.createChildSession(parent, ORG_ID, "Next", {
+    isPlatformAdmin: true,
+  });
+
+  expect(replacement).toBeString();
+  expect(await db.getSession(children[0]!)).not.toBeNull();
+});

@@ -25,7 +25,10 @@ export function useServiceWorkerUpdate(): ServiceWorkerUpdate {
   const [installing, setInstalling] = useState<ServiceWorker | null>(null);
 
   useEffect(() => {
-    if (!(import.meta.env.PROD && "serviceWorker" in navigator)) {
+    if (
+      navigator.userAgent.includes("Electron/") ||
+      !(import.meta.env.PROD && "serviceWorker" in navigator)
+    ) {
       return;
     }
 

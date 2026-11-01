@@ -27,6 +27,7 @@ const timeout = setTimeout(
 
 async function run() {
   app.setPath("userData", await mkdtemp(join(tmpdir(), "mingzhan-wrapper-")));
+  app.setPath("sessionData", app.getPath("userData"));
   await app.whenReady();
   const updater = new EventEmitter();
   let checks = 0;
@@ -216,6 +217,28 @@ async function run() {
         true
       );
       assert.match(await (await fetch(`${local.url}/chat`)).text(), /<html/);
+      const actual = await createWindow(`${local.url}/chat`, { show: false });
+      await new Promise((resolve) => setTimeout(resolve, 4000));
+
+      const rendered = await actual.webContents.executeJavaScript(
+        "({text:document.body.innerText, children:document.getElementById('root')?.childElementCount})"
+      );
+
+      assert.ok(
+        rendered.children > 0,
+        "The real web app must render inside Electron"
+      );
+      assert.match(rendered.text, /Continue|Lanjut|Sign in|Masuk|Setup|Akun/i);
+      assert.equal(
+        await actual.webContents.executeJavaScript(
+          "navigator.serviceWorker.getRegistrations().then(r=>r.length)"
+        ),
+        0
+      );
+      console.log(
+        "Passed: real production frontend renders without a PWA service worker."
+      );
+      actual.destroy();
 
       const setup = await fetch(`${local.url}/v1/auth/setup`, {
         body: JSON.stringify({
@@ -247,6 +270,30 @@ async function run() {
       });
 
       assert.equal(login.ok, true);
+
+      const authenticated = await createWindow(`${local.url}/chat`, {
+        show: false,
+      });
+
+      await authenticated.webContents.executeJavaScript(
+        `fetch('/v1/auth/login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email:'desktop@example.test',password:'test-password-123'})}).then(r=>{if(!r.ok)throw new Error('Renderer login failed')})`
+      );
+      await authenticated.loadURL(`${local.url}/chat`);
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+
+      const chat = await authenticated.webContents.executeJavaScript(
+        "({text:document.body.innerText, composer:!!document.querySelector('textarea,[contenteditable=true]')})"
+      );
+
+      assert.ok(
+        chat.composer,
+        "Authenticated desktop must render the real chat composer"
+      );
+      assert.doesNotMatch(chat.text, /This page couldn.t be loaded/);
+      authenticated.destroy();
+      console.log(
+        "Passed: authenticated production chat composer renders inside Electron."
+      );
 
       // The relaunch took a new port while setup saved the old origin, and a
       // send from the new window must still pass the origin check (#1026).

@@ -38,6 +38,7 @@ import {
   ConversationStickinessProvider,
 } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
+import { VisualQuestionSubmitContext } from "@/components/ai-elements/visual-block";
 import {
   AgentQuestionnaireAnswers,
   AgentQuestionnairePanel,
@@ -403,7 +404,9 @@ function ChatMessageListSession({
               canPreviewCitations ? openCitationPreview : undefined
             }
             onRetryMessage={onRetryMessage}
-            onSubmitQuestionnaire={onSubmitQuestionnaire}
+            onSubmitQuestionnaire={
+              turnIndex === turns.length - 1 ? onSubmitQuestionnaire : undefined
+            }
             profileId={profileId}
             questionnaire={
               turnIndex === turns.length - 1 ? questionnaire : null
@@ -510,6 +513,18 @@ function ChatMessageListSession({
   );
 }
 
+function visualQuestionSubmit(
+  disabled: boolean | undefined,
+  readOnly: boolean,
+  complete: boolean,
+  answers: AgentQuestionAnswer[] | undefined,
+  submit: ((answers: AgentQuestionAnswer[]) => void) | undefined
+) {
+  return disabled || readOnly || !complete || answers?.length
+    ? undefined
+    : submit;
+}
+
 function AssistantTurn({
   readOnly = false,
   sessionId,
@@ -581,69 +596,80 @@ function AssistantTurn({
   const turnUsage = showUsage ? sumChatUsage(turnMessages) : undefined;
 
   return (
-    <div className="group mr-auto ml-0 flex w-full max-w-full flex-col items-start justify-start gap-3">
-      {segments.map((segment) => (
-        <AssistantTurnSegmentView
-          key={
-            segment.kind === "work"
-              ? `work:${segment.groupId ?? segment.thinking?.id ?? "thought"}`
-              : `text:${segment.message.id}`
-          }
-          modelLabel={modelLabel}
-          onOpenFileCitation={onOpenFileCitation}
-          onRetryMessage={onRetryMessage}
-          profileId={profileId}
-          retryDisabled={retryDisabled}
-          segment={segment}
-          showThinking={showThinking}
-        />
-      ))}
-      {showAwaiting && !segments.some((segment) => segment.kind === "work") ? (
-        <TurnAwaitingElapsed startedAt={turnStartedAt} />
-      ) : null}
-      <TurnQuestionnaire
-        actionsDisabled={actionsDisabled}
-        answers={questionnaireAnswers}
-        messages={turnMessages}
-        onSubmit={onSubmitQuestionnaire}
-        questionnaire={questionnaire}
-      />
-      {workStreamActive || !interactiveTurnComplete ? null : (
-        <ToolCredentialCards
-          disabled={actionsDisabled}
-          messages={turnMessages}
-          onContinue={onContinueToolSetup}
-          sessionId={sessionId}
-        />
+    <VisualQuestionSubmitContext.Provider
+      value={visualQuestionSubmit(
+        actionsDisabled,
+        readOnly,
+        interactiveTurnComplete,
+        questionnaireAnswers,
+        onSubmitQuestionnaire
       )}
-      {profileId && showArtifacts ? (
-        <TurnArtifacts
-          artifacts={liveArtifacts}
-          profileId={profileId}
-          turnKey={artifactTurnKey}
-        />
-      ) : null}
-      <CreatedProfiles
-        complete={interactiveTurnComplete}
-        messages={turnMessages}
-      />
-      <PluginDrafts
-        complete={interactiveTurnComplete}
-        messages={turnMessages}
-        usedTools={usedPluginTools}
-      />
-      {showActions ? (
-        <AssistantMessageActions
+    >
+      <div className="group mr-auto ml-0 flex w-full max-w-full flex-col items-start justify-start gap-3">
+        {segments.map((segment) => (
+          <AssistantTurnSegmentView
+            key={
+              segment.kind === "work"
+                ? `work:${segment.groupId ?? segment.thinking?.id ?? "thought"}`
+                : `text:${segment.message.id}`
+            }
+            modelLabel={modelLabel}
+            onOpenFileCitation={onOpenFileCitation}
+            onRetryMessage={onRetryMessage}
+            profileId={profileId}
+            retryDisabled={retryDisabled}
+            segment={segment}
+            showThinking={showThinking}
+          />
+        ))}
+        {showAwaiting &&
+        !segments.some((segment) => segment.kind === "work") ? (
+          <TurnAwaitingElapsed startedAt={turnStartedAt} />
+        ) : null}
+        <TurnQuestionnaire
           actionsDisabled={actionsDisabled}
-          busy={branchingMessageId === anchorMessage.id}
-          copyContent={assistantTurnContent(turnMessages)}
-          message={anchorMessage}
-          onBranchMessage={onBranchMessage}
-          onRetryMessage={onRetryMessage}
-          usage={turnUsage}
+          answers={questionnaireAnswers}
+          messages={turnMessages}
+          onSubmit={onSubmitQuestionnaire}
+          questionnaire={questionnaire}
         />
-      ) : null}
-    </div>
+        {workStreamActive || !interactiveTurnComplete ? null : (
+          <ToolCredentialCards
+            disabled={actionsDisabled}
+            messages={turnMessages}
+            onContinue={onContinueToolSetup}
+            sessionId={sessionId}
+          />
+        )}
+        {profileId && showArtifacts ? (
+          <TurnArtifacts
+            artifacts={liveArtifacts}
+            profileId={profileId}
+            turnKey={artifactTurnKey}
+          />
+        ) : null}
+        <CreatedProfiles
+          complete={interactiveTurnComplete}
+          messages={turnMessages}
+        />
+        <PluginDrafts
+          complete={interactiveTurnComplete}
+          messages={turnMessages}
+          usedTools={usedPluginTools}
+        />
+        {showActions ? (
+          <AssistantMessageActions
+            actionsDisabled={actionsDisabled}
+            busy={branchingMessageId === anchorMessage.id}
+            copyContent={assistantTurnContent(turnMessages)}
+            message={anchorMessage}
+            onBranchMessage={onBranchMessage}
+            onRetryMessage={onRetryMessage}
+            usage={turnUsage}
+          />
+        ) : null}
+      </div>
+    </VisualQuestionSubmitContext.Provider>
   );
 }
 

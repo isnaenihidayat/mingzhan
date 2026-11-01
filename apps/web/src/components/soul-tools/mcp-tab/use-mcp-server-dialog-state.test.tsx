@@ -149,3 +149,188 @@ test.each(["http", "stdio"] as const)(
     }
   }
 );
+
+test("a library preset populates connection fields and resets on reopen", async () => {
+  const queries = new QueryClient();
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  let state: ReturnType<typeof useMcpServerDialogState>;
+
+  function Probe({ open }: { open: boolean }) {
+    state = useMcpServerDialogState({
+      busy: false,
+      initialPreset: { name: "Demo", url: "https://example.com/mcp" },
+      onSubmit: async () => {},
+      open,
+    });
+
+    return null;
+  }
+
+  const render = async (open: boolean) => {
+    await act(async () =>
+      root.render(
+        <QueryClientProvider client={queries}>
+          <Probe open={open} />
+        </QueryClientProvider>
+      )
+    );
+  };
+
+  try {
+    await render(true);
+    expect(state!.name).toBe("Demo");
+    expect(state!.url).toBe("https://example.com/mcp");
+    expect(state!.canSubmit).toBe(true);
+    await act(async () => state!.setName("Changed"));
+    await render(false);
+    await render(true);
+    expect(state!.name).toBe("Demo");
+    expect(state!.url).toBe("https://example.com/mcp");
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+    queries.clear();
+  }
+});
+
+test("MCP library filters transport and opens a selected preset without creating a server", async () => {
+  const { McpServersSection } = await import("./McpServersSection");
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  let selected = "";
+
+  try {
+    await act(async () =>
+      root.render(
+        <McpServersSection
+          busy={false}
+          expandedServerId={null}
+          onAddPreset={(preset) => {
+            selected = preset.name;
+          }}
+          onAddServer={() => {
+            selected = "custom";
+          }}
+          onConnect={() => {}}
+          onDelete={() => {}}
+          onEdit={() => {}}
+          onSync={() => {}}
+          onTestConnection={() => {}}
+          onToggleServer={() => {}}
+          servers={[]}
+        />
+      )
+    );
+    expect(container.querySelectorAll("article").length).toBeGreaterThan(0);
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>(
+          '[aria-label="Add Notion MCP server"]'
+        )!
+        .click()
+    );
+    expect(selected).toBe("Notion");
+    const select = container.querySelector<HTMLSelectElement>("select")!;
+    await act(async () => {
+      select.value = "stdio";
+      select.dispatchEvent(new window.Event("change", { bubbles: true }));
+    });
+    expect(container.querySelectorAll("article").length).toBe(0);
+    await act(async () => {
+      select.value = "all";
+      select.dispatchEvent(new window.Event("change", { bubbles: true }));
+    });
+    expect(container.querySelectorAll("article").length).toBeGreaterThan(0);
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+  }
+}, 15_000);
+
+test("token presets require a bearer token and clear it when reopened", async () => {
+  const queries = new QueryClient();
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  let state: ReturnType<typeof useMcpServerDialogState>;
+
+  function Probe({ open }: { open: boolean }) {
+    state = useMcpServerDialogState({
+      busy: false,
+      initialPreset: {
+        auth: "token",
+        name: "GitHub",
+        url: "https://api.githubcopilot.com/mcp/",
+      },
+      onSubmit: async () => {},
+      open,
+    });
+
+    return null;
+  }
+
+  const render = async (open: boolean) => {
+    await act(async () =>
+      root.render(
+        <QueryClientProvider client={queries}>
+          <Probe open={open} />
+        </QueryClientProvider>
+      )
+    );
+  };
+
+  try {
+    await render(true);
+    expect(state!.kind).toBe("http");
+    expect(state!.canSubmit).toBe(false);
+    await act(async () =>
+      state!.setHeaders([
+        { key: "Authorization", value: "Bearer example-test-token" },
+      ])
+    );
+    expect(state!.canSubmit).toBe(true);
+    await render(false);
+    await render(true);
+    expect(state!.headers).toEqual([{ key: "Authorization", value: "" }]);
+    expect(state!.canSubmit).toBe(false);
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+    queries.clear();
+  }
+});
+
+test("library includes all requested services and removes registered presets", async () => {
+  const { POPULAR_SERVERS, unregisteredPopularServers } = await import(
+    "./popular-mcp-servers"
+  );
+
+  for (const name of [
+    "GitHub",
+    "Tavily",
+    "Context7",
+    "Linear",
+    "Atlassian",
+    "Slack",
+    "Supabase",
+  ]) {
+    const entry = POPULAR_SERVERS.find((item) => item.name === name);
+    expect(entry).toBeDefined();
+    expect(new URL(entry!.url).protocol).toBe("https:");
+    expect(
+      unregisteredPopularServers([{ name: name.toLowerCase() }]).some(
+        (item) => item.name === name
+      )
+    ).toBe(false);
+  }
+
+  expect(POPULAR_SERVERS.find((item) => item.name === "Slack")?.auth).toBe(
+    "token"
+  );
+  expect(POPULAR_SERVERS.find((item) => item.name === "Context7")?.url).toBe(
+    "https://mcp.context7.com/mcp/oauth"
+  );
+});

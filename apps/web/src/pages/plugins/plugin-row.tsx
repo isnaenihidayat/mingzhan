@@ -9,7 +9,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@mingzhan/ui/dropdown-menu";
-import { Add01Icon, MoreHorizontalIcon, Tick02Icon } from "hugeicons-react";
+import { MoreHorizontalIcon, Tick02Icon } from "hugeicons-react";
 import { type MouseEvent, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { pluginRowActions } from "@/hooks/use-plugins";
@@ -111,7 +111,103 @@ interface PluginRowProps {
   updateVersion?: string;
 }
 
-export function PluginRow({
+function PluginCard({
+  catalogDescription,
+  plugin,
+  pluginId,
+  name,
+  official,
+  releases,
+  busy,
+  canManage,
+  canManageAgentAccess,
+  onAction,
+  updateVersion,
+}: PluginRowProps) {
+  const local = releases.some(
+    (item) => item.source === "local" || item.source === "agent"
+  );
+
+  const source = local
+    ? "Local"
+    : official
+      ? "Built-in"
+      : releases.some((item) => item.source === "npm")
+        ? "npm"
+        : "Workspace";
+
+  const version = plugin?.selectedVersion ?? releases[0]?.version;
+
+  return (
+    <li className="flex min-w-0 flex-col gap-5 rounded-2xl bg-muted/40 p-5 text-foreground sm:p-6">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <h2 className="font-semibold text-base">
+            <Link
+              className="break-words rounded-sm hover:underline focus-visible:outline-2 focus-visible:outline-ring"
+              to={`/customize/plugins/${encodeURIComponent(pluginId)}`}
+            >
+              {name}
+            </Link>
+          </h2>
+          <p
+            className="mt-1 truncate text-muted-foreground text-sm"
+            title={pluginId}
+          >
+            {source} · {pluginId}
+          </p>
+        </div>
+        <PluginRowControls
+          busy={busy}
+          canManage={canManage}
+          canManageAgentAccess={canManageAgentAccess}
+          detail={false}
+          name={name}
+          official={official}
+          onAction={onAction}
+          plugin={plugin}
+          pluginId={pluginId}
+          releases={releases}
+          updateVersion={updateVersion}
+        />
+      </div>
+      <p className="line-clamp-2 break-words text-muted-foreground text-sm leading-relaxed">
+        {PLUGIN_DESCRIPTIONS.get(pluginId) ||
+          plugin?.description ||
+          catalogDescription ||
+          releases[0]?.manifest.description}
+      </p>
+      <div className="mt-auto flex flex-wrap items-center gap-2">
+        {version ? (
+          <span className="rounded-full bg-muted px-2.5 py-1 text-muted-foreground text-xs">
+            v{version.split("+")[0]}
+          </span>
+        ) : null}
+        {plugin?.installed && plugin.lifecycleState !== "enabled" ? (
+          <span className="text-muted-foreground text-xs">
+            {plugin.lifecycleState === "disabled"
+              ? "Disabled"
+              : plugin.lifecycleState}
+          </span>
+        ) : null}
+        {updateVersion ? (
+          <span className="text-primary text-xs">Update {updateVersion}</span>
+        ) : null}
+      </div>
+      {plugin?.lastLifecycleError ? (
+        <p className="break-words text-destructive text-xs" role="alert">
+          {plugin.lastLifecycleError}
+        </p>
+      ) : null}
+    </li>
+  );
+}
+
+export function PluginRow(props: PluginRowProps) {
+  return props.detail ? <PluginDetail {...props} /> : <PluginCard {...props} />;
+}
+
+function PluginDetail({
   catalogDescription,
   detail = false,
   plugin,
@@ -321,9 +417,11 @@ function PluginRowControls({
         </Button>
       ) : null}
       {plugin?.lifecycleState === "enabled" && !detail ? (
-        <span className="inline-flex h-8 items-center gap-1.5 rounded-full bg-emerald-500/10 px-3 font-medium text-emerald-700 text-sm dark:text-emerald-400">
+        <span
+          aria-label={`${name} enabled`}
+          className="inline-flex size-9 items-center justify-center rounded-full border border-foreground text-foreground"
+        >
           <Tick02Icon aria-hidden="true" className="size-4" />
-          Added
         </span>
       ) : null}
       {canManage && (canInstall || actions?.enable) ? (
@@ -364,7 +462,7 @@ function PluginInstallButton({
   return (
     <Button
       aria-label={canInstall ? `Add ${name}` : undefined}
-      className={canInstall && !detail ? "rounded-full" : undefined}
+      className={canInstall && !detail ? "h-10 rounded-xl" : undefined}
       disabled={busy}
       onClick={(event) =>
         onAction(canInstall ? "install" : "enable", event.currentTarget)
@@ -372,16 +470,7 @@ function PluginInstallButton({
       size="sm"
       variant={canInstall && !detail ? "outline" : "default"}
     >
-      {canInstall && !detail ? (
-        <>
-          <Add01Icon aria-hidden="true" className="size-4" />
-          Add
-        </>
-      ) : canInstall ? (
-        "Add"
-      ) : (
-        "Turn on"
-      )}
+      {canInstall && !detail ? <>Install</> : canInstall ? "Add" : "Turn on"}
     </Button>
   );
 }

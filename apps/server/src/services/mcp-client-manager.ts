@@ -1,12 +1,3 @@
-import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import {
-  StreamableHTTPClientTransport,
-  StreamableHTTPError,
-} from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type {
   CachedMcpToolSummary,
   McpHttpConfig,
@@ -16,6 +7,15 @@ import type {
 } from "@mingzhan/core";
 import { getProfileSoulDir } from "@mingzhan/core";
 import type { CachedMcpTool, StoredMcpServerRecord } from "@mingzhan/db";
+import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import {
+  StreamableHTTPClientTransport,
+  StreamableHTTPError,
+} from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { z } from "zod";
 
 /** A server that does not answer `initialize` must not hold a connect open. */
@@ -432,6 +432,16 @@ export class McpClientManager {
     this.connections.delete(key);
 
     try {
+      if (connection.transport instanceof StreamableHTTPClientTransport) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          connection.transport.terminateSession().catch(() => {}),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, 2000);
+          }),
+        ]).finally(() => clearTimeout(timer));
+      }
+
       await connection.transport.close();
     } catch {
       // Ignore transport shutdown errors.

@@ -2665,7 +2665,10 @@ export class AgentService {
     parentSessionId: string,
     orgId: string,
     title: string,
-    access: Pick<CreateSessionOptions, "isPlatformAdmin" | "orgRole">
+    access: Pick<CreateSessionOptions, "isPlatformAdmin" | "orgRole">,
+    target?: Pick<CreateSessionOptions, "model" | "thinkingEffort"> & {
+      profileId?: string;
+    }
   ): Promise<string> {
     if (this.sessions.isCognito(parentSessionId)) {
       throw new MíngZhànApiError(
@@ -2692,8 +2695,10 @@ export class AgentService {
       : await this.db.listSessions();
 
     if (
-      siblings.filter((session) => session.parentSessionId === parentSessionId)
-        .length >= MAX_CHILD_SESSIONS
+      siblings.filter(
+        (session) =>
+          session.parentSessionId === parentSessionId && !session.closedAt
+      ).length >= MAX_CHILD_SESSIONS
     ) {
       throw new MíngZhànApiError(
         `This chat already started ${MAX_CHILD_SESSIONS} chats.`,
@@ -2706,15 +2711,26 @@ export class AgentService {
     const childId = await this.createSession(
       orgId,
       parseAgentChannel(inherited.channel) ?? "web",
-      inherited.profileId,
+      target?.profileId ?? inherited.profileId,
       inherited.userId,
       {
         ...access,
-        codingWorkspaceRoot: inherited.codingWorkspaceRoot ?? undefined,
-        model: inherited.model,
+        codingWorkspaceRoot:
+          target?.profileId && target.profileId !== inherited.profileId
+            ? undefined
+            : (inherited.codingWorkspaceRoot ?? undefined),
+        model:
+          target?.model ??
+          (target?.profileId && target.profileId !== inherited.profileId
+            ? undefined
+            : inherited.model),
         parentSessionId,
         projectId: parent.projectId ?? null,
-        thinkingEffort: inherited.thinkingEffort,
+        thinkingEffort:
+          target?.thinkingEffort ??
+          (target?.profileId && target.profileId !== inherited.profileId
+            ? undefined
+            : inherited.thinkingEffort),
       }
     );
 

@@ -5,6 +5,7 @@ import {
   type ToolContext,
   type ToolDefinition,
 } from "@mingzhan/core";
+import { filterProfilesForChatAccess } from "@mingzhan/core/profiles";
 import { z } from "zod";
 import type { AgentService } from "../services/agent-service";
 
@@ -273,6 +274,33 @@ export function createSessionTools(agent: AgentService): ToolDefinition[] {
         }
 
         return { closed: true, sessionId };
+      },
+    },
+    {
+      description:
+        "List agent profiles this user may delegate to in the current organization, including ids and configured models. Private profiles belonging to others and admin-only agents are filtered by the same rules as the profile picker.",
+      name: "list_agent_profiles",
+      parallelSafe: true,
+      parameters: {
+        additionalProperties: false,
+        properties: {},
+        type: "object",
+      },
+      async run(_input, context) {
+        const { profiles } = await agent.listProfiles(requireOrgId(context));
+
+        return {
+          profiles: filterProfilesForChatAccess(profiles, {
+            isPlatformAdmin: context.isPlatformAdmin,
+            orgRole: context.orgRole,
+            userId: context.userId,
+          }).map((profile) => ({
+            id: profile.id,
+            isSuper: profile.isSuper,
+            model: profile.model,
+            name: profile.name,
+          })),
+        };
       },
     },
   ];

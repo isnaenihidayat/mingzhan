@@ -575,6 +575,7 @@ if (!process.argv.includes("--smoke-test")) {
     "userData",
     join(app.getPath("appData"), "MíngZhàn Desktop Electron")
   );
+  app.setPath("sessionData", app.getPath("userData"));
 
   if (app.requestSingleInstanceLock()) {
     app.on("second-instance", () => {

@@ -81,12 +81,12 @@ jobs:
 
       - name: Verify packaged app
         run: |
-          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' apps/desktop/dist/electron/mac-arm64/MíngZhàn.app/Contents/Info.plist)" = '15.0'
-          ELECTRON_RUN_AS_NODE=1 apps/desktop/dist/electron/mac-arm64/MíngZhàn.app/Contents/MacOS/MíngZhàn --version
-          codesign --verify --deep --strict apps/desktop/dist/electron/mac-arm64/MíngZhàn.app
-          xcrun stapler validate apps/desktop/dist/electron/mac-arm64/MíngZhàn.app
-          spctl --assess --type execute apps/desktop/dist/electron/mac-arm64/MíngZhàn.app
-          MINGZHAN_DESKTOP_TEST_RUNTIME="$PWD/apps/desktop/dist/electron/mac-arm64/MíngZhàn.app/Contents/Resources/runtime" bun run --cwd apps/desktop test:runtime
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' apps/desktop/dist/electron/mac-arm64/MingZhan.app/Contents/Info.plist)" = '15.0'
+          ELECTRON_RUN_AS_NODE=1 apps/desktop/dist/electron/mac-arm64/MingZhan.app/Contents/MacOS/MingZhan --version
+          codesign --verify --deep --strict apps/desktop/dist/electron/mac-arm64/MingZhan.app
+          xcrun stapler validate apps/desktop/dist/electron/mac-arm64/MingZhan.app
+          spctl --assess --type execute apps/desktop/dist/electron/mac-arm64/MingZhan.app
+          MINGZHAN_DESKTOP_TEST_RUNTIME="$PWD/apps/desktop/dist/electron/mac-arm64/MingZhan.app/Contents/Resources/runtime" bun run --cwd apps/desktop test:runtime
 
       # Hand-off only: publishing runs in a separate job without signing access.
       - name: Upload signed build
@@ -183,17 +183,17 @@ jobs:
         run: |
           $version = (Get-Content apps/desktop/package.json | ConvertFrom-Json).version
           $output = Join-Path $PWD 'apps/desktop/dist/electron'
-          if ((Get-Item "$output/win-unpacked/MíngZhàn.exe").VersionInfo.ProductVersion -cne $version) {
+          if ((Get-Item "$output/win-unpacked/MingZhan.exe").VersionInfo.ProductVersion -cne $version) {
             throw 'Packaged application version does not match the release.'
           }
-          foreach ($file in @("$output/MíngZhàn-$version-x64-Setup.exe", "$output/win-unpacked/MíngZhàn.exe")) {
+          foreach ($file in @("$output/MíngZhàn-$version-x64-Setup.exe", "$output/win-unpacked/MingZhan.exe")) {
             $signature = Get-AuthenticodeSignature $file
             if ($signature.Status -ne 'Valid' -or !$signature.TimeStamperCertificate -or
                 $signature.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) -cne $env:WINDOWS_PUBLISHER_NAME) {
               throw "Invalid signature or publisher: $file"
             }
           }
-          bun -e 'const c = Bun.YAML.parse(await Bun.file("apps/desktop/dist/electron/win-unpacked/resources/app-update.yml").text()); if (c.provider !== "generic" || c.url !== "https://github.com/mingpromotion/mingzhan/releases/download/desktop-updates" || ![c.publisherName].flat().includes(process.env.WINDOWS_PUBLISHER_NAME)) throw new Error("Unexpected updater configuration");'
+          bun -e 'const c = Bun.YAML.parse(await Bun.file("apps/desktop/dist/electron/win-unpacked/resources/app-update.yml").text()); if (c.provider !== "generic" || c.url !== "https://github.com/isnaenihidayat/mingzhan/releases/download/desktop-updates" || ![c.publisherName].flat().includes(process.env.WINDOWS_PUBLISHER_NAME)) throw new Error("Unexpected updater configuration");'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:MINGZHAN_DESKTOP_TEST_RUNTIME = Join-Path $output 'win-unpacked/resources/runtime'
           bun run --cwd apps/desktop test:runtime

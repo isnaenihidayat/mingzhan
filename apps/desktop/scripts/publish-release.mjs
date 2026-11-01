@@ -8,7 +8,7 @@ import { isDeepStrictEqual, promisify } from "node:util";
 
 const execute = promisify(execFile);
 
-const repository = "mingpromotion/mingzhan";
+const repository = "isnaenihidayat/mingzhan";
 
 const platforms = {
   mac: { manifest: "latest-mac.yml", suffixes: ["arm64-mac.zip", "arm64.dmg"] },

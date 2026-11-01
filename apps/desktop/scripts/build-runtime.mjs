@@ -6,13 +6,24 @@ const root = fileURLToPath(new URL("../../../", import.meta.url));
 
 const output = join(root, "apps/desktop/dist/runtime");
 
+const [bunMajor, bunMinor] = Bun.version.split(".").map(Number);
+
+if (bunMajor < 1 || (bunMajor === 1 && bunMinor < 4)) {
+  throw new Error(
+    "Desktop builds require Bun 1.4 or newer. Run bun upgrade, then retry."
+  );
+}
+
 if (
   !(
-    (process.platform === "darwin" && process.arch === "arm64") ||
-    (process.platform === "win32" && process.arch === "x64")
-  )
+    ["darwin", "win32", "linux"].includes(process.platform) &&
+    ["arm64", "x64"].includes(process.arch)
+  ) ||
+  (process.platform === "win32" && process.arch !== "x64")
 ) {
-  throw new Error("Build the desktop runtime on macOS ARM64 or Windows x64.");
+  throw new Error(
+    `Unsupported desktop build target: ${process.platform}/${process.arch}. Use a native x64 or arm64 build host.`
+  );
 }
 
 const web = Bun.spawn(
@@ -69,6 +80,13 @@ for (const file of tracked.stdout.toString().split("\0").filter(Boolean)) {
 
   await mkdir(dirname(join(output, file)), { recursive: true });
   await cp(join(root, file), join(output, file));
+}
+
+// Host-side desktop bridge scripts are explicit runtime entry points, including in uncommitted local builds.
+for (const name of ["desktop-mcp-bridge.ts", "check-desktop-bridge.ts"]) {
+  const target = join(output, "apps/server/scripts", name);
+  await mkdir(dirname(target), { recursive: true });
+  await cp(join(root, "apps/server/scripts", name), target);
 }
 
 // Keep every workspace manifest so the frozen lockfile stays valid.

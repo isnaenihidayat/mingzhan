@@ -2,9 +2,21 @@
 
 The existing MíngZhàn web app with a bundled local server. Opening the app starts the server automatically; quitting stops the server and its background workers. No separate Bun, Node, Docker, or MíngZhàn server installation is needed.
 
+## Manual installers in application releases
+
+Application releases such as `v1.0.4` include desktop installers built from the same tag by the **Desktop installers** workflow:
+
+- macOS 15+ Apple Silicon: `.dmg` and `.zip`; ad-hoc signed, without Apple notarization.
+- Windows 10 build 19041+ / Windows 11 x64: `-Setup.exe`; no Authenticode certificate.
+- Linux x64: `.AppImage` and `.deb`; a desktop session and an unlocked system keyring are required.
+
+These are manual installation packages. The release includes `SHA256SUMS.txt`, and does not promote the signed `desktop-updates` feed. OS trust prompts may appear because publisher certificates are not configured. Updating manually preserves the existing desktop data directory.
+
+To build a release, create the matching application tag and draft GitHub release, then run **Actions → Desktop installers** with that tag. All three native builds and runtime tests must succeed before installer assets are attached. Download links are available on the versioned application release, not only the separate signed desktop channel.
+
 ## Windows installation
 
-Windows installer builds target Windows 10 build 19041+ and Windows 11 x64. In [desktop releases](https://github.com/mingpromotion/mingzhan/releases?q=desktop-v), look for `MíngZhàn-<version>-x64-Setup.exe`. Run it to install for your Windows account, then open MíngZhàn and complete setup. Updates and uninstalling preserve your saved data. A signed installer may still show a Windows SmartScreen warning.
+Windows installer builds target Windows 10 build 19041+ and Windows 11 x64. In [desktop releases](https://github.com/isnaenihidayat/mingzhan/releases?q=desktop-v), look for `MíngZhàn-<version>-x64-Setup.exe`. Run it to install for your Windows account, then open MíngZhàn and complete setup. Updates and uninstalling preserve your saved data. A signed installer may still show a Windows SmartScreen warning.
 
 **Do not install the unsigned `.msix` from older releases.** It is a Partner Center upload, not an installer you can double-click. New builds keep that package in the `mingzhan-windows-store` workflow artifact for Store submission only.
 
@@ -12,7 +24,7 @@ Releases through 0.1.8 do not include the EXE. Until the first signed Windows in
 
 ## Develop and build
 
-From an Apple Silicon Mac or Windows x64 machine with this Git checkout and Bun installed:
+From macOS (Apple Silicon or Intel), Windows x64, or Linux (x64/ARM64), with this Git checkout and Bun 1.4+ installed:
 
 ```sh
 bun install
@@ -31,7 +43,7 @@ On Windows x64, create the full NSIS installer:
 bun run --cwd apps/desktop package:windows
 ```
 
-The build includes Bun, the production server and worker dependencies, and the built web UI. Outputs are in `apps/desktop/dist/electron/`. Local builds are unsigned without signing credentials. macOS targets macOS 15 (Sequoia) or later on Apple Silicon; Windows targets Windows 10 build 19041+ and Windows 11 x64. CI tests the unpacked runtime, not an installed GUI.
+The build includes Bun, the production server and worker dependencies, and the built web UI. Outputs are in `apps/desktop/dist/electron/`. Local macOS builds use an ad-hoc signature; Windows/Linux builds require their own distribution signing configuration. macOS targets macOS 15 (Sequoia) or later on Apple Silicon or Intel; Windows targets Windows 10 build 19041+ and Windows 11 x64. Linux builds target the native x64 or ARM64 host. CI tests the unpacked runtime, not an installed GUI.
 
 ## Local data
 
@@ -132,3 +144,23 @@ bun run --cwd apps/desktop package:store
 ```
 
 The pinned electron-builder uses its `appx` target to invoke Windows SDK MakeAppx with `.msix` output. Both use the same package manifest format. Required Store tile assets are generated from MíngZhàn's existing icon. The unsigned output is for Store submission; ordinary sideloading requires a separately trusted signature.
+
+## Linux and native architecture builds
+
+Run `bun run --cwd apps/desktop package:linux` on Linux to create AppImage and deb files.
+On macOS use `package:mac`; `package` selects the current operating system.
+Build on each target operating system and architecture: the runtime bundles the host Bun executable and native modules, so cross-building a foreign architecture is not supported by this workflow.
+
+Linux needs a desktop session and an unlocked Secret Service/keyring (such as GNOME Keyring or KWallet). The app refuses plaintext secret storage. AppImage may require FUSE; deb is an alternative. These builds still need native Windows/Linux verification before claiming distribution-ready support.
+If an old Bun hangs during a build, run `bun upgrade` and confirm `bun --version` is at least 1.4 before retrying.
+
+## Renderer and startup checks
+
+The desktop pins Electron 45 and bundles the same production frontend as the web app.
+PWA service-worker registration is skipped inside Electron; the desktop updater owns application updates.
+Chromium session storage is explicitly kept in the desktop user-data directory.
+The packaged executable, macOS bundle and helpers use the ASCII name `MingZhan` to avoid helper lookup failures with Unicode-normalized filenames. The web UI keeps its existing branding and layout.
+Local macOS packaging uses an ad-hoc signature; public distribution still requires Developer ID signing and notarization through the release workflow.
+
+`bun run --cwd apps/desktop test:runtime` checks the real production setup screen and an authenticated chat composer after restarting the bundled server, in addition to runtime persistence and shutdown.
+Desktop data is separate from a Docker/web installation; an unconfigured desktop installation correctly opens first-run setup.

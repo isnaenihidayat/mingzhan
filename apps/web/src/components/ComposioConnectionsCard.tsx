@@ -21,7 +21,6 @@ import {
   ComposioToolkitRowList,
   ComposioToolkitTile,
 } from "@/components/ComposioToolkitRows";
-import { IntegrationsTabs } from "@/components/IntegrationsTabs";
 import { IntegrationCardShell } from "@/components/integration-settings.shared";
 import { useAuth } from "@/context/use-auth";
 import { useProfilesQuery } from "@/hooks/use-app-queries";
@@ -47,11 +46,11 @@ import {
 
 const EMPTY_PROFILES: ProfileSummary[] = [];
 
-/** Keeps the Plugins tab reachable while Composio is loading, failing, or unset. */
+/** Keep the connector heading visible across loading and error states. */
 function WithIntegrationsTabs({ children }: { children: ReactNode }) {
   return (
     <div className="space-y-10">
-      <IntegrationsTabs>{null}</IntegrationsTabs>
+      <h1 className="font-semibold text-2xl">Connectors</h1>
       {children}
     </div>
   );
@@ -94,7 +93,8 @@ function ComposioToolkitList({
 
   return (
     <div className="space-y-10">
-      <IntegrationsTabs>
+      <div className="space-y-4">
+        <h1 className="font-semibold text-2xl">Connectors</h1>
         <div className="relative w-full sm:w-72">
           <Search01Icon
             aria-hidden
@@ -113,7 +113,7 @@ function ComposioToolkitList({
             value={search}
           />
         </div>
-      </IntegrationsTabs>
+      </div>
 
       {isSearching ? (
         <section className="space-y-3">

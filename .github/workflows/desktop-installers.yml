@@ -1,0 +1,134 @@
+name: Desktop installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing vX.Y.Z tag and draft release to receive manual installers'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-installers-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            platform: mac
+          - os: windows-latest
+            platform: windows
+          - os: ubuntu-24.04
+            platform: linux
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: Validate release tag
+        shell: bash
+        run: '[[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]'
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: refs/tags/${{ inputs.release_tag }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.4
+      - name: Validate package versions
+        run: bun -e 'const root = await Bun.file("package.json").json(); const desktop = await Bun.file("apps/desktop/package.json").json(); if (process.env.RELEASE_TAG !== `v${root.version}` || root.version !== desktop.version) throw new Error("Release and desktop versions must match");'
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun apps/desktop/node_modules/electron/install.js
+      - name: Prepare Linux desktop services
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb gnome-keyring dbus-x11 libsecret-1-0 libfuse2t64
+          sudo chown root:root apps/desktop/node_modules/electron/dist/chrome-sandbox
+          sudo chmod 4755 apps/desktop/node_modules/electron/dist/chrome-sandbox
+      - name: Desktop tests
+        if: runner.os != 'Linux'
+        run: bun run --cwd apps/desktop test
+      - name: Linux desktop tests
+        if: runner.os == 'Linux'
+        run: xvfb-run -a bun run --cwd apps/desktop test
+      - run: bun run --cwd apps/desktop build:runtime
+      - name: Runtime tests
+        if: runner.os != 'Linux'
+        run: bun run --cwd apps/desktop test:runtime
+      - name: Linux runtime tests with an isolated keyring
+        if: runner.os == 'Linux'
+        env:
+          XDG_CURRENT_DESKTOP: GNOME
+        run: |
+          dbus-run-session -- bash -euo pipefail -c '
+            printf "%s" "mingzhan-ci-only" | gnome-keyring-daemon --unlock --components=secrets
+            xvfb-run -a bun run --cwd apps/desktop test:runtime
+          '
+      - name: Package macOS manual installers
+        if: runner.os == 'macOS'
+        working-directory: apps/desktop
+        run: bun x electron-builder --mac dmg zip --arm64 --config.mac.identity=- --publish never
+      - name: Package Windows manual installer
+        if: runner.os == 'Windows'
+        working-directory: apps/desktop
+        run: bun x electron-builder --win nsis --x64 --publish never
+      - name: Package Linux manual installers
+        if: runner.os == 'Linux'
+        working-directory: apps/desktop
+        run: bun x electron-builder --linux AppImage deb --x64 --publish never
+      - name: Verify macOS package
+        if: runner.os == 'macOS'
+        run: |
+          codesign --verify --deep --strict apps/desktop/dist/electron/mac-arm64/MingZhan.app
+          hdiutil verify "apps/desktop/dist/electron/MíngZhàn-$(bun -p 'require("./apps/desktop/package.json").version')-arm64.dmg"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: desktop-${{ matrix.platform }}
+          path: |
+            apps/desktop/dist/electron/*.dmg
+            apps/desktop/dist/electron/*.zip
+            apps/desktop/dist/electron/*.exe
+            apps/desktop/dist/electron/*.AppImage
+            apps/desktop/dist/electron/*.deb
+          compression-level: 0
+          if-no-files-found: error
+
+  attach:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: desktop-*
+          path: installers
+          merge-multiple: true
+      - name: Check all installer formats and create checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd installers
+          for extension in dmg zip exe AppImage deb; do
+            compgen -G "*.$extension" > /dev/null || { echo "Missing $extension installer"; exit 1; }
+          done
+          sha256sum -- *.dmg *.zip *.exe *.AppImage *.deb > SHA256SUMS.txt
+      - name: Attach installers without changing signed update feeds
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"
+          gh release upload "$RELEASE_TAG" installers/* --repo "$GITHUB_REPOSITORY"
