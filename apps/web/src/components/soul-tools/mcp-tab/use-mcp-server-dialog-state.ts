@@ -103,7 +103,9 @@ function applyMcpFormReset({
   server,
   detail,
   setters,
+  initialPreset,
 }: {
+  initialPreset?: { name: string; url: string; auth?: "token" };
   open: boolean;
   server?: McpServerSummary | null;
   detail: ReturnType<typeof useMcpServerDetailQuery>["data"];
@@ -118,10 +120,14 @@ function applyMcpFormReset({
   }
 
   if (!server) {
-    setters.setName("");
-    setters.setKind("signin");
-    setters.setUrl("");
-    setters.setHeaders([emptyHeaderRow()]);
+    setters.setName(initialPreset?.name ?? "");
+    setters.setKind(initialPreset?.auth === "token" ? "http" : "signin");
+    setters.setUrl(initialPreset?.url ?? "");
+    setters.setHeaders(
+      initialPreset?.auth === "token"
+        ? [{ key: "Authorization", value: "" }]
+        : [emptyHeaderRow()]
+    );
     setters.setCommand("");
     setters.setArgs([]);
     setters.setEnv([emptyHeaderRow()]);
@@ -319,12 +325,54 @@ function sendSignInTab(tab: Window | null, url: string | undefined): boolean {
   return true;
 }
 
+function canSubmitForm(
+  loadingForm: boolean,
+  requiredFields: string[],
+  initialPreset: { name: string; url: string; auth?: "token" } | undefined,
+  url: string,
+  kind: McpServerKind,
+  headers: McpHeaderRow[]
+) {
+  const canSubmit =
+    !loadingForm &&
+    requiredFields.every((value) => value.trim().length > 0) &&
+    (initialPreset?.auth !== "token" ||
+      url.trim() !== initialPreset.url ||
+      kind !== "http" ||
+      headers.some(
+        (row) =>
+          row.key.toLowerCase() === "authorization" &&
+          /^Bearer\s+\S+/i.test(row.value.trim())
+      ));
+
+  return canSubmit;
+}
+
+function mcpFormResetKey(
+  open: boolean,
+  server: McpServerSummary | null | undefined,
+  detail: Pick<McpServerSummary, "name" | "transport"> | null | undefined,
+  initialPreset: { name: string; url: string } | undefined
+) {
+  const formResetKey = open
+    ? server
+      ? detail
+        ? `edit-${server.id}-${detail.name}-${detail.transport}`
+        : `edit-${server.id}-loading`
+      : `create-${initialPreset?.name ?? ""}-${initialPreset?.url ?? ""}`
+    : "closed";
+
+  return formResetKey;
+}
+
 export function useMcpServerDialogState({
   open,
   busy,
   server,
   onSubmit,
+  initialPreset,
 }: {
+  initialPreset?: { name: string; url: string; auth?: "token" };
   open: boolean;
   busy: boolean;
   server?: McpServerSummary | null;
@@ -339,10 +387,20 @@ export function useMcpServerDialogState({
     open && server ? server.id : null
   );
 
-  const [name, setName] = useState("");
-  const [kind, setKind] = useState<McpServerKind>("signin");
-  const [url, setUrl] = useState("");
-  const [headers, setHeaders] = useState<McpHeaderRow[]>([emptyHeaderRow()]);
+  const [name, setName] = useState(initialPreset?.name ?? "");
+
+  const [kind, setKind] = useState<McpServerKind>(
+    initialPreset?.auth === "token" ? "http" : "signin"
+  );
+
+  const [url, setUrl] = useState(initialPreset?.url ?? "");
+
+  const [headers, setHeaders] = useState<McpHeaderRow[]>(
+    initialPreset?.auth === "token"
+      ? [{ key: "Authorization", value: "" }]
+      : [emptyHeaderRow()]
+  );
+
   const [command, setCommand] = useState("");
   const [args, setArgs] = useState<string[]>([]);
   const [env, setEnv] = useState<McpHeaderRow[]>([emptyHeaderRow()]);
@@ -371,16 +429,16 @@ export function useMcpServerDialogState({
     resolveFormTransport(transport, command, url) === "http" ? url : command,
   ];
 
-  const canSubmit =
-    !loadingForm && requiredFields.every((value) => value.trim().length > 0);
+  const canSubmit = canSubmitForm(
+    loadingForm,
+    requiredFields,
+    initialPreset,
+    url,
+    kind,
+    headers
+  );
 
-  const formResetKey = open
-    ? server
-      ? detail
-        ? `edit-${server.id}-${detail.name}-${detail.transport}`
-        : `edit-${server.id}-loading`
-      : "create"
-    : "closed";
+  const formResetKey = mcpFormResetKey(open, server, detail, initialPreset);
 
   const [prevFormResetKey, setPrevFormResetKey] = useState(formResetKey);
 
@@ -403,7 +461,13 @@ export function useMcpServerDialogState({
   if (formResetKey !== prevFormResetKey) {
     setPrevFormResetKey(formResetKey);
     setPendingAuth(null);
-    applyMcpFormReset({ detail, open, server, setters: formSetters });
+    applyMcpFormReset({
+      detail,
+      initialPreset,
+      open,
+      server,
+      setters: formSetters,
+    });
   }
 
   function buildRequest(): CreateMcpServerRequest {

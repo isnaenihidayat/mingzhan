@@ -318,40 +318,35 @@ export function usePluginManagement(
   };
 }
 
-/** Built-in (official catalog), agent drafts (local releases), then the rest. */
-export function groupPluginIds(
-  pluginIds: string[],
-  official: Array<{ id: string }>,
+export type PluginFilter = "All" | "Installed" | "Available" | "Local";
+
+export function pluginMatchesFilter(
+  pluginId: string,
+  filter: PluginFilter,
+  plugins: OrgPluginDetail[],
   releases: PluginReleaseSummary[]
 ) {
-  const builtIn = new Set(official.map((item) => item.id));
-
-  const createdBySuperMingzhan = new Set(
-    releases.flatMap((item) =>
-      item.source === "local" || item.source === "agent" ? [item.pluginId] : []
-    )
+  const installed = plugins.some(
+    (item) => item.pluginId === pluginId && item.installed
   );
 
-  const groups = [
-    {
-      ids: pluginIds.filter((id) => builtIn.has(id)),
-      title: "Built-in",
-    },
-    {
-      ids: pluginIds.filter(
-        (id) => !builtIn.has(id) && createdBySuperMingzhan.has(id)
-      ),
-      title: "Created by you",
-    },
-    {
-      ids: pluginIds.filter(
-        (id) => !(builtIn.has(id) || createdBySuperMingzhan.has(id))
-      ),
-      title: "From other sources",
-    },
-  ];
+  if (filter === "Installed") {
+    return installed;
+  }
 
-  return groups.filter((group) => group.ids.length > 0);
+  if (filter === "Available") {
+    return !installed;
+  }
+
+  if (filter === "Local") {
+    return releases.some(
+      (item) =>
+        item.pluginId === pluginId &&
+        (item.source === "local" || item.source === "agent")
+    );
+  }
+
+  return true;
 }
 
 export function pluginMatchesQuery(
@@ -379,6 +374,10 @@ export function pluginMatchesQuery(
     official?.description,
     release?.manifest.name,
     release?.manifest.description,
+    ...catalog.releases
+      .filter((item) => item.pluginId === pluginId)
+      .map((item) => item.source),
+    official ? "built-in official" : undefined,
     PLUGIN_DESCRIPTIONS.get(pluginId),
   ].some((text) => text?.toLowerCase().includes(needle));
 }

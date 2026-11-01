@@ -447,3 +447,31 @@ describe("close_session", () => {
     expect((await db.getSession(cliSessionId))?.closedAt).toBeString();
   });
 });
+
+test("agent discovery hides private, super and foreign profiles from ordinary users", async () => {
+  const db = createInMemoryDatabaseAdapter();
+  await db.upsertProfile(profile("shared", ORG_A));
+  await db.upsertProfile({
+    ...profile("mine", ORG_A),
+    ownerUserId: USER_ID,
+    sharedWithTeam: false,
+  });
+  await db.upsertProfile({
+    ...profile("private", ORG_A),
+    ownerUserId: "other",
+    sharedWithTeam: false,
+  });
+  await db.upsertProfile({ ...profile("super", ORG_A), isSuper: true });
+  await db.upsertProfile(profile("foreign", ORG_B));
+
+  const tool = createSessionTools(new AgentService(null, null, db)).find(
+    (entry) => entry.name === "list_agent_profiles"
+  )!;
+
+  const result = await tool.run({}, { ...context(ORG_A), orgRole: "member" });
+  expect(JSON.stringify(result)).toContain('"shared"');
+  expect(JSON.stringify(result)).toContain('"mine"');
+  expect(JSON.stringify(result)).not.toContain('"private"');
+  expect(JSON.stringify(result)).not.toContain('"super"');
+  expect(JSON.stringify(result)).not.toContain('"foreign"');
+});

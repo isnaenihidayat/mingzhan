@@ -20,7 +20,7 @@ describe("desktop release metadata", () => {
     expect(output.files[0]).toEqual({
       sha512: "checksum",
       size: 42,
-      url: "https://github.com/mingpromotion/mingzhan/releases/download/desktop-v0.2.0/M%C3%ADngZh%C3%A0n-0.2.0-arm64-mac.zip",
+      url: "https://github.com/isnaenihidayat/mingzhan/releases/download/desktop-v0.2.0/M%C3%ADngZh%C3%A0n-0.2.0-arm64-mac.zip",
     });
     expect(output.path).toBe(output.files[0].url);
     expect(output.sha512).toBe("checksum");
@@ -36,7 +36,7 @@ describe("desktop release metadata", () => {
       updateManifest({ ...manifest, files }, "desktop-v0.2.0").files[1]
     ).toEqual({
       sha512: "dmg-checksum",
-      url: "https://github.com/mingpromotion/mingzhan/releases/download/desktop-v0.2.0/M%C3%ADngZh%C3%A0n-0.2.0-arm64.dmg",
+      url: "https://github.com/isnaenihidayat/mingzhan/releases/download/desktop-v0.2.0/M%C3%ADngZh%C3%A0n-0.2.0-arm64.dmg",
     });
     expect(() =>
       updateManifest({ ...manifest, files: files.slice(1) }, "desktop-v0.2.0")
@@ -285,7 +285,7 @@ test("retry repairs partial promotion using public bytes even when local artifac
     (args) =>
       args[1] === "upload" &&
       args[2] === "desktop-updates" &&
-      args[3].endsWith("/latest.yml")
+      basename(args[3]) === "latest.yml"
   );
   await expect(f.publish()).rejects.toThrow();
   expect(f.releases.get("desktop-updates").assets.has("latest-mac.yml")).toBe(

@@ -20,6 +20,7 @@ import {
   McpPageState,
   McpServersSection,
 } from "@/components/soul-tools/mcp-tab/McpServersSection";
+import type { PopularServer } from "@/components/soul-tools/mcp-tab/mcp-connect-app-views";
 import { useMcpServersQuery } from "@/hooks/use-app-queries";
 import {
   useConnectMcpServerMutation,
@@ -32,6 +33,19 @@ import { client, formatError } from "@/lib/client";
 
 /** The callback connects the server on its own, so the list is re-read until it lands. */
 const AUTHORIZATION_POLL_INTERVAL_MS = 3000;
+
+function findMcpTargets(
+  servers: McpServerSummary[],
+  authId: string | undefined,
+  editId: string | null
+) {
+  return {
+    editServer: servers.find((server) => server.id === editId) ?? null,
+    pendingAuthStatus: authId
+      ? servers.find((server) => server.id === authId)?.status
+      : undefined,
+  };
+}
 
 export function McpTab({ embedded = false }: { embedded?: boolean } = {}) {
   const [pendingAuth, setPendingAuth] = useState<{
@@ -56,6 +70,7 @@ export function McpTab({ embedded = false }: { embedded?: boolean } = {}) {
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const [testingServerId, setTestingServerId] = useState<string | null>(null);
+  const [createPreset, setCreatePreset] = useState<PopularServer | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [editServerId, setEditServerId] = useState<string | null>(null);
   const [expandedServerId, setExpandedServerId] = useState<string | null>(null);
@@ -64,12 +79,11 @@ export function McpTab({ embedded = false }: { embedded?: boolean } = {}) {
     null
   );
 
-  const pendingAuthStatus = pendingAuth
-    ? servers.find((server) => server.id === pendingAuth.serverId)?.status
-    : undefined;
-
-  const editServer =
-    servers.find((server) => server.id === editServerId) ?? null;
+  const { pendingAuthStatus, editServer } = findMcpTargets(
+    servers,
+    pendingAuth?.serverId,
+    editServerId
+  );
 
   const loading = isLoading && servers.length === 0;
 
@@ -219,7 +233,14 @@ export function McpTab({ embedded = false }: { embedded?: boolean } = {}) {
         busy={busy}
         embedded={embedded}
         expandedServerId={expandedServerId}
-        onAddServer={() => setCreateOpen(true)}
+        onAddPreset={(preset) => {
+          setCreatePreset(preset);
+          setCreateOpen(true);
+        }}
+        onAddServer={() => {
+          setCreatePreset(null);
+          setCreateOpen(true);
+        }}
         onConnect={(serverId) => void handleConnect(serverId)}
         onDelete={requestDelete}
         onEdit={setEditServerId}
@@ -238,6 +259,9 @@ export function McpTab({ embedded = false }: { embedded?: boolean } = {}) {
 
       <McpServerDialog
         busy={createMutation.isPending}
+        initialCustom
+        initialPreset={createPreset ?? undefined}
+        key={createPreset?.name ?? "custom"}
         onOpenChange={(open) => {
           setCreateOpen(open);
 

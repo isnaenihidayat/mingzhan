@@ -225,3 +225,151 @@ test("installs a skill picked from skills.sh with the npx command", async () => 
     },
   ]);
 });
+
+test("skills page filters results and changes auto-discovery through the supported API", async () => {
+  const { MemoryRouter } = await import("react-router-dom");
+  const { SkillsPage } = await import("@/pages/CustomizePage");
+
+  const catalog = skills.map((skill, index) => ({
+    ...skill,
+    enabled: index !== 2,
+  }));
+
+  const install = spyOn(client, "createSkill").mockImplementation(
+    async (input) => {
+      const skill: SkillSummary = {
+        ...skills[0]!,
+        description: input.description,
+        disableModelInvocation: input.disableModelInvocation ?? false,
+        id: input.name,
+        name: input.name,
+        orgId: null,
+      };
+
+      catalog.push(skill);
+
+      return { skill: { ...skill, body: input.body ?? "", scriptIssues: [] } };
+    }
+  );
+
+  const list = spyOn(client, "listSkills").mockResolvedValue({
+    skills: catalog,
+  });
+
+  const profiles = spyOn(client, "listProfiles").mockResolvedValue({
+    profiles: [],
+  });
+
+  const patch = spyOn(client, "patchSkill").mockResolvedValue({
+    skill: {
+      ...catalog[0]!,
+      body: "",
+      disableModelInvocation: true,
+      scriptIssues: [],
+    },
+  });
+
+  // SAFETY: SkillsPage reads only the active organization id/role and platform admin flag from this auth fixture.
+  const auth = {
+    activeOrg: { id: "org-a", role: "admin" },
+    user: { isPlatformAdmin: true },
+  } as AuthContextValue;
+
+  const queries = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  cleanups.push(() => {
+    act(() => root.unmount());
+    container.remove();
+    queries.clear();
+    list.mockRestore();
+    profiles.mockRestore();
+    patch.mockRestore();
+    install.mockRestore();
+  });
+  await act(async () => {
+    root.render(
+      <QueryClientProvider client={queries}>
+        <MemoryRouter>
+          <AuthContext.Provider value={auth}>
+            <SkillsPage />
+          </AuthContext.Provider>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    await Bun.sleep(30);
+  });
+  await act(async () => {
+    await Bun.sleep(30);
+  });
+  expect(container.querySelectorAll("article").length).toBe(9);
+  expect(install).not.toHaveBeenCalled();
+
+  const availableFilter = [...container.querySelectorAll("label")]
+    .find((label) => label.textContent?.includes("Available"))!
+    .querySelector("input")!;
+
+  await act(async () => availableFilter.click());
+  expect(container.querySelectorAll("article").length).toBe(6);
+  expect(container.textContent).toContain("Not installed");
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>(
+        '[aria-label="Install mingzhan-visuals"]'
+      )!
+      .click()
+  );
+  await act(async () => {
+    await Bun.sleep(30);
+  });
+  expect(install).toHaveBeenCalledTimes(1);
+  expect(install.mock.calls[0]![0]).toMatchObject({
+    disableModelInvocation: true,
+    name: "mingzhan-visuals",
+  });
+  expect(install.mock.calls[0]![0].profileId).toBeUndefined();
+  expect(container.querySelectorAll("article").length).toBe(5);
+  await act(async () => availableFilter.click());
+
+  const disabledFilter = [...container.querySelectorAll("label")]
+    .find((label) => label.textContent?.includes("Disabled"))!
+    .querySelector("input")!;
+
+  await act(async () => disabledFilter.click());
+  expect(container.querySelectorAll("article").length).toBe(1);
+  expect(container.querySelector("article")?.textContent).toContain("Three");
+  await act(async () => disabledFilter.click());
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>(
+        '[aria-label="Disable auto-discovery for One"]'
+      )!
+      .click()
+  );
+  expect(patch).toHaveBeenCalledWith(
+    "one",
+    { disableModelInvocation: true },
+    undefined
+  );
+});
+
+test("available presets are excluded from automatic bundled installation and assignment", async () => {
+  const { AVAILABLE_SKILL_PRESETS, BUNDLED_SKILL_NAMES } = await import(
+    "@mingzhan/core/skills/bundled-names"
+  );
+
+  expect(AVAILABLE_SKILL_PRESETS).toHaveLength(6);
+
+  for (const preset of AVAILABLE_SKILL_PRESETS) {
+    expect(
+      BUNDLED_SKILL_NAMES.some((name) => name === String(preset.name))
+    ).toBe(false);
+    expect(preset.disableModelInvocation).toBe(true);
+    expect(preset.name).toMatch(/^mingzhan-/);
+    expect(preset.body.length).toBeGreaterThan(100);
+  }
+});

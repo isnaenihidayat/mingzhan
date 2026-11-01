@@ -407,3 +407,55 @@ test("draft review lists code that runs before source and config", async () => {
   ).not.toBeNull();
   expect(document.body.textContent).toContain("1 of 3 read");
 });
+
+test("plugin catalog filters keep disabled installations and identify local releases", async () => {
+  const { pluginMatchesFilter, pluginMatchesQuery } = await import(
+    "./plugins/use-plugin-management"
+  );
+
+  // SAFETY: Filtering reads only the supplied pluginId and installed fields.
+  const plugins = [
+    { installed: true, lifecycleState: "enabled", pluginId: "enabled" },
+    { installed: true, lifecycleState: "disabled", pluginId: "disabled" },
+    { installed: false, lifecycleState: "uninstalled", pluginId: "removed" },
+  ] as import("@mingzhan/core/contract").OrgPluginDetail[];
+
+  // SAFETY: Filtering and search read only the supplied pluginId, source, and manifest text.
+  const releases = [
+    {
+      manifest: { description: "Notes", name: "Draft" },
+      pluginId: "draft",
+      source: "agent",
+    },
+    {
+      manifest: { description: "Notes", name: "Folder" },
+      pluginId: "folder",
+      source: "local",
+    },
+    {
+      manifest: { description: "Notes", name: "Registry" },
+      pluginId: "registry",
+      source: "npm",
+    },
+  ] as import("@mingzhan/core/contract").PluginReleaseSummary[];
+
+  const ids = ["enabled", "disabled", "removed", "draft", "folder", "registry"];
+  expect(
+    ids.filter((id) => pluginMatchesFilter(id, "Installed", plugins, releases))
+  ).toEqual(["enabled", "disabled"]);
+  expect(
+    ids.filter((id) => pluginMatchesFilter(id, "Available", plugins, releases))
+  ).toEqual(["removed", "draft", "folder", "registry"]);
+  expect(
+    ids.filter((id) => pluginMatchesFilter(id, "Local", plugins, releases))
+  ).toEqual(["draft", "folder"]);
+  expect(
+    ids.filter((id) => pluginMatchesFilter(id, "All", plugins, releases))
+  ).toEqual(ids);
+  expect(
+    pluginMatchesQuery("registry", "npm", { official: [], plugins, releases })
+  ).toBe(true);
+  expect(
+    pluginMatchesQuery("folder", "npm", { official: [], plugins, releases })
+  ).toBe(false);
+});

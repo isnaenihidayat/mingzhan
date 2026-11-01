@@ -419,3 +419,72 @@ describe("sub_agent child chats", () => {
     expect(result.status).toBe("timeout");
   });
 });
+
+describe("sub-agent coordinator controls", () => {
+  // SAFETY: Wait/stop use only getSessionSummary and assertSessionProfileAccess on this service fixture.
+  const agent = {
+    assertSessionProfileAccess: async () => {},
+    getSessionSummary: async () => ({ parentSessionId: "parent-control" }),
+  } as never;
+
+  const context = { ...TOOL_CONTEXT, sessionId: "parent-control" };
+  test("stop requests cooperative cancellation without deleting a running turn", async () => {
+    const childId = "coordinator-stop";
+    sessionTurnRegistry.beginTurn(childId);
+    const abort = new AbortController();
+    sessionTurnRegistry.attachAbort(childId, abort);
+
+    try {
+      const result = await runSubAgentTool(
+        { action: "stop", sessionId: childId, task: "Stop" },
+        context,
+        agent
+      );
+
+      expect(result.status).toBe("success");
+      expect(abort.signal.aborted).toBe(true);
+      expect(sessionTurnRegistry.isActive(childId)).toBe(true);
+    } finally {
+      sessionTurnRegistry.endTurn(childId, { reply: "Stopped", type: "done" });
+    }
+  });
+  test("wait receives the terminal reply from a background child", async () => {
+    const childId = "coordinator-wait";
+    sessionTurnRegistry.beginTurn(childId);
+
+    const timer = setTimeout(
+      () =>
+        sessionTurnRegistry.endTurn(childId, {
+          reply: "Reviewed",
+          type: "done",
+        }),
+      10
+    );
+
+    try {
+      const result = await runSubAgentTool(
+        { action: "wait", sessionId: childId, task: "Wait", timeoutMs: 5000 },
+        context,
+        agent
+      );
+
+      expect(result).toMatchObject({
+        output: "Reviewed",
+        sessionId: childId,
+        status: "success",
+      });
+    } finally {
+      clearTimeout(timer);
+      sessionTurnRegistry.cancelTurn(childId);
+    }
+  });
+  test("coordinator controls reject a child from another parent", async () => {
+    const result = await runSubAgentTool(
+      { action: "stop", sessionId: "other", task: "Stop" },
+      { ...context, sessionId: "another-parent" },
+      agent
+    );
+
+    expect(result.status).toBe("fail");
+  });
+});

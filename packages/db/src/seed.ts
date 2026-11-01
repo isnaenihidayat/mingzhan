@@ -160,7 +160,7 @@ export async function ensureSubAgentToolDefinition(
   await db.upsertTool({
     createdAt: existing?.createdAt ?? now,
     description:
-      "Run a focused same-profile sub-agent for delegated research, review, planning, or debugging, in its own chat under this one, and get its result back. With background, return at once instead, for when the user wants separate chats to open later. For repo coding work, use bash with coding-agent instead.",
+      "Run a focused agent in a child chat for research, review, planning, or debugging. It uses the current profile by default, or an explicitly selected accessible profile in the same organization. New child chats support model/effort overrides. Background mode returns immediately; wait reads its completion and stop requests cooperative cancellation. For repo coding work, use bash with coding-agent instead.",
     handlerConfig: {},
     handlerType: "sub_agent",
     id: SUB_AGENT_TOOL_ID,

@@ -43,8 +43,8 @@ test.each(["fresh", "upgrade"])(
                  ('team', 'Team', 'team', 'now', 'now');
         INSERT INTO profiles (id, name, org_id, created_at, updated_at)
           VALUES ('team-profile', 'Team agent', 'team', 'now', 'now');
-        INSERT INTO users (id, email, name, created_at, updated_at)
-          VALUES ('team-user', 'team@example.com', 'Team user', 'now', 'now');
+        INSERT INTO users (id, email, name, password_hash, created_at, updated_at)
+          VALUES ('team-user', 'team@example.com', 'Team user', 'fixture-hash', 'now', 'now');
         INSERT INTO org_members (org_id, user_id, role, created_at)
           VALUES ('team', 'team-user', 'admin', 'now');
       `);
@@ -1042,7 +1042,10 @@ describe("install-wide name uniqueness", () => {
 
 describe("skill org id backfill", () => {
   test("recovers the owning org from source_path and leaves global skills alone", () => {
-    const configDir = mkdtempSync(join(tmpdir(), "mingzhan-skill-org-backfill-"));
+    const configDir = mkdtempSync(
+      join(tmpdir(), "mingzhan-skill-org-backfill-")
+    );
+
     const originalConfigDir = process.env.MINGZHAN_CONFIG_DIR;
     process.env.MINGZHAN_CONFIG_DIR = configDir;
     const db = new Database(":memory:");

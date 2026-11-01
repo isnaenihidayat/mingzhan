@@ -1,5 +1,20 @@
-/** Hosted (OAuth) MCP servers offered as one-click presets. Logos are single-path SVGs. */
-export const POPULAR_SERVERS = [
+/** Official remote MCP presets. Omitted auth means browser OAuth. */
+interface McpLibraryPreset {
+  abilities: readonly string[];
+  auth?: "token";
+  authHelp?: string;
+  description: string;
+  docsUrl?: string;
+  name: string;
+  path: string;
+  url: string;
+  viewBox: string;
+}
+
+const serverIconPath =
+  "M4 2h16v8H4V2zm2 2v4h12V4H6zm-2 10h16v8H4v-8zm2 2v4h12v-4H6zm1-11h2v2H7V5zm0 12h2v2H7v-2z";
+
+export const POPULAR_SERVERS: readonly McpLibraryPreset[] = [
   {
     abilities: [
       "Search your pages",
@@ -31,6 +46,130 @@ export const POPULAR_SERVERS = [
     path: "M18.3498 9.83713L18.3339 9.65759C18.1831 7.93447 17.0963 4.69261 14.0816 4.69261C11.8445 4.69261 10.1545 6.97097 8.66311 8.97967C7.47302 10.5883 6.4419 11.9683 5.3073 11.9683C5.00574 11.9357 4.61708 11.7805 4.3792 11.4294C4.16497 11.1108 4.10948 10.7026 4.22046 10.2126C4.39489 9.43684 5.39463 8.7182 6.44963 7.95063C7.02864 7.54238 7.6238 7.10955 8.03634 6.69311C9.22643 5.5091 9.82932 4.65164 9.82932 3.2717C9.82932 1.89176 9.09157 1.20565 8.47276 0.911636C7.23514 0.323844 5.41851 0.666781 4.26026 1.69583C4.08583 1.85922 3.91117 2.01418 3.75243 2.16119C2.58622 3.23097 1.80094 3.95781 0 3.40232V5.63972C2.38791 6.72588 4.39512 4.65164 5.15675 3.69633C5.74372 3.06758 6.36253 2.70006 6.82283 2.70006H6.84671C7.05298 2.70825 7.22741 2.78995 7.35454 2.93696C7.56081 3.18204 7.64018 3.46786 7.60038 3.78622C7.51305 4.45594 6.83875 5.23967 5.60113 6.09713C4.14928 7.10159 1.7218 8.78374 1.53122 10.8987C1.3884 12.4177 2.15003 13.9365 3.34012 14.5243C6.11669 15.8798 7.80665 13.5444 9.5994 11.0783C10.9719 9.1756 12.273 7.37103 14.0818 7.37103C15.7081 7.37103 16.311 8.75916 16.311 9.63301V9.80459L16.1523 9.83713C12.2095 10.5558 10.0595 14.3611 10.0595 16.1167C10.0595 17.8724 11.5034 19.375 13.2804 19.375C15.359 19.375 17.9293 17.5458 18.3419 12.4013L18.3578 12.2136H20V9.83737H18.3498V9.83713ZM16.1998 12.4746C15.8826 15.5531 14.3513 16.9904 13.4232 16.9904C13.0027 16.9904 12.4158 16.631 12.4158 15.9615C12.4158 15.2104 13.5026 12.932 15.946 12.2543L16.2316 12.1808L16.1998 12.4748V12.4746Z",
     url: "https://mcp.higgsfield.ai/mcp",
     viewBox: "0 0 20 20",
+  },
+  {
+    abilities: [
+      "Search repositories and code",
+      "Read and manage issues",
+      "Read and manage pull requests",
+    ],
+    auth: "token",
+    authHelp:
+      "Enter Authorization as Bearer followed by a GitHub personal access token with the permissions you need.",
+    description: "Search repositories and manage issues and pull requests",
+    docsUrl:
+      "https://github.com/github/github-mcp-server/blob/main/docs/remote-server.md",
+
+    name: "GitHub",
+    path: serverIconPath,
+    url: "https://api.githubcopilot.com/mcp/",
+    viewBox: "0 0 24 24",
+  },
+  {
+    abilities: [
+      "Search the web",
+      "Extract and crawl web content",
+      "Research topics",
+    ],
+    description: "Search the web and extract, crawl, and research information",
+    docsUrl: "https://docs.tavily.com/documentation/mcp",
+
+    name: "Tavily",
+    path: serverIconPath,
+    url: "https://mcp.tavily.com/mcp/",
+    viewBox: "0 0 24 24",
+  },
+  {
+    abilities: [
+      "Resolve library names",
+      "Retrieve documentation and code examples",
+    ],
+    description: "Find current library documentation and code examples",
+    docsUrl: "https://context7.com/docs/resources/all-clients",
+
+    name: "Context7",
+    path: serverIconPath,
+    url: "https://mcp.context7.com/mcp/oauth",
+    viewBox: "0 0 24 24",
+  },
+  {
+    abilities: [
+      "Find issues and projects",
+      "Create and update issues",
+      "Read and add comments",
+    ],
+    description: "Find, create, and update issues, projects, and comments",
+    docsUrl: "https://linear.app/docs/mcp",
+
+    name: "Linear",
+    path: serverIconPath,
+    url: "https://mcp.linear.app/mcp",
+    viewBox: "0 0 24 24",
+  },
+  {
+    abilities: [
+      "Search Jira and Confluence",
+      "Manage work items",
+      "Read and update workspace content",
+    ],
+    description:
+      "Work with Jira issues, Confluence pages, and Atlassian projects",
+    docsUrl:
+      "https://support.atlassian.com/atlassian-ai-gateway/docs/get-started-with-the-atlassian-remote-mcp-server/",
+
+    name: "Atlassian",
+    path: serverIconPath,
+    url: "https://mcp.atlassian.com/v2/mcp",
+    viewBox: "0 0 24 24",
+  },
+  {
+    abilities: [
+      "Search messages and channels",
+      "Read conversation threads",
+      "Send messages with granted permissions",
+    ],
+    auth: "token",
+    authHelp:
+      "Requires an approved internal or Marketplace Slack app. Obtain a user token through that app OAuth flow with MCP scopes, then enter Authorization as Bearer followed by the token. Bot tokens alone are not sufficient.",
+    description:
+      "Search workspace conversations and work with channels and messages",
+    docsUrl: "https://docs.slack.dev/ai/slack-mcp-server/",
+
+    name: "Slack",
+    path: serverIconPath,
+    url: "https://mcp.slack.com/mcp",
+    viewBox: "0 0 24 24",
+  },
+  {
+    abilities: [
+      "Inspect Supabase projects",
+      "Query databases",
+      "Manage development resources",
+    ],
+    description:
+      "Inspect projects, query databases, and manage development resources",
+    docsUrl: "https://supabase.com/docs/guides/ai-tools/mcp",
+
+    name: "Supabase",
+    path: serverIconPath,
+    url: "https://mcp.supabase.com/mcp",
+    viewBox: "0 0 24 24",
+  },
+  {
+    abilities: [
+      "Inspect app windows and browser pages",
+      "Use desktop input with OS permissions",
+      "Capture and verify current state",
+    ],
+    auth: "token",
+    authHelp:
+      "Run the MingZhan desktop MCP bridge on your host. Enter Authorization as Bearer followed by its bridge token. Docker uses host.docker.internal:4312; for the desktop app change URL to http://127.0.0.1:4312/mcp. Assign this server to the same agent as the browser/computer skill. The driver needs Accessibility and Screen Recording permissions.",
+    description:
+      "Control native apps and signed-in browsers on your computer through the authenticated host bridge.",
+    name: "MingZhan Desktop Control",
+    path: serverIconPath,
+    url: "http://host.docker.internal:4312/mcp",
+    viewBox: "0 0 24 24",
   },
 ] as const;
 

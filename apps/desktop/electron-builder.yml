@@ -1,6 +1,9 @@
 appId: com.mingzhan.desktop
-productName: MíngZhàn
+productName: MingZhan
+executableName: MingZhan
 asar: true
+extraMetadata:
+  name: mingzhan-desktop
 npmRebuild: false
 directories:
   output: dist/electron
@@ -10,7 +13,7 @@ files:
   - package.json
 publish:
   provider: generic
-  url: https://github.com/mingpromotion/mingzhan/releases/download/desktop-updates
+  url: https://github.com/isnaenihidayat/mingzhan/releases/download/desktop-updates
 extraResources:
   - from: dist/runtime
     to: runtime
@@ -22,6 +25,7 @@ extraResources:
     filter:
       - '**/*'
 mac:
+  artifactName: MíngZhàn-${version}-${arch}-mac.${ext}
   hardenedRuntime: true
   entitlements: entitlements.mac.plist
   entitlementsInherit: entitlements.mac.plist
@@ -32,9 +36,9 @@ mac:
   minimumSystemVersion: '15.0'
   target:
     - target: dmg
-      arch: [arm64]
     - target: zip
-      arch: [arm64]
+dmg:
+  artifactName: MíngZhàn-${version}-${arch}.dmg
 win:
   icon: ../web/public/icons/icon-512-v2.png
   target:
@@ -45,3 +49,11 @@ nsis:
   oneClick: true
   perMachine: false
   deleteAppDataOnUninstall: false
+
+linux:
+  maintainer: MingZhan maintainers
+  icon: ../web/public/icons/icon-512-v2.png
+  category: Utility
+  target:
+    - target: AppImage
+    - target: deb

@@ -89,6 +89,6 @@ test("the Plugins tab stays reachable when Composio is not configured", async ()
     await act(() => Bun.sleep(10));
   }
 
-  expect(hrefs()).toContain(PAGE_PATHS["plugin-management"]);
+  expect(hrefs()).not.toContain(PAGE_PATHS["plugin-management"]);
   expect(hrefs()).toContain("/settings#composio");
 });

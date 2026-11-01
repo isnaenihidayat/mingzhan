@@ -14,6 +14,8 @@ import {
   integrationSectionPath,
   PAGE_PATHS,
   pageIdFromPath,
+  SIDEBAR_PAGE_IDS,
+  sidebarPageId,
   visibleIntegrationSections,
   visibleNavGroups,
 } from "./navigation";
@@ -257,4 +259,11 @@ describe("canOpenPage", () => {
       canOpenPage("settings", { isPlatformAdmin: false, orgRole: "viewer" })
     ).toBe(true);
   });
+});
+
+test("plugin management stays in settings while connectors has a sidebar destination", () => {
+  expect(SIDEBAR_PAGE_IDS).not.toContain("plugin-management");
+  expect(SIDEBAR_PAGE_IDS).toContain("composio");
+  expect(sidebarPageId("plugin-management")).toBe("customize");
+  expect(sidebarPageId("composio")).toBe("composio");
 });

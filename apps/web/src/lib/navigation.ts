@@ -100,12 +100,7 @@ const NAV_GROUPS: NavGroup[] = [
         SharedWifiIcon
       ),
       navItem("plugin-management", "Plugins", "Manage plugins", PackageIcon),
-      navItem(
-        "composio",
-        "Connections",
-        "Connect apps and manage plugins",
-        PuzzleIcon
-      ),
+      navItem("composio", "Connectors", "Connect apps", PuzzleIcon),
     ],
     label: "Chat",
   },
@@ -187,9 +182,9 @@ export const SIDEBAR_PAGE_IDS: readonly PageId[] = [
   "customize",
 ];
 
-/** Plugins is a tab of Connections, so it lights up the Connections item. */
+/** Each management page has its own sidebar entry. */
 export function sidebarPageId(page: PageId): PageId {
-  return page === "plugin-management" ? "composio" : page;
+  return page === "plugin-management" ? "customize" : page;
 }
 
 export const STANDALONE_PAGES: Partial<Record<PageId, NavItem>> = {
