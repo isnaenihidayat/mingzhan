@@ -35,7 +35,6 @@ function createServerOptions() {
   return {
     agent: {
       assertSessionProfileAccess: async () => {},
-      beginSessionTurn: async () => true,
       createSession: async () => "session_1",
       getProfile: async () => ({ profile: { id: "default" } }),
       getSessionMessages: async () => ({

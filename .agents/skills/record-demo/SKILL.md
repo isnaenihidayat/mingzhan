@@ -77,8 +77,8 @@ async function flush() {
   if (!REC.buf.length) return;
   const items = REC.buf.splice(0);
   try {
-    const status = await RELAY.evaluate((it) => fetch("/frames", { method: "POST", headers: { "x-frame-relay": "1" }, body: JSON.stringify(it) }).then((r) => r.status), items);
-    if (status !== 200) throw new Error("frame server status " + status);
+    const res = await RELAY.evaluate((it) => fetch("/frames", { method: "POST", headers: { "x-frame-relay": "1" }, body: JSON.stringify(it) }).then((r) => r.status), items);
+    if (res.value !== 200) throw new Error("frame server status " + JSON.stringify(res));
   } catch (e) {
     REC.buf.unshift(...items);
     REC.err = String(e);

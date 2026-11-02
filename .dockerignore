@@ -23,3 +23,7 @@ file_demo/
 mingzhan-secrets.env
 
 !**/SKILL.md
+
+# Skill references must ship alongside instructions loaded with load_skill.
+!packages/core/src/skills/bundled/**/*.md
+!packages/plugins/**/skills/**/*.md

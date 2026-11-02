@@ -46,7 +46,23 @@ bun run dev:docs     # Dokumentasi lokal
 
 ## Menjalankan dengan Docker
 
-Build image lokal dan jalankan container menggunakan skrip proyek:
+Image rilis tersedia di `ghcr.io/isnaenihidayat/mingzhan` untuk Linux amd64 dan arm64. Untuk instalasi baru dengan Docker Compose:
+
+```bash
+mkdir -p mingzhan && cd mingzhan
+curl -fLO https://raw.githubusercontent.com/isnaenihidayat/mingzhan/v1.0.5/docker-compose.yaml
+umask 077
+if [ ! -e mingzhan-secrets.env ]; then
+  printf 'MINGZHAN_SECRETS_KEY=%s\n' "$(openssl rand -base64 32)" > mingzhan-secrets.env
+fi
+printf 'MINGZHAN_VERSION=1.0.5\n' > .env
+docker compose pull
+docker compose up -d
+```
+
+Buka **http://IP_SERVER:4310/chat**, lalu selesaikan setup admin sebelum membuka akses publik. Simpan master key asli saat update. Untuk domain dan HTTPS, ikuti [panduan server/VPS](docs/website/content/docs/install-vps.mdx).
+
+Untuk build image lokal:
 
 ```bash
 bash scripts/docker-build-run.sh

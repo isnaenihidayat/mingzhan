@@ -29,6 +29,11 @@ import {
   ChatQuickStarters,
   ChatWelcome,
 } from "@/pages/chat/chat-page-layout";
+import {
+  ChatStatusArtifactOpener,
+  ChatStatusButton,
+  ChatStatusProvider,
+} from "@/pages/chat/chat-status-panel";
 import type { ChatPageState } from "@/pages/chat/use-chat-page";
 
 const ProviderSetupForm = lazy(async () => ({
@@ -146,7 +151,10 @@ export function ChatPageContent({
         headerNotice={skillReviewBanner}
         onBtw={onBtw}
         onConnectProvider={() => setProviderDialogOpen(true)}
+        onEditQueuedMessage={state.editQueuedMessage}
         onModelChange={handleModelChange}
+        onRemoveQueuedMessage={state.removeQueuedMessage}
+        onSendQueuedMessageNow={state.sendQueuedMessageNow}
         onStop={stopStreaming}
         onSubmit={(text, files) => {
           void sendMessage(text, files);
@@ -251,6 +259,9 @@ function ChatConversation({
   state: ChatPageState;
 }) {
   const {
+    activeProfile,
+    contextUsage,
+    sessionChannel,
     agentQuestionnaire,
     branchingMessageId,
     busy,
@@ -272,64 +283,105 @@ function ChatConversation({
   // Cognito chats are not kept, so neither is their open panel.
   const rememberId = session && !state.cognito ? session.id : undefined;
 
-  return (
-    <ChatAttachmentPanelProvider
-      below={below}
-      key={session?.id ?? "new"}
-      rememberId={rememberId}
-    >
-      <ArtifactStreamingPanelBridge messages={messages} profileId={profileId} />
-      <BrowserLiveViewPanelBridge messages={messages} sessionId={session?.id} />
-      <ChatPageColumn cognito={cognitoSurface}>
-        {cognitoControl}
-        <div className="mx-auto flex min-h-0 w-full flex-1 flex-col">
-          <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-            <ChatMessageList
-              actionsDisabled={busy || readOnlySession}
-              branchingMessageId={branchingMessageId}
-              contentClassName="mx-auto w-full max-w-3xl px-4"
-              messages={messages}
-              modelLabel={
-                currentModelSelection
-                  ? renderModelLabel(currentModelSelection)
-                  : null
-              }
-              onBranchMessage={(message) => void handleBranchMessage(message)}
-              onContinueToolSetup={async (setupId) => {
-                await sendMessage(
-                  `Build the approved tool setup ${setupId}. Use this setupId with create_tool to connect the saved credentials and selected agent.`,
-                  []
-                );
-              }}
-              onEditMessage={(message, text) =>
-                void handleEditMessage(message, text)
-              }
-              onRetryMessage={(message) => void handleTryAgainMessage(message)}
-              onSubmitQuestionnaire={(answers) => {
-                void sendMessage(
-                  formatAgentQuestionnaireAnswersMessage(answers),
-                  [],
-                  { questionnaireAnswers: answers }
-                );
-              }}
-              profileId={profileId}
-              questionnaire={
-                !busy && queuedMessages.length === 0 ? agentQuestionnaire : null
-              }
-              sessionId={session?.id}
-              showThinking={showThinking}
-              showUsage={showUsage}
-              streamActive={busy}
-              turnStartedAt={turnStartedAt}
-              workStreamActive={turnStartedAt !== null}
-            />
-          </div>
+  const modelLabel = currentModelSelection
+    ? renderModelLabel(currentModelSelection)
+    : null;
 
-          <div className="sticky bottom-0 z-10 mt-auto w-full shrink-0 bg-background/95 pt-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] backdrop-blur supports-[backdrop-filter]:bg-background/85 sm:pt-4 sm:pb-4">
-            <div className="mx-auto w-full max-w-3xl">{composer}</div>
+  const statusData = useMemo(
+    () => ({
+      busy,
+      channel: sessionChannel,
+      contextUsage,
+      messages,
+      modelLabel,
+      profile: activeProfile,
+      profileId,
+    }),
+    [
+      busy,
+      sessionChannel,
+      contextUsage,
+      messages,
+      modelLabel,
+      activeProfile,
+      profileId,
+    ]
+  );
+
+  return (
+    <ChatStatusProvider data={statusData} key={session?.id ?? "new"}>
+      <ChatAttachmentPanelProvider
+        below={below}
+        key={session?.id ?? "new"}
+        rememberId={rememberId}
+      >
+        <ChatStatusArtifactOpener />
+        <ArtifactStreamingPanelBridge
+          messages={messages}
+          profileId={profileId}
+        />
+        <BrowserLiveViewPanelBridge
+          messages={messages}
+          sessionId={session?.id}
+        />
+        <ChatPageColumn cognito={cognitoSurface}>
+          {cognitoControl}
+          <div className="absolute top-2 right-14 z-20 rounded-full bg-background/80 backdrop-blur sm:right-16">
+            <ChatStatusButton />
           </div>
-        </div>
-      </ChatPageColumn>
-    </ChatAttachmentPanelProvider>
+          <div className="mx-auto flex min-h-0 w-full flex-1 flex-col">
+            <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+              <ChatMessageList
+                actionsDisabled={busy || readOnlySession}
+                branchingMessageId={branchingMessageId}
+                contentClassName="mx-auto w-full max-w-3xl px-4"
+                messages={messages}
+                modelLabel={
+                  currentModelSelection
+                    ? renderModelLabel(currentModelSelection)
+                    : null
+                }
+                onBranchMessage={(message) => void handleBranchMessage(message)}
+                onContinueToolSetup={async (setupId) => {
+                  await sendMessage(
+                    `Build the approved tool setup ${setupId}. Use this setupId with create_tool to connect the saved credentials and selected agent.`,
+                    []
+                  );
+                }}
+                onEditMessage={(message, text) =>
+                  void handleEditMessage(message, text)
+                }
+                onRetryMessage={(message) =>
+                  void handleTryAgainMessage(message)
+                }
+                onSubmitQuestionnaire={(answers) => {
+                  void sendMessage(
+                    formatAgentQuestionnaireAnswersMessage(answers),
+                    [],
+                    { questionnaireAnswers: answers }
+                  );
+                }}
+                profileId={profileId}
+                questionnaire={
+                  !busy && queuedMessages.length === 0
+                    ? agentQuestionnaire
+                    : null
+                }
+                sessionId={session?.id}
+                showThinking={showThinking}
+                showUsage={showUsage}
+                streamActive={busy}
+                turnStartedAt={turnStartedAt}
+                workStreamActive={turnStartedAt !== null}
+              />
+            </div>
+
+            <div className="sticky bottom-0 z-10 mt-auto w-full shrink-0 bg-background/95 pt-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] backdrop-blur supports-[backdrop-filter]:bg-background/85 sm:pt-4 sm:pb-4">
+              <div className="mx-auto w-full max-w-3xl">{composer}</div>
+            </div>
+          </div>
+        </ChatPageColumn>
+      </ChatAttachmentPanelProvider>
+    </ChatStatusProvider>
   );
 }

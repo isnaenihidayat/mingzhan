@@ -12,11 +12,13 @@ import {
 const FORCE_REFRESH_BUNDLED_SKILL_NAMES = new Set<string>([
   "manage-skills",
   "coding-agent",
+  "composio-integrations",
   "create-plugin",
   "coding-backend-codex",
   "coding-backend-cursor",
   "agent-browser",
   "artifact-design",
+  "slide-deck-design",
   "archive-profile-memory",
   "mingzhan-guide",
 ]);

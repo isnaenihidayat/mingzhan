@@ -1,0 +1,525 @@
+---
+title: "Instalasi server/VPS"
+description: "Panduan lengkap instalasi MingZhan di Ubuntu dengan Docker, domain, HTTPS, backup, update, dan pemulihan."
+---
+
+Panduan ini memakai **Ubuntu Server 24.04 LTS 64-bit, Docker Compose, dan Caddy**. Hasil akhirnya adalah MingZhan pada `https://mingzhan.example.com/chat`, dapat dibuka dari PC, laptop, Android, dan iOS.
+
+Untuk instalasi cepat dengan image GHCR, gunakan contoh Docker Compose pada [README](https://github.com/isnaenihidayat/mingzhan#menjalankan-dengan-docker). Versi panduan ini adalah **1.0.5**. Langkah di bawah memakai build source agar konfigurasi produksi, HTTPS, dan backup dapat dipahami serta disesuaikan.
+
+## 1. Persiapan
+
+| Kebutuhan | Rekomendasi awal |
+| --- | --- |
+| OS | Ubuntu Server 24.04 LTS, amd64 atau arm64 |
+| CPU/RAM | Mulai 2 vCPU/4 GB RAM untuk penggunaan kecil dengan model cloud; 8 GB RAM lebih nyaman untuk build langsung di VPS |
+| Disk | Mulai 40 GB SSD; tambah sesuai file, backup, dan cache Docker |
+| Akses | Akun SSH dengan sudo; contoh nama akun `deploy` |
+| Domain | Subdomain, misalnya `mingzhan.example.com` |
+| Provider AI | API key provider yang akan dipakai |
+
+Ini estimasi, bukan jaminan kapasitas. Model lokal, banyak worker, dan file besar memerlukan tambahan sumber daya. Model cloud tidak memerlukan GPU.
+
+Di DNS domain, buat record:
+
+| Type | Name | Value |
+| --- | --- | --- |
+| A | `mingzhan` | IPv4 publik VPS |
+
+Buat AAAA hanya jika IPv6 VPS benar-benar dapat diakses. Jika memakai Cloudflare, mulai dengan **DNS only** sampai HTTPS langsung berhasil.
+
+Pada firewall provider, izinkan SSH sesuai port server, TCP 80, dan TCP 443. Port 4310 tidak perlu dibuka ke internet.
+
+Ganti `IP_VPS`, `deploy`, `mingzhan.example.com`, dan email contoh dengan milik Anda pada semua perintah berikut.
+
+## 2. Masuk dan pasang Docker
+
+Dari komputer Anda:
+
+```bash
+ssh deploy@IP_VPS
+```
+
+Perintah selanjutnya dijalankan di **VPS**, kecuali diberi keterangan lain. Gunakan server baru; periksa instalasi Docker yang ada sebelum mengganti paket.
+
+```bash
+sudo apt update
+sudo apt install -y ca-certificates curl git openssl rsync nano ufw dnsutils
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+sudo tee /etc/apt/sources.list.d/docker.sources > /dev/null <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+sudo docker run --rm hello-world
+sudo docker compose version
+sudo docker buildx version
+```
+
+Langkah apt mengikuti [Docker resmi](https://docs.docker.com/engine/install/ubuntu/). Gunakan sudo; tidak perlu menambahkan akun ke grup docker.
+
+Jika menggunakan port SSH standar 22:
+
+```bash
+sudo ufw allow OpenSSH
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw enable
+sudo ufw status
+```
+
+Jika SSH memakai port lain, izinkan port tersebut **sebelum** mengaktifkan UFW. Port yang dipublikasikan Docker dapat melewati aturan UFW; karena itu Compose di bawah mengikat 4310 hanya ke loopback, bukan mengandalkan UFW saja.
+
+## 3. Siapkan direktori
+
+Di VPS:
+
+```bash
+sudo install -d -m 0750 -o "$(id -u)" -g "$(id -g)" /opt/mingzhan
+mkdir -p /opt/mingzhan/src
+cd /opt/mingzhan
+```
+
+Susunan direktori:
+
+```text
+/opt/mingzhan/
+  src/                    source aplikasi
+  compose.yaml            deployment produksi
+  Caddyfile               domain dan reverse proxy
+  .env                    domain dan tag image
+  mingzhan-secrets.env     master key dan seed awal
+```
+
+### Jalur A — source terbaru dari komputer ini
+
+Jalankan di **Mac/komputer lokal**. Ini menyalin source lokal tanpa `--delete`.
+
+```bash
+rsync -az --progress \
+  --exclude='.git/' \
+  --exclude='node_modules/' \
+  --exclude='dist/' \
+  --exclude='.env*' \
+  --exclude='mingzhan-secrets.env' \
+  --exclude='*.sqlite*' \
+  --exclude='*.db' \
+  --exclude='*.pem' \
+  --exclude='*.key' \
+  --exclude='file_demo/' \
+  --exclude='research/' \
+  /Users/isdev/OtherHD/Dev/MingZhan/mingzhan/ \
+  deploy@IP_VPS:/opt/mingzhan/src/
+```
+
+Trailing slash menyalin isi proyek ke `src/`. Percakapan dan akun lokal dipindahkan melalui backup/restore, bukan rsync source.
+
+### Jalur B — source publik GitHub
+
+Gunakan hanya jika tidak memilih jalur A:
+
+```bash
+cd /opt/mingzhan
+rmdir src
+git clone --branch v1.0.5 --depth 1 https://github.com/isnaenihidayat/mingzhan.git src
+```
+
+Jalur ini hanya memuat kode yang sudah di-push. `rmdir` gagal jika folder tidak kosong. Gunakan tag/commit teruji untuk build yang dapat direproduksi.
+
+## 4. Buat master key dan admin pertama
+
+Di VPS:
+
+```bash
+cd /opt/mingzhan
+umask 077
+if [ ! -e mingzhan-secrets.env ]; then
+  printf 'MINGZHAN_SECRETS_KEY=%s\n' "$(openssl rand -base64 32)" \
+    > mingzhan-secrets.env
+fi
+chmod 600 mingzhan-secrets.env
+nano mingzhan-secrets.env
+```
+
+Simpan master key yang sudah dibuat. Tambahkan tiga variabel berikut, menggunakan email dan nama Anda:
+
+```dotenv
+MINGZHAN_SEED_ADMIN_EMAIL=admin@example.com
+MINGZHAN_SEED_ADMIN_NAME=Admin
+```
+
+Untuk menambahkan password awal yang kuat tanpa mengetiknya ke shell history:
+
+```bash
+printf 'MINGZHAN_SEED_ADMIN_PASSWORD=%s\n' "$(openssl rand -hex 24)" \
+  >> mingzhan-secrets.env
+```
+
+Jalankan penambahan password ini **sekali**. Ketiga variabel seed harus ada bersama. Admin dibuat sebelum dashboard publik dibuka, sehingga pengunjung lain tidak dapat mengambil akun admin pertama melalui wizard.
+
+Lihat password awal hanya pada terminal pribadi Anda:
+
+```bash
+sed -n '/^MINGZHAN_SEED_ADMIN_PASSWORD=/p' mingzhan-secrets.env
+```
+
+**Jangan membuat master key baru ketika restart, update, atau restore.** Key yang sama diperlukan untuk membaca kredensial terenkripsi. Simpan salinannya di tempat aman yang terpisah dari backup data. Untuk migrasi data lama, gunakan master key lama dan lewati seed akun baru.
+
+## 5. Buat konfigurasi produksi
+
+Buat `.env` di VPS:
+
+```bash
+cd /opt/mingzhan
+nano .env
+```
+
+Isi:
+
+```dotenv
+MINGZHAN_DOMAIN=mingzhan.example.com
+MINGZHAN_IMAGE_REPOSITORY=mingzhan
+MINGZHAN_VERSION=server-current
+```
+
+Buat `compose.yaml`:
+
+```yaml
+name: mingzhan
+
+services:
+  mingzhan:
+    image: ${MINGZHAN_IMAGE_REPOSITORY:-mingzhan}:${MINGZHAN_VERSION:-server-current}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    env_file:
+      - mingzhan-secrets.env
+    environment:
+      MINGZHAN_CONFIG_DIR: /mingzhan/data
+      MINGZHAN_BACKUP_DIR: /mingzhan/backups
+      MINGZHAN_UPDATER_DIR: /mingzhan/updates
+      MINGZHAN_WEB_PUBLIC_URL: https://${MINGZHAN_DOMAIN:?Isi domain di .env}
+      MINGZHAN_TRUST_PROXY: "true"
+    ports:
+      - "127.0.0.1:4310:4310"
+    volumes:
+      - mingzhan-data:/mingzhan/data
+      - mingzhan-backups:/mingzhan/backups
+      - mingzhan-updates:/mingzhan/updates
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  caddy:
+    image: caddy:2.11.7-alpine
+    restart: unless-stopped
+    depends_on:
+      mingzhan:
+        condition: service_healthy
+    environment:
+      MINGZHAN_DOMAIN: ${MINGZHAN_DOMAIN:?Isi domain di .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  updater:
+    image: docker:29-cli
+    profiles: ["updater"]
+    restart: unless-stopped
+    environment:
+      DOCKER_HOST: unix:///var/run/docker.sock
+      MINGZHAN_IMAGE_REPOSITORY: ${MINGZHAN_IMAGE_REPOSITORY:-mingzhan}
+      MINGZHAN_IMAGE: ${MINGZHAN_IMAGE_REPOSITORY:-mingzhan}:${MINGZHAN_VERSION:-server-current}
+    entrypoint:
+      - sh
+      - -c
+      - docker run --rm --entrypoint cat "$$MINGZHAN_IMAGE" /app/scripts/mingzhan-updater.sh > /tmp/updater.sh && exec sh /tmp/updater.sh
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/compose
+      - mingzhan-updates:/updates
+
+volumes:
+  mingzhan-data:
+    name: mingzhan_data
+  mingzhan-backups:
+    name: mingzhan_backups
+  mingzhan-updates:
+    name: mingzhan_updates
+  caddy-data:
+    name: mingzhan_caddy_data
+  caddy-config:
+    name: mingzhan_caddy_config
+```
+
+Gunakan file produksi ini sendiri, **jangan digabung** dengan `src/docker-compose.yaml`: file source tersebut memublikasikan 4310 pada semua interface. Updater didefinisikan tetapi belum aktif; build source diperbarui manual pada langkah 10.
+
+Buat `Caddyfile`:
+
+```text
+{$MINGZHAN_DOMAIN} {
+    @metrics path /metrics
+    respond @metrics 404
+
+    reverse_proxy mingzhan:4310 {
+        flush_interval -1
+    }
+}
+```
+
+Caddy mengurus sertifikat dan perpanjangan HTTPS jika DNS benar dan port 80/443 dapat dijangkau. Volume Caddy menyimpan state sertifikat. Alur ini menggunakan domain publik, bukan sertifikat CA LAN. Lihat [automatic HTTPS Caddy](https://caddyserver.com/docs/automatic-https).
+
+## 6. Build dan jalankan
+
+Di VPS:
+
+```bash
+cd /opt/mingzhan
+sudo docker compose config --quiet
+sudo docker buildx build --load -t mingzhan:server-current ./src
+sudo docker compose up -d
+sudo docker compose ps
+sudo docker compose logs --tail 100 mingzhan caddy
+```
+
+Dockerfile membangun web, API, dan workers. Host tidak memerlukan Bun, Node.js, atau database terpisah.
+
+Untuk menyertakan binary coding agents Claude Code/Codex, ganti perintah build dengan:
+
+```bash
+sudo docker buildx build --load \
+  --build-arg INSTALL_CODING_AGENTS=true \
+  -t mingzhan:server-current ./src
+```
+
+Ini menambah ukuran image; akun coding agent tetap perlu dikonfigurasi. Google Meet capture memerlukan dependensi opsional tersendiri.
+
+Periksa layanan:
+
+```bash
+curl -fsS http://127.0.0.1:4310/health
+curl -fsS http://127.0.0.1:4310/readyz
+curl -I https://mingzhan.example.com/chat
+```
+
+`/health` seharusnya mengembalikan `ok: true`. Karena admin sudah di-seed, `userConfigured` seharusnya true; itu belum membuktikan provider AI sudah siap.
+
+## 7. Login dan hubungkan provider
+
+Buka `https://mingzhan.example.com/chat`.
+
+1. Login memakai email dan password seed.
+2. Jika provider belum tersedia, buka `/setup` atau **Settings → AI Providers**.
+3. Tambahkan provider yang dipakai, simpan API key, lalu pilih model.
+4. Buka chat dan kirim pesan uji.
+5. Tambahkan anggota melalui pengelolaan organisasi; berikan peran yang sesuai. Setiap orang memakai akunnya sendiri.
+
+Setelah login berhasil, ganti password awal melalui pengaturan akun jika tersedia. Hapus tiga baris `MINGZHAN_SEED_ADMIN_*` dari `mingzhan-secrets.env` dengan nano; **pertahankan master key**, lalu terapkan:
+
+```bash
+cd /opt/mingzhan
+sudo docker compose up -d --force-recreate mingzhan
+```
+
+Menghapus seed tidak menghapus akun dan tidak mereset password database.
+
+Dari PC, laptop, Android, atau iOS, gunakan alamat HTTPS yang sama. File tools dan Bash berjalan pada VPS, bukan otomatis pada perangkat pengunjung. Mengendalikan desktop/browser perangkat klien memerlukan bridge dan izin tersendiri. Dikte/notifikasi bergantung pada dukungan browser dan izin perangkat.
+
+## 8. Operasional sehari-hari
+
+Jalankan dari `/opt/mingzhan`:
+
+```bash
+sudo docker compose ps
+sudo docker compose logs --tail 100 mingzhan
+sudo docker compose logs --tail 100 caddy
+sudo docker compose restart mingzhan
+```
+
+Setelah mengubah `.env` atau secrets, gunakan `up -d --force-recreate mingzhan`, bukan hanya `restart`, agar environment dibaca ulang.
+
+Container hidup kembali setelah reboot bila Docker aktif. `docker compose down` menghentikan container/network. **Jangan gunakan `down -v` untuk restart/update**: opsi itu menghapus volume data.
+
+## 9. Backup
+
+### Export dashboard dan backup harian
+
+Platform admin dapat memakai **Settings → Export ZIP** pada pengaturan data workspace. File ini memuat data instalasi dan bukan sekadar satu percakapan. Simpan master key terpisah.
+
+Dengan konfigurasi di atas, backup harian terenkripsi disimpan pada `/mingzhan/backups`, di volume `mingzhan_backups`, dengan retensi tujuh backup terjadwal terbaru. Periksa:
+
+```bash
+sudo docker compose exec -T mingzhan sh -c 'ls -lh /mingzhan/backups'
+```
+
+Backup pada VPS yang sama bukan perlindungan dari hilangnya VPS. Salin backup ke penyimpanan lain secara berkala. File terjadwal `.zip.enc` bukan tar archive; jangan mengekstraknya memakai perintah tar di bawah.
+
+### Snapshot volume untuk update/pemulihan
+
+Buat backup konsisten saat aplikasi dihentikan sebentar:
+
+```bash
+cd /opt/mingzhan
+sudo docker compose stop -t 30 mingzhan
+sudo docker compose run --rm --no-deps -T \
+  --user 1000:1000 --entrypoint sh mingzhan -c \
+  'umask 077; tar -C /mingzhan/data -czf /mingzhan/backups/manual-$(date -u +%Y%m%dT%H%M%SZ).tar.gz .'
+sudo docker compose up -d mingzhan
+```
+
+Socket PM2 yang diabaikan tar dibuat kembali ketika aplikasi hidup. Jika backup gagal, tetap hidupkan kembali aplikasi dan periksa error sebelum melanjutkan update.
+
+Untuk menyalin backup keluar container:
+
+```bash
+mkdir -m 700 -p /opt/mingzhan/backup-export
+sudo docker compose cp mingzhan:/mingzhan/backups/. /opt/mingzhan/backup-export/
+sudo chown -R "$(id -u):$(id -g)" /opt/mingzhan/backup-export
+```
+
+Dari **komputer lokal**:
+
+```bash
+rsync -az deploy@IP_VPS:/opt/mingzhan/backup-export/ ./mingzhan-backups/
+mkdir -m 700 -p ./mingzhan-private-config
+scp deploy@IP_VPS:/opt/mingzhan/mingzhan-secrets.env ./mingzhan-private-config/
+chmod 600 ./mingzhan-private-config/mingzhan-secrets.env
+```
+
+Simpan juga `compose.yaml`, `.env`, `Caddyfile`, dan source/tag yang dipakai. Untuk source yang belum dipublikasikan, pertahankan arsip source atau ekspor image agar pemulihan dapat memakai build yang sama:
+
+```bash
+umask 077
+sudo docker image save mingzhan:server-current | gzip > mingzhan-server-image.tar.gz
+```
+
+Simpan image archive tersebut di luar VPS juga. Master key dan data backup sebaiknya disimpan terpisah.
+
+## 10. Update build source
+
+1. Buat snapshot pada langkah 9.
+2. Perbarui source. Jalur A: kirim source baru dengan rsync yang sama. Jalur B: jalankan `git pull --ff-only` pada `/opt/mingzhan/src` bila checkout bersih dan memang ingin memperbarui branch tersebut.
+3. Simpan image lama, build image berikutnya, lalu ganti service:
+
+```bash
+cd /opt/mingzhan
+MZ_ROLLBACK_TAG=before-update-$(date -u +%Y%m%dT%H%M%SZ)
+sudo docker tag mingzhan:server-current "mingzhan:$MZ_ROLLBACK_TAG"
+printf '%s\n' "$MZ_ROLLBACK_TAG" > rollback-image-tag.txt
+sudo docker buildx build --load -t mingzhan:server-next ./src
+sudo docker tag mingzhan:server-next mingzhan:server-current
+sudo docker compose up -d mingzhan
+sudo docker compose ps
+curl -fsS http://127.0.0.1:4310/health
+```
+
+Build sebelum mengganti aplikasi. Simpan image lama dan backup sampai chat, file, integrasi dan automations diperiksa.
+
+Bila perlu kembali ke image sebelumnya:
+
+```bash
+cd /opt/mingzhan
+MZ_ROLLBACK_TAG=$(cat rollback-image-tag.txt)
+sudo docker tag "mingzhan:$MZ_ROLLBACK_TAG" mingzhan:server-current
+sudo docker compose up -d mingzhan
+```
+
+**Rollback image bukan rollback database.** Jika versi baru telah memigrasikan data secara tidak kompatibel, pulihkan juga snapshot yang cocok. Jangan menebak kompatibilitas migrasi hanya berdasarkan nomor versi.
+
+### Kapan tombol Update Docker dapat dipakai?
+
+Updater membutuhkan image registry dengan tag rilis valid. Build lokal ini memakai update manual. Untuk beralih ke image GHCR:
+
+1. Verifikasi tag dengan `sudo docker buildx imagetools inspect ghcr.io/isnaenihidayat/mingzhan:1.0.5`.
+2. Ubah `.env`: repository menjadi `ghcr.io/isnaenihidayat/mingzhan`, versi menjadi tag valid, dan tambahkan `COMPOSE_PROFILES=updater`.
+3. Pull image valid, lalu jalankan Compose kembali:
+
+```bash
+sudo docker compose pull mingzhan updater
+sudo docker compose up -d
+sudo docker compose logs --tail 50 updater
+```
+
+Gunakan Version/Update di Settings setelah itu. Updater memakai Docker socket untuk mengganti container; ia tidak membangun source lokal.
+
+## 11. Restore pada server baru
+
+Gunakan archive `.tar.gz` hasil snapshot volume, bukan `.zip` atau `.zip.enc`. Restore ini untuk instalasi baru/volume kosong; bukan untuk menggabungkan dua instalasi.
+
+1. Siapkan Docker, direktori produksi, dan konfigurasi yang sama.
+2. Pasang kembali master key asli pada `mingzhan-secrets.env`. Jangan buat key baru dan jangan seed akun baru.
+3. Build source yang cocok dengan backup, atau muat image tersimpan:
+
+```bash
+gunzip -c mingzhan-server-image.tar.gz | sudo docker image load
+```
+
+4. Jangan jalankan service aplikasi dahulu. Pulihkan ke volume baru dengan nama yang sama seperti Compose:
+
+```bash
+sudo docker volume create mingzhan_data
+cat /path/ke/manual-backup.tar.gz | sudo docker run --rm -i \
+  --user 1000:1000 \
+  -v mingzhan_data:/mingzhan/data \
+  --entrypoint sh mingzhan:server-current -c \
+  'test ! -e /mingzhan/data/sqlite/mingzhan.sqlite || { echo "Volume sudah berisi database; restore dibatalkan." >&2; exit 1; }; tar -xzf - -C /mingzhan/data'
+```
+
+5. Arahkan DNS ke server baru bila IP berubah. Periksa domain/public URL, lalu jalankan:
+
+```bash
+cd /opt/mingzhan
+sudo docker compose up -d
+curl -fsS http://127.0.0.1:4310/health
+sudo docker compose logs --tail 100 mingzhan
+```
+
+Login memakai akun dari backup. Periksa percakapan, proyek, file dan provider. Pemulihan tidak memerlukan akun admin baru jika database lama telah dikembalikan. Lakukan uji restore berkala pada lingkungan terpisah.
+
+## 12. Troubleshooting
+
+| Gejala | Pemeriksaan |
+| --- | --- |
+| `pull access denied` / GHCR not found | Jangan gunakan tag yang belum diterbitkan. Ikuti build source dan pastikan tag di `.env` sama dengan hasil build. |
+| HTTPS gagal | Periksa `dig +short mingzhan.example.com`, A/AAAA, firewall provider, port 80/443, dan log Caddy. Pastikan domain bukan masih menuju host lama. |
+| `502 Bad Gateway` | Periksa health dan log MingZhan. Caddy menuju `mingzhan:4310`, bukan localhost di container Caddy. |
+| Login berulang/callback salah | Periksa public URL HTTPS, domain browser, header proxy dan trusted proxy. Pastikan akses lewat domain yang sama. |
+| Port 80/443 sudah dipakai | Cek `sudo ss -lntp`; jika VPS sudah memakai Nginx/Traefik/Caddy, gunakan reverse proxy yang ada atau sediakan host terpisah, bukan menjalankan dua listener pada port sama. |
+| Chat terbuka tetapi AI tidak menjawab | Periksa API key, model per agent, quota/billing provider, dan akses internet keluar VPS. Health OK tidak menguji model cloud. |
+| `Cannot decrypt` / master key mismatch | Kembalikan master key yang cocok dengan database/backup. Jangan mengatasi ini dengan menghasilkan key baru. |
+| Build berhenti/killed | Periksa RAM dan `df -h`; sediakan RAM/disk tambahan atau build pada mesin yang sesuai arsitektur VPS. |
+| PDF Chrome gagal di Docker | Checkout terbaru menyediakan fallback WeasyPrint. Browser print tetap tersedia. Jangan menonaktifkan sandbox host hanya untuk menyembunyikan error. |
+| Tools tidak melihat file komputer saya | Tools berjalan di VPS. Unggah file melalui aplikasi atau atur bridge/MCP yang memang diizinkan. |
+| Tombol Update tidak aktif | Normal pada build source dengan updater profile belum aktif; gunakan langkah update manual. |
+
+Validasi Compose/Caddy tidak membuktikan DNS, firewall, sertifikat publik, atau kapasitas VPS. Periksa semuanya sesudah instalasi.
+
+## Referensi
+
+- [Repository MingZhan](https://github.com/isnaenihidayat/mingzhan)
+- [Docker Engine pada Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
+- [Caddy automatic HTTPS](https://caddyserver.com/docs/automatic-https)
+- [Backup dan restore MingZhan](/backup-restore)

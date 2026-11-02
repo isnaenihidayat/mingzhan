@@ -31,7 +31,6 @@ async function toolFor(lastLine: string) {
     directory,
     disableModelInvocation: false,
     hasTool: true,
-    includeBodyOnMatch: true,
     name: "adder",
     scriptIssues: [],
     scriptTools: [],
@@ -93,7 +92,10 @@ test.skipIf(process.platform === "win32")(
       expect(result).toEqual({ env: "yes" });
     } finally {
       await rm(directory, { force: true, recursive: true });
-      await rm(process.env.MINGZHAN_CONFIG_DIR, { force: true, recursive: true });
+      await rm(process.env.MINGZHAN_CONFIG_DIR, {
+        force: true,
+        recursive: true,
+      });
 
       if (previous === undefined) {
         delete process.env.MINGZHAN_CONFIG_DIR;
@@ -116,7 +118,6 @@ test("a skill tool that never reads stdin is refused with a reason naming it", a
       directory,
       disableModelInvocation: false,
       hasTool: true,
-      includeBodyOnMatch: true,
       name: "echo",
       scriptIssues: [],
       scriptTools: [],
@@ -165,7 +166,6 @@ if __name__ == "__main__":
       directory,
       disableModelInvocation: false,
       hasTool: true,
-      includeBodyOnMatch: true,
       name: "config_reader",
       scriptIssues: [],
       scriptTools: [],

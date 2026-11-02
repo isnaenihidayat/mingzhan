@@ -1,6 +1,6 @@
 services:
   mingzhan:
-    image: ${MINGZHAN_IMAGE_REPOSITORY:-mingzhan}:${MINGZHAN_VERSION:-latest}
+    image: ${MINGZHAN_IMAGE_REPOSITORY:-ghcr.io/isnaenihidayat/mingzhan}:${MINGZHAN_VERSION:-latest}
     ports:
       - "4310:4310"
     env_file:
@@ -34,8 +34,8 @@ services:
     environment:
       # The docker:cli image defaults to tcp://docker:2375.
       - DOCKER_HOST=unix:///var/run/docker.sock
-      - MINGZHAN_IMAGE_REPOSITORY=${MINGZHAN_IMAGE_REPOSITORY:-mingzhan}
-      - MINGZHAN_IMAGE=${MINGZHAN_IMAGE_REPOSITORY:-mingzhan}:${MINGZHAN_VERSION:-latest}
+      - MINGZHAN_IMAGE_REPOSITORY=${MINGZHAN_IMAGE_REPOSITORY:-ghcr.io/isnaenihidayat/mingzhan}
+      - MINGZHAN_IMAGE=${MINGZHAN_IMAGE_REPOSITORY:-ghcr.io/isnaenihidayat/mingzhan}:${MINGZHAN_VERSION:-latest}
     # The script ships inside the MíngZhàn image, so it updates with MíngZhàn.
     entrypoint:
       - sh

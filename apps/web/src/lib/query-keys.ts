@@ -68,6 +68,7 @@ export const queryKeys = {
   mcp: {
     all: ["mcp", "servers"] as const,
     detail: (serverId: string) => ["mcp", "servers", serverId] as const,
+    registry: (query: string) => ["mcp", "registry", query] as const,
   },
   mingzhanUpgrade: ["system", "upgrade"] as const,
   mingzhanVersion: ["system", "version"] as const,

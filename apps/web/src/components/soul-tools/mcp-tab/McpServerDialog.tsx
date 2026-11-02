@@ -1,5 +1,6 @@
 import type {
   CreateMcpServerRequest,
+  McpRegistryServer,
   McpServerResponse,
   McpServerSummary,
 } from "@mingzhan/core/contract";
@@ -13,7 +14,9 @@ import {
   DialogTitle,
 } from "@mingzhan/ui/dialog";
 import { Spinner } from "@mingzhan/ui/spinner";
+import { toast } from "@mingzhan/ui/toast";
 import { cn } from "@mingzhan/ui/utils";
+import { useQueryClient } from "@tanstack/react-query";
 import { type ComponentProps, useState } from "react";
 import {
   McpAppPicker,
@@ -25,8 +28,15 @@ import {
 import { McpImportConfigDialog } from "@/components/soul-tools/mcp-tab/mcp-import-config-dialog";
 import { McpServerDialogForm } from "@/components/soul-tools/mcp-tab/mcp-server-dialog-form";
 import { unregisteredPopularServers } from "@/components/soul-tools/mcp-tab/popular-mcp-servers";
+import { emptyHeaderRow } from "@/components/soul-tools/mcp-tab/shared";
 import { useMcpServerDialogState } from "@/components/soul-tools/mcp-tab/use-mcp-server-dialog-state";
-import { useMcpServersQuery } from "@/hooks/use-app-queries";
+import { useAuth } from "@/context/use-auth";
+import { useMcpServersQuery, useProfileQuery } from "@/hooks/use-app-queries";
+import { connectComposioApp, useComposioToolkits } from "@/hooks/use-composio";
+import { formatError } from "@/lib/client";
+import { canManageAgent } from "@/lib/profiles";
+import { invalidateQueries } from "@/lib/query-client";
+import { queryKeys } from "@/lib/query-keys";
 
 type McpServerDialogState = ReturnType<typeof useMcpServerDialogState>;
 
@@ -147,7 +157,26 @@ function McpServerDialogCreateForm({
   );
 }
 
-type CreateView = "apps" | "connect" | "custom";
+type CreateView = "apps" | "custom" | "connect";
+
+function initialRegistryHeaderValue(header: {
+  isSecret?: boolean;
+  value?: string;
+}): string {
+  if (!header.value) {
+    return "";
+  }
+
+  // Keep the text before a "{placeholder}" (for example "Bearer ") so the
+  // user pastes only their own value. A secret without a template starts empty.
+  const templateIdx = header.value.indexOf("{");
+
+  if (templateIdx !== -1) {
+    return header.value.slice(0, templateIdx);
+  }
+
+  return header.isSecret ? "" : header.value;
+}
 
 function initialCreateView(preset?: PopularServer, custom = false): CreateView {
   if (preset) {
@@ -157,6 +186,96 @@ function initialCreateView(preset?: PopularServer, custom = false): CreateView {
   return custom ? "custom" : "apps";
 }
 
+function applyRegistryConnection(
+  server: McpRegistryServer,
+  state: McpServerDialogState
+): boolean {
+  const remote =
+    server.remotes.find(
+      (r) => r.type === "streamable-http" || r.type === "http"
+    ) ?? server.remotes[0];
+
+  if (!remote) {
+    return false;
+  }
+
+  state.setName(server.name);
+  state.setUrl(remote.url);
+  state.selectKind("http");
+
+  const headers = (remote.headers ?? [])
+    .filter((header) => header.isSecret === true || header.isRequired === true)
+    .map((header) => ({
+      key: header.name,
+      value: initialRegistryHeaderValue(header),
+    }));
+
+  state.setHeaders(headers.length > 0 ? headers : [emptyHeaderRow()]);
+  state.clearTestResult();
+
+  return true;
+}
+
+function offeredComposioToolkits(
+  composio: ReturnType<typeof useComposioToolkits>["data"],
+  canManage: boolean,
+  isOrgAdmin: boolean
+) {
+  const enabledSlugs = new Set(
+    composio?.orgToolkits
+      .filter((item) => item.status === "enabled")
+      .map((item) => item.toolkitSlug)
+  );
+
+  return composio?.configured && canManage
+    ? composio.catalog.filter(
+        (item) => isOrgAdmin || enabledSlugs.has(item.slug)
+      )
+    : [];
+}
+
+function configurePresetConnection(
+  item: PopularServer,
+  state: McpServerDialogState
+): CreateView | null {
+  if (!("url" in item)) {
+    return null;
+  }
+
+  state.selectKind(item.auth === "token" ? "http" : "signin");
+  state.setName(item.name);
+  state.setUrl(item.url);
+  state.setHeaders(
+    item.auth === "token"
+      ? [{ key: "Authorization", value: "" }]
+      : [emptyHeaderRow()]
+  );
+
+  return item.auth === "token" ? "custom" : "connect";
+}
+
+function McpPresetHelp({ preset }: { preset: PopularServer | null }) {
+  if (!preset?.authHelp) {
+    return null;
+  }
+
+  return (
+    <p className="px-6 text-muted-foreground text-sm">
+      {preset.authHelp}{" "}
+      {preset.docsUrl ? (
+        <a
+          className="underline"
+          href={preset.docsUrl}
+          rel="noreferrer"
+          target="_blank"
+        >
+          Setup guide
+        </a>
+      ) : null}
+    </p>
+  );
+}
+
 function McpCreateBody({
   availableServers,
   initialPreset,
@@ -164,6 +283,7 @@ function McpCreateBody({
   busy,
   onAssign,
   onOpenChange,
+  profileId,
   state,
 }: {
   availableServers?: McpServerSummary[];
@@ -172,8 +292,13 @@ function McpCreateBody({
   busy: boolean;
   onAssign?: (serverId: string) => void;
   onOpenChange: (open: boolean) => void;
+  profileId?: string;
   state: McpServerDialogState;
 }) {
+  const queryClient = useQueryClient();
+  const { activeOrg, user } = useAuth();
+  const isOrgAdmin = activeOrg?.role === "admin";
+
   const [view, setView] = useState<CreateView>(() =>
     initialCreateView(initialPreset, initialCustom)
   );
@@ -183,17 +308,79 @@ function McpCreateBody({
   );
 
   const [query, setQuery] = useState("");
+  const [connecting, setConnecting] = useState(false);
 
   // Every server in the org, assigned or not, so a preset never duplicates one.
   const { data: orgServers } = useMcpServersQuery();
+  const { data: composio } = useComposioToolkits();
+  const { data: profile } = useProfileQuery(profileId ?? null);
 
-  function startForm(name: string, url: string, token = false) {
-    state.selectKind(token ? "http" : "signin");
-    state.setHeaders(
-      token ? [{ key: "Authorization", value: "" }] : [{ key: "", value: "" }]
-    );
-    state.setName(name);
-    state.setUrl(url);
+  // A Composio app only works once it is on the agent, so offer it only to
+  // someone who can add it there.
+  const canManage = canManageAgent(profile, user, isOrgAdmin);
+
+  // A member cannot turn a toolkit on, so they see only the ones an admin has.
+  const offered = offeredComposioToolkits(composio, canManage, isOrgAdmin);
+
+  async function connectApp(item: PopularServer) {
+    setPreset(item);
+
+    if (
+      !(
+        item.toolkit && offered.some((toolkit) => toolkit.slug === item.toolkit)
+      )
+    ) {
+      // No Composio for this app here: sign in to its own MCP server.
+      const nextView = configurePresetConnection(item, state);
+
+      if (nextView) {
+        setView(nextView);
+      }
+
+      return;
+    }
+
+    if (!composio) {
+      return;
+    }
+
+    setConnecting(true);
+
+    try {
+      const signInUrl = await connectComposioApp({
+        isOrgAdmin,
+        profileId,
+        returnTo: `${window.location.pathname}${window.location.search}`,
+        toolkitSlug: item.toolkit,
+        toolkits: composio,
+      });
+
+      if (signInUrl) {
+        window.location.href = signInUrl;
+
+        return;
+      }
+
+      await invalidateQueries(
+        queryClient,
+        queryKeys.composio.toolkits,
+        queryKeys.composio.profileToolkits(profileId ?? "none"),
+        queryKeys.profiles.all
+      );
+      toast(`${item.name} is ready`);
+      onOpenChange(false);
+    } catch (error) {
+      toast(formatError(error));
+      setConnecting(false);
+    }
+  }
+
+  function selectRegistryServer(server: McpRegistryServer) {
+    if (!applyRegistryConnection(server, state)) {
+      return;
+    }
+
+    setView("custom");
   }
 
   if (state.pendingAuth) {
@@ -202,22 +389,8 @@ function McpCreateBody({
         name={state.pendingAuth.name}
         onDone={() => onOpenChange(false)}
         opened={state.pendingAuth.opened}
-        preset={preset ?? undefined}
         serverId={state.pendingAuth.serverId}
         url={state.pendingAuth.url}
-      />
-    );
-  }
-
-  if (view === "connect" && preset) {
-    return (
-      <McpConnectApp
-        busy={busy}
-        canSubmit={state.canSubmit}
-        onBack={() => setView("apps")}
-        onSubmit={state.handleSubmit}
-        preset={preset}
-        submitError={state.submitError}
       />
     );
   }
@@ -230,21 +403,7 @@ function McpCreateBody({
         onImport={state.openImportDialog}
         onKindChange={state.selectKind}
       >
-        {preset?.authHelp ? (
-          <p className="px-6 text-muted-foreground text-sm">
-            {preset.authHelp}{" "}
-            {preset.docsUrl ? (
-              <a
-                className="underline"
-                href={preset.docsUrl}
-                rel="noreferrer"
-                target="_blank"
-              >
-                Setup guide
-              </a>
-            ) : null}
-          </p>
-        ) : null}
+        <McpPresetHelp preset={preset} />
         <McpServerDialogCreateForm
           busy={busy}
           onOpenChange={onOpenChange}
@@ -256,21 +415,42 @@ function McpCreateBody({
     );
   }
 
+  if (view === "connect" && preset) {
+    return (
+      <McpConnectApp
+        busy={busy || connecting || state.formDisabled}
+        canSubmit={state.canSubmit}
+        onBack={() => setView("apps")}
+        onSubmit={(event) => {
+          if (
+            preset.toolkit &&
+            offered.some((toolkit) => toolkit.slug === preset.toolkit)
+          ) {
+            event.preventDefault();
+            void connectApp(preset);
+          } else {
+            void state.handleSubmit(event);
+          }
+        }}
+        preset={preset}
+        submitError={state.submitError}
+      />
+    );
+  }
+
   return (
     <McpAppPicker
-      busy={busy}
+      busy={busy || connecting}
       onAssign={onAssign}
-      onConnect={(item) => {
-        setPreset(item);
-        startForm(item.name, item.url, item.auth === "token");
-        setView(item.auth === "token" ? "custom" : "connect");
-      }}
+      onConnect={(item) => void connectApp(item)}
       onCustom={() => {
-        setPreset(null);
-        startForm("", "");
+        state.selectKind("signin");
+        state.setName("");
+        state.setUrl("");
         setView("custom");
       }}
       onQueryChange={setQuery}
+      onSelectRegistry={selectRegistryServer}
       popular={unregisteredPopularServers(orgServers ?? availableServers)}
       query={query}
       registered={onAssign ? (availableServers ?? []) : []}
@@ -289,6 +469,7 @@ export function McpServerDialog({
   onOpenChange,
   onSubmit,
   onAssign,
+  profileId,
 }: {
   open: boolean;
   busy: boolean;
@@ -302,6 +483,8 @@ export function McpServerDialog({
     request: CreateMcpServerRequest
   ) => Promise<McpServerResponse | void>;
   onAssign?: (serverId: string) => void;
+  /** The agent the dialog adds to; a preset app is assigned to it. */
+  profileId?: string;
 }) {
   const state = useMcpServerDialogState({
     busy,
@@ -355,6 +538,7 @@ export function McpServerDialog({
                 initialPreset={initialPreset}
                 onAssign={onAssign}
                 onOpenChange={onOpenChange}
+                profileId={profileId}
                 state={state}
               />
             ) : null}

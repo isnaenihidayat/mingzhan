@@ -4,7 +4,7 @@ import { access, mkdir, mkdtemp, readdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { discoverSkillDirectory } from "../discover";
-import { matchSkillsForMessage } from "../match";
+import { findExplicitSkill } from "../match";
 import { readBundledSkillMarkdown } from "./index";
 import { ensureBundledSkillFiles } from "./install";
 
@@ -66,10 +66,11 @@ describe("ensureBundledSkillFiles", () => {
       expect(discovered?.scriptIssues).toEqual([]);
       expect(discovered?.disableModelInvocation).toBe(false);
       expect(
-        matchSkillsForMessage(discovered ? [discovered] : [], message).map(
-          (skill) => skill.name
-        )
-      ).toEqual([name]);
+        findExplicitSkill(
+          discovered ? [discovered] : [],
+          `/skill ${name} ${message}`
+        )?.name
+      ).toBe(name);
 
       // Referenced procedures must survive installation beside SKILL.md.
       for (const match of discovered?.body.matchAll(
@@ -284,21 +285,22 @@ describe("ensureBundledSkillFiles", () => {
     ).toBe(await readBundledSkillMarkdown("artifact-design"));
   });
 
-  test("matches artifact-design for a casual slide deck request", async () => {
+  test("installs the slide deck template beside the skill", async () => {
     await ensureBundledSkillFiles();
 
-    const skill = await discoverSkillDirectory(
-      join(configDir, "agent", "skills", "artifact-design")
+    const template = await readFile(
+      join(
+        configDir,
+        "agent",
+        "skills",
+        "slide-deck-design",
+        "assets",
+        "deck.html"
+      ),
+      "utf8"
     );
 
-    expect(skill).not.toBeNull();
-
-    const matched = matchSkillsForMessage(
-      skill ? [skill] : [],
-      "hey can you make me a slide deck for our team sync on friday? it's about Q3 results. keep it like 6-7 slides"
-    );
-
-    expect(matched.map((entry) => entry.name)).toEqual(["artifact-design"]);
+    expect(template).toContain('class="slide"');
   });
 
   test("refreshes an installed memory archive skill on startup", async () => {
