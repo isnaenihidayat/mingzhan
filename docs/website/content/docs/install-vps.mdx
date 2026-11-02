@@ -5,7 +5,7 @@ description: "Panduan lengkap instalasi MingZhan di Ubuntu dengan Docker, domain
 
 Panduan ini memakai **Ubuntu Server 24.04 LTS 64-bit, Docker Compose, dan Caddy**. Hasil akhirnya adalah MingZhan pada `https://mingzhan.example.com/chat`, dapat dibuka dari PC, laptop, Android, dan iOS.
 
-Untuk instalasi cepat dengan image GHCR, gunakan contoh Docker Compose pada [README](https://github.com/isnaenihidayat/mingzhan#menjalankan-dengan-docker). Versi panduan ini adalah **1.0.5**. Langkah di bawah memakai build source agar konfigurasi produksi, HTTPS, dan backup dapat dipahami serta disesuaikan.
+Untuk instalasi cepat dengan image GHCR, gunakan contoh Docker Compose pada [README](https://github.com/isnaenihidayat/mingzhan#menjalankan-dengan-docker). Versi panduan ini adalah **1.0.6**. Langkah di bawah memakai build source agar konfigurasi produksi, HTTPS, dan backup dapat dipahami serta disesuaikan.
 
 ## 1. Persiapan
 
@@ -133,7 +133,7 @@ Gunakan hanya jika tidak memilih jalur A:
 ```bash
 cd /opt/mingzhan
 rmdir src
-git clone --branch v1.0.5 --depth 1 https://github.com/isnaenihidayat/mingzhan.git src
+git clone --branch v1.0.6 --depth 1 https://github.com/isnaenihidayat/mingzhan.git src
 ```
 
 Jalur ini hanya memuat kode yang sudah di-push. `rmdir` gagal jika folder tidak kosong. Gunakan tag/commit teruji untuk build yang dapat direproduksi.
@@ -453,7 +453,7 @@ sudo docker compose up -d mingzhan
 
 Updater membutuhkan image registry dengan tag rilis valid. Build lokal ini memakai update manual. Untuk beralih ke image GHCR:
 
-1. Verifikasi tag dengan `sudo docker buildx imagetools inspect ghcr.io/isnaenihidayat/mingzhan:1.0.5`.
+1. Verifikasi tag dengan `sudo docker buildx imagetools inspect ghcr.io/isnaenihidayat/mingzhan:1.0.6`.
 2. Ubah `.env`: repository menjadi `ghcr.io/isnaenihidayat/mingzhan`, versi menjadi tag valid, dan tambahkan `COMPOSE_PROFILES=updater`.
 3. Pull image valid, lalu jalankan Compose kembali:
 

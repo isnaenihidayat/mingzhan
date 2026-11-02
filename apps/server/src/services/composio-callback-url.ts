@@ -16,7 +16,8 @@ import {
  */
 export function resolveRequestClientOrigin(
   request?: Request,
-  explicitOrigin?: string
+  explicitOrigin?: string,
+  options: { initialSetup?: boolean } = {}
 ): string | undefined {
   const candidate = readClaimedOrigin(request, explicitOrigin);
 
@@ -26,6 +27,24 @@ export function resolveRequestClientOrigin(
 
   if (!isValidBaseUrl(candidate)) {
     throw new MíngZhànApiError("Origin must be an http or https URL.", 400);
+  }
+
+  // Only the zero-user setup route may bootstrap a direct deployment's URL.
+  // Keep the stricter OAuth/share allowlist for every other caller, and never
+  // replace an operator-provisioned URL or trust unverified forwarding headers.
+  const initialSetup = options.initialSetup && !resolveWebPublicUrl();
+  const browserOrigin = request?.headers.get("origin");
+
+  if (initialSetup && browserOrigin && !sameOrigin(candidate, browserOrigin)) {
+    throw new MíngZhànApiError("Origin is not allowed.", 400);
+  }
+
+  const directSetupOrigin =
+    initialSetup &&
+    sameOrigin(candidate, resolveRequestListenerOrigin(request));
+
+  if (directSetupOrigin) {
+    return new URL(candidate).origin;
   }
 
   if (!isAllowedClientOrigin(candidate, request)) {
@@ -103,6 +122,18 @@ function isAllowedClientOrigin(candidate: string, request?: Request): boolean {
     trustForwardedHeaders() &&
     sameHost(candidate, resolveRequestSelfOrigin(request))
   );
+}
+
+function sameOrigin(a: string, b?: string): boolean {
+  if (!b) {
+    return false;
+  }
+
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
 }
 
 /**

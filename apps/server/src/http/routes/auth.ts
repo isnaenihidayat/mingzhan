@@ -649,7 +649,8 @@ export function registerAuthRoutes(app: HonoApp, options: ServerOptions): void {
 
     const webPublicUrl = resolveRequestClientOrigin(
       c.req.raw,
-      body.webPublicUrl
+      body.webPublicUrl,
+      { initialSetup: true }
     );
 
     if (webPublicUrl) {
