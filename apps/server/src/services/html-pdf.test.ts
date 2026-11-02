@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import {
   chmod,
   mkdir,
@@ -131,3 +131,36 @@ test.skipIf(!hasChrome)(
   },
   60_000
 );
+
+test("finds Chrome in the Windows installation directory without PATH", async () => {
+  const originalRoot = process.env.ProgramFiles;
+  const originalChrome = process.env.MINGZHAN_CHROME_PATH;
+  const binary = path.join(
+    dir,
+    "Google",
+    "Chrome",
+    "Application",
+    "chrome.exe"
+  );
+  await mkdir(path.dirname(binary), { recursive: true });
+  await writeFile(binary, "installed Chrome fixture");
+  const which = spyOn(Bun, "which").mockReturnValue(null);
+
+  try {
+    delete process.env.MINGZHAN_CHROME_PATH;
+    process.env.ProgramFiles = dir;
+    expect(resolveChromeBin("win32")).toBe(binary);
+  } finally {
+    which.mockRestore();
+    if (originalRoot === undefined) {
+      delete process.env.ProgramFiles;
+    } else {
+      process.env.ProgramFiles = originalRoot;
+    }
+    if (originalChrome === undefined) {
+      delete process.env.MINGZHAN_CHROME_PATH;
+    } else {
+      process.env.MINGZHAN_CHROME_PATH = originalChrome;
+    }
+  }
+});

@@ -57,7 +57,9 @@ const MAC_CHROME =
 const CHROME_MISSING_MESSAGE =
   "PDF export needs headless Chrome on the MíngZhàn server. Ask the server admin to install Chrome or Chromium, or to set MINGZHAN_CHROME_PATH to the Chrome binary.";
 
-export function resolveChromeBin(): string | null {
+export function resolveChromeBin(
+  platform: NodeJS.Platform = process.platform
+): string | null {
   const configured = process.env.MINGZHAN_CHROME_PATH?.trim();
 
   if (configured) {
@@ -72,9 +74,31 @@ export function resolveChromeBin(): string | null {
     }
   }
 
-  return process.platform === "darwin" && existsSync(MAC_CHROME)
-    ? MAC_CHROME
-    : null;
+  if (platform === "win32") {
+    for (const root of [
+      process.env.ProgramFiles,
+      process.env["ProgramFiles(x86)"],
+      process.env.LOCALAPPDATA,
+    ]) {
+      if (!root) {
+        continue;
+      }
+
+      const binary = path.join(
+        root,
+        "Google",
+        "Chrome",
+        "Application",
+        "chrome.exe"
+      );
+
+      if (existsSync(binary)) {
+        return binary;
+      }
+    }
+  }
+
+  return platform === "darwin" && existsSync(MAC_CHROME) ? MAC_CHROME : null;
 }
 
 type JsonValue = z.infer<ReturnType<typeof z.json>>;
