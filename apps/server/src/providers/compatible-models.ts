@@ -19,6 +19,8 @@ import {
   readProviderString,
 } from "./shared";
 
+export { fetchNetraModelLimits } from "./netra-model-limits";
+
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 
 const DEFAULT_MAX_OUTPUT = 8192;

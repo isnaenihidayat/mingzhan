@@ -7,6 +7,7 @@
     "first-time-setup",
     "providers",
     "---Deploy---",
+    "install-vps",
     "docker",
     "coolify",
     "tailscale",

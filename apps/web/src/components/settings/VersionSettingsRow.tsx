@@ -15,6 +15,9 @@ import { queryKeys } from "@/lib/query-keys";
 
 type UpgradeStatus = MíngZhànUpgradeResponse["status"];
 
+const UPGRADE_DOCS_URL =
+  "https://ahmadrosid.github.io/mingzhan/docker#upgrade-a-docker-run-install";
+
 function VersionStatus({
   query,
 }: {
@@ -64,9 +67,19 @@ function UpgradeAction({
 
   if (!available) {
     return (
-      <pre className="overflow-x-auto rounded-md bg-muted px-3 py-2 font-mono text-xs">
-        {`sed -i 's/^MINGZHAN_VERSION=.*/MINGZHAN_VERSION=${latest}/' .env\ndocker compose pull && docker compose up -d`}
-      </pre>
+      <div className="space-y-1">
+        <pre className="overflow-x-auto rounded-md bg-muted px-3 py-2 font-mono text-xs">
+          {`sed -i 's/^MINGZHAN_VERSION=.*/MINGZHAN_VERSION=${latest}/' .env\ndocker compose pull && docker compose up -d`}
+        </pre>
+        <a
+          className="text-xs underline underline-offset-2"
+          href={UPGRADE_DOCS_URL}
+          rel="noreferrer"
+          target="_blank"
+        >
+          Not on Compose?
+        </a>
+      </div>
     );
   }
 
@@ -144,12 +157,22 @@ function UpgradeMessage({ status }: { status: UpgradeStatus }) {
   const failed = status.state === "failed" || status.state === "rolled_back";
 
   return (
-    <p
-      className={failed ? "text-destructive text-xs" : "text-xs"}
-      role="status"
-    >
-      {status.message}
-    </p>
+    <div className="space-y-1">
+      <p
+        className={failed ? "text-destructive text-xs" : "text-xs"}
+        role="status"
+      >
+        {status.message}
+      </p>
+      {status.state === "running" && status.progress ? (
+        <progress
+          aria-label="Download"
+          className="h-1 w-40 appearance-none overflow-hidden rounded-full [&::-moz-progress-bar]:bg-primary [&::-webkit-progress-bar]:bg-muted [&::-webkit-progress-value]:bg-primary"
+          max={status.progress.total}
+          value={status.progress.done}
+        />
+      ) : null}
+    </div>
   );
 }
 

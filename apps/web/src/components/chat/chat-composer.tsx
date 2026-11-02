@@ -124,7 +124,6 @@ import {
   selectFolderFiles,
 } from "@/lib/chat-images";
 import {
-  type ComposerStackEdge,
   composerHitTargetClass,
   composerIconButtonClass,
   composerInputGroupClass,
@@ -156,6 +155,9 @@ interface ChatComposerBaseProps {
   enableDictation?: boolean;
   error: string | null;
   footerClassName?: string;
+  onEditQueuedMessage?: (id: string, text: string) => void;
+  onRemoveQueuedMessage?: (id: string) => void;
+  onSendQueuedMessageNow?: (id: string) => void;
   onStop?: () => void;
   onSubmit: (text: string, files: FileUIPart[]) => void;
   placeholder?: string;
@@ -273,33 +275,6 @@ function ChatComposerOfflineHint({
   );
 }
 
-function ChatComposerWorkStack({
-  hasQueuedMessages,
-  queueStackEdge,
-  queuedMessages,
-  showTodos,
-  todos,
-}: {
-  hasQueuedMessages: boolean;
-  queueStackEdge: ComposerStackEdge;
-  queuedMessages: QueuedComposerMessage[];
-  showTodos: boolean;
-  todos: AgentTodo[];
-}) {
-  return (
-    <>
-      {showTodos ? <AgentTodoPanel stack todos={todos} /> : null}
-      {hasQueuedMessages ? (
-        <ChatMessageQueuePanel
-          messages={queuedMessages}
-          stack
-          stackEdge={queueStackEdge}
-        />
-      ) : null}
-    </>
-  );
-}
-
 const FULL_TEXTAREA_CLASS =
   "max-h-36 min-h-9 px-1 py-1 text-base leading-relaxed [scrollbar-gutter:stable] placeholder:text-muted-foreground sm:min-h-8 sm:text-sm";
 
@@ -407,6 +382,33 @@ function ChatComposerStackedPrompt({
   );
 }
 
+function barePromptAppearance(isMinimal: boolean) {
+  if (isMinimal) {
+    return {
+      className: composerShellCompactClass,
+      footerClass: "justify-end pt-1.5",
+      input: { multiple: false },
+      textarea: { className: MINIMAL_TEXTAREA_CLASS },
+    };
+  }
+
+  return {
+    className: composerShellClass,
+    footerClass: "flex-nowrap items-center gap-1.5 pt-1",
+    input: {
+      accept: ALL_ATTACHMENT_ACCEPT,
+      maxFileSize: MAX_IMAGE_BYTES,
+      maxFiles: MAX_FOLDER_FILES,
+      multiple: true,
+      prepareFiles: prepareChatUploadFiles,
+    },
+    textarea: {
+      className: FULL_TEXTAREA_CLASS,
+      longPasteWordThreshold: LONG_PASTE_WORD_THRESHOLD,
+    },
+  };
+}
+
 function ChatComposerBarePrompt({
   availableSkills,
   busy,
@@ -447,6 +449,7 @@ function ChatComposerBarePrompt({
   skillPickerKey: string;
 }) {
   const [dictationActive, setDictationActive] = useState(false);
+  const appearance = barePromptAppearance(isMinimal);
 
   return (
     <>
@@ -456,12 +459,9 @@ function ChatComposerBarePrompt({
         showTips={showTips}
       />
       <PromptInput
-        accept={isMinimal ? undefined : ALL_ATTACHMENT_ACCEPT}
-        className={isMinimal ? composerShellCompactClass : composerShellClass}
+        {...appearance.input}
+        className={appearance.className}
         inputGroupClassName={composerInputGroupClass}
-        maxFileSize={isMinimal ? undefined : MAX_IMAGE_BYTES}
-        maxFiles={isMinimal ? undefined : MAX_FOLDER_FILES}
-        multiple={!isMinimal}
         onError={
           isMinimal
             ? undefined
@@ -475,7 +475,6 @@ function ChatComposerBarePrompt({
           setAttachmentError(null);
           onSubmit(text.trim(), files);
         }}
-        prepareFiles={isMinimal ? undefined : prepareChatUploadFiles}
         rimActive={busy}
       >
         <ChatComposerCommandBanner availableSkills={availableSkills} />
@@ -485,12 +484,9 @@ function ChatComposerBarePrompt({
         <PromptInputBody>
           <ChatComposerTextarea
             availableSkills={availableSkills}
-            className={isMinimal ? MINIMAL_TEXTAREA_CLASS : FULL_TEXTAREA_CLASS}
+            {...appearance.textarea}
             disabled={disabled}
             key={skillPickerKey}
-            longPasteWordThreshold={
-              isMinimal ? undefined : LONG_PASTE_WORD_THRESHOLD
-            }
             onAddCommand={onAddCommand}
             placeholder={placeholder}
           />
@@ -498,9 +494,7 @@ function ChatComposerBarePrompt({
         <PromptInputFooter
           className={cn(
             "w-full border-0 px-0 py-0",
-            isMinimal
-              ? "justify-end pt-1.5"
-              : "flex-nowrap items-center gap-1.5 pt-1",
+            appearance.footerClass,
             footerClassName
           )}
         >
@@ -555,11 +549,8 @@ function resolveChatComposerLayout(
   const isMinimal = props.variant === "minimal";
   const todos = props.todos ?? EMPTY_TODOS;
   const queuedMessages = props.queuedMessages ?? EMPTY_QUEUED_MESSAGES;
-  const hasQueuedMessages = queuedMessages.length > 0;
 
   const showTodos = hasActiveAgentTodos(todos) && !displayError;
-
-  const queueStackEdge: ComposerStackEdge = showTodos ? "continue" : "start";
 
   const availableSkills = isMinimal
     ? EMPTY_SKILLS
@@ -569,13 +560,11 @@ function resolveChatComposerLayout(
     availableSkills,
     disabled: props.disabled ?? false,
     enableAddCommands: !isMinimal && enableAddCommands,
-    hasQueuedMessages,
     isMinimal,
     placeholder: props.placeholder ?? "Do anything...",
     queuedMessages,
-    queueStackEdge,
     showOfflineHint: !isMinimal && props.showOfflineHint === true,
-    showStacked: (showTodos || hasQueuedMessages) && !isMinimal,
+    showStacked: showTodos && !isMinimal,
     showTips: !isMinimal && props.showTips === true,
     showTodos,
     skillPickerKey: availableSkills.map((skill) => skill.id).join("\0"),
@@ -614,16 +603,20 @@ function ChatComposerMain({
     skillPickerKey: layout.skillPickerKey,
   };
 
+  const queue = layout.isMinimal ? null : (
+    <ChatMessageQueuePanel
+      messages={layout.queuedMessages}
+      onEdit={props.onEditQueuedMessage}
+      onRemove={props.onRemoveQueuedMessage}
+      onSendNow={props.onSendQueuedMessageNow}
+    />
+  );
+
   if (layout.showStacked && isFullComposer(props)) {
     return (
       <div className="relative flex w-full flex-col">
-        <ChatComposerWorkStack
-          hasQueuedMessages={layout.hasQueuedMessages}
-          queuedMessages={layout.queuedMessages}
-          queueStackEdge={layout.queueStackEdge}
-          showTodos={layout.showTodos}
-          todos={layout.todos}
-        />
+        {queue}
+        <AgentTodoPanel stack todos={layout.todos} />
         <div className="relative z-10 -mt-2 w-full">
           <ChatComposerStackedPrompt
             {...promptProps}
@@ -636,14 +629,17 @@ function ChatComposerMain({
   }
 
   return (
-    <ChatComposerBarePrompt
-      {...promptProps}
-      fullProps={isFullComposer(props) ? props : undefined}
-      isMinimal={layout.isMinimal}
-      primarySupportsVision={
-        isFullComposer(props) ? props.primarySupportsVision : undefined
-      }
-    />
+    <>
+      {queue}
+      <ChatComposerBarePrompt
+        {...promptProps}
+        fullProps={isFullComposer(props) ? props : undefined}
+        isMinimal={layout.isMinimal}
+        primarySupportsVision={
+          isFullComposer(props) ? props.primarySupportsVision : undefined
+        }
+      />
+    </>
   );
 }
 

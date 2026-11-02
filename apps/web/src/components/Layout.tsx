@@ -24,10 +24,8 @@ import { useBtwChatStore } from "@/context/btw-chat-store";
 import { useAppContext } from "@/context/use-app-context";
 import { useAgentGroupQuery } from "@/hooks/use-agent-groups";
 import { useOrgPlugins } from "@/hooks/use-plugins";
-import {
-  useHistorySessionsQuery,
-  useSessionSummaryQuery,
-} from "@/hooks/use-resource-mutations";
+import { useChatSessionSummary } from "@/hooks/use-resource-mutations";
+import { useOrgFromNotification, usePushPresence } from "@/hooks/use-web-push";
 import {
   enabledPluginNavEntries,
   findNavItem,
@@ -47,6 +45,8 @@ const BtwChatHost = lazy(() =>
 
 export function Layout() {
   const shell = useAppShell();
+  usePushPresence();
+  const switchingOrg = useOrgFromNotification();
   const btwOpen = useBtwChatStore((store) => store.chat !== null);
 
   return (
@@ -77,7 +77,7 @@ export function Layout() {
             <AppShellError error={shell.error} />
             <main className={appShellMainClassName(shell.page, shell.pathname)}>
               <RouteBoundary resetKey={shell.pathname}>
-                <Outlet />
+                {switchingOrg ? null : <Outlet />}
               </RouteBoundary>
             </main>
           </div>
@@ -149,18 +149,10 @@ function useAppShell() {
   const chatProfileId = chatRoute?.params.profileId ?? "";
   const chatSessionId = chatRoute?.params.sessionId ?? null;
 
-  const { data: sessions, hasNextPage } =
-    useHistorySessionsQuery(chatProfileId);
-
-  const listedChat = sessions.find((session) => session.id === chatSessionId);
-
-  // An old chat opened by URL can sit on a page the sidebar has not loaded.
-  const { data: unlistedChat } = useSessionSummaryQuery(
+  const chatTitle = useChatSessionSummary(
     chatProfileId,
-    listedChat || !hasNextPage ? null : chatSessionId
-  );
-
-  const chatTitle = (listedChat ?? unlistedChat)?.title?.trim();
+    chatSessionId
+  )?.title?.trim();
 
   // On a phone the header names the group.
   const groupRoute = groupRouteFromPath(location.pathname);

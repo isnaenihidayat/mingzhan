@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { createInMemoryDatabaseAdapter } from "@mingzhan/db";
 import { setupTestConfigDir } from "../test-config-dir";
 import { AgentService } from "./agent-service";
-import { createDefaultProfile } from "./agent-service-test-fixtures";
+import {
+  createDefaultProfile,
+  startStoppedTurn,
+} from "./agent-service-test-fixtures";
 import { sessionTurnRegistry } from "./session-turn-registry";
 
 const ORG_ID = "org_test";
@@ -80,8 +83,7 @@ describe("listSessions reports the live turn", () => {
     expect(await listed()).toEqual([]);
     expect(await listed("hello")).toEqual([sessionId]);
 
-    expect(await service.beginSessionTurn(sessionId, ORG_ID)).toBe(true);
-    sessionTurnRegistry.cancelTurn(sessionId);
+    expect(await startStoppedTurn(service, sessionId, ORG_ID)).toBe("started");
 
     expect(await listed()).toEqual([sessionId]);
   });
@@ -164,12 +166,51 @@ describe("listSessions reports the live turn", () => {
     const update = db.updateSessionClosedAt.bind(db);
     db.updateSessionClosedAt = () => Promise.reject(new Error("busy"));
 
-    await expect(service.beginSessionTurn(sessionId, ORG_ID)).rejects.toThrow();
+    await expect(
+      startStoppedTurn(service, sessionId, ORG_ID)
+    ).rejects.toThrow();
     expect(sessionTurnRegistry.isActive(sessionId)).toBe(false);
 
     db.updateSessionClosedAt = update;
-    expect(await service.beginSessionTurn(sessionId, ORG_ID)).toBe(true);
-    sessionTurnRegistry.cancelTurn(sessionId);
+    expect(await startStoppedTurn(service, sessionId, ORG_ID)).toBe("started");
+  });
+
+  test("a closed sub_agent chat does not reopen past the open-chat cap", async () => {
+    const { db, service } = await createService();
+    const access = { isPlatformAdmin: false, orgRole: null };
+
+    const parentId = await service.createSession(
+      ORG_ID,
+      "web",
+      "profile_default",
+      USER.id
+    );
+
+    const children: string[] = [];
+
+    for (let index = 0; index < 5; index += 1) {
+      children.push(
+        await service.createChildSession(
+          parentId,
+          ORG_ID,
+          `Topic ${index}`,
+          access
+        )
+      );
+    }
+
+    const closedId = children[0] ?? "";
+
+    expect(await service.closeSession(closedId, ORG_ID, { user: USER })).toBe(
+      true
+    );
+    await service.createChildSession(parentId, ORG_ID, "Topic 5", access);
+
+    await expect(
+      startStoppedTurn(service, closedId, ORG_ID)
+    ).rejects.toMatchObject({ status: 400 });
+    expect((await db.getSession(closedId))?.closedAt).toBeString();
+    expect(sessionTurnRegistry.isActive(closedId)).toBe(false);
   });
 
   test("closing a chat closes the chats sub_agent started from it, not its branches", async () => {

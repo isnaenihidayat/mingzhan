@@ -33,7 +33,6 @@ function createServerOptions() {
   return {
     agent: {
       assertSessionProfileAccess: async () => {},
-      beginSessionTurn: async () => true,
       createSession: async () => "session_1",
       getProfile: async () => ({ profile: { id: "default" } }),
       getSessionMessages: async () => ({
@@ -137,7 +136,10 @@ describe("createHonoApp", () => {
       expect(directives.get(name)).toEqual(["'none'"]);
     }
 
-    expect(directives.get("sandbox")).toEqual(["allow-scripts"]);
+    expect(directives.get("sandbox")).toEqual([
+      "allow-scripts",
+      "allow-modals",
+    ]);
     expect(response.headers.get("Permissions-Policy")).toBe(
       "camera=(), microphone=()"
     );

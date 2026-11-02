@@ -153,6 +153,7 @@ export function McpServersSection({
   expandedServerId,
   onToggleServer,
   onAddServer,
+  onSearchRegistry,
   onAddPreset,
   onEdit,
   onConnect,
@@ -165,6 +166,7 @@ export function McpServersSection({
   syncingServerId?: string | null;
   embedded?: boolean;
   onAddServer: () => void;
+  onSearchRegistry?: () => void;
   onAddPreset?: (preset: PopularServer) => void;
   expandedServerId: string | null;
   onToggleServer: (serverId: string | null) => void;
@@ -214,14 +216,26 @@ export function McpServersSection({
             from the library or configure your own.
           </p>
         </div>
-        <Button
-          className="h-10 shrink-0 rounded-xl"
-          disabled={busy}
-          onClick={onAddServer}
-          variant="outline"
-        >
-          Add custom server
-        </Button>
+        <div className="flex flex-wrap gap-2">
+          {onSearchRegistry ? (
+            <Button
+              className="h-10 shrink-0 rounded-xl"
+              disabled={busy}
+              onClick={onSearchRegistry}
+              variant="outline"
+            >
+              Search registry
+            </Button>
+          ) : null}
+          <Button
+            className="h-10 shrink-0 rounded-xl"
+            disabled={busy}
+            onClick={onAddServer}
+            variant="outline"
+          >
+            Add custom server
+          </Button>
+        </div>
       </header>
       <div className="flex flex-col gap-3 sm:flex-row">
         <div className="relative min-w-0 flex-1">

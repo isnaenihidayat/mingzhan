@@ -533,7 +533,10 @@ export async function createWindow(url, { show = true } = {}) {
         new URL(contents.getURL()).origin === origin;
 
       callback(
-        Boolean(sameServer && permission === "clipboard-sanitized-write")
+        Boolean(
+          sameServer &&
+            ["clipboard-sanitized-write", "notifications"].includes(permission)
+        )
       );
     }
   );

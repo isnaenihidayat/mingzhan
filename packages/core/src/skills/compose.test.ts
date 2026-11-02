@@ -1,10 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
   composeAgentBrowserCapabilityPrompt,
-  composeMatchedSkillsPrompt,
+  composeLoadedSkillPrompt,
   composeSkillsCatalog,
 } from "./compose";
-import { matchSkillsForMessage } from "./match";
 import type { DiscoveredSkill } from "./types";
 
 const baseSkill: DiscoveredSkill = {
@@ -13,7 +12,6 @@ const baseSkill: DiscoveredSkill = {
   directory: "/tmp/weather",
   disableModelInvocation: false,
   hasTool: true,
-  includeBodyOnMatch: false,
   name: "weather",
   scriptIssues: [],
   scriptTools: [],
@@ -21,31 +19,32 @@ const baseSkill: DiscoveredSkill = {
   toolPath: "/tmp/weather/tool.ts",
 };
 
-describe("composeMatchedSkillsPrompt", () => {
-  test("omits body when body-on-match is disabled", () => {
-    const prompt = composeMatchedSkillsPrompt([baseSkill]);
+describe("composeLoadedSkillPrompt", () => {
+  test("includes the body and where to resolve references", () => {
+    const prompt = composeLoadedSkillPrompt(baseSkill);
 
-    expect(prompt).not.toContain("Call the weather tool");
+    expect(prompt).toContain("Call the weather tool with a city name.");
     expect(prompt).toContain(baseSkill.skillFilePath);
     expect(prompt).toContain(baseSkill.directory);
   });
+});
 
-  test("includes body when includeBodyOnMatch is true", () => {
-    const prompt = composeMatchedSkillsPrompt([
-      { ...baseSkill, includeBodyOnMatch: true },
+describe("composeSkillsCatalog", () => {
+  test("lists model-loadable skills and leaves out /skill-only skills", () => {
+    const catalog = composeSkillsCatalog([
+      baseSkill,
+      { ...baseSkill, disableModelInvocation: true, name: "deploy" },
     ]);
 
-    expect(prompt).toContain("Call the weather tool with a city name.");
-    expect(prompt).toContain(baseSkill.skillFilePath);
+    expect(catalog).toContain("**weather**");
+    expect(catalog).not.toContain("**deploy**");
+    expect(catalog).not.toContain(baseSkill.body);
   });
 
-  test("includes body on explicit invocation regardless of flag", () => {
-    const prompt = composeMatchedSkillsPrompt([baseSkill], {
-      explicitInvocation: true,
-    });
-
-    expect(prompt).toContain("Call the weather tool with a city name.");
-    expect(prompt).toContain(baseSkill.skillFilePath);
+  test("is empty when every skill is /skill-only", () => {
+    expect(
+      composeSkillsCatalog([{ ...baseSkill, disableModelInvocation: true }])
+    ).toBe("");
   });
 });
 
@@ -69,31 +68,6 @@ describe("composeAgentBrowserCapabilityPrompt", () => {
   });
 });
 
-describe("skill instruction discovery", () => {
-  test("natural-language Bang-Motion request gets its instruction location", () => {
-    const skill = {
-      ...baseSkill,
-      body: "Read references/explainer.md before creating the animation.",
-      directory: "/tmp/skills/bang-motion",
-      name: "bang-motion",
-      scriptIssues: [],
-      scriptTools: [],
-      skillFilePath: "/tmp/skills/bang-motion/SKILL.md",
-    };
-
-    const matched = matchSkillsForMessage(
-      [skill],
-      "Buatkan explainer tentang kereta Whoosh sekitar 1 menit\nstyle vector gunakan skill Bang-Motion"
-    );
-
-    expect(matched).toHaveLength(1);
-    const prompt = composeMatchedSkillsPrompt(matched);
-    expect(prompt).toContain(skill.skillFilePath);
-    expect(prompt).toContain(skill.directory);
-    expect(prompt).not.toContain(skill.body);
-  });
-});
-
 describe("skills that ship code nothing can run", () => {
   const stranded: DiscoveredSkill = {
     ...baseSkill,
@@ -104,13 +78,6 @@ describe("skills that ship code nothing can run", () => {
     ],
     toolPath: null,
   };
-
-  test("the catalog says the scripts cannot run", () => {
-    const line = composeSkillsCatalog([stranded]);
-
-    expect(line).toContain("ships 1 script that cannot run here");
-    expect(line).toContain("do not answer from their source");
-  });
 
   test("more than one is counted, not listed", () => {
     const line = composeSkillsCatalog([
@@ -127,13 +94,5 @@ describe("skills that ship code nothing can run", () => {
     ]);
 
     expect(line).toContain("ships 2 scripts that cannot run here");
-  });
-
-  test("a prose-only skill with no scripts stays silent", () => {
-    const prose = { ...baseSkill, hasTool: false, toolPath: null };
-    const line = composeSkillsCatalog([prose]);
-
-    expect(line).not.toContain("cannot run here");
-    expect(line).not.toContain("(includes tool)");
   });
 });

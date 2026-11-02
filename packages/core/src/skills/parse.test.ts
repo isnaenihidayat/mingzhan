@@ -40,17 +40,19 @@ description: Test skill.
     expect(parsed.frontmatter.name).toBe("opencode");
   });
 
-  test("parses include-body-on-match frontmatter", () => {
+  test("accepts legacy skill metadata without dropping instructions", () => {
     const parsed = parseSkillMarkdown(
       `---
 name: create-automation
 description: Schedule automations.
 include-body-on-match: true
 ---
+Follow the legacy instructions.
 `,
       "/tmp/skills/create-automation/SKILL.md"
     );
 
-    expect(parsed.frontmatter.includeBodyOnMatch).toBe(true);
+    const expectedBody = "Follow the legacy instructions.";
+    expect(parsed.body).toBe(expectedBody);
   });
 });

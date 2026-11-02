@@ -1,11 +1,14 @@
-import type { McpServerSummary } from "@mingzhan/core/contract";
+import type {
+  McpRegistryServer,
+  McpServerSummary,
+} from "@mingzhan/core/contract";
 import { Button } from "@mingzhan/ui/button";
 import { buttonVariants } from "@mingzhan/ui/button-variants";
 import { DialogTitle } from "@mingzhan/ui/dialog";
 import { Input } from "@mingzhan/ui/input";
 import { Spinner } from "@mingzhan/ui/spinner";
 import { cn } from "@mingzhan/ui/utils";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Add01Icon,
   ArrowLeft01Icon,
@@ -14,10 +17,12 @@ import {
   Search01Icon,
   Tick02Icon,
 } from "hugeicons-react";
-import { type FormEvent, type ReactNode, useState } from "react";
+import { type FormEvent, type ReactNode, useEffect, useState } from "react";
 import { POPULAR_SERVERS } from "@/components/soul-tools/mcp-tab/popular-mcp-servers";
 import type { McpServerKind } from "@/components/soul-tools/mcp-tab/use-mcp-server-dialog-state";
+import { useAuth } from "@/context/use-auth";
 import { useMcpServerDetailQuery } from "@/hooks/use-app-queries";
+import { client, formatError } from "@/lib/client";
 import { queryKeys } from "@/lib/query-keys";
 
 export type PopularServer = (typeof POPULAR_SERVERS)[number];
@@ -116,7 +121,7 @@ function appCards({
 
   const connect = popular.map((preset) => ({
     description: preset.description,
-    key: preset.url,
+    key: preset.toolkit ?? preset.name,
     name: preset.name,
     onPick: () => onConnect(preset),
     preset,
@@ -162,6 +167,44 @@ function AppCardButton({ busy, card }: { busy: boolean; card: AppCard }) {
           Connect
         </span>
       )}
+    </button>
+  );
+}
+
+function RegistryServerCardButton({
+  busy,
+  onSelect,
+  server,
+}: {
+  busy: boolean;
+  onSelect: (server: McpRegistryServer) => void;
+  server: McpRegistryServer;
+}) {
+  return (
+    <button
+      aria-label={`Add ${server.name} from registry`}
+      className="flex h-full w-full items-center gap-3 rounded-lg border border-border bg-card px-3 py-2.5 text-left transition-colors hover:bg-muted/50 disabled:opacity-50"
+      disabled={busy}
+      onClick={() => onSelect(server)}
+      type="button"
+    >
+      <div
+        aria-hidden
+        className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted font-semibold text-foreground/80 text-sm"
+      >
+        {server.name.charAt(0).toUpperCase()}
+      </div>
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="truncate font-medium text-foreground text-sm">
+          {server.name}
+        </span>
+        <span className="truncate text-muted-foreground text-xs">
+          {server.description || server.remotes[0]?.url || "Remote MCP server"}
+        </span>
+      </span>
+      <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-[0.6875rem] text-muted-foreground uppercase">
+        {server.transport}
+      </span>
     </button>
   );
 }
@@ -221,6 +264,7 @@ export function McpAppPicker({
   onConnect,
   onCustom,
   onQueryChange,
+  onSelectRegistry,
   popular,
   query,
   registered,
@@ -230,11 +274,30 @@ export function McpAppPicker({
   onConnect: (preset: PopularServer) => void;
   onCustom: () => void;
   onQueryChange: (value: string) => void;
+  onSelectRegistry?: (server: McpRegistryServer) => void;
   popular: readonly PopularServer[];
   query: string;
   registered: McpServerSummary[];
 }) {
   const [filter, setFilter] = useState<AppFilter>("all");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
+  const { user } = useAuth();
+  const isPlatformAdmin = user?.isPlatformAdmin === true;
+  const isSearchingRegistry = isPlatformAdmin && debouncedQuery.length >= 2;
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedQuery(query.trim()), 300);
+
+    return () => clearTimeout(timer);
+  }, [query]);
+
+  const registryResults = useQuery({
+    enabled: isSearchingRegistry,
+    queryFn: () => client.searchMcpRegistry(debouncedQuery),
+    queryKey: queryKeys.mcp.registry(debouncedQuery),
+    staleTime: 60_000,
+  });
+
   const needle = query.trim().toLowerCase();
 
   const searched = appCards({
@@ -256,6 +319,10 @@ export function McpAppPicker({
     (card) => !showChips || matchesFilter(card, filter)
   );
 
+  const registryServers = isSearchingRegistry
+    ? (registryResults.data?.servers ?? [])
+    : [];
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex flex-col gap-4 px-6 pt-6">
@@ -268,12 +335,17 @@ export function McpAppPicker({
             />
             <Input
               aria-label="Search apps"
-              className="pl-9"
+              className="pr-9 pl-9"
               onChange={(event) => onQueryChange(event.target.value)}
-              placeholder="Search apps"
+              placeholder="Search apps or registry"
               type="search"
               value={query}
             />
+            {isSearchingRegistry && registryResults.isFetching ? (
+              <span className="pointer-events-none absolute top-1/2 right-3 -translate-y-1/2 text-muted-foreground">
+                <Spinner className="size-4" />
+              </span>
+            ) : null}
           </div>
           {showChips ? (
             <AppFilterChips
@@ -285,10 +357,28 @@ export function McpAppPicker({
         </div>
       </div>
 
+      {isSearchingRegistry && registryResults.error ? (
+        <div
+          className="mx-6 mt-3 rounded-md bg-destructive/10 px-3 py-2 text-destructive text-sm"
+          role="alert"
+        >
+          {formatError(registryResults.error)}
+        </div>
+      ) : null}
+
       <ul className="grid min-h-0 flex-1 auto-rows-min gap-2 overflow-y-auto px-6 py-5 sm:grid-cols-2">
         {cards.map((card) => (
           <li key={card.key}>
             <AppCardButton busy={busy} card={card} />
+          </li>
+        ))}
+        {registryServers.map((server) => (
+          <li key={`${server.name}-${server.remotes[0]?.url}`}>
+            <RegistryServerCardButton
+              busy={busy}
+              onSelect={(item) => onSelectRegistry?.(item)}
+              server={server}
+            />
           </li>
         ))}
         <li>
@@ -389,6 +479,77 @@ export function McpCustomConnection({
   );
 }
 
+export function McpSignInPending({
+  name,
+  onDone,
+  opened,
+  serverId,
+  url,
+}: {
+  name: string;
+  onDone: () => void;
+  opened: boolean;
+  serverId: string;
+  url: string;
+}) {
+  const queryClient = useQueryClient();
+
+  const { data: server } = useMcpServerDetailQuery(serverId, {
+    refetchInterval: SIGN_IN_POLL_INTERVAL_MS,
+  });
+
+  const connected = server?.status === "connected";
+
+  function finish() {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.profiles.all });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.mcp.all });
+    onDone();
+  }
+
+  if (connected) {
+    return (
+      <div className="flex flex-1 flex-col items-center justify-center gap-4 p-6 text-center">
+        <CheckmarkCircle02Icon
+          aria-hidden
+          className="size-14 text-emerald-600 dark:text-emerald-400"
+        />
+        <DialogTitle className="text-xl">{name} is connected</DialogTitle>
+        <Button className="min-w-40" onClick={finish} size="lg" type="button">
+          Done
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-1 flex-col items-center justify-center gap-5 p-6 text-center">
+      <AppLogo name={name} size="lg" />
+      <DialogTitle className="text-xl">Finish signing in to {name}</DialogTitle>
+      <p className="max-w-sm text-muted-foreground text-sm">
+        Approve access in the {name} tab. This window updates by itself.
+      </p>
+      <a
+        className={cn(
+          buttonVariants({
+            size: "lg",
+            variant: opened ? "outline" : "default",
+          }),
+          "min-w-56"
+        )}
+        href={url}
+        rel="noreferrer"
+        target="_blank"
+      >
+        {opened ? `Open ${name} again` : `Open ${name}`}
+      </a>
+      <p className="flex items-center gap-2 text-muted-foreground text-sm">
+        <Spinner className="size-4" />
+        Waiting for approval
+      </p>
+    </div>
+  );
+}
+
 export function McpConnectApp({
   busy,
   canSubmit,
@@ -451,78 +612,5 @@ export function McpConnectApp({
         </Button>
       </div>
     </form>
-  );
-}
-
-export function McpSignInPending({
-  name,
-  onDone,
-  opened,
-  preset,
-  serverId,
-  url,
-}: {
-  name: string;
-  onDone: () => void;
-  opened: boolean;
-  preset?: PopularServer;
-  serverId: string;
-  url: string;
-}) {
-  const queryClient = useQueryClient();
-
-  const { data: server } = useMcpServerDetailQuery(serverId, {
-    refetchInterval: SIGN_IN_POLL_INTERVAL_MS,
-  });
-
-  const connected = server?.status === "connected";
-
-  function finish() {
-    void queryClient.invalidateQueries({ queryKey: queryKeys.profiles.all });
-    void queryClient.invalidateQueries({ queryKey: queryKeys.mcp.all });
-    onDone();
-  }
-
-  if (connected) {
-    return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-4 p-6 text-center">
-        <CheckmarkCircle02Icon
-          aria-hidden
-          className="size-14 text-emerald-600 dark:text-emerald-400"
-        />
-        <DialogTitle className="text-xl">{name} is connected</DialogTitle>
-        <Button className="min-w-40" onClick={finish} size="lg" type="button">
-          Done
-        </Button>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-5 p-6 text-center">
-      <AppLogo name={name} preset={preset} size="lg" />
-      <DialogTitle className="text-xl">Finish signing in to {name}</DialogTitle>
-      <p className="max-w-sm text-muted-foreground text-sm">
-        Approve access in the {name} tab. This window updates by itself.
-      </p>
-      <a
-        className={cn(
-          buttonVariants({
-            size: "lg",
-            variant: opened ? "outline" : "default",
-          }),
-          "min-w-56"
-        )}
-        href={url}
-        rel="noreferrer"
-        target="_blank"
-      >
-        {opened ? `Open ${name} again` : `Open ${name}`}
-      </a>
-      <p className="flex items-center gap-2 text-muted-foreground text-sm">
-        <Spinner className="size-4" />
-        Waiting for approval
-      </p>
-    </div>
   );
 }

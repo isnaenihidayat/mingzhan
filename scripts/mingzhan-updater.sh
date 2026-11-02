@@ -17,9 +17,11 @@ compose() {
   docker compose --project-directory "$COMPOSE_DIR" -p "$PROJECT" "$@"
 }
 
+# The optional fourth and fifth arguments are layers done and layers in total.
 status() {
-  printf '{"state":"%s","version":"%s","message":"%s","at":"%s"}\n' \
-    "$1" "$2" "$3" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$UPDATES/status.tmp"
+  printf '{"state":"%s","version":"%s","message":"%s","at":"%s"%s}\n' \
+    "$1" "$2" "$3" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "${5:+,\"progress\":{\"done\":$4,\"total\":$5\}}" > "$UPDATES/status.tmp"
   mv "$UPDATES/status.tmp" "$UPDATES/status.json"
   touch "$UPDATES/heartbeat"
   echo "updater: $1 $2 $3"
@@ -66,6 +68,22 @@ wait_healthy() {
   return 1
 }
 
+# Without a TTY, docker pull names each layer but prints no byte counts, so
+# progress is in layers. The log keeps the pull's exit status, a pipe would not.
+pull() {
+  docker pull "$REPO:$1" > /tmp/pull.log 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    total=$(grep -c 'Pulling fs layer' /tmp/pull.log)
+    finished=$(grep -c 'Pull complete' /tmp/pull.log)
+    if [ "$total" -gt 0 ]; then
+      status running "$1" "Downloading $1." "$finished" "$total"
+    fi
+    sleep 2
+  done
+  wait "$pid"
+}
+
 set_version() {
   if grep -q '^MINGZHAN_VERSION=' "$ENV_FILE" 2>/dev/null; then
     sed -i "s/^MINGZHAN_VERSION=.*/MINGZHAN_VERSION=$1/" "$ENV_FILE"
@@ -105,7 +123,7 @@ prepare() {
   [ "$FROM" != "$TO" ] || { status failed "$TO" "Already on $TO."; return 1; }
 
   status running "$TO" "Downloading $TO."
-  docker image inspect "$REPO:$TO" >/dev/null 2>&1 || docker pull -q "$REPO:$TO" >/dev/null ||
+  docker image inspect "$REPO:$TO" >/dev/null 2>&1 || pull "$TO" ||
     { status failed "$TO" "Could not download $TO. Nothing was changed."; return 1; }
   # Going back names the old version, so make sure that tag exists even on :latest.
   docker tag "$(docker inspect "$MINGZHAN" --format '{{.Image}}')" "$REPO:$FROM"
@@ -135,6 +153,13 @@ prune() {
     -c 'ls -1t /backup/pre-upgrade-*.tar.gz | tail -n +4 | xargs -r rm -f'
 }
 
+# This container outlives the upgrade, so without this it keeps the script of
+# the version it started on and a fix here never reaches the Update button.
+run_shipped_script() {
+  docker run --rm --entrypoint cat "$REPO:$TO" /app/scripts/mingzhan-updater.sh > /tmp/next.sh &&
+    exec sh /tmp/next.sh
+}
+
 upgrade() {
   prepare "$1" || return
   start || { restore "$TO did not become healthy."; return; }
@@ -148,6 +173,7 @@ upgrade() {
 
   prune
   status done "$TO" "Updated from $FROM to $TO."
+  run_shipped_script
 }
 
 # The data goes back to the archive taken when $1 was left, so anything written
@@ -164,6 +190,7 @@ rollback() {
 
   prune
   status done "$TO" "Restored $TO with its data from when it was left. $FROM is archived."
+  run_shipped_script
 }
 
 mkdir -p "$UPDATES"
@@ -172,6 +199,8 @@ while true; do
   touch "$UPDATES/heartbeat"
   if [ -f "$UPDATES/request" ]; then
     read -r action version < "$UPDATES/request"
+    # Before the request goes, so the page never sees neither of them.
+    status running "$version" "Starting."
     rm -f "$UPDATES/request"
     case "$action" in
       rollback) rollback "$version" ;;

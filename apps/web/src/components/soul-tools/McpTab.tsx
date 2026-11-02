@@ -47,6 +47,21 @@ function findMcpTargets(
   };
 }
 
+async function testMcpConnection(server: McpServerSummary) {
+  const result = await client.testMcpServer({
+    config: server.transport === "http" ? { url: "" } : { command: "" },
+    name: server.name,
+    serverId: server.id,
+    transport: server.transport,
+  });
+
+  if (!result.ok) {
+    throw new Error(result.error ?? "Connection test failed.");
+  }
+
+  return `Connection successful. Found ${result.toolCount} tool${result.toolCount === 1 ? "" : "s"}.`;
+}
+
 export function McpTab({ embedded = false }: { embedded?: boolean } = {}) {
   const [pendingAuth, setPendingAuth] = useState<{
     name: string;
@@ -72,6 +87,7 @@ export function McpTab({ embedded = false }: { embedded?: boolean } = {}) {
   const [testingServerId, setTestingServerId] = useState<string | null>(null);
   const [createPreset, setCreatePreset] = useState<PopularServer | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [createFromRegistry, setCreateFromRegistry] = useState(false);
   const [editServerId, setEditServerId] = useState<string | null>(null);
   const [expandedServerId, setExpandedServerId] = useState<string | null>(null);
 
@@ -180,20 +196,7 @@ export function McpTab({ embedded = false }: { embedded?: boolean } = {}) {
     setTestingServerId(server.id);
 
     try {
-      const result = await client.testMcpServer({
-        config: server.transport === "http" ? { url: "" } : { command: "" },
-        name: server.name,
-        serverId: server.id,
-        transport: server.transport,
-      });
-
-      if (result.ok) {
-        setActionNotice(
-          `Connection successful. Found ${result.toolCount} tool${result.toolCount === 1 ? "" : "s"}.`
-        );
-      } else {
-        setActionError(result.error ?? "Connection test failed.");
-      }
+      setActionNotice(await testMcpConnection(server));
     } catch (err) {
       setActionError(formatError(err));
     } finally {
@@ -234,16 +237,23 @@ export function McpTab({ embedded = false }: { embedded?: boolean } = {}) {
         embedded={embedded}
         expandedServerId={expandedServerId}
         onAddPreset={(preset) => {
+          setCreateFromRegistry(false);
           setCreatePreset(preset);
           setCreateOpen(true);
         }}
         onAddServer={() => {
+          setCreateFromRegistry(false);
           setCreatePreset(null);
           setCreateOpen(true);
         }}
         onConnect={(serverId) => void handleConnect(serverId)}
         onDelete={requestDelete}
         onEdit={setEditServerId}
+        onSearchRegistry={() => {
+          setCreateFromRegistry(true);
+          setCreatePreset(null);
+          setCreateOpen(true);
+        }}
         onSync={(serverId) => void handleSync(serverId)}
         onTestConnection={(serverId) => {
           const server = servers.find((item) => item.id === serverId);
@@ -259,9 +269,9 @@ export function McpTab({ embedded = false }: { embedded?: boolean } = {}) {
 
       <McpServerDialog
         busy={createMutation.isPending}
-        initialCustom
+        initialCustom={!createFromRegistry}
         initialPreset={createPreset ?? undefined}
-        key={createPreset?.name ?? "custom"}
+        key={createPreset?.name ?? (createFromRegistry ? "registry" : "custom")}
         onOpenChange={(open) => {
           setCreateOpen(open);
 
@@ -293,41 +303,16 @@ export function McpTab({ embedded = false }: { embedded?: boolean } = {}) {
         open={createOpen}
       />
 
-      <McpServerDialog
-        busy={updateMutation.isPending || connectMutation.isPending}
-        onOpenChange={(open) => {
-          if (!open) {
-            setEditServerId(null);
-            setActionError(null);
-          }
-        }}
-        onSubmit={async (request) => {
-          if (!editServer) {
-            return;
-          }
-
+      <McpEditServerDialog
+        connectMutation={connectMutation}
+        onClose={() => {
+          setEditServerId(null);
           setActionError(null);
-
-          try {
-            const wasConnected = editServer.status === "connected";
-            const { connect: _connect, ...updateRequest } = request;
-            await updateMutation.mutateAsync({
-              request: updateRequest,
-              serverId: editServer.id,
-            });
-            setEditServerId(null);
-
-            if (wasConnected) {
-              await connectMutation.mutateAsync(editServer.id);
-            }
-          } catch (err) {
-            const message = formatError(err);
-            setActionError(message);
-            throw new Error(message);
-          }
         }}
+        onError={setActionError}
         open={editServerId !== null}
         server={editServer}
+        updateMutation={updateMutation}
       />
 
       <DeleteMcpServerDialog
@@ -337,6 +322,60 @@ export function McpTab({ embedded = false }: { embedded?: boolean } = {}) {
         target={deleteTarget}
       />
     </>
+  );
+}
+
+function McpEditServerDialog({
+  connectMutation,
+  onClose,
+  onError,
+  open,
+  server,
+  updateMutation,
+}: {
+  connectMutation: ReturnType<typeof useConnectMcpServerMutation>;
+  onClose: () => void;
+  onError: (message: string | null) => void;
+  open: boolean;
+  server: McpServerSummary | null;
+  updateMutation: ReturnType<typeof useUpdateMcpServerMutation>;
+}) {
+  return (
+    <McpServerDialog
+      busy={updateMutation.isPending || connectMutation.isPending}
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen) {
+          onClose();
+        }
+      }}
+      onSubmit={async (request) => {
+        if (!server) {
+          return;
+        }
+
+        onError(null);
+
+        try {
+          const wasConnected = server.status === "connected";
+          const { connect: _connect, ...updateRequest } = request;
+          await updateMutation.mutateAsync({
+            request: updateRequest,
+            serverId: server.id,
+          });
+          onClose();
+
+          if (wasConnected) {
+            await connectMutation.mutateAsync(server.id);
+          }
+        } catch (err) {
+          const message = formatError(err);
+          onError(message);
+          throw new Error(message);
+        }
+      }}
+      open={open}
+      server={server}
+    />
   );
 }
 

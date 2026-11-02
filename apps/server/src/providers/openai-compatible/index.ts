@@ -55,6 +55,7 @@ export interface OpenAICompatibleProviderOptions {
   maxOutputTokens?: number;
   model: string;
   providerName?: ProviderClient["name"];
+  resolveMaxOutputTokens?: () => Promise<number | undefined>;
   supportsThinking: boolean;
   /** `responses` targets `/responses`; anything else stays on `/chat/completions`. */
   wireApi?: WireApi;
@@ -97,6 +98,7 @@ export function createOpenAICompatibleProvider(
         messages: input.messages,
         model,
         netra: options.providerName === "netra",
+        resolveMaxOutputTokens: options.resolveMaxOutputTokens,
         signal: input.signal,
         system: input.system,
         thinking: options.supportsThinking
@@ -179,6 +181,7 @@ export function createOpenAICompatibleProvider(
         messages: input.messages,
         model,
         netra: options.providerName === "netra",
+        resolveMaxOutputTokens: options.resolveMaxOutputTokens,
         signal: input.signal,
         system: input.system,
         thinking: options.supportsThinking
@@ -315,6 +318,7 @@ async function requestChatCompletion(
   label: string,
   options: {
     maxOutputTokens?: number;
+    resolveMaxOutputTokens?: () => Promise<number | undefined>;
     model: string;
     system: string;
     messages: ChatMessage[];
@@ -344,8 +348,11 @@ async function requestChatCompletion(
       request.tools = toOpenAITools(options.tools);
     }
 
-    if (options.maxOutputTokens) {
-      request.max_tokens = options.maxOutputTokens;
+    const maxTokens =
+      (await options.resolveMaxOutputTokens?.()) ?? options.maxOutputTokens;
+
+    if (maxTokens) {
+      request.max_tokens = maxTokens;
     }
 
     const completion = await client.chat.completions.create(request, {
@@ -393,6 +400,7 @@ async function requestChatCompletion(
 async function streamChatCompletion(options: {
   label: string;
   maxOutputTokens?: number;
+  resolveMaxOutputTokens?: () => Promise<number | undefined>;
   baseUrl: string;
   apiKey: string;
   model: string;
@@ -425,8 +433,11 @@ async function streamChatCompletion(options: {
     requestBody.tools = toOpenAITools(options.tools);
   }
 
-  if (options.maxOutputTokens) {
-    requestBody.max_tokens = options.maxOutputTokens;
+  const maxTokens =
+    (await options.resolveMaxOutputTokens?.()) ?? options.maxOutputTokens;
+
+  if (maxTokens) {
+    requestBody.max_tokens = maxTokens;
   }
 
   const response = await fetchWithoutIdleTimeout(

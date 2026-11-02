@@ -1,6 +1,7 @@
 name: Docker Publish
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -90,6 +91,10 @@ jobs:
           platforms: ${{ matrix.platform }}
           build-args: INSTALL_CODING_AGENTS=${{ matrix.coding_agents }}
           tags: ghcr.io/${{ github.repository }}:build-${{ github.sha }}-${{ matrix.arch }}${{ matrix.suffix }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=MingZhan Workspace
           cache-from: type=gha,scope=${{ matrix.arch }}${{ matrix.suffix }}
           cache-to: type=gha,scope=${{ matrix.arch }}${{ matrix.suffix }},mode=max
           # Runtime dependencies install from the committed lockfile, so the

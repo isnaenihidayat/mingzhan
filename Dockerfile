@@ -75,13 +75,14 @@ RUN set -eu; \
 FROM oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4 AS runtime
 WORKDIR /app
 
-# HTML artifact → PDF export (services/html-pdf.ts). WeasyPrint comes from pip:
-# Debian's 62.x drops clamp()/vw sizes, so decks print with default text.
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl sudo python3 python3-venv \
-    python3-pip libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0 fonts-dejavu-core \
+# Headless Chromium supports artifact PDF export without optional Meet audio dependencies.
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl sudo python3 python3-venv chromium chromium-sandbox fonts-liberation fonts-dejavu-core \
+    python3-pip libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0 \
   && PIP_NO_COMPILE=1 pip3 install --no-cache-dir --break-system-packages weasyprint==70.0 \
   && apt-get purge -y python3-pip && apt-get autoremove -y \
   && rm -rf /var/lib/apt/lists/*
+# Keep PDF export working on Docker hosts that cannot run the Chromium sandbox.
+ENV MINGZHAN_PDF_FALLBACK=weasyprint
 COPY --from=ffmpeg-binaries /ffmpeg /ffprobe /usr/local/bin/
 
 # Optional Google Meet audio-capture runtime. Chromium remains sandboxed and

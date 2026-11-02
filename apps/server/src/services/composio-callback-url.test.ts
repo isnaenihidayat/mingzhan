@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { saveUserWebPublicUrl } from "@mingzhan/core";
+import { MíngZhànApiError, saveUserWebPublicUrl } from "@mingzhan/core";
 import {
   isLoopbackComposioCallbackBaseUrl,
   persistWebPublicUrl,
@@ -14,6 +14,7 @@ describe("composio-callback-url", () => {
   const previous = {
     configDir: process.env.MINGZHAN_CONFIG_DIR,
     publicUrl: process.env.MINGZHAN_PUBLIC_URL,
+    trustProxy: process.env.MINGZHAN_TRUST_PROXY,
     webPublicUrl: process.env.MINGZHAN_WEB_PUBLIC_URL,
   };
 
@@ -28,6 +29,7 @@ describe("composio-callback-url", () => {
     process.env.MINGZHAN_CONFIG_DIR = isolatedConfigDir;
     delete process.env.MINGZHAN_PUBLIC_URL;
     delete process.env.MINGZHAN_WEB_PUBLIC_URL;
+    delete process.env.MINGZHAN_TRUST_PROXY;
   });
 
   afterEach(() => {
@@ -50,9 +52,19 @@ describe("composio-callback-url", () => {
     } else {
       process.env.MINGZHAN_WEB_PUBLIC_URL = previous.webPublicUrl;
     }
+
+    if (previous.trustProxy === undefined) {
+      delete process.env.MINGZHAN_TRUST_PROXY;
+    } else {
+      process.env.MINGZHAN_TRUST_PROXY = previous.trustProxy;
+    }
   });
 
   test("resolveRequestClientOrigin prefers explicit origin", () => {
+    // The precedence test needs an origin the request may name: behind a
+    // trusted proxy the listener host vouches for the explicit origin.
+    process.env.MINGZHAN_TRUST_PROXY = "true";
+
     const request = new Request(
       "http://app.example.com/v1/composio/toolkits/gmail/connect",
       {
@@ -60,9 +72,13 @@ describe("composio-callback-url", () => {
       }
     );
 
-    expect(
-      resolveRequestClientOrigin(request, "https://app.example.com/")
-    ).toBe("https://app.example.com");
+    try {
+      expect(
+        resolveRequestClientOrigin(request, "https://app.example.com/")
+      ).toBe("https://app.example.com");
+    } finally {
+      delete process.env.MINGZHAN_TRUST_PROXY;
+    }
   });
 
   test("resolveRequestClientOrigin rejects an origin off the request host", () => {
@@ -157,6 +173,147 @@ describe("composio-callback-url", () => {
     }
   });
 
+  test("a forwarded host alone does not become the callback base", () => {
+    const request = new Request(
+      "http://api.example.com/v1/composio/toolkits/gmail/connect",
+      {
+        headers: {
+          "X-Forwarded-Host": "evil.example.com",
+          "X-Forwarded-Proto": "https",
+        },
+        method: "POST",
+      }
+    );
+
+    // Without a trusted proxy the request URL names whatever the caller sent,
+    // so a remote base fails closed to loopback (#477).
+    expect(resolveComposioCallbackBaseUrl({ request })).toBe(
+      "http://127.0.0.1:3003"
+    );
+  });
+
+  test("a claimed origin is not vouched for by a forwarded header", () => {
+    const request = new Request(
+      "http://api.example.com/v1/composio/toolkits/gmail/connect",
+      {
+        headers: {
+          Origin: "https://evil.example.com",
+          "X-Forwarded-Host": "evil.example.com",
+          "X-Forwarded-Proto": "https",
+        },
+        method: "POST",
+      }
+    );
+
+    let thrown: unknown;
+
+    try {
+      resolveRequestClientOrigin(request);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(MíngZhànApiError);
+    // SAFETY: The instanceof check above narrows the caught error.
+    expect((thrown as MíngZhànApiError).status).toBe(400);
+  });
+
+  test("a spoofed request host cannot vouch for a remote claim", () => {
+    // Bun builds request.url from the caller's Host header, so a spoofed Host
+    // shows up here as the request URL itself.
+    const request = new Request(
+      "http://evil.example.com/v1/composio/toolkits/gmail/connect",
+      { headers: { Origin: "https://evil.example.com" }, method: "POST" }
+    );
+
+    let thrown: unknown;
+
+    try {
+      resolveRequestClientOrigin(request);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(MíngZhànApiError);
+    // SAFETY: The instanceof check above narrows the caught error.
+    expect((thrown as MíngZhànApiError).status).toBe(400);
+  });
+
+  test("an unflagged install fails closed to loopback for a spoofed host", () => {
+    const request = new Request(
+      "http://evil.example.com/v1/composio/toolkits/gmail/connect",
+      { method: "POST" }
+    );
+
+    expect(resolveComposioCallbackBaseUrl({ request })).toBe(
+      "http://127.0.0.1:3003"
+    );
+  });
+
+  test("a trusted proxy names the callback base and scheme", () => {
+    process.env.MINGZHAN_TRUST_PROXY = "true";
+
+    const request = new Request(
+      "http://internal:4310/v1/composio/toolkits/gmail/connect",
+      {
+        headers: {
+          "X-Forwarded-Host": "mingzhan.example.com",
+          "X-Forwarded-Proto": "https",
+        },
+        method: "POST",
+      }
+    );
+
+    try {
+      expect(resolveComposioCallbackBaseUrl({ request })).toBe(
+        "https://mingzhan.example.com"
+      );
+    } finally {
+      delete process.env.MINGZHAN_TRUST_PROXY;
+    }
+  });
+
+  test("a trusted proxy may vouch for the origin it names", () => {
+    process.env.MINGZHAN_TRUST_PROXY = "true";
+
+    const request = new Request(
+      "http://internal:4310/v1/composio/toolkits/gmail/connect",
+      {
+        headers: {
+          Origin: "https://mingzhan.example.com",
+          "X-Forwarded-Host": "mingzhan.example.com",
+          "X-Forwarded-Proto": "https",
+        },
+        method: "POST",
+      }
+    );
+
+    try {
+      expect(resolveRequestClientOrigin(request)).toBe(
+        "https://mingzhan.example.com"
+      );
+    } finally {
+      delete process.env.MINGZHAN_TRUST_PROXY;
+    }
+  });
+
+  test("a claimed origin matching the listener host is accepted behind a trusted proxy", () => {
+    process.env.MINGZHAN_TRUST_PROXY = "true";
+
+    const request = new Request(
+      "http://api.example.com/v1/composio/toolkits/gmail/connect",
+      { headers: { Origin: "http://api.example.com" }, method: "POST" }
+    );
+
+    try {
+      expect(resolveRequestClientOrigin(request)).toBe(
+        "http://api.example.com"
+      );
+    } finally {
+      delete process.env.MINGZHAN_TRUST_PROXY;
+    }
+  });
+
   test("the desktop app ignores a public URL restored from another install", async () => {
     // A backup restored into the desktop app carries the web install's URL,
     // but the desktop UI is only ever served on loopback.
@@ -216,7 +373,11 @@ describe("composio-callback-url", () => {
   });
 
   test("an unparseable clientOrigin is refused, not silently dropped", () => {
-    const configDir = join(tmpdir(), `mingzhan-callback-url-unset-${Date.now()}`);
+    const configDir = join(
+      tmpdir(),
+      `mingzhan-callback-url-unset-${Date.now()}`
+    );
+
     mkdirSync(configDir, { recursive: true });
     const previousConfigDir = process.env.MINGZHAN_CONFIG_DIR;
     const previousPublicUrl = process.env.MINGZHAN_WEB_PUBLIC_URL;
@@ -251,7 +412,11 @@ describe("composio-callback-url", () => {
   });
 
   test("persistWebPublicUrl preserves path segments", async () => {
-    const configDir = join(tmpdir(), `mingzhan-callback-url-test-${Date.now()}`);
+    const configDir = join(
+      tmpdir(),
+      `mingzhan-callback-url-test-${Date.now()}`
+    );
+
     mkdirSync(configDir, { recursive: true });
     const previousConfigDir = process.env.MINGZHAN_CONFIG_DIR;
     process.env.MINGZHAN_CONFIG_DIR = configDir;
@@ -278,7 +443,11 @@ describe("composio-callback-url", () => {
   });
 
   test("persistWebPublicUrl refuses a host the deployment does not serve", async () => {
-    const configDir = join(tmpdir(), `mingzhan-callback-url-host-${Date.now()}`);
+    const configDir = join(
+      tmpdir(),
+      `mingzhan-callback-url-host-${Date.now()}`
+    );
+
     mkdirSync(configDir, { recursive: true });
     const previousConfigDir = process.env.MINGZHAN_CONFIG_DIR;
     const previousPublicUrl = process.env.MINGZHAN_WEB_PUBLIC_URL;

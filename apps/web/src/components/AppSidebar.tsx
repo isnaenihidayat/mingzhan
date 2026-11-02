@@ -6,6 +6,7 @@ import type { ElementType } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { GroupRecents } from "@/components/agent-groups/group-recents";
 import { OrgSwitcher } from "@/components/OrgSwitcher";
+import { SidebarNotifications } from "@/components/SidebarNotifications";
 import { SidebarProjects } from "@/components/SidebarProjects";
 import { RecentChats } from "@/components/SidebarRecentChats";
 import { useAuth } from "@/context/use-auth";
@@ -156,6 +157,7 @@ export function AppSidebar({
           </div>
         )}
       </nav>
+      <SidebarNotifications collapsed={collapsed} />
     </aside>
   );
 }
