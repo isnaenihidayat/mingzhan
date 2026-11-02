@@ -390,21 +390,25 @@ export class SystemClient extends MíngZhànClientCore {
     );
   }
 
-  async discoverModels(request: {
-    baseUrl?: string;
-    apiKey?: string;
-    providerId?: string;
-    provider?:
-      | "ollama"
-      | "openai_compatible"
-      | "fireworks"
-      | "netra"
-      | "cloudflare";
-    hostMode?: "local" | "cloud";
-  }): Promise<ModelsResponse> {
+  async discoverModels(
+    request: {
+      baseUrl?: string;
+      apiKey?: string;
+      providerId?: string;
+      provider?:
+        | "ollama"
+        | "openai_compatible"
+        | "fireworks"
+        | "netra"
+        | "cloudflare";
+      hostMode?: "local" | "cloud";
+    },
+    options: { signal?: AbortSignal } = {}
+  ): Promise<ModelsResponse> {
     return this.request<ModelsResponse>("/v1/models/discover", {
       body: JSON.stringify(request),
       method: "POST",
+      signal: options.signal,
     });
   }
 

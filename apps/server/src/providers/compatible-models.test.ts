@@ -333,3 +333,96 @@ test("Netra upgrades a saved catalog without inheriting retired prices", () => {
   expect(models[0]?.id).toBe("deepseek/deepseek-v4.1-flash");
   expect(models[0]?.inputPerMillionUsd).toBeUndefined();
 });
+
+test("remote discovery stops at one deadline without retrying a stalled endpoint", async () => {
+  const controller = new AbortController();
+
+  const timeout = spyOn(AbortSignal, "timeout").mockReturnValue(
+    controller.signal
+  );
+
+  let calls = 0;
+  globalThis.fetch = asTestFetch((_url, init) => {
+    calls += 1;
+
+    return new Promise((resolve, reject) => {
+      const responseTimer = setTimeout(
+        () => resolve(Response.json({ data: [{ id: "late-model" }] })),
+        100
+      );
+
+      init?.signal?.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(responseTimer);
+          reject(init.signal?.reason);
+        },
+        { once: true }
+      );
+    });
+  });
+
+  const timer = setTimeout(
+    () => controller.abort(new DOMException("Timed out", "TimeoutError")),
+    25
+  );
+
+  try {
+    await expect(
+      fetchRemoteOpenAIModels("http://endpoint.test/v1", "test-key")
+    ).rejects.toMatchObject({ status: 504 });
+    expect(calls).toBe(1);
+  } finally {
+    clearTimeout(timer);
+    timeout.mockRestore();
+  }
+}, 1000);
+
+test("the shared discovery deadline also stops a stalled fallback response body", async () => {
+  const controller = new AbortController();
+
+  const timeout = spyOn(AbortSignal, "timeout").mockReturnValue(
+    controller.signal
+  );
+
+  let calls = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  mockServer = serve({
+    fetch: () => {
+      calls += 1;
+
+      if (calls === 1) {
+        return Response.json({ data: [] });
+      }
+
+      timer = setTimeout(
+        () => controller.abort(new DOMException("Timed out", "TimeoutError")),
+        50
+      );
+
+      return new Response(
+        new ReadableStream({
+          start(stream) {
+            stream.enqueue(new TextEncoder().encode('{"data":['));
+          },
+        }),
+        { headers: { "Content-Type": "application/json" } }
+      );
+    },
+    port: 0,
+  });
+
+  try {
+    await expect(
+      fetchRemoteOpenAIModels(
+        `http://127.0.0.1:${mockServer.port}/v1`,
+        "test-key"
+      )
+    ).rejects.toMatchObject({ status: 504 });
+    expect(calls).toBe(2);
+    expect(timeout).toHaveBeenCalledTimes(1);
+  } finally {
+    clearTimeout(timer);
+    timeout.mockRestore();
+  }
+}, 1000);

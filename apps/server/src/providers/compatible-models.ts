@@ -609,14 +609,17 @@ export async function fetchRemoteOpenAIModels(
   apiKey: string
 ): Promise<CustomModelEntry[]> {
   const normalized = normalizeBaseUrl(baseUrl);
+  const signal = AbortSignal.timeout(15_000);
 
   const client = new OpenAI({
     apiKey: apiKey || "not-needed",
     baseURL: normalized,
+    maxRetries: 0,
+    timeout: 15_000,
   });
 
   try {
-    const page = await client.models.list();
+    const page = await client.models.list({ signal });
     const entries: CustomModelEntry[] = [];
     const ids = new Set<string>();
 
@@ -636,7 +639,22 @@ export async function fetchRemoteOpenAIModels(
     // Fall through to raw fetch for hosts without SDK-compatible models.list.
   }
 
-  return fetchRemoteOpenAIModelsRaw(normalized, apiKey);
+  try {
+    if (signal.aborted) {
+      throw signal.reason;
+    }
+
+    return await fetchRemoteOpenAIModelsRaw(normalized, apiKey, signal);
+  } catch (error) {
+    if (signal.aborted) {
+      throw new MíngZhànApiError(
+        "The model endpoint timed out. Try again.",
+        504
+      );
+    }
+
+    throw error;
+  }
 }
 
 export async function fetchNetraModels(
@@ -659,7 +677,8 @@ export async function fetchNetraModels(
 
 async function fetchRemoteOpenAIModelsRaw(
   baseUrl: string,
-  apiKey: string
+  apiKey: string,
+  signal: AbortSignal
 ): Promise<CustomModelEntry[]> {
   let response: Response;
 
@@ -670,7 +689,7 @@ async function fetchRemoteOpenAIModelsRaw(
       headers.set("Authorization", `Bearer ${apiKey}`);
     }
 
-    response = await fetch(`${baseUrl}/models`, { headers });
+    response = await fetch(`${baseUrl}/models`, { headers, signal });
   } catch {
     throw new MíngZhànApiError("Could not reach the model endpoint.", 502);
   }
