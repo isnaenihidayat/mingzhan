@@ -212,6 +212,7 @@ function applyRegistryConnection(
 
   state.setHeaders(headers.length > 0 ? headers : [emptyHeaderRow()]);
   state.clearTestResult();
+
   return true;
 }
 
@@ -249,6 +250,7 @@ function configurePresetConnection(
       ? [{ key: "Authorization", value: "" }]
       : [emptyHeaderRow()]
   );
+
   return item.auth === "token" ? "custom" : "connect";
 }
 
@@ -330,6 +332,7 @@ function McpCreateBody({
     ) {
       // No Composio for this app here: sign in to its own MCP server.
       const nextView = configurePresetConnection(item, state);
+
       if (nextView) {
         setView(nextView);
       }
