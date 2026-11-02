@@ -25,6 +25,23 @@ const timeout = setTimeout(
   process.argv.includes("--runtime-test") ? 120_000 : 20_000
 );
 
+async function waitForRenderedState(window, script, ready) {
+  const deadline = Date.now() + 30_000;
+  let state;
+
+  while (Date.now() < deadline) {
+    state = await window.webContents.executeJavaScript(script);
+
+    if (ready(state)) {
+      return state;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+
+  throw new Error(`Renderer did not become ready: ${JSON.stringify(state)}`);
+}
+
 async function run() {
   app.setPath("userData", await mkdtemp(join(tmpdir(), "mingzhan-wrapper-")));
   app.setPath("sessionData", app.getPath("userData"));
@@ -218,10 +235,13 @@ async function run() {
       );
       assert.match(await (await fetch(`${local.url}/chat`)).text(), /<html/);
       const actual = await createWindow(`${local.url}/chat`, { show: false });
-      await new Promise((resolve) => setTimeout(resolve, 4000));
 
-      const rendered = await actual.webContents.executeJavaScript(
-        "({text:document.body.innerText, children:document.getElementById('root')?.childElementCount})"
+      const rendered = await waitForRenderedState(
+        actual,
+        "({text:document.body.innerText, children:document.getElementById('root')?.childElementCount})",
+        (state) =>
+          state.children > 0 &&
+          /Continue|Lanjut|Sign in|Masuk|Setup|Akun/i.test(state.text)
       );
 
       assert.ok(
@@ -279,10 +299,12 @@ async function run() {
         `fetch('/v1/auth/login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email:'desktop@example.test',password:'test-password-123'})}).then(r=>{if(!r.ok)throw new Error('Renderer login failed')})`
       );
       await authenticated.loadURL(`${local.url}/chat`);
-      await new Promise((resolve) => setTimeout(resolve, 3000));
 
-      const chat = await authenticated.webContents.executeJavaScript(
-        "({text:document.body.innerText, composer:!!document.querySelector('textarea,[contenteditable=true]')})"
+      const chat = await waitForRenderedState(
+        authenticated,
+        "({text:document.body.innerText, composer:!!document.querySelector('textarea,[contenteditable=true]')})",
+        (state) =>
+          state.composer || /This page couldn.t be loaded/.test(state.text)
       );
 
       assert.ok(
