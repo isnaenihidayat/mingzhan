@@ -50,12 +50,12 @@ Image rilis tersedia di `ghcr.io/isnaenihidayat/mingzhan` untuk Linux amd64 dan 
 
 ```bash
 mkdir -p mingzhan && cd mingzhan
-curl -fLO https://raw.githubusercontent.com/isnaenihidayat/mingzhan/v1.0.5/docker-compose.yaml
+curl -fLO https://raw.githubusercontent.com/isnaenihidayat/mingzhan/v1.0.6/docker-compose.yaml
 umask 077
 if [ ! -e mingzhan-secrets.env ]; then
   printf 'MINGZHAN_SECRETS_KEY=%s\n' "$(openssl rand -base64 32)" > mingzhan-secrets.env
 fi
-printf 'MINGZHAN_VERSION=1.0.5\n' > .env
+printf 'MINGZHAN_VERSION=1.0.6\n' > .env
 docker compose pull
 docker compose up -d
 ```

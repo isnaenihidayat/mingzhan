@@ -133,6 +133,181 @@ describe("web public url settings", () => {
     );
   });
 
+  test.each([
+    "http://192.168.1.2:4310",
+    "http://203.0.113.12:4310",
+    "http://[fd00::2]:4310",
+    "https://mingzhan.example.test",
+  ])("first-run setup saves its direct origin %s", async (origin) => {
+    await withTestEnv(
+      {
+        MINGZHAN_PUBLIC_URL: undefined,
+        MINGZHAN_TRUST_PROXY: undefined,
+        MINGZHAN_WEB_PUBLIC_URL: undefined,
+      },
+      async () => {
+        const { app, databaseAdapter } = createMinimalHonoApp();
+
+        const response = await app.fetch(
+          new Request(`${origin}/v1/auth/setup`, {
+            body: JSON.stringify({
+              ...buildSetupAuthBody(),
+              webPublicUrl: origin,
+            }),
+            headers: {
+              "Content-Type": "application/json",
+              Origin: origin,
+              Referer: `${origin}/setup`,
+            },
+            method: "POST",
+          })
+        );
+
+        expect(response.status).toBe(201);
+        expect(response.headers.has("set-cookie")).toBe(true);
+        expect(await databaseAdapter.countHumanUsers()).toBe(1);
+        expect(await loadUserWebPublicUrl()).toBe(origin);
+      }
+    );
+  });
+
+  test.each([
+    {
+      origin: "http://192.168.1.2:4310",
+      publicUrl: "https://attacker.example",
+    },
+    {
+      origin: "https://attacker.example",
+      publicUrl: "http://192.168.1.2:4310",
+    },
+    {
+      origin: "https://attacker.example",
+      publicUrl: "https://attacker.example",
+    },
+    { origin: "http://192.168.1.2:4311", publicUrl: "http://192.168.1.2:4311" },
+    {
+      origin: "https://192.168.1.2:4310",
+      publicUrl: "https://192.168.1.2:4310",
+    },
+  ])(
+    "first-run setup rejects conflicting or foreign origins: %j",
+    async ({ origin, publicUrl }) => {
+      await withTestEnv(
+        {
+          MINGZHAN_PUBLIC_URL: undefined,
+          MINGZHAN_TRUST_PROXY: undefined,
+          MINGZHAN_WEB_PUBLIC_URL: undefined,
+        },
+        async () => {
+          const { app, databaseAdapter } = createMinimalHonoApp();
+
+          const response = await app.fetch(
+            new Request("http://192.168.1.2:4310/v1/auth/setup", {
+              body: JSON.stringify({
+                ...buildSetupAuthBody(),
+                webPublicUrl: publicUrl,
+              }),
+              headers: {
+                "Content-Type": "application/json",
+                Origin: origin,
+                "X-Forwarded-Host": "attacker.example",
+                "X-Forwarded-Proto": "https",
+              },
+              method: "POST",
+            })
+          );
+
+          expect(response.status).toBe(400);
+          expect(await databaseAdapter.countHumanUsers()).toBe(0);
+          expect(await loadUserWebPublicUrl()).toBeNull();
+        }
+      );
+    }
+  );
+
+  test("first-run setup accepts a direct browser origin without an explicit public URL", async () => {
+    await withTestEnv(
+      {
+        MINGZHAN_PUBLIC_URL: undefined,
+        MINGZHAN_TRUST_PROXY: undefined,
+        MINGZHAN_WEB_PUBLIC_URL: undefined,
+      },
+      async () => {
+        const origin = "http://192.168.1.2:4310";
+        const { app } = createMinimalHonoApp();
+
+        const response = await app.fetch(
+          new Request(`${origin}/v1/auth/setup`, {
+            body: JSON.stringify(buildSetupAuthBody()),
+            headers: { "Content-Type": "application/json", Origin: origin },
+            method: "POST",
+          })
+        );
+
+        expect(response.status).toBe(201);
+        expect(await loadUserWebPublicUrl()).toBe(origin);
+      }
+    );
+  });
+
+  test("an explicit matching public URL enables direct VPS setup on existing images", async () => {
+    const origin = "http://192.168.1.2:4310";
+    await withTestEnv(
+      {
+        MINGZHAN_PUBLIC_URL: undefined,
+        MINGZHAN_TRUST_PROXY: undefined,
+        MINGZHAN_WEB_PUBLIC_URL: origin,
+      },
+      async () => {
+        const { app } = createMinimalHonoApp();
+
+        const response = await app.fetch(
+          new Request(`${origin}/v1/auth/setup`, {
+            body: JSON.stringify({
+              ...buildSetupAuthBody(),
+              webPublicUrl: origin,
+            }),
+            headers: { "Content-Type": "application/json", Origin: origin },
+            method: "POST",
+          })
+        );
+
+        expect(response.status).toBe(201);
+        expect(response.headers.has("set-cookie")).toBe(true);
+        expect(await loadUserWebPublicUrl()).toBe(origin);
+      }
+    );
+  });
+
+  test("first-run direct access cannot replace an operator-provisioned public URL", async () => {
+    await withTestEnv(
+      {
+        MINGZHAN_PUBLIC_URL: undefined,
+        MINGZHAN_TRUST_PROXY: undefined,
+        MINGZHAN_WEB_PUBLIC_URL: "https://mingzhan.example.com",
+      },
+      async () => {
+        const origin = "http://192.168.1.2:4310";
+        const { app, databaseAdapter } = createMinimalHonoApp();
+
+        const response = await app.fetch(
+          new Request(`${origin}/v1/auth/setup`, {
+            body: JSON.stringify({
+              ...buildSetupAuthBody(),
+              webPublicUrl: origin,
+            }),
+            headers: { "Content-Type": "application/json", Origin: origin },
+            method: "POST",
+          })
+        );
+
+        expect(response.status).toBe(400);
+        expect(await databaseAdapter.countHumanUsers()).toBe(0);
+        expect(await loadUserWebPublicUrl()).toBeNull();
+      }
+    );
+  });
+
   test("first-run setup accepts the origin a trusted proxy forwards", async () => {
     await withTestEnv(
       {
