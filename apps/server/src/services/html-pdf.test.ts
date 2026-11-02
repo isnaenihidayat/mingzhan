@@ -135,6 +135,7 @@ test.skipIf(!hasChrome)(
 test("finds Chrome in the Windows installation directory without PATH", async () => {
   const originalRoot = process.env.ProgramFiles;
   const originalChrome = process.env.MINGZHAN_CHROME_PATH;
+
   const binary = path.join(
     dir,
     "Google",
@@ -142,6 +143,7 @@ test("finds Chrome in the Windows installation directory without PATH", async ()
     "Application",
     "chrome.exe"
   );
+
   await mkdir(path.dirname(binary), { recursive: true });
   await writeFile(binary, "installed Chrome fixture");
   const which = spyOn(Bun, "which").mockReturnValue(null);
@@ -152,11 +154,13 @@ test("finds Chrome in the Windows installation directory without PATH", async ()
     expect(resolveChromeBin("win32")).toBe(binary);
   } finally {
     which.mockRestore();
+
     if (originalRoot === undefined) {
       delete process.env.ProgramFiles;
     } else {
       process.env.ProgramFiles = originalRoot;
     }
+
     if (originalChrome === undefined) {
       delete process.env.MINGZHAN_CHROME_PATH;
     } else {
