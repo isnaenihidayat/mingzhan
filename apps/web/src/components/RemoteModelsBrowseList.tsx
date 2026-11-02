@@ -1,7 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { CatalogModelsBrowseList } from "@/components/CatalogModelsBrowseList";
 import { client } from "@/lib/client";
+import { validateBaseUrlInput } from "@/lib/models";
 import { queryKeys } from "@/lib/query-keys";
 
 export interface RemoteModelRow {
@@ -53,11 +54,33 @@ export function RemoteModelsBrowseList({
   }, [apiKey]);
 
   const trimmedBaseUrl = baseUrl?.trim() ?? "";
-  const canFetch = Boolean(providerId?.trim() || trimmedBaseUrl);
+
+  const inputVersion = JSON.stringify([
+    trimmedBaseUrl,
+    credentialCacheKey,
+    providerId,
+    provider,
+    hostMode,
+  ]);
+
+  const [settledInput, setSettledInput] = useState<string | null>(null);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setSettledInput(inputVersion), 400);
+
+    return () => clearTimeout(timer);
+  }, [inputVersion]);
+
+  const canFetch =
+    settledInput === inputVersion &&
+    Boolean(
+      providerId?.trim() ||
+        (trimmedBaseUrl && !validateBaseUrlInput(trimmedBaseUrl))
+    );
 
   const { data, isLoading, error, refetch, isFetching } = useQuery({
     enabled: canFetch,
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       // When providerId is set, still forward baseUrl so Edit provider can probe a
       // typed (unsaved) URL while the server resolves stored credentials via id.
       const trimmedProviderId = providerId?.trim();
@@ -83,7 +106,7 @@ export function RemoteModelsBrowseList({
         request.hostMode = hostMode;
       }
 
-      const response = await client.discoverModels(request);
+      const response = await client.discoverModels(request, { signal });
 
       return (response.customModels ?? response.models ?? []).map((entry) => {
         const row: RemoteModelRow = {
@@ -109,6 +132,7 @@ export function RemoteModelsBrowseList({
       provider,
       providerId,
     }),
+    retry: false,
     staleTime: 1000 * 30,
   });
 
