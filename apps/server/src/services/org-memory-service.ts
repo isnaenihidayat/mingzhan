@@ -21,6 +21,7 @@ import {
   type OrgMemoryChangeLogEntry,
   parseOrgMemoryContent,
   rebuildOrgMemoryContent,
+  toHtmlCommentText,
 } from "@mingzhan/core";
 import { createChatLock } from "@mingzhan/core/channel-chat-lock";
 import {
@@ -504,7 +505,7 @@ export class OrgMemoryService {
 
       if (options.reason?.trim()) {
         appendLines.push(
-          `<!-- reason: ${options.reason.trim().replace(/-->/g, "")} -->`
+          `<!-- reason: ${toHtmlCommentText(options.reason)} -->`
         );
       }
 
@@ -726,7 +727,10 @@ export class OrgMemoryService {
     }
 
     if (proposal.status !== "pending") {
-      throw new MíngZhànApiError("Only pending proposals can be rejected.", 400);
+      throw new MíngZhànApiError(
+        "Only pending proposals can be rejected.",
+        400
+      );
     }
 
     const reviewedAt = new Date().toISOString();
@@ -888,7 +892,10 @@ export class OrgMemoryService {
 
   private requireDatabase(): DatabaseAdapter {
     if (!this.database) {
-      throw new MíngZhànApiError("Org memory proposals are not configured.", 500);
+      throw new MíngZhànApiError(
+        "Org memory proposals are not configured.",
+        500
+      );
     }
 
     return this.database;

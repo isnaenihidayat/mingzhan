@@ -207,9 +207,7 @@ function UserContextStatusCopy({
 
   return (
     <p className="text-muted-foreground text-xs">
-      {isActive
-        ? "USER.md is set for this org"
-        : "Answer a few questions so replies fit how you work"}
+      {isActive ? "Set for this org" : "Not set up"}
     </p>
   );
 }
@@ -234,8 +232,10 @@ export function UserContextSettings() {
     <>
       <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
         <div className="min-w-0 space-y-0.5">
-          <p className="font-medium text-foreground text-sm">Personalisation</p>
-          <UserContextStatusCopy isActive={isActive} loadError={loadError} />
+          <p className="text-foreground text-sm">Personalisation</p>
+          {isLoading ? null : (
+            <UserContextStatusCopy isActive={isActive} loadError={loadError} />
+          )}
         </div>
 
         {isLoading ? <Spinner /> : null}

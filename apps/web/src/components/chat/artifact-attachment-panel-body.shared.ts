@@ -1,5 +1,6 @@
 import type { ArtifactPreviewMode } from "@/components/chat/artifact-preview-mode-toggle";
 import { clampAttachmentPanelWidth } from "@/components/chat/attachment-panel-width";
+import { isXlsxFile } from "@/lib/artifact-spreadsheet";
 import {
   artifactCodeLanguage,
   isDelimitedSpreadsheetFile,
@@ -32,7 +33,11 @@ export function artifactPanelDefaultWidth(
     isDocxFile(filename, mimeType) || isLegacyDocFile(filename, mimeType);
 
   const isMarkdown = isMarkdownArtifactMimeType(mimeType) || isWordDocument;
-  const isSpreadsheet = isDelimitedSpreadsheetFile(filename, mimeType);
+
+  const isSpreadsheet =
+    isDelimitedSpreadsheetFile(filename, mimeType) ||
+    isXlsxFile(filename, mimeType);
+
   const language = artifactCodeLanguage(filename);
 
   const baseWidth = isVideo
@@ -75,6 +80,10 @@ export function artifactPanelTypeLabel({
   filename: string;
   mimeType: string;
 }): string {
+  if (isXlsxFile(filename, mimeType)) {
+    return "Excel";
+  }
+
   if (isHtmlArtifactMimeType(mimeType)) {
     return "HTML";
   }
@@ -115,6 +124,10 @@ export function artifactPanelHeaderMeta({
   streaming?: boolean;
   showPreviewToggle: boolean;
 }) {
+  if (isXlsxFile(filename, mimeType)) {
+    return { subtitle: null, title: filename, typeLabel: "Excel" };
+  }
+
   if (showPreviewToggle) {
     return {
       subtitle: null,

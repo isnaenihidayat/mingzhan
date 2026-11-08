@@ -793,7 +793,9 @@ export class PluginService {
           if (
             !(
               install &&
-              ["enabled", "disabled"].includes(install.lifecycleState)
+              ["enabled", "disabled", "retained"].includes(
+                install.lifecycleState
+              )
             )
           ) {
             throw new PluginHostError("invalid_state");

@@ -1,11 +1,17 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import type { ProviderClient, ToolCall } from "@mingzhan/core";
+import {
+  ensureBundledSkillFiles,
+  type GenerateChatInput,
+  type ProviderClient,
+  type ToolCall,
+} from "@mingzhan/core";
 import { createInMemoryDatabaseAdapter } from "@mingzhan/db";
 import { setupTestConfigDir } from "../test-config-dir";
 import { AgentService } from "./agent-service";
 import { createDefaultProfile } from "./agent-service-test-fixtures";
 import { McpClientManager } from "./mcp-client-manager";
 import { McpService } from "./mcp-service";
+import { SkillsService } from "./skills-service";
 
 const TEST_ORG_ID = "org_test";
 
@@ -208,5 +214,191 @@ describe("AgentService MCP discovery", () => {
         allowed ? { ok: true } : { error: expect.any(String) }
       );
     }
+  });
+});
+
+describe("AgentService /skill requests", () => {
+  setupTestConfigDir("mingzhan-explicit-skill-");
+
+  async function systemPromptFor(
+    message: string,
+    { assignMissingSkill = false } = {}
+  ): Promise<string> {
+    const db = createInMemoryDatabaseAdapter();
+    await db.upsertProfile(createDefaultProfile());
+
+    const skills = new SkillsService(db);
+    await ensureBundledSkillFiles();
+    await skills.syncDiscoveredSkills();
+
+    const manage = (await skills.listSkills()).skills.find(
+      (skill) => skill.name === "manage-skills"
+    );
+
+    await db.assignSkillToProfile("profile_default", manage!.id);
+
+    if (assignMissingSkill) {
+      // Assigned, but its files are gone, so it cannot load.
+      const record = await db.getSkillByName("manage-skills");
+
+      await db.upsertSkill({
+        ...record!,
+        id: "skill_ghost_notes",
+        name: "ghost-notes",
+        sourcePath: "/missing/ghost-notes",
+      });
+
+      await db.assignSkillToProfile("profile_default", "skill_ghost_notes");
+    }
+
+    const agent = new AgentService(null, null, db);
+    agent.setSkillsService(skills);
+
+    let system = "";
+
+    const answer = {
+      assistantMessage: { content: "ok", role: "assistant", toolCalls: [] },
+      content: "ok",
+      toolCalls: [],
+    };
+
+    const record = (input: GenerateChatInput) => {
+      system = input.system ?? "";
+
+      return Promise.resolve(answer);
+    };
+
+    Object.assign(agent, {
+      _providerConfigured: true,
+      createHarnessForProfile: () => ({
+        provider: { generateChat: record, name: "openai", streamChat: record },
+      }),
+    });
+
+    const sessionId = await agent.createSession(
+      TEST_ORG_ID,
+      "web",
+      "profile_default",
+      null
+    );
+
+    const session = await agent.sessions.get(sessionId, TEST_ORG_ID);
+    await session?.send({ message });
+
+    return system;
+  }
+
+  test("loads an assigned skill", async () => {
+    const system = await systemPromptFor("/skill manage-skills list them");
+
+    expect(system).toContain("# Active Skill: manage-skills");
+    expect(system).not.toContain('asked for the skill "manage-skills"');
+  });
+
+  test("tells the agent when the named skill is not assigned", async () => {
+    const system = await systemPromptFor("/skill ghost-notes summarize");
+
+    expect(system).toContain('"ghost-notes"');
+    expect(system).not.toContain("# Active Skill: ghost-notes");
+  });
+
+  test("ignores 'use skill' in ordinary prose", async () => {
+    const system = await systemPromptFor("how do I use skill based routing?");
+
+    expect(system).not.toContain('"based"');
+  });
+
+  test("does not tell the user to add a skill that is assigned but did not load", async () => {
+    const system = await systemPromptFor("/skill ghost-notes summarize", {
+      assignMissingSkill: true,
+    });
+
+    expect(system).toContain('"ghost-notes"');
+    expect(system).not.toContain("# Active Skill: ghost-notes");
+    expect(system).not.toContain("Add skill");
+  });
+});
+
+describe("AgentService documents from earlier turns", () => {
+  setupTestConfigDir("mingzhan-document-history-");
+
+  const pdf = Buffer.from("%PDF-1.4\n% mingzhan-2386 report\n%%EOF\n").toString(
+    "base64"
+  );
+
+  async function callsCarryingTheDocument(
+    assignExtract: boolean
+  ): Promise<boolean[]> {
+    const db = createInMemoryDatabaseAdapter();
+    await db.upsertProfile(createDefaultProfile());
+
+    if (assignExtract) {
+      const now = new Date().toISOString();
+
+      await db.upsertTool({
+        createdAt: now,
+        description: "extract_document_text",
+        handlerConfig: {},
+        handlerType: "builtin",
+        id: "tool_extract_document_text",
+        name: "extract_document_text",
+        updatedAt: now,
+      });
+      await db.assignToolToProfile(
+        "profile_default",
+        "tool_extract_document_text"
+      );
+    }
+
+    const agent = new AgentService(null, null, db);
+    const calls: GenerateChatInput[] = [];
+
+    const record = (input: GenerateChatInput) => {
+      calls.push(input);
+
+      return Promise.resolve({
+        assistantMessage: { content: "ok", role: "assistant", toolCalls: [] },
+        content: "ok",
+        toolCalls: [],
+      });
+    };
+
+    Object.assign(agent, {
+      _providerConfigured: true,
+      createHarnessForProfile: () => ({
+        provider: {
+          generateChat: record,
+          name: "anthropic",
+          streamChat: record,
+        },
+      }),
+    });
+
+    const sessionId = await agent.createSession(
+      TEST_ORG_ID,
+      "web",
+      "profile_default",
+      null
+    );
+
+    const session = await agent.sessions.get(sessionId, TEST_ORG_ID);
+
+    await session?.send({
+      documents: [
+        { data: pdf, filename: "report.pdf", mediaType: "application/pdf" },
+      ],
+      message: "Read this",
+    });
+    await session?.send({ message: "What was the total?" });
+
+    return calls.map((call) => JSON.stringify(call.messages).includes(pdf));
+  }
+
+  test("are sent as a reference when the profile can reopen them", async () => {
+    expect(await callsCarryingTheDocument(true)).toEqual([true, false]);
+  });
+
+  test("are sent in full when the profile cannot reopen them", async () => {
+    expect(await callsCarryingTheDocument(false)).toEqual([true, true]);
   });
 });

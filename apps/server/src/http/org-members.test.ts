@@ -281,6 +281,26 @@ test("shared agent selection returns stable team profiles and enforces invocatio
     expect(response.status).toBe(expected);
   }
 
+  await db.upsertMcpServer({
+    cachedTools: [],
+    config: { url: "https://mcp.example.test" },
+    createdAt: now,
+    enabled: true,
+    id: "mcp_team",
+    lastError: "fetch failed: https://mcp.example.test/v1?key=team",
+    name: "Team MCP",
+    orgId: "org_team_a",
+    status: "error",
+    transport: "http",
+    updatedAt: now,
+  });
+  await db.assignMcpServerToProfile(profileId, "mcp_team");
+  const withMcp = await post();
+  expect(withMcp.status).toBe(200);
+  const withMcpResult: ProfileResponse = await withMcp.json();
+  expect(withMcpResult.profile.mcpServers).toEqual([
+    expect.objectContaining({ lastError: null, status: "error" }),
+  ]);
   await db.upsertProfile({
     ...source,
     acpAgent: { args: ["--token", "parent-secret"], command: "agent" },
@@ -703,7 +723,27 @@ test("organization overview filters teams, counts local additions, and preserves
   );
 
   expect(archived.teams.map((team) => team.id)).toEqual(["org_team_a"]);
-  await db.disableUser("user_reader", now);
+
+  // The disable guard keeps the last usable admin of each org enabled, and
+  // user_reader is the only admin of org_team_a and org_other.
+  await db.createUser({
+    createdAt: now,
+    email: "second_admin@example.com",
+    id: "user_second_admin",
+    passwordHash: "test",
+    updatedAt: now,
+  });
+
+  for (const orgId of ["org_team_a", "org_other"]) {
+    await db.upsertOrgMember({
+      createdAt: now,
+      orgId,
+      role: "admin",
+      userId: "user_second_admin",
+    });
+  }
+
+  expect(await db.disableUserUnlessLastAdmin("user_reader", now)).toBe(true);
   await expect(
     orgService.getOrganizationOverview("org_team_a", "user_reader")
   ).rejects.toMatchObject({ status: 404 });
@@ -1139,7 +1179,7 @@ test("publication lists derive the active team's parent and enforce read access"
     db.getOrganizationById = getOrganizationById;
   }
 
-  await db.disableUser("user_reader", now);
+  expect(await db.disableUserUnlessLastAdmin("user_reader", now)).toBe(true);
   await expect(
     orgService.listSharedResources("org_team_a", "user_reader")
   ).rejects.toMatchObject({ status: 404 });

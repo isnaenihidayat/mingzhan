@@ -75,29 +75,16 @@ RUN set -eu; \
 FROM oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4 AS runtime
 WORKDIR /app
 
-# Headless Chromium supports artifact PDF export without optional Meet audio dependencies.
+# Headless Chromium supports PDF export; Calc and Python validate real XLSX artifacts.
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl sudo python3 python3-venv chromium chromium-sandbox fonts-liberation fonts-dejavu-core \
-    python3-pip libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0 \
+    python3-pip python3-openpyxl python3-fitz libreoffice-calc \
+    libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0 \
   && PIP_NO_COMPILE=1 pip3 install --no-cache-dir --break-system-packages weasyprint==70.0 \
   && apt-get purge -y python3-pip && apt-get autoremove -y \
   && rm -rf /var/lib/apt/lists/*
 # Keep PDF export working on Docker hosts that cannot run the Chromium sandbox.
 ENV MINGZHAN_PDF_FALLBACK=weasyprint
 COPY --from=ffmpeg-binaries /ffmpeg /ffprobe /usr/local/bin/
-
-# Optional Google Meet audio-capture runtime. Chromium remains sandboxed and
-# runs as the existing non-root MíngZhàn user. The manifest and lockfile are
-# copied unconditionally (two small files) so the install below can be
-# frozen; the packages themselves only land when the build arg is true.
-ARG INSTALL_MEET_DEPS=false
-COPY .docker/meet-deps/package.json .docker/meet-deps/bun.lock /opt/mingzhan-meet/
-RUN if [ "$INSTALL_MEET_DEPS" = "true" ]; then \
-      apt-get update && apt-get install -y --no-install-recommends \
-        chromium pulseaudio pulseaudio-utils fonts-liberation xvfb \
-      && rm -rf /var/lib/apt/lists/* \
-      && cd /opt/mingzhan-meet \
-      && bun install --frozen-lockfile --production --ignore-scripts; \
-    fi
 
 # A named volume copies this owner on first mount, so uid 1000 can write
 # backups and upgrade requests there.

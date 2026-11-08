@@ -11,3 +11,7 @@ Produce editable Word documents, or make targeted edits to an existing DOCX. Rea
 3. Editing: preserve styles, section breaks, links, comments and revision markup not involved in the change. Replacing a paragraph's entire text can destroy run formatting. For tracked changes, comments or complex OOXML, inspect the relevant XML and relationships; do not claim python-docx preserves every unsupported feature.
 4. Reopen the saved document and verify headings, paragraphs, table dimensions and required content. If LibreOffice or another renderer is available, render a separate PDF preview and inspect pagination, clipping and table breaks. Never claim a visual check based only on successful saving.
 5. Return the actual DOCX artifact. State any unsupported editing operation before applying a lossy workaround.
+
+## Delivery gate
+
+Before delivery, follow [references/verification.md](references/verification.md). Run structural checks, render page previews when supported, and inspect the rendered pages. For Excel, evaluate formulas with a real spreadsheet engine and compare key totals to an independent calculation. Report a missing renderer or formula engine as an unverified check; a script returning success alone is not proof of visual quality.

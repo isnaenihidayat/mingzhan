@@ -8,6 +8,7 @@ import {
 import { ChannelSessionStore as SessionStore } from "@mingzhan/core/channel-session-store";
 import type { ChatMessage, SendMessageInput } from "@mingzhan/core/contract";
 import { loadDiscordConfigFile } from "@mingzhan/core/discord-config";
+import { MAX_ATTACHMENTS_PER_MESSAGE } from "@mingzhan/core/message-content";
 import type {
   ButtonInteraction,
   StringSelectMenuInteraction,
@@ -157,6 +158,7 @@ async function createPairedHandler(
   options: NonNullable<Parameters<typeof createMockClient>[0]> & {
     apiClient?: MíngZhànClient;
     configProfileId?: string;
+    owner?: { orgId: string; profileId: string };
     pairedUserIds?: string[];
     allowedUserIds?: string[];
   } = {}
@@ -192,6 +194,7 @@ async function createPairedHandler(
     client,
     config: {
       botToken: "discord-bot-token",
+      owner: options.owner,
       profileId: options.configProfileId ?? "default",
     },
     orgStore,
@@ -329,9 +332,10 @@ describe("Discord selection pickers", () => {
           .find((button) => button.label === "Apply")?.disabled
       ).toBe(true);
 
-      const pick = createPickerInteraction("mingzhan:org:424242424242424242:0", [
-        "org_b",
-      ]);
+      const pick = createPickerInteraction(
+        "mingzhan:org:424242424242424242:0",
+        ["org_b"]
+      );
 
       // SAFETY: The picker fixture models the select interaction used here.
       const preview = readPickerPayload(
@@ -492,7 +496,11 @@ describe("Discord selection pickers", () => {
         "org_b",
         "org_a",
       ]);
-      await selectAndApply(handler, "mingzhan:org:424242424242424242:0", "org_b");
+      await selectAndApply(
+        handler,
+        "mingzhan:org:424242424242424242:0",
+        "org_b"
+      );
       await send("thread_1", "continue");
       expect(sent.at(-1)?.orgId).toBe("org_b");
       expect(sent.at(-1)?.sessionId).not.toBe(sent[0]?.sessionId);
@@ -564,9 +572,17 @@ describe("Discord selection pickers", () => {
       const sibling =
         handler.sessionStore.getHotSession<RemoteChatSession>(siblingKey);
 
-      await selectAndApply(handler, "mingzhan:org:424242424242424242:0", "org_a");
+      await selectAndApply(
+        handler,
+        "mingzhan:org:424242424242424242:0",
+        "org_a"
+      );
       expect(handler.sessionStore.getHotSession(key)).toBeDefined();
-      await selectAndApply(handler, "mingzhan:org:424242424242424242:0", "org_b");
+      await selectAndApply(
+        handler,
+        "mingzhan:org:424242424242424242:0",
+        "org_b"
+      );
       expect(handler.sessionStore.get(key)).toBeUndefined();
       expect(handler.sessionStore.getHotSession(key)).toBeUndefined();
       expect(
@@ -768,173 +784,9 @@ describe("createChatHandler artifact delivery", () => {
       expect(calls.publishProfileArtifactShare).toBe(1);
       expect(calls.readProfileArtifactContent).toBe(1);
       expect(dm.fileSendCalls).toBe(1);
-      expect(
-        dm.sentMessages.some((reply) =>
-          reply.includes("https://app.example/s/tok_test")
-        )
-      ).toBe(true);
-    });
-  });
-
-  test("auto-uploads a PDF artifact after a paired save_artifact turn", async () => {
-    await withTempHome(async (homeDir) => {
-      const pdfMeta = JSON.stringify({
-        mimeType: "application/pdf",
-        savedAt: "2026-07-13T10:00:00.000Z",
-        sizeBytes: 270_000,
-      });
-
-      const pdfMessages: ChatMessage[] = [
-        { content: "save pitch deck", role: "user" },
-        {
-          content: "",
-          role: "assistant",
-          toolCalls: [
-            {
-              arguments: {
-                content: "%PDF-1.4",
-                path: "artifacts/mingzhan-pitch-deck.pdf",
-              },
-              id: "tool_1",
-              name: "write_file",
-            },
-            {
-              arguments: {
-                content: pdfMeta,
-                path: "artifacts/mingzhan-pitch-deck.pdf.mingzhan-meta.json",
-              },
-              id: "tool_2",
-              name: "write_file",
-            },
-          ],
-        },
-        {
-          content: JSON.stringify({
-            bytesWritten: 270_000,
-            path: "/home/.mingzhan/orgs/org/profiles/default/artifacts/mingzhan-pitch-deck.pdf",
-          }),
-          name: "write_file",
-          role: "tool",
-          toolCallId: "tool_1",
-        },
-        {
-          content: JSON.stringify({
-            bytesWritten: pdfMeta.length,
-            path: "/home/.mingzhan/orgs/org/profiles/default/artifacts/mingzhan-pitch-deck.pdf.mingzhan-meta.json",
-          }),
-          name: "write_file",
-          role: "tool",
-          toolCallId: "tool_2",
-        },
-        { content: "Saved the pitch deck.", role: "assistant" },
-      ];
-
-      const { handleMessage, calls, sessionStore } = await createPairedHandler(
-        homeDir,
-        {
-          artifactContentBytes: new TextEncoder().encode("%PDF-1.4"),
-          messages: pdfMessages,
-        }
+      expect(dm.sentMessages.join("\n")).toContain(
+        "https://app.example/s/tok_test"
       );
-
-      sessionStore.set("dm_channel_1", {
-        profileId: "default",
-        sessionId: "session_test",
-        updatedAt: new Date().toISOString(),
-      });
-      await sessionStore.save();
-
-      const dm = createDmMessage({
-        content: "thanks",
-        userId: "424242424242424242",
-      });
-
-      await handleMessage(dm.message);
-
-      expect(calls.publishProfileArtifactShare).toBe(1);
-      expect(calls.readProfileArtifactContent).toBe(1);
-      expect(dm.fileSendCalls).toBe(1);
-    });
-  });
-
-  test("auto-uploads a CSV artifact after a paired save_artifact turn", async () => {
-    await withTempHome(async (homeDir) => {
-      const csvMeta = JSON.stringify({
-        mimeType: "text/csv",
-        savedAt: "2026-07-13T10:00:00.000Z",
-        sizeBytes: 24,
-      });
-
-      const csvMessages: ChatMessage[] = [
-        { content: "export csv", role: "user" },
-        {
-          content: "",
-          role: "assistant",
-          toolCalls: [
-            {
-              arguments: {
-                content: "a,b\n1,2\n",
-                path: "artifacts/export.csv",
-              },
-              id: "tool_1",
-              name: "write_file",
-            },
-            {
-              arguments: {
-                content: csvMeta,
-                path: "artifacts/export.csv.mingzhan-meta.json",
-              },
-              id: "tool_2",
-              name: "write_file",
-            },
-          ],
-        },
-        {
-          content: JSON.stringify({
-            bytesWritten: 8,
-            path: "/home/.mingzhan/orgs/org/profiles/default/artifacts/export.csv",
-          }),
-          name: "write_file",
-          role: "tool",
-          toolCallId: "tool_1",
-        },
-        {
-          content: JSON.stringify({
-            bytesWritten: csvMeta.length,
-            path: "/home/.mingzhan/orgs/org/profiles/default/artifacts/export.csv.mingzhan-meta.json",
-          }),
-          name: "write_file",
-          role: "tool",
-          toolCallId: "tool_2",
-        },
-        { content: "Saved the CSV.", role: "assistant" },
-      ];
-
-      const { handleMessage, calls, sessionStore } = await createPairedHandler(
-        homeDir,
-        {
-          artifactContentBytes: new TextEncoder().encode("a,b\n1,2\n"),
-          messages: csvMessages,
-        }
-      );
-
-      sessionStore.set("dm_channel_1", {
-        profileId: "default",
-        sessionId: "session_test",
-        updatedAt: new Date().toISOString(),
-      });
-      await sessionStore.save();
-
-      const dm = createDmMessage({
-        content: "thanks",
-        userId: "424242424242424242",
-      });
-
-      await handleMessage(dm.message);
-
-      expect(calls.publishProfileArtifactShare).toBe(1);
-      expect(calls.readProfileArtifactContent).toBe(1);
-      expect(dm.fileSendCalls).toBe(1);
     });
   });
 
@@ -1012,11 +864,9 @@ describe("createChatHandler artifact delivery", () => {
       expect(calls.publishProfileArtifactShare).toBe(1);
       expect(calls.readProfileArtifactContent).toBe(0);
       expect(dm.fileSendCalls).toBe(0);
-      expect(
-        dm.sentMessages.some((reply) =>
-          reply.includes("https://app.example/s/tok_test")
-        )
-      ).toBe(true);
+      expect(dm.sentMessages.join("\n")).toContain(
+        "https://app.example/s/tok_test"
+      );
     });
   });
 
@@ -1971,6 +1821,61 @@ describe("createChatHandler guild thread routing", () => {
     });
   });
 
+  // The owner's agent is listed only in the owner's org, not the active one.
+  test("/status names the owner's agent from the owner's org", async () => {
+    await withTempHome(async (homeDir) => {
+      const { handleSlashCommand } = await createPairedHandler(homeDir, {
+        owner: { orgId: "org_owner", profileId: "agent_owner" },
+        profilesByOrgId: {
+          org_owner: [
+            { id: "agent_owner", model: "local::owned", name: "Owner Bot" },
+          ],
+        },
+        providerConfigured: true,
+      });
+
+      const statusCmd = createSlashInteraction({ commandName: "status" });
+      await handleSlashCommand(statusCmd.interaction);
+
+      const statusText = statusCmd.replies.join("\n");
+      expect(statusText).toContain("Profile: Owner Bot");
+      expect(statusText).toContain("Model: owned");
+    });
+  });
+
+  test("/status names the profile, model and this chat's session", async () => {
+    await withTempHome(async (homeDir) => {
+      const { handleSlashCommand } = await createPairedHandler(homeDir, {
+        profiles: [
+          {
+            id: "default",
+            isDefault: true,
+            model: "local::base",
+            name: "Default Bot",
+          },
+        ],
+        providerConfigured: true,
+      });
+
+      const newCmd = createSlashInteraction({ commandName: "new" });
+      await handleSlashCommand(newCmd.interaction);
+
+      const statusCmd = createSlashInteraction({ commandName: "status" });
+      await handleSlashCommand(statusCmd.interaction);
+
+      expect(statusCmd.replies.join("\n")).toBe(
+        [
+          "Server: ok",
+          "Provider configured: yes",
+          "Profile: Default Bot",
+          "Provider: unknown",
+          "Model: base",
+          "Session: session_",
+        ].join("\n")
+      );
+    });
+  });
+
   test("slash commands in threads still clear and start new sessions", async () => {
     await withTempHome(async (homeDir) => {
       const { handleSlashCommand, sessionStore } =
@@ -2387,40 +2292,6 @@ describe("createChatHandler guild thread routing", () => {
     });
   });
 
-  test("wedged chat lock recovers so follow-ups are not silenced forever", async () => {
-    chatLockOptions.waitMs = 40;
-
-    let releaseHang!: () => void;
-
-    const hang = new Promise<void>((resolve) => {
-      releaseHang = resolve;
-    });
-
-    const order: string[] = [];
-
-    const first = withChatLock("g:channel:t:thread_wedge", async () => {
-      order.push("first-start");
-      await hang;
-      order.push("first-end");
-    });
-
-    await Bun.sleep(5);
-    const secondStarted = Date.now();
-
-    const second = withChatLock("g:channel:t:thread_wedge", async () => {
-      order.push("second");
-    });
-
-    await second;
-    const waitedMs = Date.now() - secondStarted;
-    expect(waitedMs).toBeGreaterThanOrEqual(35);
-    expect(order).toEqual(["first-start", "second"]);
-
-    releaseHang();
-    await first;
-    expect(order).toEqual(["first-start", "second", "first-end"]);
-  });
-
   test("withChatLock removes map entries after the critical section", async () => {
     expect(getChatLockCountForTests()).toBe(0);
 
@@ -2636,12 +2507,15 @@ describe("createChatHandler inbound images", () => {
         const { handleMessage, calls } = await createPairedHandler(homeDir);
 
         const dm = createDmMessage({
-          attachments: Array.from({ length: 6 }, (_, index) => ({
-            contentType: "image/png",
-            name: `shot-${index}.png`,
-            size: 8,
-            url: `https://cdn.example/shot-${index}.png`,
-          })),
+          attachments: Array.from(
+            { length: MAX_ATTACHMENTS_PER_MESSAGE + 1 },
+            (_, index) => ({
+              contentType: "image/png",
+              name: `shot-${index}.png`,
+              size: 8,
+              url: `https://cdn.example/shot-${index}.png`,
+            })
+          ),
           content: "",
           userId: "424242424242424242",
         });

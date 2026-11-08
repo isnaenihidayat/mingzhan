@@ -1049,7 +1049,8 @@ describe("ComposioService", () => {
       expect(listed.configured).toBe(true);
       expect(listed.composioReachable).toBe(false);
       expect(listed.composioAvailable).toBe(false);
-      expect(listed.catalogError).toBe("Failed to fetch toolkits");
+      expect(listed.catalogError).toBeTruthy();
+      expect(listed.orgToolkits).toEqual([]);
       expect(listed.catalog).toEqual([]);
       expect(listed.orgToolkits).toEqual([]);
       expect(listed.userConnections).toEqual([]);

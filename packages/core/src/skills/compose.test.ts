@@ -29,6 +29,25 @@ describe("composeLoadedSkillPrompt", () => {
   });
 });
 
+test("loaded spreadsheet instructions resolve executable assets outside the workspace", () => {
+  const prompt = composeLoadedSkillPrompt({
+    ...baseSkill,
+    directory: "/shared/skills/xlsx",
+    name: "xlsx",
+    skillFilePath: "/shared/skills/xlsx/SKILL.md",
+  });
+
+  expect(prompt).toContain("/shared/skills/xlsx/scripts/build_workbook.py");
+  expect(prompt).toContain("/shared/skills/xlsx/assets/ooh-commission.json");
+  expect(prompt).toContain(
+    "/shared/skills/doc-coauthoring/scripts/verify_document.py"
+  );
+  expect(prompt).toContain("--recalculate --render");
+  expect(composeLoadedSkillPrompt(baseSkill)).not.toContain(
+    "build_workbook.py"
+  );
+});
+
 describe("composeSkillsCatalog", () => {
   test("lists model-loadable skills and leaves out /skill-only skills", () => {
     const catalog = composeSkillsCatalog([

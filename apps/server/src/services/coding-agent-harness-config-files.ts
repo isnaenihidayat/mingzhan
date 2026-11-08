@@ -1,7 +1,7 @@
 import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { ProviderName } from "@mingzhan/core";
+import { normalizeBaseUrl, type ProviderName } from "@mingzhan/core";
 import type { StoredCodingAgentHarnessKind } from "@mingzhan/db";
 import type { CodingAgentProviderRouting } from "./coding-agent-provider-routing";
 import { formatModelForHarness } from "./coding-agent-spawn-env";
@@ -41,6 +41,14 @@ export async function createHarnessConfigDir(
   };
 }
 
+/**
+ * A TOML basic string. JSON escapes are valid TOML escapes, so `\` or `"`
+ * cannot end the string; TOML also forbids a raw DEL, which JSON keeps.
+ */
+function toTomlString(value: string): string {
+  return JSON.stringify(value).replaceAll("\u007f", "\\u007f");
+}
+
 export async function writeCodexConfigToml(
   configDir: string,
   routing: CodingAgentProviderRouting,
@@ -62,14 +70,14 @@ export async function writeCodexConfigToml(
     "",
     "[model_providers.mingzhan]",
     'name = "MíngZhàn"',
-    `base_url = "${baseUrl}"`,
+    `base_url = ${toTomlString(baseUrl)}`,
     `wire_api = "responses"`,
     "",
     'env_key = "MINGZHAN_HARNESS_API_KEY"',
     "",
     "[profiles.mingzhan]",
     'model_provider = "mingzhan"',
-    `model = "${model.replace(/"/g, '\\"')}"`,
+    `model = ${toTomlString(model)}`,
     "",
   ].join("\n");
 
@@ -200,7 +208,7 @@ function isDefaultBaseUrl(
     return false;
   }
 
-  return baseUrl.replace(/\/+$/, "") === defaultUrl.replace(/\/+$/, "");
+  return normalizeBaseUrl(baseUrl) === normalizeBaseUrl(defaultUrl);
 }
 
 /**

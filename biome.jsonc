@@ -8,6 +8,8 @@
   ],
   "files": {
     "includes": [
+      "!apps/web/src/components/moodstone/core",
+      "!apps/web/src/components/moodstone/svg.ts",
       "!packages/plugins/*/actions",
       "!packages/plugins/*/ui/app.js",
       "!packages/plugins/*/workers",

@@ -499,7 +499,7 @@ function ProfileFooterActions({
           },
         ]
       : []),
-    ...(showAdmin && !state.detail?.sharedAgent
+    ...(showAdmin && !(state.detail?.sharedAgent || state.detail?.isSuper)
       ? [
           ...(showMove
             ? [
@@ -519,7 +519,7 @@ function ProfileFooterActions({
           },
         ]
       : []),
-    ...(showAdmin
+    ...(showAdmin && !state.detail?.isSuper
       ? [
           {
             destructive: true,
@@ -532,7 +532,10 @@ function ProfileFooterActions({
       : []),
   ];
 
-  // Two columns; an odd button out and the destructive one take a full row.
+  if (actions.length === 0) {
+    return null;
+  }
+
   const regular = actions.filter((action) => !action.destructive);
   const fullRow = new Set(regular.length % 2 === 1 ? [regular.at(-1)] : []);
 

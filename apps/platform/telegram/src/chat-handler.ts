@@ -8,6 +8,7 @@ import {
   stopActiveStream,
 } from "@mingzhan/core/channel-active-stream";
 import { createChatLock } from "@mingzhan/core/channel-chat-lock";
+import { describeChannelStatus } from "@mingzhan/core/channel-commands";
 import {
   type ChannelOrgStore,
   findOrgBySelectionInput,
@@ -119,12 +120,25 @@ export interface ChatHandlerDeps {
   authStore: TelegramAuthStore;
   client: MíngZhànClient;
   config: TelegramBridgeConfig;
+  dispatchTurn?: (
+    key: string,
+    work: () => Promise<void>,
+    ctx: Context
+  ) => boolean;
   getBotInfo?: () => TelegramBotInfo | undefined;
   orgStore: ChannelOrgStore;
   sessionStore: ChannelSessionStore;
 }
 
 export function createChatHandler(deps: ChatHandlerDeps) {
+  // Each update owns its API client. The lock is per chat, so two chats run at
+  // once, and a shared client's setOrgId would send one chat's requests to
+  // the other chat's org.
+  return (ctx: Context) =>
+    createScopedChatHandler({ ...deps, client: deps.client.forOrg() })(ctx);
+}
+
+function createScopedChatHandler(deps: ChatHandlerDeps) {
   const {
     client,
     config,
@@ -132,6 +146,7 @@ export function createChatHandler(deps: ChatHandlerDeps) {
     sessionStore,
     orgStore,
     getBotInfo = () => undefined,
+    dispatchTurn,
   } = deps;
 
   return async function handleMessage(ctx: Context): Promise<void> {
@@ -194,7 +209,7 @@ export function createChatHandler(deps: ChatHandlerDeps) {
       return;
     }
 
-    await withChatLock(conversationKey, async () => {
+    const turn = async () => {
       await authStore.reload();
       const isAuthorized = authStore.isAuthorized(userId);
 
@@ -338,7 +353,23 @@ export function createChatHandler(deps: ChatHandlerDeps) {
         telegram,
         messageText
       );
-    });
+    };
+
+    const runTurn = () => withChatLock(conversationKey, turn);
+
+    if (!dispatchTurn) {
+      await runTurn();
+
+      return;
+    }
+
+    if (!dispatchTurn(conversationKey, runTurn, ctx)) {
+      await authStore.reload();
+
+      if (authStore.isAuthorized(userId)) {
+        await telegram.send("This bot is busy. Try again shortly.");
+      }
+    }
   };
 
   async function requestAccess(ctx: Context, userId: number): Promise<void> {
@@ -875,42 +906,26 @@ export function createChatHandler(deps: ChatHandlerDeps) {
   async function listSelectableProfiles(orgId?: string) {
     const { profiles } = await client.listProfiles(orgId);
 
-    return filterProfilesForChatAccess(profiles, { excludeSuperMingzhan: true });
+    return filterProfilesForChatAccess(profiles, {
+      excludeSuperMingzhan: true,
+    });
   }
 
   async function replyStatus(
     telegram: TelegramRichMessenger,
     chatId: string
   ): Promise<void> {
-    try {
-      const health = await client.health();
+    const status = await describeChannelStatus(client, {
+      findAgent: async () => {
+        const agent = await resolveSessionProfile(chatId);
 
-      const lines = [
-        `Server: ${health.ok ? "ok" : "degraded"}`,
-        `Provider configured: ${health.providerConfigured ? "yes" : "no"}`,
-      ];
+        return { agent, id: agent.id };
+      },
+      label: "Profile",
+      sessionId: sessionStore.get(chatId)?.sessionId,
+    });
 
-      if (health.providerConfigured) {
-        const models = await client.getModels();
-        const profiles = await listSelectableProfiles();
-        const profileId = await resolveSessionProfileId(chatId);
-        const profile = profiles.find((entry) => entry.id === profileId);
-
-        const modelLabel = profile?.model?.includes("::")
-          ? profile.model.slice(profile.model.indexOf("::") + 2)
-          : (profile?.model ?? "none");
-
-        lines.push(`Profile: ${profile?.name ?? profileId}`);
-        lines.push(`Provider: ${models.provider ?? "unknown"}`);
-        lines.push(`Model: ${modelLabel}`);
-      } else {
-        lines.push("Chat runs in offline mode without an API key.");
-      }
-
-      await replyChunks(telegram, lines.join("\n"));
-    } catch (error) {
-      await telegram.send(formatClientError(error));
-    }
+    await replyChunks(telegram, status);
   }
 
   async function resolveSession(chatId: string): Promise<RemoteChatSession> {
@@ -986,14 +1001,23 @@ export function createChatHandler(deps: ChatHandlerDeps) {
   }
 
   async function resolveSessionProfileId(chatId: string): Promise<string> {
+    return (await resolveSessionProfile(chatId)).id;
+  }
+
+  /** The chat's agent. An owner's connection looks it up in the owner's org. */
+  async function resolveSessionProfile(chatId: string) {
     if (config.owner) {
       const { profiles } = await client.listProfiles(config.owner.orgId);
 
-      if (!profiles.some((profile) => profile.id === config.owner!.profileId)) {
+      const ownerProfile = profiles.find(
+        (profile) => profile.id === config.owner!.profileId
+      );
+
+      if (!ownerProfile) {
         throw new Error("The connection owner is unavailable.");
       }
 
-      return config.owner.profileId;
+      return ownerProfile;
     }
 
     const profiles = await listSelectableProfiles();
@@ -1003,11 +1027,11 @@ export function createChatHandler(deps: ChatHandlerDeps) {
       const match = profiles.find((profile) => profile.id === storedProfileId);
 
       if (match) {
-        return match.id;
+        return match;
       }
     }
 
-    return pickProfileForOrg(profiles, config.profileId).id;
+    return pickProfileForOrg(profiles, config.profileId);
   }
 
   async function clearSessionArtifactState(

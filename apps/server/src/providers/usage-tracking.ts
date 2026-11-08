@@ -3,10 +3,8 @@ import type {
   ChatMessage,
   GenerateChatInput,
   GenerateTextInput,
-  GenerateTextResult,
   LlmToolDefinition,
   ProviderClient,
-  StreamChatHandlers,
 } from "@mingzhan/core";
 import { estimateUserContentTokens } from "@mingzhan/core";
 import type {
@@ -215,9 +213,18 @@ export function wrapProviderWithUsageTracking(
   provider: ProviderClient,
   tracker: LlmUsageTracker,
   modelId: string,
-  attribution: Pick<LlmUsageRecordOptions, "orgId" | "profileId" | "userId">,
+  attribution: Pick<
+    LlmUsageRecordOptions,
+    "orgId" | "profileId" | "sessionId" | "userId"
+  >,
   pricingContext: PricingContext = {}
 ): ProviderClient {
+  const request = {
+    ...attribution,
+    modelId,
+    provider: pricingContext.provider ?? provider.name,
+  };
+
   function withRecordedUsage(
     input: GenerateChatInput,
     result: ChatCompletionResult
@@ -263,38 +270,58 @@ export function wrapProviderWithUsageTracking(
     };
   }
 
+  function chatUsage(result: ChatCompletionResult) {
+    return {
+      estimatedCostUsd: result.usage?.costUsd ?? null,
+      inputTokens: result.usage?.inputTokens ?? 0,
+      outputTokens: result.usage?.outputTokens ?? 0,
+    };
+  }
+
   return {
     ...provider,
-    async generateChat(
-      input: GenerateChatInput
-    ): Promise<ChatCompletionResult> {
-      const result = await provider.generateChat(input);
-
-      return withRecordedUsage(input, result);
+    generateChat(input) {
+      return tracker.trackRequest(
+        request,
+        async () =>
+          withRecordedUsage(input, await provider.generateChat(input)),
+        chatUsage,
+        input.signal
+      );
     },
-    async generateText(input: GenerateTextInput): Promise<GenerateTextResult> {
-      const result = await provider.generateText(input);
+    generateText(input) {
+      return tracker.trackRequest(
+        request,
+        () => provider.generateText(input),
+        (result) => {
+          const inputTokens =
+            result.usage?.inputTokens ?? estimateTextInputTokens(input);
 
-      const inputTokens =
-        result.usage?.inputTokens ?? estimateTextInputTokens(input);
+          const outputTokens =
+            result.usage?.outputTokens ?? estimateTokens(result.content);
 
-      const outputTokens =
-        result.usage?.outputTokens ?? estimateTokens(result.content);
+          const estimatedCostUsd = tracker.record(
+            modelId,
+            inputTokens,
+            outputTokens,
+            {
+              ...attribution,
+              pricingContext,
+            }
+          );
 
-      tracker.record(modelId, inputTokens, outputTokens, {
-        ...attribution,
-        pricingContext,
-      });
-
-      return result;
+          return { estimatedCostUsd, inputTokens, outputTokens };
+        }
+      );
     },
-    async streamChat(
-      input: GenerateChatInput,
-      handlers: StreamChatHandlers
-    ): Promise<ChatCompletionResult> {
-      const result = await provider.streamChat(input, handlers);
-
-      return withRecordedUsage(input, result);
+    streamChat(input, handlers) {
+      return tracker.trackRequest(
+        request,
+        async () =>
+          withRecordedUsage(input, await provider.streamChat(input, handlers)),
+        chatUsage,
+        input.signal
+      );
     },
   };
 }

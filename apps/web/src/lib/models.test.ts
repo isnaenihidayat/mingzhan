@@ -2,18 +2,19 @@ import { describe, expect, test } from "bun:test";
 import type { ProviderName } from "@mingzhan/core";
 import { USER_PROVIDER_NAMES } from "@mingzhan/core/provider-resolution";
 import {
-  appendOpenRouterModelRow,
   buildCreateProviderRequest,
   effectiveProfileModelSelection,
   encodeModelSelection,
   filterVisionCapableProviderGroups,
   firstAvailableProviderOption,
   hasOpenCodeZenProvider,
+  isLocalBaseUrl,
   isOpenCodeZenBaseUrl,
   knownModelSelection,
   profileModelSelectionValue,
   resolveModelThinkingSupport,
   resolveModelVisionSupport,
+  resolveOpenRouterSetupModel,
   validateCustomModelsInput,
 } from "./models";
 
@@ -30,6 +31,19 @@ describe("buildCreateProviderRequest", () => {
       "fireworks",
       "ollama",
       "opencode_go",
+      "openai",
+      "anthropic",
+      "gemini",
+      "deepseek",
+      "doubao",
+      "together",
+      "xiaomi",
+      "meta",
+      "vercel_ai_gateway",
+      "mistral",
+      "qwen",
+      "qwen_cn",
+      "perplexity",
     ];
 
     for (const provider of USER_PROVIDER_NAMES) {
@@ -230,6 +244,8 @@ describe("resolveModelVisionSupport", () => {
       "openrouter",
       "mistral",
       "ollama",
+      "netra",
+      "groq",
     ];
 
     for (const provider of USER_PROVIDER_NAMES) {
@@ -481,43 +497,36 @@ describe("validateCustomModelsInput", () => {
       "Add at least one model."
     );
   });
+
+  test("rejects the same model ID twice", () => {
+    expect(
+      validateCustomModelsInput([{ id: "m" }, { id: " m " }])
+    ).not.toBeNull();
+    expect(validateCustomModelsInput([{ id: "m" }, { id: "n" }])).toBeNull();
+  });
 });
 
-describe("appendOpenRouterModelRow", () => {
-  test("keeps the context window the browse row carried", () => {
+describe("isLocalBaseUrl", () => {
+  test("treats loopback and private hosts as local", () => {
+    expect(isLocalBaseUrl("http://localhost:11434/v1")).toBe(true);
+    expect(isLocalBaseUrl("http://192.168.1.4:8000/v1")).toBe(true);
+    expect(isLocalBaseUrl("https://apihub.agnes-ai.com/v1")).toBe(false);
+  });
+});
+
+describe("resolveOpenRouterSetupModel", () => {
+  test("the row marked default wins over the catalog pick", () => {
     expect(
-      appendOpenRouterModelRow(
-        [],
-        "anthropic/claude-sonnet-4-6",
-        "Sonnet 4.6",
-        {
-          contextWindow: 1_000_000,
-        }
+      resolveOpenRouterSetupModel(
+        [{ id: "a/one" }, { default: true, id: "a/two" }],
+        "a/one"
       )
-    ).toEqual([
-      {
-        contextWindow: 1_000_000,
-        default: true,
-        id: "anthropic/claude-sonnet-4-6",
-        name: "Sonnet 4.6",
-      },
-    ]);
+    ).toBe("a/two");
   });
 
-  test("preserves existing rows and moves the default to the picked model", () => {
+  test("with no row marked, the catalog pick stays", () => {
     expect(
-      appendOpenRouterModelRow(
-        [
-          { contextWindow: 32_000, default: true, id: "a/one", name: "One" },
-          { id: "a/two" },
-          { id: "   " },
-        ],
-        "a/two",
-        "Two"
-      )
-    ).toEqual([
-      { contextWindow: 32_000, default: false, id: "a/one", name: "One" },
-      { default: true, id: "a/two", name: "a/two" },
-    ]);
+      resolveOpenRouterSetupModel([{ id: "a/one" }, { id: "a/two" }], "a/two")
+    ).toBe("a/two");
   });
 });

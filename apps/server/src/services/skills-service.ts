@@ -49,6 +49,7 @@ import {
   discoverSkills,
   fetchGitHubSkillBundle,
   findExplicitSkill,
+  findSpreadsheetCreationSkill,
   type GitHubSkillBundle,
   getOrgConfigDir,
   getProfileSoulDir,
@@ -82,6 +83,10 @@ import type {
   StoredSkillUsageRecord,
 } from "@mingzhan/db";
 import { z } from "zod";
+import {
+  REMOTE_BACKEND_HOST_CODE_REFUSAL,
+  resolveBashBackend,
+} from "../tools/bash-config";
 import { isCloudBrowserRuntime } from "./agent-browser-service";
 import { loadJavascriptSkillTool } from "./javascript-tool-loader";
 import type { PluginService } from "./plugin-service";
@@ -964,14 +969,6 @@ export class SkillsService {
       );
     }
 
-    const beforeContent = await readFile(
-      path.join(
-        resolveProfileSkillDirectory(orgId, profileId, name),
-        SKILL_FILE_NAME
-      ),
-      "utf8"
-    ).catch(() => null);
-
     const patched = await patchSkillFile({
       name,
       newString,
@@ -993,13 +990,18 @@ export class SkillsService {
       "utf8"
     );
 
-    await this.recordSkillVersion(record, beforeContent, afterContent, meta);
+    await this.recordSkillVersion(
+      record,
+      patched.previousContent,
+      afterContent,
+      meta
+    );
 
     if (meta) {
       await recordProfileChangeEvent(this.db, {
         actorUserId: meta.actorUserId,
         afterValue: afterContent,
-        beforeValue: beforeContent,
+        beforeValue: patched.previousContent,
         field: "skills",
         orgId,
         profileId,
@@ -1679,7 +1681,7 @@ export class SkillsService {
     return entry.discovered;
   }
 
-  /** The assigned skill a `/skill <name>` message names. */
+  /** Resolve an explicit skill, or preload the assigned workflow for workbook creation. */
   async findExplicitSkillForMessage(
     orgId: string,
     profileId: string,
@@ -1688,10 +1690,11 @@ export class SkillsService {
   ): Promise<DiscoveredSkill | null> {
     const assigned = await this.getPromptSkills(orgId, profileId);
 
-    const skill = findExplicitSkill(
-      assigned.map((item) => item.discovered),
-      userMessage
-    );
+    const discovered = assigned.map((item) => item.discovered);
+
+    const skill =
+      findExplicitSkill(discovered, userMessage) ??
+      findSpreadsheetCreationSkill(discovered, userMessage);
 
     const skillId = assigned.find((item) => item.discovered === skill)?.record
       .id;
@@ -2018,6 +2021,8 @@ export class SkillsService {
       return true;
     };
 
+    const remoteBackend = resolveBashBackend() === "remote";
+
     const loadable: typeof assigned = [];
 
     const blocked: Array<{
@@ -2027,6 +2032,19 @@ export class SkillsService {
 
     for (const item of assigned) {
       if (isPluginOwnedSkill(item.record)) {
+        continue;
+      }
+
+      // Review approves code for the host, but under the remote backend only
+      // code the operator installed may run there.
+      if (
+        remoteBackend &&
+        !isGlobalSkillSourcePath(item.discovered.directory)
+      ) {
+        blocked.push({
+          discovered: item.discovered,
+          reason: REMOTE_BACKEND_HOST_CODE_REFUSAL,
+        });
         continue;
       }
 
@@ -2125,9 +2143,10 @@ export class SkillsService {
     // A profile that already holds a host shell gets a runner for each skill
     // whose Python no harness reaches, so nothing runs here that the profile
     // could not already run through bash. A shared skill executes for another
-    // org's profile, whose tools this one does not see, so it gets none.
+    // org's profile, whose tools this one does not see, so it gets none. Under
+    // the remote backend bash is not a host shell, so no profile gets one.
     const runners =
-      !sharedContext &&
+      !(sharedContext || remoteBackend) &&
       (await this.db.listToolsForProfile(profileId)).some(
         (tool) => tool.handlerType === "bash"
       )

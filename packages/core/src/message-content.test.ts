@@ -5,6 +5,7 @@ import {
   countUserImages,
   estimateUserContentTokens,
   getUserMessageText,
+  MAX_ATTACHMENTS_PER_MESSAGE,
   messagesIncludeUserImages,
   normalizeUserContent,
   parseDataUrl,
@@ -180,8 +181,13 @@ describe("validateDocumentAttachments", () => {
 });
 
 describe("validateCombinedAttachmentCount", () => {
-  test("rejects more than five attachments total", () => {
-    expect(() => validateCombinedAttachmentCount(3, 3)).toThrow(MíngZhànApiError);
+  test("accepts the limit and rejects one more", () => {
+    expect(() =>
+      validateCombinedAttachmentCount(MAX_ATTACHMENTS_PER_MESSAGE - 3, 3)
+    ).not.toThrow();
+    expect(() =>
+      validateCombinedAttachmentCount(MAX_ATTACHMENTS_PER_MESSAGE - 2, 3)
+    ).toThrow(MíngZhànApiError);
   });
 });
 

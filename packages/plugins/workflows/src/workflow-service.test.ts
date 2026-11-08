@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { run } from "./actions";
 import { parseWorkflowRecord } from "./workflow-ops";
+import { WorkflowRunner } from "./workflow-runner";
 import { WorkflowService } from "./workflow-service";
 
 test("save action finishes updating before closing its database", async () => {
@@ -117,6 +118,71 @@ test("database prevents overlapping subprocess runs and imports transactionally"
   }
 });
 
+test("separate processes start runs of different workflows at once", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "workflow-race-"));
+  const databasePath = join(dir, "data.sqlite");
+  const service = new WorkflowService(databasePath, "org_a");
+  service.db.exec(
+    await readFile(
+      new URL("../migrations/001-workflows.sql", import.meta.url),
+      "utf8"
+    )
+  );
+
+  try {
+    const ids: string[] = [];
+
+    for (let index = 0; index < 4; index++) {
+      const workflow = await service.create(
+        {
+          name: `Workflow ${index}`,
+          steps: [{ id: "summary", kind: "summarize", prompt: "Summarize" }],
+        },
+        "profile",
+        new Set()
+      );
+
+      ids.push(workflow.id);
+    }
+
+    const modulePath = new URL("./workflow-service.ts", import.meta.url)
+      .pathname;
+
+    const startAt = Date.now() + 300;
+
+    const script = `
+      const { WorkflowService } = await import(${JSON.stringify(modulePath)});
+      const [path, workflowId, startAt] = process.argv.slice(1);
+      const service = new WorkflowService(path, "org_a");
+      while (Date.now() < Number(startAt)) {}
+      try {
+        await service.createRun(workflowId, {});
+      } finally {
+        service.close();
+      }
+    `;
+
+    const exitCodes = await Promise.all(
+      ids.map(
+        (id) =>
+          Bun.spawn(["bun", "-e", script, databasePath, id, String(startAt)], {
+            stderr: "ignore",
+            stdout: "ignore",
+          }).exited
+      )
+    );
+
+    expect(exitCodes).toEqual([0, 0, 0, 0]);
+
+    for (const id of ids) {
+      expect(await service.listRuns(id)).toHaveLength(1);
+    }
+  } finally {
+    service.close();
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
 test("create and update reject malformed tool inputs without persisting changes", async () => {
   const service = new WorkflowService(":memory:", "org_a");
   service.db.exec(
@@ -195,6 +261,209 @@ test("create and update reject malformed tool inputs without persisting changes"
       kind: "tool",
       tool: "web_fetch",
     });
+  } finally {
+    service.close();
+  }
+});
+
+test("a run that expires mid-run stays failed when the runner finishes late", async () => {
+  const service = new WorkflowService(":memory:", "org_a");
+  service.db.exec(
+    await readFile(
+      new URL("../migrations/001-workflows.sql", import.meta.url),
+      "utf8"
+    )
+  );
+
+  try {
+    const workflow = await service.create(
+      {
+        name: "Slow",
+        steps: [{ id: "summary", kind: "summarize", prompt: "Summarize" }],
+      },
+      "profile",
+      new Set()
+    );
+
+    const runner = new WorkflowRunner(service, {
+      executeTool: async () => ({}),
+      runWorkflowSummarize: async () => {
+        service.db.query("UPDATE runs SET lease_until = ?").run(Date.now() - 1);
+        await service.listRuns(workflow.id);
+
+        return "late output";
+      },
+    });
+
+    const result = await runner.run(workflow.id);
+    const [stored] = await service.listRuns(workflow.id);
+
+    expect(result.error).toBeDefined();
+    expect(result.output).toBeUndefined();
+    expect(stored?.status).toBe("failed");
+    expect(stored?.output).toBeNull();
+  } finally {
+    service.close();
+  }
+});
+
+test("a filter check ends the run as skipped while a plain check still fails", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "workflow-filter-"));
+  const databasePath = join(dir, "data.sqlite");
+  const service = new WorkflowService(databasePath, "org_a");
+
+  try {
+    service.db.exec(
+      await readFile(
+        new URL("../migrations/001-workflows.sql", import.meta.url),
+        "utf8"
+      )
+    );
+
+    let summaries = 0;
+
+    const context = {
+      actionKey: "create_workflow",
+      actor: { id: "admin", role: "admin" as const },
+      apiVersion: 1 as const,
+      databasePath,
+      dataDir: dir,
+      host: async ({ op }: { op: string }) => {
+        if (op === "summarize") {
+          summaries += 1;
+
+          return "Summary";
+        }
+
+        return op === "profiles" ? [{ id: "profile", isDefault: true }] : [];
+      },
+      invocationId: "test",
+      orgId: "org_a",
+      pluginId: "workflows",
+      pluginVersion: "1.0.1",
+    };
+
+    const create = async (onFail?: "fail" | "skip") => {
+      const created = parseWorkflowRecord(
+        await run(
+          {
+            name: "GitHub mail",
+            steps: [
+              {
+                id: "from_github",
+                kind: "compare",
+                left: "{{input.from}}",
+                onFail,
+                op: "contains",
+                right: "github.com",
+              },
+              { id: "note", kind: "template", template: "{{input.from}}" },
+              { id: "summary", kind: "summarize", prompt: "Summarize" },
+            ],
+          },
+          context
+        )
+      );
+
+      return String(created.id);
+    };
+
+    const runWorkflow = async (workflowId: string, from: string) =>
+      parseWorkflowRecord(
+        await run(
+          { input: { from }, workflowId },
+          { ...context, actionKey: "run_workflow" }
+        )
+      );
+
+    const filter = await create("skip");
+    const skipped = await runWorkflow(filter, "Stripe <billing@stripe.com>");
+    const skippedRun = parseWorkflowRecord(skipped.run);
+
+    expect(skipped.status).toBe("skipped");
+    expect(skipped.error).toBeUndefined();
+    expect(skippedRun.status).toBe("skipped");
+    expect(skippedRun.error).toBeNull();
+    expect(
+      (await service.getRun(filter, String(skippedRun.id)))?.steps?.map(
+        (step) => [step.stepId, step.status, step.error ?? null]
+      )
+    ).toEqual([["from_github", "skipped", null]]);
+    expect(summaries).toBe(0);
+
+    const passed = await runWorkflow(filter, "GitHub <noreply@github.com>");
+    expect(passed.status).toBe("completed");
+    expect(passed.output).toBe("Summary");
+    expect(summaries).toBe(1);
+
+    for (const onFail of [undefined, "fail"] as const) {
+      const plain = await create(onFail);
+      const failed = await runWorkflow(plain, "Stripe <billing@stripe.com>");
+      const failedRun = parseWorkflowRecord(failed.run);
+
+      expect(failed.status).toBe("failed");
+      expect(failedRun.status).toBe("failed");
+      expect(failedRun.error).toEqual(expect.any(String));
+      expect(
+        (await service.getRun(plain, String(failedRun.id)))?.steps?.map(
+          (step) => step.status
+        )
+      ).toEqual(["failed"]);
+    }
+
+    expect(summaries).toBe(1);
+  } finally {
+    service.close();
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
+test("a filter skip on a run that expired mid-run stays failed", async () => {
+  const service = new WorkflowService(":memory:", "org_a");
+  service.db.exec(
+    await readFile(
+      new URL("../migrations/001-workflows.sql", import.meta.url),
+      "utf8"
+    )
+  );
+
+  try {
+    const workflow = await service.create(
+      {
+        name: "Slow filter",
+        steps: [
+          { id: "fetch", input: {}, kind: "tool", tool: "slow_tool" },
+          {
+            id: "from_github",
+            kind: "compare",
+            left: "stripe.com",
+            onFail: "skip",
+            op: "contains",
+            right: "github.com",
+          },
+          { id: "summary", kind: "summarize", prompt: "Summarize" },
+        ],
+      },
+      "profile",
+      new Set(["slow_tool"])
+    );
+
+    const runner = new WorkflowRunner(service, {
+      executeTool: async () => {
+        service.db.query("UPDATE runs SET lease_until = ?").run(Date.now() - 1);
+        await service.listRuns(workflow.id);
+
+        return { ok: true };
+      },
+      runWorkflowSummarize: async () => "unused",
+    });
+
+    const result = await runner.run(workflow.id);
+    const [stored] = await service.listRuns(workflow.id);
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toBeDefined();
+    expect(stored?.status).toBe("failed");
   } finally {
     service.close();
   }

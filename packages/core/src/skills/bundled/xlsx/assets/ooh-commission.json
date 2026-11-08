@@ -1,0 +1,231 @@
+{
+  "sheets": [
+    {
+      "name": "Asumsi",
+      "rows": [
+        ["Item", "Nilai"],
+        ["Target tahunan", 3000000000],
+        ["Basis", "Gross billing; rancangan ilustratif"],
+        ["Metode", "Retroaktif; rate berlaku atas seluruh billing"],
+        [
+          "Status data",
+          "Seluruh angka adalah asumsi rancangan yang dapat diubah, bukan benchmark pasar terverifikasi"
+        ],
+        ["Mata uang", "IDR"],
+        ["Periode", "Tahunan; tahun ditentukan pengguna"]
+      ],
+      "formats": {
+        "B": "#,##0"
+      }
+    },
+    {
+      "name": "KPI",
+      "rows": [
+        ["KPI", "Bobot"],
+        ["Pencapaian gross billing", 0.6],
+        ["Pertumbuhan revenue", 0.15],
+        ["New business", 0.1],
+        ["Utilisasi inventory", 0.1],
+        ["Retensi", 0.05],
+        [
+          "Total",
+          {
+            "formula": "=SUM(B2:B6)"
+          }
+        ]
+      ],
+      "formats": {
+        "B": "0%"
+      }
+    },
+    {
+      "name": "Tiering",
+      "rows": [
+        ["Batas achievement", "Rate komisi"],
+        [0, 0],
+        [0.8, 0.03],
+        [1, 0.05],
+        [1.2, 0.07],
+        [1.5, 0.1]
+      ],
+      "formats": {
+        "A": "0%",
+        "B": "0%"
+      }
+    },
+    {
+      "name": "Simulasi",
+      "rows": [
+        ["Skenario", "Gross billing", "Achievement", "Rate", "Komisi"],
+        [
+          "0.79",
+          {
+            "formula": "=VALUE(A2)*Asumsi!$B$2"
+          },
+          {
+            "formula": "=B2/Asumsi!$B$2"
+          },
+          {
+            "formula": "=LOOKUP(C2,Tiering!$A$2:$A$6,Tiering!$B$2:$B$6)"
+          },
+          {
+            "formula": "=B2*D2"
+          }
+        ],
+        [
+          "0.8",
+          {
+            "formula": "=VALUE(A3)*Asumsi!$B$2"
+          },
+          {
+            "formula": "=B3/Asumsi!$B$2"
+          },
+          {
+            "formula": "=LOOKUP(C3,Tiering!$A$2:$A$6,Tiering!$B$2:$B$6)"
+          },
+          {
+            "formula": "=B3*D3"
+          }
+        ],
+        [
+          "0.999",
+          {
+            "formula": "=VALUE(A4)*Asumsi!$B$2"
+          },
+          {
+            "formula": "=B4/Asumsi!$B$2"
+          },
+          {
+            "formula": "=LOOKUP(C4,Tiering!$A$2:$A$6,Tiering!$B$2:$B$6)"
+          },
+          {
+            "formula": "=B4*D4"
+          }
+        ],
+        [
+          "1",
+          {
+            "formula": "=VALUE(A5)*Asumsi!$B$2"
+          },
+          {
+            "formula": "=B5/Asumsi!$B$2"
+          },
+          {
+            "formula": "=LOOKUP(C5,Tiering!$A$2:$A$6,Tiering!$B$2:$B$6)"
+          },
+          {
+            "formula": "=B5*D5"
+          }
+        ],
+        [
+          "1.199",
+          {
+            "formula": "=VALUE(A6)*Asumsi!$B$2"
+          },
+          {
+            "formula": "=B6/Asumsi!$B$2"
+          },
+          {
+            "formula": "=LOOKUP(C6,Tiering!$A$2:$A$6,Tiering!$B$2:$B$6)"
+          },
+          {
+            "formula": "=B6*D6"
+          }
+        ],
+        [
+          "1.2",
+          {
+            "formula": "=VALUE(A7)*Asumsi!$B$2"
+          },
+          {
+            "formula": "=B7/Asumsi!$B$2"
+          },
+          {
+            "formula": "=LOOKUP(C7,Tiering!$A$2:$A$6,Tiering!$B$2:$B$6)"
+          },
+          {
+            "formula": "=B7*D7"
+          }
+        ],
+        [
+          "1.499",
+          {
+            "formula": "=VALUE(A8)*Asumsi!$B$2"
+          },
+          {
+            "formula": "=B8/Asumsi!$B$2"
+          },
+          {
+            "formula": "=LOOKUP(C8,Tiering!$A$2:$A$6,Tiering!$B$2:$B$6)"
+          },
+          {
+            "formula": "=B8*D8"
+          }
+        ],
+        [
+          "1.5",
+          {
+            "formula": "=VALUE(A9)*Asumsi!$B$2"
+          },
+          {
+            "formula": "=B9/Asumsi!$B$2"
+          },
+          {
+            "formula": "=LOOKUP(C9,Tiering!$A$2:$A$6,Tiering!$B$2:$B$6)"
+          },
+          {
+            "formula": "=B9*D9"
+          }
+        ],
+        [
+          "1.6",
+          {
+            "formula": "=VALUE(A10)*Asumsi!$B$2"
+          },
+          {
+            "formula": "=B10/Asumsi!$B$2"
+          },
+          {
+            "formula": "=LOOKUP(C10,Tiering!$A$2:$A$6,Tiering!$B$2:$B$6)"
+          },
+          {
+            "formula": "=B10*D10"
+          }
+        ]
+      ],
+      "formats": {
+        "B": "#,##0",
+        "C": "0.0%",
+        "D": "0.0%",
+        "E": "#,##0"
+      },
+      "charts": [
+        {
+          "title": "Komisi per skenario",
+          "value_column": 5,
+          "label_column": 1
+        }
+      ]
+    },
+    {
+      "name": "Ketentuan",
+      "rows": [
+        ["Item", "Rancangan"],
+        ["Pembayaran", "Triwulanan dengan true-up tahunan"],
+        ["Batasan", "Contoh rancangan, belum benchmark pasar"],
+        [
+          "Dasar payout",
+          "Gross billing yang memenuhi syarat; evaluasi risiko piutang dan margin"
+        ],
+        [
+          "Clawback",
+          "Usulan: koreksi pembatalan atau invoice gagal tertagih saat true-up"
+        ],
+        [
+          "Persetujuan",
+          "Rate, target, batas payout dan mekanisme memerlukan persetujuan perusahaan"
+        ]
+      ]
+    }
+  ]
+}

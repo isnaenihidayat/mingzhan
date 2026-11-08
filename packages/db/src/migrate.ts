@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { orgIdFromSkillSourcePath } from "@mingzhan/core";
+import { GENERATE_IMAGE_TOOL_ID } from "@mingzhan/core/tools/protected";
 
 const BOOTSTRAP_SCHEMA_VERSION = 1;
 
@@ -68,6 +69,7 @@ export function migrateDatabase(db: Database): void {
   );
   atomic(migrateLlmTurnUsageTable);
   atomic(migrateLlmUsageActorStatsTable);
+  atomic(migrateLlmRequestLogTable);
   atomic(migrateLlmUsageDailyStatsTable);
   atomic(migrateAttachmentsTable);
   atomic(migrateAutomationRunsTable);
@@ -82,6 +84,7 @@ export function migrateDatabase(db: Database): void {
   atomic(migrateRemoveGoogleMeetPlugin);
   atomic(migrateFilePinsTable);
   atomic(migrateNotificationWebhookDeliveriesTable);
+  atomic(migrateRegressionCasesTable);
   atomic(migrateManagedSecretsTable);
   atomic(migrateArtifactsTable);
   atomic((database) =>
@@ -95,6 +98,43 @@ export function migrateDatabase(db: Database): void {
   );
   atomic(migrateProfileSharedWithTeamColumn);
   atomic(migrateSessionOwners);
+  atomic(migrateGenerateImageDefaultOn);
+}
+
+/**
+ * generate_image is on by default. Agents made before that get the tool once.
+ * The done marker has its own table: older builds never touch it, so a
+ * downgrade and upgrade cannot give the tool back where an admin removed it.
+ * A fresh database has no agents yet, so it only records the marker.
+ */
+function migrateGenerateImageDefaultOn(db: Database): void {
+  const migrationId = "generate_image_default_on";
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS applied_data_migrations (
+      id TEXT PRIMARY KEY NOT NULL,
+      applied_at TEXT NOT NULL
+    )
+  `);
+
+  const applied = db
+    .prepare<{ id: string }, SQLQueryBindings[]>(
+      "SELECT id FROM applied_data_migrations WHERE id = ?"
+    )
+    .get(migrationId);
+
+  if (applied) {
+    return;
+  }
+
+  db.prepare(
+    `INSERT OR IGNORE INTO profile_tools (profile_id, tool_id)
+    SELECT profiles.id, tools.id FROM profiles JOIN tools ON tools.id = ?`
+  ).run(GENERATE_IMAGE_TOOL_ID);
+
+  db.prepare(
+    "INSERT INTO applied_data_migrations (id, applied_at) VALUES (?, ?)"
+  ).run(migrationId, new Date().toISOString());
 }
 
 /**
@@ -757,6 +797,36 @@ function migrateLlmTurnUsageTable(db: Database): void {
     CREATE INDEX IF NOT EXISTS llm_turn_usage_org_bucket
       ON llm_turn_usage (org_id, bucket);
   `);
+}
+
+function migrateLlmRequestLogTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS llm_request_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      org_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      profile_id TEXT,
+      session_id TEXT,
+      started_at TEXT NOT NULL,
+      duration_ms INTEGER NOT NULL,
+      provider TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      input_tokens INTEGER,
+      output_tokens INTEGER,
+      estimated_cost_usd REAL
+    );
+    CREATE INDEX IF NOT EXISTS llm_request_log_actor
+      ON llm_request_log (org_id, user_id, started_at DESC, id DESC);
+  `);
+
+  const columns = db
+    .query<{ name: string }, []>("PRAGMA table_info(llm_request_log)")
+    .all();
+
+  if (!columns.some((column) => column.name === "session_id")) {
+    db.exec("ALTER TABLE llm_request_log ADD COLUMN session_id TEXT");
+  }
 }
 
 /**
@@ -1578,6 +1648,7 @@ function migrateBrowserSessionsTable(db: Database): void {
       revoked_at TEXT,
       last_used_at TEXT,
       active_org_id TEXT,
+      user_agent TEXT,
       FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
     );
     CREATE UNIQUE INDEX IF NOT EXISTS browser_sessions_token_hash_unique
@@ -1594,6 +1665,10 @@ function migrateBrowserSessionsTable(db: Database): void {
 
   if (!columnNames.has("active_org_id")) {
     db.exec("ALTER TABLE browser_sessions ADD COLUMN active_org_id TEXT;");
+  }
+
+  if (!columnNames.has("user_agent")) {
+    db.exec("ALTER TABLE browser_sessions ADD COLUMN user_agent TEXT;");
   }
 }
 
@@ -2623,4 +2698,32 @@ CREATE TABLE IF NOT EXISTS notification_webhook_deliveries (
 CREATE INDEX IF NOT EXISTS notification_webhook_deliveries_created_at
   ON notification_webhook_deliveries (created_at);
   `);
+}
+
+function migrateRegressionCasesTable(db: Database): void {
+  db.exec(`
+CREATE TABLE IF NOT EXISTS regression_cases (
+  id TEXT PRIMARY KEY NOT NULL,
+  org_id TEXT NOT NULL,
+  profile_id TEXT NOT NULL,
+  source_type TEXT NOT NULL CHECK(source_type IN ('session', 'automation_run')),
+  source_id TEXT NOT NULL,
+  source_automation_id TEXT,
+  input TEXT NOT NULL,
+  expected_result TEXT NOT NULL,
+  created_by_user_id TEXT,
+  private_to_user_id TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (org_id) REFERENCES organizations (id) ON DELETE CASCADE,
+  FOREIGN KEY (profile_id) REFERENCES profiles (id) ON DELETE CASCADE,
+  FOREIGN KEY (created_by_user_id) REFERENCES users (id) ON DELETE SET NULL,
+  FOREIGN KEY (private_to_user_id) REFERENCES users (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS regression_cases_profile_created
+  ON regression_cases (org_id, profile_id, created_at DESC);
+  `);
+
+  // The table first shipped without this column.
+  addNullableTextColumnIfMissing(db, "regression_cases", "private_to_user_id");
 }

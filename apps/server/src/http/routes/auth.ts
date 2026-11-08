@@ -1855,6 +1855,7 @@ export function registerAuthRoutes(app: HonoApp, options: ServerOptions): void {
         expiresAt: record.expiresAt,
         id: record.id,
         lastUsedAt: record.lastUsedAt,
+        userAgent: record.userAgent ?? null,
       })),
     });
   });

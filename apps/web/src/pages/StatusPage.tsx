@@ -11,6 +11,7 @@ import { cn } from "@mingzhan/ui/utils";
 import type { Clock01Icon } from "hugeicons-react";
 import { type ReactNode, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
+import { AdoptionRequestLog } from "@/components/settings/AdoptionRequestLog";
 import { OrgLlmQuotaCard } from "@/components/settings/OrgLlmQuotaCard";
 import {
   WorkerActionBar,
@@ -752,35 +753,77 @@ function ModelShareList({
 }
 
 function AdoptionGrid({ users }: { users: LlmUsageGroupStats[] }) {
-  return (
-    <ul className="grid grid-cols-3 gap-x-2 gap-y-4 sm:grid-cols-4">
-      {users.map((user) => {
-        const label = user.id ? (user.name ?? user.id) : "Unattributed";
+  const { activeOrg } = useAuth();
 
-        return (
-          <li
-            className="flex min-w-0 flex-col items-center gap-1 text-center"
-            key={user.id ?? ""}
-          >
-            <span
-              aria-hidden="true"
-              className={cn(
-                "flex size-10 items-center justify-center rounded-full font-medium text-sm",
-                user.id
-                  ? "bg-primary/15 text-primary"
-                  : "bg-muted text-muted-foreground"
+  const [selected, setSelected] = useState<{
+    orgId: string;
+    userId: string;
+  } | null>(null);
+
+  const account =
+    selected && selected.orgId === activeOrg?.id
+      ? users.find((user) => user.id === selected.userId)
+      : undefined;
+
+  return (
+    <>
+      <ul className="grid grid-cols-3 gap-x-2 gap-y-4 sm:grid-cols-4">
+        {users.map((user) => {
+          const label = user.id ? (user.name ?? user.id) : "Unattributed";
+
+          const content = (
+            <>
+              <span
+                aria-hidden="true"
+                className={cn(
+                  "flex size-10 items-center justify-center rounded-full font-medium text-sm",
+                  user.id
+                    ? "bg-primary/15 text-primary"
+                    : "bg-muted text-muted-foreground"
+                )}
+              >
+                {user.id ? initialsOf(label) : "–"}
+              </span>
+              <span className="w-full truncate text-sm">{label}</span>
+              <span className="whitespace-nowrap text-muted-foreground text-xs tabular-nums">
+                {compactNumber.format(user.requestCount)} requests
+              </span>
+            </>
+          );
+
+          return (
+            <li className="min-w-0 text-center" key={user.id ?? ""}>
+              {user.id && activeOrg?.id ? (
+                <button
+                  aria-label={`View request log for ${label}`}
+                  className="flex w-full min-w-0 flex-col items-center gap-1 rounded-lg p-2 hover:bg-muted focus-visible:outline-2 focus-visible:outline-primary"
+                  onClick={() => {
+                    if (user.id) {
+                      setSelected({ orgId: activeOrg.id, userId: user.id });
+                    }
+                  }}
+                  type="button"
+                >
+                  {content}
+                </button>
+              ) : (
+                <div className="flex flex-col items-center gap-1 p-2">
+                  {content}
+                </div>
               )}
-            >
-              {user.id ? initialsOf(label) : "–"}
-            </span>
-            <span className="w-full truncate text-sm">{label}</span>
-            <span className="whitespace-nowrap text-muted-foreground text-xs tabular-nums">
-              {compactNumber.format(user.requestCount)} requests
-            </span>
-          </li>
-        );
-      })}
-    </ul>
+            </li>
+          );
+        })}
+      </ul>
+      {selected && account && (
+        <AdoptionRequestLog
+          account={account}
+          onClose={() => setSelected(null)}
+          orgId={selected.orgId}
+          userId={selected.userId}
+        />
+      )}
+    </>
   );
 }
 

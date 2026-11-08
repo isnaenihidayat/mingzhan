@@ -9,6 +9,7 @@
     "test": "bun test"
   },
   "dependencies": {
+    "@grammyjs/runner": "2.0.3",
     "@mingzhan/client": "workspace:*",
     "@mingzhan/core": "workspace:*",
     "grammy": "^1.46.0"

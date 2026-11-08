@@ -1,8 +1,5 @@
 import { findCustomModel, type ProviderInstance } from "@mingzhan/core";
-import {
-  NETRA_AGENT_MODEL_ID,
-  resolveNetraModelId,
-} from "@mingzhan/core/discovery-providers";
+import { resolveNetraModelId } from "@mingzhan/core/discovery-providers";
 import {
   getModelById,
   getModelsForProvider,
@@ -64,11 +61,10 @@ export function modelExistsOnInstance(
   }
 
   if (instance.type === "netra") {
-    return (
-      resolveNetraModelId(trimmed) === NETRA_AGENT_MODEL_ID &&
-      (instance.customModels ?? []).some(
-        (entry) => resolveNetraModelId(entry.id) === NETRA_AGENT_MODEL_ID
-      )
+    const resolved = resolveNetraModelId(trimmed);
+
+    return (instance.customModels ?? []).some(
+      (entry) => resolveNetraModelId(entry.id) === resolved
     );
   }
 

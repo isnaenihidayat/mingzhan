@@ -4,12 +4,17 @@ import type {
   LlmUsageModelStats,
   LlmUsageStats,
 } from "@mingzhan/core";
+import type { LlmRequestLogEntry } from "@mingzhan/core/contract";
 import type { DatabaseAdapter, LlmUsageActor } from "@mingzhan/db";
 import {
   estimateUsageCostUsd,
   getExplicitModelPricing,
   type PricingContext,
 } from "../providers/pricing";
+import type {
+  GenerateImageResult,
+  ResolvedImageGenerationSelection,
+} from "./image-generation";
 
 const LLM_USAGE_DAILY_WINDOW_DAYS = 30;
 
@@ -22,6 +27,7 @@ export interface LlmUsageRecordOptions extends LlmUsageActor {
   /** Owning tenant. The ledger is per org, so an unattributable call is not stored. */
   orgId: string;
   pricingContext?: PricingContext;
+  sessionId?: string | null;
 }
 
 /**
@@ -145,6 +151,109 @@ export class LlmUsageTracker {
     } catch (error) {
       console.warn("Failed to persist LLM usage stats:", error);
     }
+  }
+
+  async trackRequest<T>(
+    request: LlmUsageRecordOptions & { modelId: string; provider: string },
+    call: () => Promise<T>,
+    usageOf: (result: T) => {
+      inputTokens: number | null;
+      outputTokens: number | null;
+      estimatedCostUsd: number | null;
+    },
+    signal?: AbortSignal
+  ): Promise<T> {
+    const startedAt = new Date().toISOString();
+    const start = performance.now();
+
+    const metadata = () => ({
+      durationMs: Math.round(performance.now() - start),
+      modelId: request.modelId,
+      provider: request.provider,
+      startedAt,
+    });
+
+    let result: T;
+
+    try {
+      result = await call();
+    } catch (error) {
+      this.recordRequest(request, {
+        ...metadata(),
+        estimatedCostUsd: null,
+        inputTokens: null,
+        outputTokens: null,
+        status: signal?.aborted ? "cancelled" : "failed",
+      });
+      throw error;
+    }
+
+    this.recordRequest(request, {
+      ...metadata(),
+      ...usageOf(result),
+      status: "success",
+    });
+
+    return result;
+  }
+
+  async trackImageRequest(
+    actor: LlmUsageRecordOptions,
+    selection: ResolvedImageGenerationSelection,
+    generate: () => Promise<GenerateImageResult>,
+    signal?: AbortSignal
+  ): Promise<GenerateImageResult> {
+    const pricing = { providerInstance: selection.instance };
+
+    return this.trackRequest(
+      {
+        ...actor,
+        modelId: selection.model,
+        provider: selection.instance.type,
+      },
+      generate,
+      (result) => {
+        const usage = result.usage;
+
+        return {
+          estimatedCostUsd:
+            usage && getExplicitModelPricing(result.model, pricing)
+              ? estimateUsageCostUsd(
+                  result.model,
+                  usage.inputTokens,
+                  usage.outputTokens,
+                  pricing
+                )
+              : null,
+          inputTokens: usage?.inputTokens ?? null,
+          outputTokens: usage?.outputTokens ?? null,
+        };
+      },
+      signal
+    );
+  }
+
+  private recordRequest(
+    actor: Pick<
+      LlmUsageRecordOptions,
+      "orgId" | "profileId" | "sessionId" | "userId"
+    >,
+    entry: Omit<LlmRequestLogEntry, "id" | "agentName" | "profileId" | "chat">
+  ): void {
+    if (!(this.db && actor.orgId.trim() && actor.userId)) {
+      return;
+    }
+
+    const write = this.db
+      .insertLlmRequestLog(actor.orgId, actor.userId, {
+        ...entry,
+        profileId: actor.profileId ?? null,
+        sessionId: actor.sessionId ?? null,
+      })
+      .catch(() => console.warn("Failed to persist LLM request metadata"));
+
+    this.pendingWrites.add(write);
+    void write.finally(() => this.pendingWrites.delete(write));
   }
 
   async getStats(orgId: string): Promise<LlmUsageStats> {

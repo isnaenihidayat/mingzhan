@@ -18,6 +18,7 @@ import type {
 import { OrgUsageQuotaService } from "../../services/org-usage-quota-service";
 import type { ServerOptions } from "../context";
 import {
+  profileResponseFor,
   requireOrgAdminFromContext,
   requireOrgAdminOrPlatformAdminFromContext,
   requireOrgMember,
@@ -202,7 +203,7 @@ export function registerOrgMemberRoutes(
       );
 
       return json<ProfileResponse>(
-        await options.agent.getProfile(orgId, profile.id)
+        profileResponseFor(c, await options.agent.getProfile(orgId, profile.id))
       );
     }
   );
@@ -604,6 +605,7 @@ export function registerOrgMemberRoutes(
     const body = await readJson(c.req.raw, addOrgMemberSchema);
 
     const member = await orgService.addMember({
+      bypassDomainAllowlist: auth.isPlatformAdmin,
       email: body.email,
       name: body.name,
       orgId,

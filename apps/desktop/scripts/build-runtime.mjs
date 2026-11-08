@@ -82,11 +82,30 @@ for (const file of tracked.stdout.toString().split("\0").filter(Boolean)) {
   await cp(join(root, file), join(output, file));
 }
 
-// Host-side desktop bridge scripts are explicit runtime entry points, including in uncommitted local builds.
-for (const name of ["desktop-mcp-bridge.ts", "check-desktop-bridge.ts"]) {
-  const target = join(output, "apps/server/scripts", name);
+// Explicit entry points and bundled assets also work in uncommitted local builds.
+// Do not include arbitrary untracked files: they may contain local credentials.
+for (const file of [
+  "apps/server/scripts/desktop-mcp-bridge.ts",
+  "apps/server/scripts/check-desktop-bridge.ts",
+  "apps/server/src/providers/command-code/index.ts",
+  "apps/server/src/services/image-generation-chatgpt.ts",
+  "apps/server/src/services/mcp-fetch.ts",
+  "apps/server/src/services/mcp-secret-store.ts",
+  "apps/server/src/services/oauth-callback-claim.ts",
+  "apps/server/src/http/routes/regression-cases.ts",
+  "apps/server/src/http/turn-stream.ts",
+  "apps/server/src/services/mcp-tool-result.ts",
+  "apps/server/src/tools/bash-state-paths.ts",
+  "packages/core/src/channel-commands.ts",
+  "packages/core/src/channel-bot-token-reader.ts",
+  "packages/core/src/skills/bundled",
+]) {
+  const target = join(output, file);
   await mkdir(dirname(target), { recursive: true });
-  await cp(join(root, "apps/server/scripts", name), target);
+  await cp(join(root, file), target, {
+    filter: (source) => !/\.(test|spec)\.[cm]?[jt]sx?$/.test(source),
+    recursive: true,
+  });
 }
 
 // Keep every workspace manifest so the frozen lockfile stays valid.

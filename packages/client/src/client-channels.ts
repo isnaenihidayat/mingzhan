@@ -52,6 +52,20 @@ export class ChannelsClient extends AutomationsClient {
     });
   }
 
+  /** Workers only: the server decrypts the bot token for the local token holder. */
+  async getChannelBotToken(
+    scope: string,
+    name: string
+  ): Promise<string | null> {
+    const response = await this.request<{ token: string | null }>(
+      `/v1/internal/channel-bot-token?scope=${encodeURIComponent(scope)}&name=${encodeURIComponent(name)}`,
+      // A server that takes the socket and stalls must not wedge the worker.
+      { signal: AbortSignal.timeout(10_000) }
+    );
+
+    return response.token;
+  }
+
   async getTelegramSettings(
     profileId?: string
   ): Promise<TelegramSettingsResponse> {
@@ -224,6 +238,15 @@ export class ChannelsClient extends AutomationsClient {
         body: JSON.stringify(request),
         method: "PUT",
       }
+    );
+  }
+
+  async regenerateTeamsHandshake(
+    profileId?: string
+  ): Promise<TeamsSettingsResponse> {
+    return this.request<TeamsSettingsResponse>(
+      `/v1/settings/teams/handshake?profileId=${encodeURIComponent(profileId ?? "")}`,
+      { method: "POST" }
     );
   }
 

@@ -1,7 +1,4 @@
-import { queryOptions, useQuery } from "@tanstack/react-query";
-import { client } from "@/lib/client";
 import type { SelectedProvider } from "@/lib/models";
-import { queryKeys } from "@/lib/query-keys";
 
 export interface ModelsDevRow {
   apiUrl: string;
@@ -10,9 +7,9 @@ export interface ModelsDevRow {
   experimental: boolean;
   isFree: boolean;
   isZen: boolean;
+  mingzhanProvider: SelectedProvider;
   modelId: string;
   modelName: string;
-  mingzhanProvider: SelectedProvider;
   providerId: string;
   providerName: string;
   reasoning: boolean;
@@ -92,17 +89,6 @@ function resolvemingzhanProvider(
   return "openai_compatible";
 }
 
-async function fetchModelsDev(): Promise<ModelsDevRow[]> {
-  return parseModelsDevCatalog(
-    // SAFETY: The enclosing parser checks the value before this conversion.
-    // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- This dictionary holds external JSON keys until the boundary parser validates each value.
-    (await client.getExternalModelCatalog("models-dev")) as Record<
-      string,
-      unknown
-    >
-  );
-}
-
 export function parseModelsDevCatalog(
   // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- This dictionary holds external JSON keys until the boundary parser validates each value.
   data: Record<string, unknown>
@@ -175,10 +161,10 @@ export function parseModelsDevCatalog(
         deprecated: (model.status as string | undefined) === "deprecated",
         isFree,
         isZen: providerId === "opencode",
+        mingzhanProvider,
         modelId,
         // SAFETY: The enclosing parser checks the value before this conversion.
         modelName: (model.name as string | undefined) ?? modelId,
-        mingzhanProvider,
         providerId,
         providerName,
         // SAFETY: The enclosing parser checks the value before this conversion.
@@ -195,14 +181,4 @@ export function parseModelsDevCatalog(
   }
 
   return rows;
-}
-
-const modelsDevQueryOptions = queryOptions({
-  queryFn: fetchModelsDev,
-  queryKey: queryKeys.modelsDev,
-  staleTime: 1000 * 60 * 30,
-});
-
-export function useModelsDev() {
-  return useQuery(modelsDevQueryOptions);
 }

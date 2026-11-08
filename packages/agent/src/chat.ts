@@ -11,12 +11,18 @@ import type {
   MessageContentPart,
   ProviderChatOptions,
   ProviderClient,
+  RehydrateMessagesOptions,
   SendMessageInput,
   ToolCall,
   ToolContext,
   ToolDefinition,
 } from "@mingzhan/core";
-import { createId, ProviderStreamInterruptedError } from "@mingzhan/core";
+import {
+  createId,
+  MODEL_CONNECTION_CLOSED_MESSAGE,
+  MíngZhànApiError,
+  ProviderStreamInterruptedError,
+} from "@mingzhan/core";
 import { z } from "zod";
 
 export interface AgentRequest {
@@ -78,6 +84,49 @@ const QuestionnaireToolResultSchema = z.object({ questionnaire: z.json() });
 const MAX_TOOL_ITERATIONS = 100;
 
 const MAX_TURN_OUTPUT_TOKENS = 200_000;
+
+/** Wait before the one retry a turn spends on a transient provider failure. */
+const PROVIDER_RETRY_DELAY_MS = 500;
+
+/**
+ * Connection failures that carry no HTTP status. Bun names them in `.code`
+ * ("ConnectionRefused", "ENOTFOUND", ...), older stacks use the Node
+ * spellings ("ECONNRESET", ...), and Bun's refused-host TypeError is only
+ * recognized by its fixed message. The OpenAI-shaped adapters pass all of
+ * these through as-is, so the retry gate has to recognize them itself.
+ */
+const CONNECTION_ERROR_CODES = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "EAI_AGAIN",
+  "ENOTFOUND",
+  "ConnectionRefused",
+  "ConnectionReset",
+  "ConnectionClosed",
+]);
+
+function isTransientConnectionError<ErrorValue>(error: ErrorValue): boolean {
+  if (!(error instanceof TypeError)) {
+    return false;
+  }
+
+  // SAFETY: TypeError is the only shape this helper handles, and Bun's
+  // fetch connection failures carry the socket code on it when the runtime
+  // names one. The fallback covers the case where no code was attached.
+  const code = (error as { code?: string }).code;
+
+  if (code) {
+    return CONNECTION_ERROR_CODES.has(code);
+  }
+
+  return (
+    error.message.startsWith("Unable to connect") ||
+    error.message.includes("getaddrinfo")
+  );
+}
 
 const MAX_OPEN_TODO_NUDGES = 2;
 
@@ -169,7 +218,8 @@ export interface AgentChatSessionOptions {
     content: string | MessageContentPart[]
   ) => Promise<string | MessageContentPart[]>;
   rehydrateMessagesForProvider?: (
-    messages: readonly ChatMessage[]
+    messages: readonly ChatMessage[],
+    options: RehydrateMessagesOptions
   ) => Promise<ChatMessage[]>;
   resolvePromptContext?: (
     context?: ResolvePromptContextInput
@@ -533,7 +583,8 @@ async function sendMessage(
       content: string | MessageContentPart[]
     ) => Promise<string | MessageContentPart[]>;
     rehydrateMessagesForProvider?: (
-      messages: readonly ChatMessage[]
+      messages: readonly ChatMessage[],
+      options: RehydrateMessagesOptions
     ) => Promise<ChatMessage[]>;
     signal?: AbortSignal;
     whatsappMessage?: ToolContext["whatsappMessage"];
@@ -735,7 +786,8 @@ async function runConversation(
   handlers?: StreamHandlers,
   toolContext?: ToolContext,
   rehydrateMessagesForProvider?: (
-    messages: readonly ChatMessage[]
+    messages: readonly ChatMessage[],
+    options: RehydrateMessagesOptions
   ) => Promise<ChatMessage[]>,
   onContextUsage?: (
     usedTokens: number,
@@ -750,7 +802,9 @@ async function runConversation(
   let finalReplyOnly = false;
   let thinkingOff = false;
   let streamRetried = false;
+  let transientRetried = false;
   let streamInterrupted = false;
+  let malformedToolRetried = false;
   let openTodoNudges = 0;
   let openTodosReminder: string | null = null;
 
@@ -849,6 +903,40 @@ async function runConversation(
         streamRetried = true;
         streamInterrupted = true;
         continue;
+      }
+
+      // Providers surface rate limits, gateways, and timeouts as one 502
+      // (buildProviderHttpError maps every non-auth HTTP status there, for
+      // the OpenAI-shaped adapters and now Gemini too), and a refused
+      // connection or failed DNS lookup arrives as Bun's TypeError before any
+      // HTTP happens. One bounded try per turn covers both; drops that land
+      // after a chunk or a tool call go through the interrupted path instead,
+      // and permanent failures still fail the turn.
+      if (
+        ((error instanceof MíngZhànApiError &&
+          error.status >= 500 &&
+          !(error instanceof ProviderStreamInterruptedError)) ||
+          isTransientConnectionError(error)) &&
+        !transientRetried &&
+        !signal?.aborted
+      ) {
+        transientRetried = true;
+        await new Promise((resolve) =>
+          setTimeout(resolve, PROVIDER_RETRY_DELAY_MS)
+        );
+        continue;
+      }
+
+      // A dropped connection reaches the user in plain words, on every
+      // surface; the runtime's text stays on `cause` for the logs.
+      if (
+        error instanceof ProviderStreamInterruptedError ||
+        isTransientConnectionError(error)
+      ) {
+        throw Object.assign(
+          new ProviderStreamInterruptedError(MODEL_CONNECTION_CLOSED_MESSAGE),
+          { cause: error }
+        );
       }
 
       throw error;
@@ -965,17 +1053,50 @@ async function runConversation(
     }
 
     if (!enableToolLoop || result.toolCalls.length === 0) {
-      if (
-        enableToolLoop &&
-        openTodoNudges < MAX_OPEN_TODO_NUDGES &&
-        producedTokens < MAX_TURN_OUTPUT_TOKENS
-      ) {
-        openTodosReminder = (await toolContext?.openTodosReminder?.()) ?? null;
+      const pendingTodos = enableToolLoop
+        ? ((await toolContext?.openTodosReminder?.()) ?? null)
+        : null;
 
-        if (openTodosReminder) {
-          openTodoNudges += 1;
-          continue;
+      const malformedTool = Boolean(
+        llmTools?.length &&
+          /<\/(?:tool_call|arg_value|arg_key)>/i.test(result.content)
+      );
+
+      const canRetry =
+        iteration + 1 < MAX_TOOL_ITERATIONS &&
+        producedTokens < MAX_TURN_OUTPUT_TOKENS;
+
+      if (malformedTool && !malformedToolRetried && canRetry) {
+        malformedToolRetried = true;
+        openTodosReminder =
+          "Your last response contained tool markup as text. No tool ran from that text. Use a structured tool call to retry only the unfinished action. Preserve results already saved.";
+        continue;
+      }
+
+      if (
+        !malformedTool &&
+        pendingTodos &&
+        openTodoNudges < MAX_OPEN_TODO_NUDGES &&
+        canRetry
+      ) {
+        openTodosReminder = pendingTodos;
+        openTodoNudges += 1;
+        continue;
+      }
+
+      if (malformedTool || pendingTodos) {
+        const notice = malformedTool
+          ? "Work incomplete: the provider returned a tool call as text, so the action did not run. Send another message to continue."
+          : "Work incomplete: some tasks are still open. Send another message to continue.";
+
+        const suffix = `\n\n${notice}`;
+        history.push({ content: notice, role: "assistant" });
+
+        if (mode === "stream") {
+          handlers?.onChunk(suffix);
         }
+
+        return result.content + suffix;
       }
 
       return result.content;
@@ -1243,7 +1364,8 @@ async function generateReply(
   mode: "send" | "stream",
   handlers?: StreamHandlers,
   rehydrateMessagesForProvider?: (
-    messages: readonly ChatMessage[]
+    messages: readonly ChatMessage[],
+    options: RehydrateMessagesOptions
   ) => Promise<ChatMessage[]>,
   signal?: AbortSignal,
   toolGroupId?: string
@@ -1258,8 +1380,13 @@ async function generateReply(
   );
 
   let attachments: MessageContentPart[] = [];
+  let turnStartIndex: number | undefined;
 
   for (const [index, message] of history.entries()) {
+    if (index === lastUserIndex) {
+      turnStartIndex = expanded.length;
+    }
+
     if (message.role === "tool" && message.attachments?.length) {
       const { attachments: parts, ...toolMessage } = message;
       expanded.push(toolMessage);
@@ -1288,7 +1415,10 @@ async function generateReply(
   const messages =
     rehydrateMessagesForProvider === undefined
       ? expanded
-      : await rehydrateMessagesForProvider(expanded);
+      : await rehydrateMessagesForProvider(expanded, {
+          toolNames: tools?.map((tool) => tool.name) ?? [],
+          turnStartIndex,
+        });
 
   const input = {
     messages,
@@ -1370,13 +1500,30 @@ async function generateReply(
             },
           };
     } catch (error) {
-      const interrupted = error instanceof ProviderStreamInterruptedError;
+      // A connection that lands after a chunk or a tool call has gone out is
+      // the same shape as a broken stream: keep the partial reply in history,
+      // close the steps that never got their tool end, and let the interrupted
+      // path retry it once with its note, instead of the turn gate replaying
+      // the call from scratch and leaving those steps open.
+      const streamError =
+        (content || thinking || pendingToolInputs.size > 0) &&
+        isTransientConnectionError(error) &&
+        !(error instanceof ProviderStreamInterruptedError)
+          ? Object.assign(
+              new ProviderStreamInterruptedError(
+                MODEL_CONNECTION_CLOSED_MESSAGE
+              ),
+              { cause: error }
+            )
+          : error;
+
+      const interrupted = streamError instanceof ProviderStreamInterruptedError;
 
       // Tool calls cut off by the broken stream never run; close their steps.
       if (interrupted) {
         for (const [toolCallId, tool] of pendingToolInputs) {
           handlers.onToolEnd?.({
-            result: { error: error.message },
+            result: { error: streamError.message },
             tool,
             toolCallId,
             toolGroupId,
@@ -1384,7 +1531,13 @@ async function generateReply(
         }
       }
 
-      if ((signal?.aborted || interrupted) && (content || thinking)) {
+      // The retry replays history, and providers such as DeepSeek reject an
+      // assistant message with no content. Keep a cut-off reply only with text.
+      const keepPartial = interrupted
+        ? Boolean(content.trim())
+        : Boolean(content || thinking);
+
+      if ((signal?.aborted || interrupted) && keepPartial) {
         finishThinking();
 
         const message: ChatMessage = {
@@ -1403,7 +1556,7 @@ async function generateReply(
         history.push(message);
       }
 
-      throw error;
+      throw streamError;
     }
   }
 

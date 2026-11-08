@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import type { ChatMessage, UserConfig } from "@mingzhan/core";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { ChatMessage, ProviderClient, UserConfig } from "@mingzhan/core";
 import {
   createInMemoryDatabaseAdapter,
   type DatabaseAdapter,
@@ -8,6 +11,8 @@ import {
   evaluatePostTurnReviewTurnEligibility,
   SkillPostTurnReviewService,
 } from "./skill-post-turn-review-service";
+import { SkillsService } from "./skills-service";
+import { ORG_ID, seedSkillOrg } from "./skills-service-test-fixtures";
 
 function toolCall(id: string, name = "read_file") {
   return { arguments: {}, id, name };
@@ -316,6 +321,145 @@ describe("SkillPostTurnReviewService", () => {
     release();
     expect(await first).toBe("ran");
     expect(ran).toBe(1);
+  });
+
+  test("review prompt carries the SKILL.md of skills the session loaded", async () => {
+    const originalConfigDir = process.env.MINGZHAN_CONFIG_DIR;
+
+    const configDir = await mkdtemp(
+      join(tmpdir(), "mingzhan-post-turn-review-")
+    );
+
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    try {
+      const db = createInMemoryDatabaseAdapter();
+      const profile = await seedSkillOrg(db);
+      const skills = new SkillsService(db);
+
+      for (const name of [
+        "deploy-notes",
+        "explicit-notes",
+        "failed-notes",
+        "late-notes",
+        "old-notes",
+        "release-notes",
+      ]) {
+        const created = await skills.createSkill(ORG_ID, {
+          body: `${name}-body-marker`,
+          description: `About ${name}.`,
+          name,
+          profileId: profile.id,
+        });
+
+        await db.assignSkillToProfile(profile.id, created.skill.id);
+      }
+
+      let prompt = "";
+
+      const provider: ProviderClient = {
+        generateChat: () => Promise.reject(new Error("unused")),
+        generateText: (request) => {
+          prompt = request.prompt;
+
+          return Promise.resolve({ content: '{"action":"noop"}' });
+        },
+        name: "openai",
+        streamChat: () => Promise.reject(new Error("unused")),
+      };
+
+      const service = new SkillPostTurnReviewService(db, () => null);
+      service.resolveProviderForProfile = () => Promise.resolve(provider);
+
+      const turnMessages: ChatMessage[] = [
+        { content: "/skill late-notes now release", role: "user" },
+        {
+          content: "",
+          role: "assistant",
+          toolCalls: [
+            {
+              arguments: { name: "failed-notes" },
+              id: "2",
+              name: "load_skill",
+            },
+          ],
+        },
+        {
+          content: JSON.stringify({ error: "No skill named failed-notes" }),
+          name: "load_skill",
+          role: "tool",
+          toolCallId: "2",
+        },
+        // Skills that are not assigned take no slot from the profile's skills.
+        {
+          content: "",
+          role: "assistant",
+          toolCalls: [
+            {
+              arguments: { name: "global-notes" },
+              id: "3",
+              name: "load_skill",
+            },
+          ],
+        },
+        {
+          content: JSON.stringify({ instructions: "x", name: "global-notes" }),
+          name: "load_skill",
+          role: "tool",
+          toolCallId: "3",
+        },
+        { content: "/skill ghost-notes", role: "user" },
+      ];
+
+      await service.reviewTurnWithLlm({
+        messages: [
+          { content: "/skill old-notes", role: "user" },
+          { content: "ok", role: "assistant" },
+          { content: "/skill explicit-notes deploy", role: "user" },
+          {
+            content: "",
+            role: "assistant",
+            toolCalls: [
+              {
+                arguments: { name: " deploy-notes " },
+                id: "1",
+                name: "load_skill",
+              },
+            ],
+          },
+          {
+            // Compaction replaced the result, so the call's own name counts.
+            content: "[output truncated by compaction]",
+            name: "load_skill",
+            role: "tool",
+            toolCallId: "1",
+          },
+          { content: "done", role: "assistant" },
+          ...turnMessages,
+        ],
+        orgId: ORG_ID,
+        profileId: profile.id,
+        sessionId: "session_1",
+        turnMessages,
+        userId: null,
+      });
+
+      expect(prompt).toContain("deploy-notes-body-marker");
+      expect(prompt).toContain("explicit-notes-body-marker");
+      expect(prompt).toContain("late-notes-body-marker");
+      // Only the three most recent loads keep a body.
+      expect(prompt).not.toContain("old-notes-body-marker");
+      expect(prompt).not.toContain("failed-notes-body-marker");
+      expect(prompt).not.toContain("release-notes-body-marker");
+    } finally {
+      if (originalConfigDir === undefined) {
+        delete process.env.MINGZHAN_CONFIG_DIR;
+      } else {
+        process.env.MINGZHAN_CONFIG_DIR = originalConfigDir;
+      }
+
+      await rm(configDir, { force: true, recursive: true });
+    }
   });
 
   test("resolveProviderForProfile passes the model string to createProvider", async () => {

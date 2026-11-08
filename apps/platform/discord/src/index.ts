@@ -6,12 +6,14 @@ import {
   log,
 } from "@mingzhan/core";
 import { hasActiveStreams } from "@mingzhan/core/channel-active-stream";
-import { channelOwnerFromEnv } from "@mingzhan/core/channel-config-shared";
+import {
+  channelOwnerFromEnv,
+  readBotTokensFromServer,
+} from "@mingzhan/core/channel-config-shared";
 import { ChannelOrgStore } from "@mingzhan/core/channel-org";
 import { ChannelSessionStore } from "@mingzhan/core/channel-session-store";
 import { getDiscordConfigDir } from "@mingzhan/core/discord-config";
 import { createDiscordWorkerHeartbeat } from "@mingzhan/core/discord-worker";
-
 import {
   ensureServerRunning,
   stopSpawnedServer,
@@ -64,6 +66,15 @@ registerCleanupHandlers(async () => {
 });
 
 try {
+  const authToken =
+    (await loadLocalAuthToken("discord@mingzhan.internal")) ?? undefined;
+
+  // The token is encrypted on disk; the server reads it for us.
+  const tokenClient = new MíngZhànClient({ authToken });
+  readBotTokensFromServer((secret) =>
+    tokenClient.getChannelBotToken(secret.scope, secret.name)
+  );
+
   const config = await loadConfig();
   await heartbeat.acquire();
 
@@ -74,8 +85,7 @@ try {
   spawnedChild = child;
 
   const client = new MíngZhànClient({
-    authToken:
-      (await loadLocalAuthToken("discord@mingzhan.internal")) ?? undefined,
+    authToken,
     baseUrl: serverUrl,
     clientOrigin: resolveWebPublicUrl(),
     orgId: owner.orgId,

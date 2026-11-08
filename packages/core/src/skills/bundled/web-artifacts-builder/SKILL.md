@@ -11,3 +11,7 @@ Build a working browser artifact with the complexity the task needs.
 3. Keep local state coherent and show loading/error states for actual requests. Clearly distinguish mock data from connected data. Do not embed credentials, access private APIs directly from a shared artifact, or imply a demo is production-connected.
 4. Use relative assets or inline resources when possible; explain required network resources. A static artifact must not depend on a development server running on the user's host.
 5. Verify build output, interactions when a browser is authorized/available, and that referenced assets exist. Save the final text artifact through save_artifact and report any server-side capability it still needs.
+
+## Data-driven artifacts
+
+For filterable charts and tables, use the bundled interactive-visualizations workflow and its offline dashboard helper. Keep the source and calculation visible, distinguish scenarios from measured data, and verify that chart values, visible rows and exported CSV agree after each filter/sort action. Use the data-analysis skill for calculations rather than inventing display values.

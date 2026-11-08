@@ -12,6 +12,7 @@ import type { SkillProposal } from "@mingzhan/core/contract";
 import {
   assertNotBundledSkillName,
   assertValidSkillName,
+  prepareSkillPatch,
 } from "@mingzhan/core/skills/write";
 import type {
   DatabaseAdapter,
@@ -152,7 +153,10 @@ export class SkillProposalService {
     }
 
     if (proposal.status !== "pending") {
-      throw new MíngZhànApiError("Only pending proposals can be approved.", 400);
+      throw new MíngZhànApiError(
+        "Only pending proposals can be approved.",
+        400
+      );
     }
 
     if (await db.getSharedAgentInstance(orgId, proposal.profileId)) {
@@ -240,7 +244,10 @@ export class SkillProposalService {
       const relativePath = proposal.relativePath;
 
       if (!relativePath?.trim()) {
-        throw new MíngZhànApiError("Remove-file proposal is missing path.", 400);
+        throw new MíngZhànApiError(
+          "Remove-file proposal is missing path.",
+          400
+        );
       }
 
       await skills.removeAssignedProfileSkillSupportingFile(
@@ -301,7 +308,10 @@ export class SkillProposalService {
     }
 
     if (proposal.status !== "pending") {
-      throw new MíngZhànApiError("Only pending proposals can be rejected.", 400);
+      throw new MíngZhànApiError(
+        "Only pending proposals can be rejected.",
+        400
+      );
     }
 
     const reviewedAt = new Date().toISOString();
@@ -431,6 +441,14 @@ export class SkillProposalService {
 
     this.assertPatchFieldSize(oldString);
     this.assertPatchFieldSize(newString);
+
+    await prepareSkillPatch({
+      name,
+      newString,
+      oldString,
+      orgId: input.orgId,
+      profileId: input.profileId,
+    });
 
     const db = this.requireDatabase();
 

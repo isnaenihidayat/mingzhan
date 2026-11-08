@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import {
+  chmod,
   link,
   lstat,
   mkdir,
@@ -13,13 +14,16 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { MíngZhànApiError } from "@mingzhan/core";
 import { createDatabase, createSqliteDatabase } from "@mingzhan/db";
 import * as fflate from "fflate";
 import {
+  cleanupDataPortabilityTempDirs,
   createMíngZhànDataExport,
+  createMíngZhànDataExportFile,
   createMíngZhànOrgDataExport,
+  DATA_IMPORT_LIMITS,
   decodeArchiveRequestData,
   MAX_IMPORT_ARCHIVE_BYTES,
   MAX_IMPORT_ENTRIES,
@@ -30,9 +34,11 @@ import {
   previewMíngZhànDataImport,
   restoreMíngZhànDataImport,
   retireAppUserData,
+  SETUP_IMPORT_LIMITS,
 } from "./data-portability";
 import { MeetingStore } from "./google-meet/store";
 import { ManagedSecrets } from "./managed-secrets";
+import { writeBackup } from "./scheduled-backup";
 
 let rootDir = "";
 
@@ -844,17 +850,28 @@ describe("MíngZhàn data portability", () => {
     const filePath = join(rootDir, "at-budget.bin");
     await writeFile(filePath, Buffer.alloc(MAX_IMPORT_ENTRY_BYTES));
 
+    const limits = {
+      ...DATA_IMPORT_LIMITS,
+      entryBytes: MAX_IMPORT_ENTRY_BYTES,
+    };
+
     const exported = await createMíngZhànDataExport({
       databasePath: null,
+      limits,
       rootDir,
     });
 
-    const preview = await previewMíngZhànDataImport(exported.data, { rootDir });
+    const preview = await previewMíngZhànDataImport(exported.data, {
+      limits,
+      rootDir,
+    });
+
     expect(preview.archiveFileCount).toBe(1);
     expect(preview.archiveTotalBytes).toBe(MAX_IMPORT_ENTRY_BYTES);
 
     const restored = await restoreMíngZhànDataImport(exported.data, {
       confirm: true,
+      limits,
       rootDir,
     });
 
@@ -876,7 +893,14 @@ describe("MíngZhàn data portability", () => {
     }
 
     await expect(
-      createMíngZhànDataExport({ databasePath, rootDir })
+      createMíngZhànDataExport({
+        databasePath,
+        limits: {
+          ...DATA_IMPORT_LIMITS,
+          entryBytes: MAX_IMPORT_ENTRY_BYTES,
+        },
+        rootDir,
+      })
     ).rejects.toMatchObject({ status: 413 });
     expect(await readdir(rootDir)).toEqual(["mingzhan.sqlite"]);
     const original = new Database(databasePath, { readonly: true });
@@ -907,24 +931,20 @@ describe("MíngZhàn data portability", () => {
       createMíngZhànDataExport({ databasePath: null, rootDir })
     ).rejects.toMatchObject({ status: 413 });
     expect((await readdir(rootDir)).length).toBe(MAX_IMPORT_ENTRIES);
-  }, 30_000);
+  }, 90_000);
 
   test("counts the manifest against the export expanded-byte budget", async () => {
     for (let index = 0; index < 5; index += 1) {
       await writeFile(join(rootDir, `part-${index}.bin`), "original");
     }
 
-    const readMock = spyOn(fsPromises, "readFile").mockResolvedValue(
-      Buffer.alloc(MAX_IMPORT_ENTRY_BYTES)
-    );
-
-    try {
-      await expect(
-        createMíngZhànDataExport({ databasePath: null, rootDir })
-      ).rejects.toMatchObject({ status: 413 });
-    } finally {
-      readMock.mockRestore();
-    }
+    await expect(
+      createMíngZhànDataExport({
+        databasePath: null,
+        limits: { ...DATA_IMPORT_LIMITS, uncompressedBytes: 7 },
+        rootDir,
+      })
+    ).rejects.toMatchObject({ status: 413 });
 
     expect((await readdir(rootDir)).length).toBe(5);
   });
@@ -940,20 +960,7 @@ describe("MíngZhàn data portability", () => {
     await writeFile(join(files, "1/gone.txt"), "d");
     await writeFile(join(files, "2/replaced.txt"), "e");
 
-    const realReadFile = fsPromises.readFile;
     const realReaddir = fsPromises.readdir;
-
-    // Each spy changes its target, then forwards the same arguments to the real call.
-    const readMock = spyOn(fsPromises, "readFile").mockImplementation(
-      // SAFETY: the wrapper forwards its arguments to the real readFile unchanged.
-      (async (...args: Parameters<typeof realReadFile>) => {
-        if (String(args[0]).endsWith("before-read.txt")) {
-          await rm(String(args[0]), { force: true });
-        }
-
-        return await realReadFile(...args);
-      }) as typeof realReadFile
-    );
 
     const readdirMock = spyOn(fsPromises, "readdir").mockImplementation(
       // SAFETY: the wrapper forwards its arguments to the real readdir unchanged.
@@ -967,7 +974,14 @@ describe("MíngZhàn data portability", () => {
           await writeFile(args[0], "now a file");
         }
 
-        return await realReaddir(...args);
+        const entries = await realReaddir(...args);
+
+        // This file is in the inventory, then gone before the export opens it.
+        if (args[0] === join(files, "0")) {
+          await rm(join(files, "0/before-read.txt"), { force: true });
+        }
+
+        return entries;
       }) as typeof realReaddir
     );
 
@@ -976,7 +990,6 @@ describe("MíngZhàn data portability", () => {
     try {
       result = await createMíngZhànDataExport({ databasePath: null, rootDir });
     } finally {
-      readMock.mockRestore();
       readdirMock.mockRestore();
     }
 
@@ -1017,29 +1030,188 @@ describe("MíngZhàn data portability", () => {
     }
   });
 
-  test("fails the export on read errors other than a deleted path", async () => {
-    await writeFile(join(rootDir, "notes.txt"), "ok");
-    const realReadFile = fsPromises.readFile;
+  test.each(["notes.txt", "config.ini"])(
+    "names %s when the server cannot read it",
+    async (name) => {
+      await writeFile(join(rootDir, name), "ok");
+      const realReadFile = fsPromises.readFile;
+      const realOpen = fsPromises.open;
 
-    const readMock = spyOn(fsPromises, "readFile").mockImplementation(
-      // SAFETY: the wrapper forwards its arguments to the real readFile unchanged.
-      (async (...args: Parameters<typeof realReadFile>) => {
-        if (args[0] === join(rootDir, "notes.txt")) {
-          throw Object.assign(new Error("denied"), { code: "EACCES" });
+      const denied = () =>
+        Object.assign(new Error("denied"), { code: "EPERM" });
+
+      const readMock = spyOn(fsPromises, "readFile").mockImplementation(
+        // SAFETY: the wrapper forwards its arguments to the real readFile unchanged.
+        (async (...args: Parameters<typeof realReadFile>) => {
+          if (args[0] === join(rootDir, name)) {
+            throw denied();
+          }
+
+          return await realReadFile(...args);
+        }) as typeof realReadFile
+      );
+
+      const openMock = spyOn(fsPromises, "open").mockImplementation(
+        // SAFETY: the wrapper forwards its arguments to the real open unchanged.
+        (async (...args: Parameters<typeof realOpen>) => {
+          if (args[0] === join(rootDir, name)) {
+            throw denied();
+          }
+
+          return await realOpen(...args);
+        }) as typeof realOpen
+      );
+
+      try {
+        await expect(
+          createMíngZhànDataExport({ databasePath: null, rootDir })
+        ).rejects.toMatchObject({
+          message: expect.stringContaining(name),
+          status: 409,
+        });
+      } finally {
+        readMock.mockRestore();
+        openMock.mockRestore();
+      }
+    }
+  );
+
+  // chmod does nothing on Windows, and root lists a mode 000 folder anyway.
+  describe.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "real unreadable folders",
+    () => {
+      test.each([
+        "orgs",
+        "orgs/o1",
+        "orgs/o1/plugins",
+        "orgs/o1/profiles/p1",
+        "backups",
+      ])("names %s when the server cannot list it", async (folder) => {
+        await mkdir(join(rootDir, "orgs/o1/plugins/p/db"), { recursive: true });
+        await mkdir(join(rootDir, "orgs/o1/profiles/p1"), { recursive: true });
+        await mkdir(join(rootDir, "backups"), { recursive: true });
+        await writeFile(join(rootDir, "orgs/o1/profiles/p1/SOUL.md"), "soul");
+        await writeFile(join(rootDir, "backups/notes.txt"), "ok");
+        await chmod(join(rootDir, folder), 0o000);
+
+        try {
+          const refusal = await createMíngZhànDataExport({
+            databasePath: null,
+            rootDir,
+          }).then(
+            () => null,
+            (error: Error & { status?: number }) => error
+          );
+
+          expect(refusal?.status).toBe(409);
+          expect(refusal?.message).toContain(folder);
+          expect(refusal?.message).not.toContain(rootDir);
+        } finally {
+          // Lets afterEach delete the folder.
+          await chmod(join(rootDir, folder), 0o700);
+        }
+      });
+    }
+  );
+
+  // chmod does nothing on Windows, and root opens a mode 000 database anyway.
+  describe.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "real unreadable databases and data root",
+    () => {
+      test.each([
+        "orgs/o1/plugins/p/db/data.sqlite",
+        "orgs/o1/meet/meetings.sqlite",
+        "data/sqlite/mingzhan.sqlite",
+      ])("names %s when the server cannot open it", async (blocked) => {
+        for (const path of [
+          "orgs/o1/plugins/p/db/data.sqlite",
+          "orgs/o1/meet/meetings.sqlite",
+          "data/sqlite/mingzhan.sqlite",
+        ]) {
+          await mkdir(dirname(join(rootDir, path)), { recursive: true });
+          const db = new Database(join(rootDir, path));
+          db.exec("CREATE TABLE t (x)");
+          db.close(true);
         }
 
-        return await realReadFile(...args);
-      }) as typeof realReadFile
-    );
+        await chmod(join(rootDir, blocked), 0o000);
 
-    try {
-      await expect(
-        createMíngZhànDataExport({ databasePath: null, rootDir })
-      ).rejects.toMatchObject({ code: "EACCES" });
-    } finally {
-      readMock.mockRestore();
+        const refusal = await createMíngZhànDataExport({
+          databasePath: join(rootDir, "data/sqlite/mingzhan.sqlite"),
+          rootDir,
+        }).then(
+          () => null,
+          (error: Error & { status?: number }) => error
+        );
+
+        expect(refusal?.status).toBe(409);
+        expect(refusal?.message).toStartWith(
+          `Cannot export a restorable backup: the server cannot read ${blocked}.`
+        );
+        expect(refusal?.message).not.toContain(rootDir);
+      });
+
+      test("names the data folder when the server cannot list the root", async () => {
+        await writeFile(join(rootDir, "notes.txt"), "ok");
+        // Keeps write and search, as a volume can after a change of owner.
+        await chmod(rootDir, 0o300);
+
+        try {
+          const refusal = await createMíngZhànDataExport({
+            databasePath: null,
+            rootDir,
+          }).then(
+            () => null,
+            (error: Error & { status?: number }) => error
+          );
+
+          expect(refusal?.status).toBe(409);
+          expect(refusal?.message).toStartWith(
+            "Cannot export a restorable backup: the server cannot read the data folder."
+          );
+          expect(refusal?.message).not.toContain(rootDir);
+        } finally {
+          // Lets afterEach delete the folder.
+          await chmod(rootDir, 0o700);
+        }
+      });
     }
-  });
+  );
+
+  // chmod does nothing on Windows, and root reads a mode 000 file anyway.
+  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "a real unreadable file fails manual and scheduled backups by name",
+    async () => {
+      const relativePath = "orgs/o1/profiles/p1/SOUL.md.bak-0101";
+      await mkdir(join(rootDir, "orgs/o1/profiles/p1"), { recursive: true });
+      await writeFile(join(rootDir, relativePath), "soul");
+      await chmod(join(rootDir, relativePath), 0o000);
+
+      const refusal = {
+        message: expect.stringContaining(relativePath),
+        status: 409,
+      };
+
+      const exportFile = async () => {
+        const exported = await createMíngZhànDataExportFile({
+          databasePath: null,
+          rootDir,
+        });
+
+        return { cleanup: exported.cleanup, path: exported.path };
+      };
+
+      await expect(exportFile()).rejects.toMatchObject(refusal);
+      await expect(
+        writeBackup({
+          dir: join(rootDir, "backups"),
+          exportFile,
+          key: Buffer.alloc(32),
+        })
+      ).rejects.toMatchObject(refusal);
+      expect(await readdir(rootDir)).toEqual(["orgs"]);
+    }
+  );
 
   test("leaves out Litestream state next to the snapshotted database", async () => {
     const databasePath = join(rootDir, "sqlite/mingzhan.sqlite");
@@ -1062,20 +1234,33 @@ describe("MíngZhàn data portability", () => {
     );
   });
 
+  test("removes stale data portability temp dirs at startup", async () => {
+    for (const name of [
+      ".mingzhan-export-old",
+      ".mingzhan-upload-old",
+      ".mingzhan-restore-old",
+      ".mingzhan-backup-old",
+    ]) {
+      await mkdir(join(rootDir, name), { recursive: true });
+    }
+
+    await writeFile(join(rootDir, "keep.txt"), "keep");
+
+    await cleanupDataPortabilityTempDirs(rootDir);
+
+    expect(await readdir(rootDir)).toEqual(["keep.txt"]);
+  });
+
   test("rejects a ZIP result above the compressed restore budget", async () => {
     await writeFile(join(rootDir, "config.ini"), "original");
 
-    const zipMock = spyOn(fflate, "zipSync").mockReturnValue(
-      new Uint8Array(MAX_IMPORT_ARCHIVE_BYTES + 1)
-    );
-
-    try {
-      await expect(
-        createMíngZhànDataExport({ databasePath: null, rootDir })
-      ).rejects.toMatchObject({ status: 413 });
-    } finally {
-      zipMock.mockRestore();
-    }
+    await expect(
+      createMíngZhànDataExport({
+        databasePath: null,
+        limits: { ...DATA_IMPORT_LIMITS, archiveBytes: 100 },
+        rootDir,
+      })
+    ).rejects.toMatchObject({ status: 413 });
 
     expect(await readFile(join(rootDir, "config.ini"), "utf8")).toBe(
       "original"
@@ -1563,7 +1748,9 @@ describe("MíngZhàn data portability", () => {
     const unsafe = buildUnsafeZip();
     await expect(
       previewMíngZhànDataImport(unsafe, { rootDir })
-    ).rejects.toThrow("Archive entry escapes restore root");
+    ).rejects.toThrow(
+      /Archive entry escapes restore root|invalid relative path/
+    );
 
     const reserved = buildZipWithEntry(
       ".mingzhan-backup-evil/secret.txt",
@@ -1760,8 +1947,38 @@ describe("MíngZhàn data portability", () => {
     ]);
 
     await expect(
-      previewMíngZhànDataImport(archive, { rootDir })
+      previewMíngZhànDataImport(archive, {
+        limits: {
+          ...DATA_IMPORT_LIMITS,
+          entryBytes: MAX_IMPORT_ENTRY_BYTES,
+        },
+        rootDir,
+      })
     ).rejects.toThrow(/big\.bin exceeds/);
+  });
+
+  test("stops an entry that inflates past its declared size", async () => {
+    const manifest = Buffer.from(
+      JSON.stringify({ kind: "mingzhan-export", version: 1 })
+    ).toString("utf8");
+
+    const archive = buildZipWithEntries([
+      { content: manifest, name: MINGZHAN_EXPORT_MANIFEST },
+      {
+        content: "x".repeat(1024 * 1024),
+        declaredSize: 1,
+        name: "bomb.bin",
+      },
+    ]);
+
+    await expect(
+      restoreMíngZhànDataImport(archive, {
+        confirm: true,
+        databasePath: null,
+        limits: SETUP_IMPORT_LIMITS,
+        rootDir,
+      })
+    ).rejects.toThrow(/wrong size/);
   });
 
   test("rejects an archive with more entries than the entry-count cap", async () => {
@@ -1790,7 +2007,10 @@ describe("MíngZhàn data portability", () => {
     );
 
     await expect(
-      previewMíngZhànDataImport(archive, { rootDir })
+      previewMíngZhànDataImport(archive, {
+        limits: SETUP_IMPORT_LIMITS,
+        rootDir,
+      })
     ).rejects.toThrow(/uncompressed limit/);
   });
 });

@@ -327,6 +327,34 @@ step
     ).rejects.toThrow(/multiple|duplicate/i);
   });
 
+  test("writes new_string literally, including $ patterns", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-skill-patch-dollar-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    await writeRawProfileSkillMarkdown({
+      content: `---
+name: shell
+description: Shell notes.
+---
+
+Print the pid.
+`,
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+    });
+
+    const result = await patchSkillFile({
+      name: "shell",
+      newString: "Run `echo $$ $& $1`.",
+      oldString: "Print the pid.",
+      orgId: ORG_ID,
+      profileId: PROFILE_ID,
+    });
+
+    const onDisk = await readFile(join(result.directory, "SKILL.md"), "utf8");
+    expect(onDisk).toContain("Run `echo $$ $& $1`.");
+  });
+
   test("refuses patch on bundled skill name", async () => {
     configDir = await mkdtemp(join(tmpdir(), "mingzhan-skill-patch-bundled-"));
     process.env.MINGZHAN_CONFIG_DIR = configDir;

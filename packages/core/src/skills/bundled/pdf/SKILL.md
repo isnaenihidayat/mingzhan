@@ -11,3 +11,7 @@ Work with PDF files in the user's profile workspace. Read [references/python.md]
 3. Preserve source files. Merge or split in requested order, retaining orientation and reporting intentional annotation/form changes. For forms, inspect field names and types before filling; retain editability unless the user asks for flattening. Do not promise digital signatures survive modification.
 4. Validate by reopening the file, checking page count and extracted text, and checking populated fields where applicable. Render and inspect pages when a renderer is available; otherwise state that visual validation was not performed.
 5. Deliver the verified PDF through the artifact path returned by MíngZhàn. A Markdown explanation is not a generated PDF.
+
+## Delivery gate
+
+Before delivery, follow [references/verification.md](references/verification.md). Run structural checks, render page previews when supported, and inspect the rendered pages. For Excel, evaluate formulas with a real spreadsheet engine and compare key totals to an independent calculation. Report a missing renderer or formula engine as an unverified check; a script returning success alone is not proof of visual quality.

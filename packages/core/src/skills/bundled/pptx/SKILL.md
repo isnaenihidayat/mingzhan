@@ -11,3 +11,7 @@ Build editable PowerPoint presentations rather than HTML slides when PPTX is req
 3. Keep title/body hierarchies consistent. Bound each shape to the slide, allow room for labels, and avoid shrinking text to conceal overflow. Provide source labels for data and speaker notes when requested.
 4. Reopen the deck to inspect slide count, text, shape bounds and required charts. Render through an available Office/LibreOffice runtime to inspect clipping and readability. If rendering is unavailable, report structural checks separately from visual checks.
 5. Return the actual PPTX file, and a PDF preview only if one was successfully rendered. Do not present a raster image of each slide as a fully editable deck.
+
+## Delivery gate
+
+Before delivery, follow [references/verification.md](references/verification.md). Run structural checks, render page previews when supported, and inspect the rendered pages. For Excel, evaluate formulas with a real spreadsheet engine and compare key totals to an independent calculation. Report a missing renderer or formula engine as an unverified check; a script returning success alone is not proof of visual quality.

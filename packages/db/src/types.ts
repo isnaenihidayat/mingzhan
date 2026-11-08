@@ -8,8 +8,15 @@ import type {
   OrgPluginSummary,
   OrgRole,
   PluginReleaseSummary,
+  RegressionCaseSourceType,
   ThinkingEffort,
 } from "@mingzhan/core";
+
+import type {
+  LlmRequestLogEntry,
+  LlmRequestLogFilters,
+  LlmRequestLogPage,
+} from "@mingzhan/core/contract";
 
 export type { OrgRole } from "@mingzhan/core";
 
@@ -127,6 +134,25 @@ export interface StoredProfileRecord {
   thinkingEffort?: ThinkingEffort | null;
   thinkingEnabled?: boolean | null;
   updatedAt: string;
+}
+
+export interface StoredRegressionCaseRecord {
+  createdAt: string;
+  createdByUserId: string | null;
+  expectedResult: string;
+  id: string;
+  input: string;
+  orgId: string;
+  /**
+   * Set when the source chat was private. Only this user and platform admins
+   * may read the copied input.
+   */
+  privateToUserId: string | null;
+  profileId: string;
+  /** Set only for `automation_run` sources, which need it to reach the run. */
+  sourceAutomationId: string | null;
+  sourceId: string;
+  sourceType: RegressionCaseSourceType;
 }
 
 export interface StoredToolRecord {
@@ -417,6 +443,10 @@ export interface StoredProfileComposioToolkitRecord {
 export interface LlmUsageActor {
   profileId?: string | null;
   userId?: string | null;
+}
+
+interface StoredLlmRequestLogEntry extends Omit<LlmRequestLogEntry, "chat"> {
+  sessionId: string | null;
 }
 
 export interface LlmUsageStatsDelta {
@@ -845,6 +875,8 @@ export interface StoredBrowserSessionRecord {
   lastUsedAt: string | null;
   revokedAt: string | null;
   sessionTokenHash: string;
+  /** Capped User-Agent header, so the owner can tell sessions apart. */
+  userAgent?: string | null;
   userId: string;
 }
 
@@ -1005,6 +1037,9 @@ export interface DatabaseAdapter {
   createProjectFile(
     record: StoredProjectFileRecord
   ): Promise<StoredProjectFileRecord>;
+
+  createRegressionCase(record: StoredRegressionCaseRecord): Promise<void>;
+
   createSharedAgentInstance(
     teamOrgId: string,
     publicationId: string,
@@ -1064,8 +1099,16 @@ export interface DatabaseAdapter {
   deleteTool(id: string): Promise<boolean>;
   deleteWorkflow(id: string): Promise<boolean>;
   deleteWorkflowRun(workflowId: string, runId: string): Promise<boolean>;
-  disableUser(id: string, disabledAt: string): Promise<void>;
+  /**
+   * Resolves to `false` when the user is the last usable admin of a live org
+   * or the last usable platform admin.
+   */
+  disableUserUnlessLastAdmin(id: string, disabledAt: string): Promise<boolean>;
   enableUser(id: string): Promise<void>;
+  /**
+   * Resolves to `false`, with nothing written, when the user is missing or is
+   * the last usable admin of a live org or the last usable platform admin.
+   */
   eraseUser(input: {
     id: string;
     email: string;
@@ -1093,6 +1136,11 @@ export interface DatabaseAdapter {
     orgId: string,
     sessionId: string
   ): Promise<StoredConversationShareRecord | null>;
+  getArtifactRecord(
+    orgId: string,
+    profileId: string,
+    filename: string
+  ): Promise<StoredArtifactRecord | null>;
   getArtifactShareById(
     orgId: string,
     profileId: string,
@@ -1132,6 +1180,9 @@ export interface DatabaseAdapter {
     tokenHash: string
   ): Promise<StoredConversationShareRecord | null>;
   getDefaultProfileForOrg(orgId: string): Promise<StoredProfileRecord | null>;
+  getLastUserMessageForSession(
+    sessionId: string
+  ): Promise<StoredSessionMessageRecord | null>;
 
   getLlmUsageStats(orgId: string): Promise<StoredLlmUsageStatsRecord | null>;
   getManagedSecret(
@@ -1221,6 +1272,12 @@ export interface DatabaseAdapter {
     projectId: string,
     id: string
   ): Promise<StoredProjectFileRecord | null>;
+
+  getRegressionCase(
+    orgId: string,
+    profileId: string,
+    caseId: string
+  ): Promise<StoredRegressionCaseRecord | null>;
   getSession(id: string): Promise<StoredSessionRecord | null>;
   getSessionQuestionnaire(
     sessionId: string
@@ -1319,6 +1376,13 @@ export interface DatabaseAdapter {
   insertAttachment(record: StoredAttachmentRecord): Promise<void>;
   insertAutomationRun(record: StoredAutomationRunRecord): Promise<void>;
   insertAutomationRunStep(step: StoredAutomationRunStepRecord): Promise<void>;
+  insertLlmRequestLog(
+    orgId: string,
+    userId: string,
+    entry: Omit<StoredLlmRequestLogEntry, "id" | "agentName" | "sessionId"> & {
+      sessionId?: string | null;
+    }
+  ): Promise<void>;
   insertWorkflowRun(record: StoredWorkflowRunRecord): Promise<void>;
   insertWorkflowRunStep(record: StoredWorkflowRunStepRecord): Promise<void>;
 
@@ -1375,6 +1439,13 @@ export interface DatabaseAdapter {
     userId: string,
     profileId: string
   ): Promise<string[]>;
+  listLlmRequestLog(
+    orgId: string,
+    userId: string,
+    filters: LlmRequestLogFilters
+  ): Promise<
+    Omit<LlmRequestLogPage, "entries"> & { entries: StoredLlmRequestLogEntry[] }
+  >;
   listLlmTurnUsage(orgId: string): Promise<StoredLlmTurnUsageRecord[]>;
   /** Rows from `sinceDay` (inclusive, `YYYY-MM-DD`) onward. */
   listLlmUsageDailyStats(
@@ -1442,6 +1513,13 @@ export interface DatabaseAdapter {
     projectId: string
   ): Promise<StoredProjectFileRecord[]>;
   listProjects(orgId: string): Promise<StoredProjectRecord[]>;
+
+  /** Newest first. Org-scoped: another org's profile returns nothing. */
+  listRegressionCasesForProfile(
+    orgId: string,
+    profileId: string,
+    options?: { limit?: number; offset?: number }
+  ): Promise<StoredRegressionCaseRecord[]>;
   /**
    * Newest first, pinned ahead. `after` is the last row of the previous page;
    * `sessionId` narrows the list to that one session. `userId` keeps the
@@ -1651,7 +1729,12 @@ export interface DatabaseAdapter {
     id: string,
     activeOrgId: string | null
   ): Promise<void>;
-  updateBrowserSessionLastUsedAt(id: string, lastUsedAt: string): Promise<void>;
+  /** Also fills user_agent when the row has none, so sessions from before the column get a device label. */
+  updateBrowserSessionLastUsedAt(
+    id: string,
+    lastUsedAt: string,
+    userAgent?: string | null
+  ): Promise<void>;
   /** False when the change would leave the org without an admin. */
   updateOrgMemberRole(
     orgId: string,

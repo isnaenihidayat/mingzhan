@@ -2,9 +2,9 @@
   "name": "@mingzhan/desktop",
   "version": "1.0.5",
   "private": true,
-  "description": "The MíngZhàn web app in a desktop window",
+  "description": "The M\u00edngZh\u00e0n web app in a desktop window",
   "homepage": "https://github.com/isnaenihidayat/mingzhan",
-  "author": "MíngZhàn",
+  "author": "M\u00edngZh\u00e0n",
   "type": "module",
   "main": "main.mjs",
   "scripts": {
@@ -23,7 +23,7 @@
     "electron-updater": "^6.8.9"
   },
   "devDependencies": {
-    "electron": "45.0.0",
+    "electron": "45.2.1",
     "electron-builder": "26.17.0"
   },
   "engines": {

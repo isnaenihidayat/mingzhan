@@ -81,6 +81,25 @@ function createServerOptions() {
 }
 
 describe("createHonoApp", () => {
+  test("allows local and blob workers for application workbook decompression", async () => {
+    const response = await createHonoApp(createServerOptions()).fetch(
+      new Request("http://localhost:4310/health")
+    );
+
+    const csp = response.headers.get("Content-Security-Policy") ?? "";
+
+    const workers = csp
+      .split(";")
+      .find((directive) => directive.trim().startsWith("worker-src"));
+
+    expect(response.status).toBe(200);
+    expect(workers?.trim().split(/\s+/)).toEqual([
+      "worker-src",
+      "'self'",
+      "blob:",
+    ]);
+  });
+
   test("serves the artifact frame with its own CSP so artifact scripts run", async () => {
     // With a web dist the SPA fallback must not swallow the frame path.
     const app = createHonoApp({
@@ -120,7 +139,10 @@ describe("createHonoApp", () => {
       "data:",
       "https://fonts.googleapis.com",
     ]);
-    expect(directives.get("font-src")).toEqual(["https://fonts.gstatic.com"]);
+    expect(directives.get("font-src")).toEqual([
+      "data:",
+      "https://fonts.gstatic.com",
+    ]);
     expect(directives.get("img-src")).toEqual(["data:"]);
     expect(directives.get("media-src")).toEqual(["data:"]);
 
@@ -175,7 +197,7 @@ describe("createHonoApp", () => {
 
       expect(response.status).toBe(200);
       const html = await response.text();
-      const inlineScript = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+      const inlineScript = html.match(/<script>([\s\S]*?)<\/script>/i)?.[1];
       const scriptUrl = html.match(/<script src="([^"]+)"/)?.[1];
       expect(inlineScript).toBeDefined();
       expect(scriptUrl).toBeDefined();
@@ -223,7 +245,7 @@ describe("createHonoApp", () => {
       resolve(import.meta.dir, "../../../web/index.html")
     ).text();
 
-    const inlineScript = indexHtml.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+    const inlineScript = indexHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1];
 
     if (!inlineScript) {
       throw new Error("apps/web/index.html no longer inlines a script");

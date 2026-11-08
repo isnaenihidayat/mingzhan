@@ -1,5 +1,8 @@
+import { realpath, stat } from "node:fs/promises";
+import path from "node:path";
 import {
   builtinTools,
+  getProfileSoulDir,
   type JsonSchema,
   type ListToolsResponse,
   MíngZhànApiError,
@@ -18,6 +21,7 @@ import { emailTool } from "@mingzhan/core/tools/email";
 import { BROWSER_TOOL_IDS } from "@mingzhan/core/tools/protected";
 import { loadWebSearchConfig } from "@mingzhan/core/web-search-config";
 import type { DatabaseAdapter, StoredToolRecord } from "@mingzhan/db";
+import { z } from "zod";
 import { type BashInput, bashTool, runBash } from "../tools/bash";
 import { createBrowserTools } from "../tools/browser-tools";
 import { isCloudBrowserRuntime } from "./agent-browser-service";
@@ -225,7 +229,104 @@ function createCodingAgentAwareBashTool(
         orgService
       );
 
-      return runBash(enriched, context);
+      const startedAt = Date.now();
+      const result = await runBash(enriched, context);
+
+      if (
+        result.exitCode !== 0 ||
+        result.timedOut ||
+        !context.orgId ||
+        !context.profileId ||
+        !context.userId
+      ) {
+        return result;
+      }
+
+      // The CLI workbook builder writes real binaries without save_artifact.
+      // Register only fresh, canonical artifacts from this authenticated turn.
+      const workspace = getProfileSoulDir(context.orgId, context.profileId);
+
+      const root = await realpath(path.join(workspace, "artifacts")).catch(
+        () => null
+      );
+
+      if (!root) {
+        return result;
+      }
+
+      const manifestSchema = z.object({
+        bytes: z.number().int().nonnegative(),
+        path: z.string(),
+      });
+
+      for (const line of result.stdout.split("\n").slice(-32)) {
+        let value: unknown;
+
+        try {
+          value = JSON.parse(line);
+        } catch {
+          continue;
+        }
+
+        const manifest = manifestSchema.safeParse(value);
+
+        if (!manifest.success) {
+          continue;
+        }
+
+        const actual = await realpath(
+          path.resolve(workspace, enriched.cwd ?? ".", manifest.data.path)
+        ).catch(() => null);
+
+        if (!actual) {
+          continue;
+        }
+
+        const relative = path.relative(root, actual);
+
+        if (
+          !relative ||
+          relative.startsWith("..") ||
+          path.isAbsolute(relative) ||
+          relative.includes(".mingzhan-meta")
+        ) {
+          continue;
+        }
+
+        const info = await stat(actual).catch(() => null);
+
+        if (
+          !info?.isFile() ||
+          info.mtimeMs < startedAt - 1000 ||
+          info.size !== manifest.data.bytes
+        ) {
+          continue;
+        }
+
+        const filename = relative.split(path.sep).join("/");
+
+        const previous = await db.getArtifactRecord(
+          context.orgId,
+          context.profileId,
+          filename
+        );
+
+        if (previous && previous.userId !== context.userId) {
+          continue;
+        }
+
+        await db.upsertArtifactRecord({
+          channel: context.channel ?? null,
+          createdAt: previous?.createdAt ?? new Date().toISOString(),
+          filename,
+          orgId: context.orgId,
+          profileId: context.profileId,
+          sessionId: context.sessionId?.trim() || null,
+          userId: context.userId,
+        });
+      }
+
+      return result;
     },
   };
 }

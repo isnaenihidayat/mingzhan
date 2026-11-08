@@ -1,4 +1,7 @@
-export { MíngZhànApiError, MíngZhànAuthExpiredError } from "@mingzhan/core/api-error";
+export {
+  MíngZhànApiError,
+  MíngZhànAuthExpiredError,
+} from "@mingzhan/core/api-error";
 
 export { MíngZhànClient } from "./client";
 
@@ -6,6 +9,7 @@ export type {
   RemoteChatSession,
   SendMessageArg,
   StreamHandlers,
+  TransferProgress,
 } from "./types";
 
 import type { ProfileSummary } from "@mingzhan/core/contract";

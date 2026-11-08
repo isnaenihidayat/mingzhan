@@ -1,8 +1,238 @@
 import { describe, expect, test } from "bun:test";
-import { withTempHome } from "@mingzhan/core/channel-test-helpers";
-import { activity, CONFIG, createHarness } from "./test-helpers";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { asTestFetch, withTempHome } from "@mingzhan/core/channel-test-helpers";
+import {
+  getTeamsConfigDir,
+  loadTeamsConfigFile,
+  regenerateTeamsHandshake,
+  saveTeamsConfig,
+} from "@mingzhan/core/teams-config";
+import {
+  ALLOWED,
+  activity,
+  CONFIG,
+  createHarness,
+  OWNER,
+  TENANT,
+} from "./test-helpers";
 
 describe("teams chat handler", () => {
+  async function pairingHarness(homeDir: string, allowedUserIds?: string) {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = asTestFetch(async () =>
+      Response.json({ access_token: "fixture", token_type: "Bearer" })
+    );
+
+    try {
+      await saveTeamsConfig(
+        {
+          allowedUserIds,
+          clientId: CONFIG.clientId,
+          clientSecret: CONFIG.clientSecret,
+          tenantId: TENANT,
+        },
+        OWNER
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    const generated = await regenerateTeamsHandshake(OWNER);
+
+    const harness = createHarness(homeDir, {
+      loadConfig: () => loadTeamsConfigFile(OWNER),
+    });
+
+    return { ...harness, code: generated.handshakeCode! };
+  }
+
+  test("a code in a personal chat links the sender and only the later message starts a turn", async () => {
+    await withTempHome("mingzhan-teams-handler-", async (homeDir) => {
+      const { handle, code, replies, turns, createdSessions } =
+        await pairingHarness(homeDir);
+
+      await handle(activity({ text: "before pairing" }));
+      expect(turns).toEqual([]);
+      await handle(activity({ text: code }));
+      expect(turns).toEqual([]);
+      expect(createdSessions).toEqual([]);
+      expect(replies).toHaveLength(1);
+      expect((await loadTeamsConfigFile(OWNER))?.pairedUserIds).toEqual([
+        ALLOWED,
+      ]);
+      await handle(activity({ text: "after pairing" }));
+      expect(turns.map((turn) => turn.message)).toEqual(["after pairing"]);
+
+      const restarted = createHarness(homeDir, {
+        loadConfig: () => loadTeamsConfigFile(OWNER),
+      });
+
+      await restarted.handle(activity({ text: "after restart" }));
+      expect(restarted.turns).toHaveLength(1);
+    });
+  });
+
+  for (const patch of [
+    { conversationType: "groupChat" },
+    { conversationType: "channel" },
+    { tenantId: CONFIG.clientId },
+    { senderId: "not-a-guid" },
+    { senderId: "" },
+    { isBot: true },
+    { channelId: "webchat" },
+  ]) {
+    test(`a code cannot pair an activity with ${JSON.stringify(patch)}`, async () => {
+      await withTempHome("mingzhan-teams-handler-", async (homeDir) => {
+        const { handle, code, turns, createdSessions } =
+          await pairingHarness(homeDir);
+
+        await handle(activity({ text: code, ...patch }));
+        expect(turns).toEqual([]);
+        expect(createdSessions).toEqual([]);
+        expect((await loadTeamsConfigFile(OWNER))?.pairedUserIds).toEqual([]);
+        expect((await loadTeamsConfigFile(OWNER))?.handshakeCode).toBe(code);
+      });
+    });
+  }
+
+  const CODE_THREAD = "19:general@thread.tacv2;messageid=1001";
+
+  function channelPost(text: string, senderId = ALLOWED) {
+    return activity({
+      conversationId: CODE_THREAD,
+      conversationType: "channel",
+      mentionsBot: true,
+      senderId,
+      text,
+    });
+  }
+
+  for (const [name, allowed, post] of [
+    ["an unlinked sender's code", undefined, (code: string) => code],
+    ["an allowlisted sender's code", ALLOWED, (code: string) => code],
+    [
+      "a code inside a sentence",
+      undefined,
+      (code: string) => `my code is ${code.toLowerCase()} thanks`,
+    ],
+  ] as const) {
+    test(`${name} posted in a channel is spent and reaches no agent`, async () => {
+      await withTempHome("mingzhan-teams-handler-", async (homeDir) => {
+        const { handle, code, replies, turns } = await pairingHarness(
+          homeDir,
+          allowed
+        );
+
+        await handle(channelPost(post(code)));
+
+        const config = await loadTeamsConfigFile(OWNER);
+
+        expect(turns).toEqual([]);
+        expect(config?.pairedUserIds).toEqual([]);
+        expect(config?.handshakeCode).toBeNull();
+        expect(replies.map((entry) => entry.conversationId)).toEqual([
+          CODE_THREAD,
+        ]);
+
+        // The posted code no longer pairs, even in a personal chat.
+        const stranger = "99999999-9999-4999-8999-999999999999";
+        await handle(activity({ senderId: stranger, text: code }));
+        expect((await loadTeamsConfigFile(OWNER))?.pairedUserIds).toEqual([]);
+      });
+    });
+  }
+
+  test("a code spent before the lock is not made live again", async () => {
+    await withTempHome("mingzhan-teams-handler-", async (homeDir) => {
+      const { code } = await pairingHarness(homeDir);
+      const stale = await loadTeamsConfigFile(OWNER);
+
+      // A personal chat pairs with the code while the channel post waits.
+      await createHarness(homeDir, {
+        loadConfig: () => loadTeamsConfigFile(OWNER),
+      }).handle(activity({ senderId: ALLOWED, text: code }));
+
+      const late = createHarness(homeDir, {
+        loadConfig: async () => stale,
+      });
+
+      await late.handle(
+        channelPost(code, "99999999-9999-4999-8999-999999999999")
+      );
+
+      const config = await loadTeamsConfigFile(OWNER);
+
+      expect(config?.handshakeCode).toBeNull();
+      expect(config?.pairedUserIds).toEqual([ALLOWED]);
+    });
+  });
+
+  test("a code that cannot be spent still reaches no agent", async () => {
+    await withTempHome("mingzhan-teams-handler-", async (homeDir) => {
+      const { handle, code, replies, turns } = await pairingHarness(
+        homeDir,
+        ALLOWED
+      );
+
+      // Another writer holds the pairing lock, so the spend gives up.
+      await writeFile(
+        join(getTeamsConfigDir(OWNER), "pairing.lock"),
+        `${process.pid}\n`
+      );
+
+      await handle(channelPost(`my code is ${code}`));
+
+      expect(turns).toEqual([]);
+      expect(replies.map((entry) => entry.conversationId)).toEqual([
+        CODE_THREAD,
+      ]);
+      expect((await loadTeamsConfigFile(OWNER))?.handshakeCode).toBe(code);
+    });
+  }, 15_000);
+
+  test("an authorized sender's code-shaped message reaches the agent", async () => {
+    await withTempHome("mingzhan-teams-handler-", async (homeDir) => {
+      const { handle, replies, turns } = createHarness(homeDir);
+      const guid = "55555555-5555-4555-8555-555555555555";
+      await handle(activity({ text: "A".repeat(32) }));
+      await handle(activity({ text: guid }));
+
+      expect(turns.map((turn) => turn.message)).toEqual(["A".repeat(32), guid]);
+    });
+  });
+
+  test("wrong and consumed codes never start a turn or link a second sender", async () => {
+    await withTempHome("mingzhan-teams-handler-", async (homeDir) => {
+      const { handle, code, turns } = await pairingHarness(homeDir);
+      await handle(
+        activity({
+          text: code === "0".repeat(32) ? "1".repeat(32) : "0".repeat(32),
+        })
+      );
+      expect((await loadTeamsConfigFile(OWNER))?.pairedUserIds).toEqual([]);
+      await handle(activity({ text: code }));
+      await handle(activity({ senderId: CONFIG.clientId, text: code }));
+      expect((await loadTeamsConfigFile(OWNER))?.pairedUserIds).toEqual([
+        ALLOWED,
+      ]);
+      expect(turns).toEqual([]);
+    });
+  });
+
+  test("duplicate delivery consumes a code and replies once", async () => {
+    await withTempHome("mingzhan-teams-handler-", async (homeDir) => {
+      const { handle, code, replies, turns } = await pairingHarness(homeDir);
+      const message = activity({ text: code });
+      await Promise.all([handle(message), handle(message)]);
+      expect(replies).toHaveLength(1);
+      expect((await loadTeamsConfigFile(OWNER))?.pairedUserIds).toEqual([
+        ALLOWED,
+      ]);
+      expect(turns).toEqual([]);
+    });
+  });
+
   test("an allowed user in a personal chat gets the agent's reply", async () => {
     await withTempHome("mingzhan-teams-handler-", async (homeDir) => {
       const { handle, replies, turns } = createHarness(homeDir);
@@ -43,6 +273,7 @@ describe("teams chat handler", () => {
       { senderId: "99999999-9999-4999-8999-999999999999" },
     ],
     ["a group conversation", { conversationType: "groupChat" }],
+    ["a channel message without a mention", { conversationType: "channel" }],
     ["an empty message", { text: "   " }],
     ["another Bot Framework channel", { channelId: "webchat" }],
   ] as const) {

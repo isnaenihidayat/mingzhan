@@ -20,6 +20,7 @@ import {
 import type { ServerOptions } from "../context";
 import {
   requireActiveOrgIdFromContext,
+  requireOrgAdminOrPlatformAdminFromContext,
   requirePlatformAdminFromContext,
   requireProfileManageFromContext,
 } from "../org-guards";
@@ -65,7 +66,7 @@ export const ARTIFACT_FRAME_CSP = [
   "default-src 'none'",
   "script-src 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://unpkg.com https://cdn.tailwindcss.com https://code.jquery.com",
   "style-src 'unsafe-inline' data: https://fonts.googleapis.com",
-  "font-src https://fonts.gstatic.com",
+  "font-src data: https://fonts.gstatic.com",
   "img-src data:",
   "media-src data:",
   "connect-src 'none'",
@@ -242,7 +243,7 @@ export function registerSystemRoutes(
       },
       502: {
         content: { "application/json": { schema: errorSchema } },
-        description: "GitHub releases unreachable",
+        description: "Latest version unreachable",
       },
     },
     summary: "Check for a newer MíngZhàn release",
@@ -393,6 +394,66 @@ export function registerSystemRoutes(
       },
       200
     );
+  });
+
+  app.get("/v1/system/usage/users/:userId/requests", async (c) => {
+    const auth = requireOrgAdminOrPlatformAdminFromContext(c);
+    const orgId = requireActiveOrgIdFromContext(c);
+
+    const query = z
+      .object({
+        before: z.coerce.number().int().positive().optional(),
+        from: z.iso.date().optional(),
+        to: z.iso.date().optional(),
+        model: z.string().trim().min(1).max(256).optional(),
+        status: z.enum(["success", "failed", "cancelled"]).optional(),
+      })
+      .safeParse(c.req.query());
+
+    if (
+      !query.success ||
+      (query.data.from && query.data.to && query.data.from > query.data.to)
+    ) {
+      return c.json({ error: "Invalid request log filters." }, 400);
+    }
+
+    if (!databaseAdapter) {
+      return c.json({ error: "Usage storage unavailable." }, 503);
+    }
+
+    c.header("Cache-Control", "no-store");
+
+    const page = await databaseAdapter.listLlmRequestLog(
+      orgId,
+      c.req.param("userId"),
+      query.data
+    );
+
+    const checks = new Map<
+      string,
+      ReturnType<typeof agent.getUsageChatReference>
+    >();
+
+    const entries = await Promise.all(
+      page.entries.map(async ({ sessionId, ...entry }) => {
+        if (!sessionId) {
+          return entry;
+        }
+
+        let check = checks.get(sessionId);
+
+        if (!check) {
+          check = agent.getUsageChatReference(sessionId, orgId, auth);
+          checks.set(sessionId, check);
+        }
+
+        const chat = await check;
+
+        return chat ? { ...entry, chat } : entry;
+      })
+    );
+
+    return c.json({ ...page, entries });
   });
 
   app.openapi(systemStatusRoute, async (c) => {

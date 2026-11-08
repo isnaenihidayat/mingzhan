@@ -4,7 +4,7 @@ services:
     ports:
       - "4310:4310"
     env_file:
-      - mingzhan-secrets.env
+      - ${MINGZHAN_COMPOSE_SECRETS_FILE:-mingzhan-secrets.env}
     environment:
       - MINGZHAN_CONFIG_DIR=/mingzhan/data
       # Daily encrypted export, newest 7 kept. Must stay outside the data volume.
@@ -34,6 +34,8 @@ services:
     environment:
       # The docker:cli image defaults to tcp://docker:2375.
       - DOCKER_HOST=unix:///var/run/docker.sock
+      # Compose runs inside the updater, where a host-side symlink may not resolve.
+      - MINGZHAN_COMPOSE_SECRETS_FILE=/run/mingzhan-secrets.env
       - MINGZHAN_IMAGE_REPOSITORY=${MINGZHAN_IMAGE_REPOSITORY:-ghcr.io/isnaenihidayat/mingzhan}
       - MINGZHAN_IMAGE=${MINGZHAN_IMAGE_REPOSITORY:-ghcr.io/isnaenihidayat/mingzhan}:${MINGZHAN_VERSION:-latest}
     # The script ships inside the MíngZhàn image, so it updates with MíngZhàn.
@@ -44,6 +46,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - .:/compose
+      - ./mingzhan-secrets.env:/run/mingzhan-secrets.env:ro
       - mingzhan-updates:/updates
     restart: unless-stopped
 
