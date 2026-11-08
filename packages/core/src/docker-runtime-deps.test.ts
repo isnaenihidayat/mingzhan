@@ -3,11 +3,7 @@ import { join } from "node:path";
 
 const REPO_ROOT = join(import.meta.dir, "..", "..", "..");
 
-/** A production dependency set baked into the image at build time. */
-const DEPENDENCY_SETS = {
-  meet: ".docker/meet-deps",
-  runtime: ".docker/runtime-deps",
-} as const;
+const RUNTIME_DEPS = ".docker/runtime-deps";
 
 type Manifest = { dependencies?: Record<string, string> };
 
@@ -58,15 +54,13 @@ describe("production image dependency sets", () => {
     expect(stage).toContain("ARG INSTALL_CODING_AGENTS=false");
   });
 
-  test("the optional Meet stage installs the committed manifest and lockfile", async () => {
+  test("runtime keeps Chromium and FFmpeg for artifact and recording processing", async () => {
     const dockerfile = await Bun.file(join(REPO_ROOT, "Dockerfile")).text();
     const stage = dockerStage(dockerfile, "runtime");
 
-    expect(stage).toContain("ARG INSTALL_MEET_DEPS=false");
-    expect(stage).toContain(
-      "COPY .docker/meet-deps/package.json .docker/meet-deps/bun.lock"
-    );
-    expect(stage).toMatch(FROZEN_INSTALL);
+    expect(stage).toMatch(/\bchromium\b/);
+    expect(stage).toContain("COPY --from=ffmpeg-binaries /ffmpeg /ffprobe");
+    expect(stage).not.toContain(".docker/meet-deps");
   });
 
   // `bun add` re-resolves whatever the registry serves that day, which is how a
@@ -79,27 +73,25 @@ describe("production image dependency sets", () => {
 
   // The frozen install only pins bytes if the manifest itself is exact, and the
   // image ships whatever the lockfile resolves — so the two have to agree.
-  for (const [name, directory] of Object.entries(DEPENDENCY_SETS)) {
-    test(`every ${name} dependency is exact and locked to the declared version`, async () => {
-      const manifest = await readCommittedJsonc<Manifest>(
-        `${directory}/package.json`
+  test("every runtime dependency is exact and locked to the declared version", async () => {
+    const manifest = await readCommittedJsonc<Manifest>(
+      `${RUNTIME_DEPS}/package.json`
+    );
+
+    const lockfile = await readCommittedJsonc<Lockfile>(
+      `${RUNTIME_DEPS}/bun.lock`
+    );
+
+    const declared = manifest.dependencies ?? {};
+
+    expect(Object.keys(declared).length).toBeGreaterThan(0);
+    expect(lockfile.workspaces[""]?.dependencies ?? {}).toEqual(declared);
+
+    for (const [dependency, version] of Object.entries(declared)) {
+      expect(version).toMatch(/^\d+\.\d+\.\d+(?:[-+].+)?$/);
+      expect(lockfile.packages[dependency]?.[0]).toStartWith(
+        `${dependency}@${version}`
       );
-
-      const lockfile = await readCommittedJsonc<Lockfile>(
-        `${directory}/bun.lock`
-      );
-
-      const declared = manifest.dependencies ?? {};
-
-      expect(Object.keys(declared).length).toBeGreaterThan(0);
-      expect(lockfile.workspaces[""]?.dependencies ?? {}).toEqual(declared);
-
-      for (const [dependency, version] of Object.entries(declared)) {
-        expect(version).toMatch(/^\d+\.\d+\.\d+(?:[-+].+)?$/);
-        expect(lockfile.packages[dependency]?.[0]).toStartWith(
-          `${dependency}@${version}`
-        );
-      }
-    });
-  }
+    }
+  });
 });

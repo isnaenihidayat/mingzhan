@@ -5,7 +5,11 @@ import type {
   ThinkingEffort,
   ToolCall,
 } from "@mingzhan/core";
-import { MíngZhànApiError } from "@mingzhan/core";
+import {
+  MODEL_CONNECTION_CLOSED_MESSAGE,
+  MíngZhànApiError,
+  ProviderStreamInterruptedError,
+} from "@mingzhan/core";
 import { z } from "zod";
 
 export type ProviderJsonValue =
@@ -238,7 +242,7 @@ export async function readSseEvents(
   let sawDone = false;
 
   while (true) {
-    const { done, value } = await reader.read();
+    const { done, value } = await readStreamChunk(reader);
 
     if (value) {
       buffer += decoder.decode(value, { stream: true });
@@ -270,6 +274,28 @@ export async function readSseEvents(
   }
 
   return sawDone;
+}
+
+// A socket that drops mid-stream (ECONNRESET) becomes an interruption, so the
+// chat loop retries once. Cancels and deadlines keep their own errors.
+async function readStreamChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>
+): ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]> {
+  try {
+    return await reader.read();
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.name === "AbortError" || error.name === "TimeoutError")
+    ) {
+      throw error;
+    }
+
+    throw Object.assign(
+      new ProviderStreamInterruptedError(MODEL_CONNECTION_CLOSED_MESSAGE),
+      { cause: error }
+    );
+  }
 }
 
 async function emitSseEvent(

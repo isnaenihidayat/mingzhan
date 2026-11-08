@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
 import {
   composeAgentBrowserCapabilityPrompt,
   composeLoadedSkillPrompt,
@@ -27,6 +28,36 @@ describe("composeLoadedSkillPrompt", () => {
     expect(prompt).toContain(baseSkill.skillFilePath);
     expect(prompt).toContain(baseSkill.directory);
   });
+});
+
+test("loaded spreadsheet instructions resolve executable assets outside the workspace", () => {
+  const skillsDirectory =
+    process.platform === "win32" ? "C:/shared/skills" : "/shared/skills";
+
+  const directory = join(skillsDirectory, "xlsx");
+
+  const prompt = composeLoadedSkillPrompt({
+    ...baseSkill,
+    directory,
+    name: "xlsx",
+    skillFilePath: join(directory, "SKILL.md"),
+  });
+
+  expect(prompt).toContain(
+    JSON.stringify(join(directory, "scripts", "build_workbook.py"))
+  );
+  expect(prompt).toContain(
+    JSON.stringify(join(directory, "assets", "ooh-commission.json"))
+  );
+  expect(prompt).toContain(
+    JSON.stringify(
+      join(skillsDirectory, "doc-coauthoring", "scripts", "verify_document.py")
+    )
+  );
+  expect(prompt).toContain("--recalculate --render");
+  expect(composeLoadedSkillPrompt(baseSkill)).not.toContain(
+    "build_workbook.py"
+  );
 });
 
 describe("composeSkillsCatalog", () => {

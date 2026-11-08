@@ -22,6 +22,7 @@ import {
   Globe02Icon,
   Logout03Icon,
   MoonIcon,
+  NewReleasesIcon,
   SparklesIcon,
   Sun01Icon,
   UserIcon,
@@ -60,6 +61,12 @@ function accountInitials(name: string) {
   return letters.toUpperCase();
 }
 
+function getReleaseNotesUrl(version?: string) {
+  return version && /^\d+\.\d+\.\d+/.test(version)
+    ? `https://github.com/isnaenihidayat/mingzhan/releases/tag/v${encodeURIComponent(version)}`
+    : "https://github.com/isnaenihidayat/mingzhan/releases";
+}
+
 export function SidebarUserMenu() {
   const { user, activeOrg, logout, refreshSession } = useAuth();
   const { health } = useAppContext();
@@ -68,6 +75,8 @@ export function SidebarUserMenu() {
   const [profileOpen, setProfileOpen] = useState(false);
   const [personalisationOpen, setPersonalisationOpen] = useState(false);
   const version = health?.version?.trim();
+
+  const releaseNotesUrl = getReleaseNotesUrl(version);
 
   const canCheckUpdates =
     user?.isPlatformAdmin === true && health?.updateCheckEnabled === true;
@@ -131,6 +140,24 @@ export function SidebarUserMenu() {
                       </p>
                     </div>
                   </div>
+
+                  <DropdownMenuItem
+                    className="px-2.5 py-1.5"
+                    render={
+                      <a
+                        aria-label="What's new"
+                        href={releaseNotesUrl}
+                        rel="noreferrer"
+                        target="_blank"
+                      />
+                    }
+                  >
+                    <NewReleasesIcon
+                      aria-hidden
+                      className="size-4 text-muted-foreground"
+                    />
+                    What's new
+                  </DropdownMenuItem>
 
                   <div className="h-px bg-border" />
 

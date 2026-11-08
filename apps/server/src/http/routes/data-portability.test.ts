@@ -1,14 +1,16 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import * as fsPromises from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   getKnowledgeBaseDir,
   getOrgKnowledgeBaseDir,
   getProfileArtifactsDir,
   getUserConfigDir,
+  MíngZhànApiError,
   saveAttachmentBytes,
 } from "@mingzhan/core";
-import * as fflate from "fflate";
 import { unzipSync, zipSync } from "fflate";
 import {
   createMíngZhànDataExport,
@@ -17,6 +19,10 @@ import {
   MINGZHAN_ORG_EXPORT_MANIFEST,
   MINGZHAN_USER_EXPORT_MANIFEST,
 } from "../../services/data-portability";
+import {
+  encryptBackup,
+  startScheduledBackups,
+} from "../../services/scheduled-backup";
 import { setupTestConfigDir } from "../../test-config-dir";
 import { createMinimalHonoApp } from "../test-app-helpers";
 import {
@@ -59,9 +65,8 @@ describe("data portability routes", () => {
       databaseAdapter
     );
 
-    const zipMock = spyOn(fflate, "zipSync").mockReturnValue(
-      new Uint8Array(MAX_IMPORT_ARCHIVE_BYTES + 1)
-    );
+    const previousCap = process.env.MINGZHAN_DATA_IMPORT_MAX_ARCHIVE_BYTES;
+    process.env.MINGZHAN_DATA_IMPORT_MAX_ARCHIVE_BYTES = "100";
 
     try {
       const response = await app.fetch(
@@ -74,7 +79,49 @@ describe("data portability routes", () => {
       expect(response.headers.get("content-disposition")).toBeNull();
       expect((await response.json()).error).toEqual(expect.any(String));
     } finally {
-      zipMock.mockRestore();
+      if (previousCap === undefined) {
+        delete process.env.MINGZHAN_DATA_IMPORT_MAX_ARCHIVE_BYTES;
+      } else {
+        process.env.MINGZHAN_DATA_IMPORT_MAX_ARCHIVE_BYTES = previousCap;
+      }
+    }
+  });
+
+  test("platform export returns 409 naming a file the server cannot read", async () => {
+    const { app, authService, databaseAdapter } = createApp();
+
+    const session = await loginPlatformAdminSession(
+      app,
+      authService,
+      databaseAdapter
+    );
+
+    const blocked = join(getUserConfigDir(), "SOUL.md.bak-0101");
+    await writeFile(blocked, "soul");
+    const realOpen = fsPromises.open;
+
+    const openMock = spyOn(fsPromises, "open").mockImplementation(
+      // SAFETY: the wrapper forwards its arguments to the real open unchanged.
+      (async (...args: Parameters<typeof realOpen>) => {
+        if (args[0] === blocked) {
+          throw Object.assign(new Error("denied"), { code: "EACCES" });
+        }
+
+        return await realOpen(...args);
+      }) as typeof realOpen
+    );
+
+    try {
+      const response = await app.fetch(
+        new Request("http://localhost:4310/v1/platform/data/export", {
+          headers: session.headers(),
+        })
+      );
+
+      expect(response.status).toBe(409);
+      expect((await response.json()).error).toContain("SOUL.md.bak-0101");
+    } finally {
+      openMock.mockRestore();
     }
   });
 
@@ -105,6 +152,67 @@ describe("data portability routes", () => {
     expect(Buffer.from(archive["config.ini"]!).toString("utf8")).toBe(
       "provider=openai"
     );
+  });
+
+  test("platform admin reads the last scheduled backup's 409", async () => {
+    const { app, authService, databaseAdapter } = createApp();
+
+    const session = await loginPlatformAdminSession(
+      app,
+      authService,
+      databaseAdapter
+    );
+
+    const lastError = async () => {
+      const response = await app.fetch(
+        new Request("http://localhost:4310/v1/platform/data/backup-status", {
+          headers: session.headers(),
+        })
+      );
+
+      expect(response.status).toBe(200);
+
+      return (await response.json()).lastError;
+    };
+
+    const previousDir = process.env.MINGZHAN_BACKUP_DIR;
+    const dir = await mkdtemp(join(tmpdir(), "mingzhan-backup-status-"));
+
+    const blocked = new MíngZhànApiError(
+      "the server cannot read config.ini",
+      409
+    );
+
+    try {
+      delete process.env.MINGZHAN_BACKUP_DIR;
+      expect(await lastError()).toBeNull();
+
+      process.env.MINGZHAN_BACKUP_DIR = dir;
+      expect(await lastError()).toBeNull();
+
+      // An empty backup dir runs the first backup at once.
+      const stop = await startScheduledBackups({
+        dir,
+        exportFile: () => Promise.reject(blocked),
+        key: Buffer.alloc(32, 4),
+      });
+
+      await Bun.sleep(50);
+      stop();
+
+      expect(await lastError()).toEqual({
+        at: expect.any(String),
+        message: blocked.message,
+      });
+    } finally {
+      if (previousDir === undefined) {
+        delete process.env.MINGZHAN_BACKUP_DIR;
+      } else {
+        process.env.MINGZHAN_BACKUP_DIR = previousDir;
+      }
+
+      await rm(dir, { force: true, recursive: true });
+    }
   });
 
   test("platform admin exports one user's data without secrets or other users", async () => {
@@ -638,6 +746,223 @@ describe("data portability routes", () => {
     ).resolves.toBe("original");
   });
 
+  test("platform admin can preview and restore a raw ZIP body", async () => {
+    const { app, authService, databaseAdapter } = createApp();
+
+    const session = await loginPlatformAdminSession(
+      app,
+      authService,
+      databaseAdapter
+    );
+
+    await writeFile(join(getUserConfigDir(), "config.ini"), "original");
+
+    const exportResponse = await app.fetch(
+      new Request("http://localhost:4310/v1/platform/data/export", {
+        headers: session.headers(),
+      })
+    );
+
+    const archive = Buffer.from(await exportResponse.arrayBuffer());
+    await writeFile(join(getUserConfigDir(), "config.ini"), "changed");
+
+    const send = (path: string, body: Buffer = archive) =>
+      app.fetch(
+        new Request(`http://localhost:4310/v1/platform/data/import/${path}`, {
+          body,
+          headers: session.headers({
+            "Content-Type": "application/zip",
+            "X-CSRF-Token": session.csrfToken,
+          }),
+          method: "POST",
+        })
+      );
+
+    const preview = await send("preview");
+    expect(preview.status).toBe(200);
+    await expect(preview.json()).resolves.toMatchObject({
+      archiveFileCount: 1,
+    });
+
+    expect((await send("restore")).status).toBe(400);
+
+    const previousCap = process.env.MINGZHAN_DATA_IMPORT_MAX_ARCHIVE_BYTES;
+    process.env.MINGZHAN_DATA_IMPORT_MAX_ARCHIVE_BYTES = String(
+      MAX_IMPORT_ARCHIVE_BYTES
+    );
+
+    try {
+      expect(
+        (await send("preview", Buffer.alloc(MAX_IMPORT_ARCHIVE_BYTES + 1)))
+          .status
+      ).toBe(413);
+    } finally {
+      if (previousCap === undefined) {
+        delete process.env.MINGZHAN_DATA_IMPORT_MAX_ARCHIVE_BYTES;
+      } else {
+        process.env.MINGZHAN_DATA_IMPORT_MAX_ARCHIVE_BYTES = previousCap;
+      }
+    }
+
+    await expect(
+      readFile(join(getUserConfigDir(), "config.ini"), "utf8")
+    ).resolves.toBe("changed");
+
+    expect((await send("restore?confirm=true")).status).toBe(200);
+    await expect(
+      readFile(join(getUserConfigDir(), "config.ini"), "utf8")
+    ).resolves.toBe("original");
+  });
+
+  test("platform admin can restore an encrypted backup sent as a raw ZIP", async () => {
+    const previousKey = process.env.MINGZHAN_SECRETS_KEY;
+    const key = Buffer.alloc(32, 4);
+    process.env.MINGZHAN_SECRETS_KEY = key.toString("base64");
+
+    try {
+      const { app, authService, databaseAdapter } = createApp();
+
+      const session = await loginPlatformAdminSession(
+        app,
+        authService,
+        databaseAdapter
+      );
+
+      await writeFile(join(getUserConfigDir(), "config.ini"), "original");
+
+      const encrypted = encryptBackup(
+        (await createMíngZhànDataExport({ rootDir: getUserConfigDir() })).data,
+        key
+      );
+
+      await writeFile(join(getUserConfigDir(), "config.ini"), "changed");
+
+      const send = (path: string) =>
+        app.fetch(
+          new Request(`http://localhost:4310/v1/platform/data/import/${path}`, {
+            body: encrypted,
+            headers: session.headers({
+              "Content-Type": "application/zip",
+              "X-CSRF-Token": session.csrfToken,
+            }),
+            method: "POST",
+          })
+        );
+
+      expect((await send("preview")).status).toBe(200);
+      expect((await send("restore?confirm=true")).status).toBe(200);
+      await expect(
+        readFile(join(getUserConfigDir(), "config.ini"), "utf8")
+      ).resolves.toBe("original");
+    } finally {
+      if (previousKey === undefined) {
+        delete process.env.MINGZHAN_SECRETS_KEY;
+      } else {
+        process.env.MINGZHAN_SECRETS_KEY = previousKey;
+      }
+    }
+  });
+
+  test("a restore upload cut off mid-body does not lock later restores", async () => {
+    const { app, authService, databaseAdapter } = createApp();
+
+    const session = await loginPlatformAdminSession(
+      app,
+      authService,
+      databaseAdapter
+    );
+
+    const headers = session.headers({
+      "Content-Type": "application/json",
+      "X-CSRF-Token": session.csrfToken,
+    });
+
+    const server = Bun.serve({ fetch: app.fetch, port: 0 });
+    const path = "/v1/platform/data/import/restore";
+
+    try {
+      const lines = [...new Headers(headers)].map(
+        ([name, value]) => `${name}: ${value}`
+      );
+
+      const socket = await Bun.connect({
+        hostname: "127.0.0.1",
+        port: server.port,
+        socket: { data() {} },
+      });
+
+      // Promises more bytes than it sends, then hangs up like a closed tab.
+      socket.write(
+        `POST ${path} HTTP/1.1\r\nHost: localhost\r\n${lines.join("\r\n")}\r\nContent-Length: 5000000\r\n\r\n{"data":"AAAA`
+      );
+      await Bun.sleep(200);
+      socket.terminate();
+      await Bun.sleep(200);
+
+      const next = await fetch(`http://127.0.0.1:${server.port}${path}`, {
+        body: JSON.stringify({ confirm: false, data: "AQID" }),
+        headers,
+        method: "POST",
+      });
+
+      expect(await next.json()).not.toEqual({
+        error: "A data restore is already in progress.",
+      });
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("a raw ZIP restore cut off mid-body does not lock later restores", async () => {
+    const { app, authService, databaseAdapter } = createApp();
+
+    const session = await loginPlatformAdminSession(
+      app,
+      authService,
+      databaseAdapter
+    );
+
+    const headers = session.headers({
+      "Content-Type": "application/zip",
+      "X-CSRF-Token": session.csrfToken,
+    });
+
+    const server = Bun.serve({ fetch: app.fetch, port: 0 });
+    const path = "/v1/platform/data/import/restore";
+
+    try {
+      const lines = [...new Headers(headers)].map(
+        ([name, value]) => `${name}: ${value}`
+      );
+
+      const socket = await Bun.connect({
+        hostname: "127.0.0.1",
+        port: server.port,
+        socket: { data() {} },
+      });
+
+      // Promises more bytes than it sends, then hangs up like a closed tab.
+      socket.write(
+        `POST ${path} HTTP/1.1\r\nHost: localhost\r\n${lines.join("\r\n")}\r\nContent-Length: 5000000\r\n\r\nPK\x03\x04`
+      );
+      await Bun.sleep(200);
+      socket.terminate();
+      await Bun.sleep(200);
+
+      const next = await fetch(`http://127.0.0.1:${server.port}${path}`, {
+        body: new Uint8Array([1, 2, 3]),
+        headers,
+        method: "POST",
+      });
+
+      expect(await next.json()).not.toEqual({
+        error: "A data restore is already in progress.",
+      });
+    } finally {
+      server.stop(true);
+    }
+  });
+
   test("non-platform users cannot export or import data", async () => {
     const { app, authService, databaseAdapter } = createApp();
 
@@ -719,7 +1044,14 @@ describe("data portability routes", () => {
       })
     );
 
+    const backupStatusResponse = await app.fetch(
+      new Request("http://localhost:4310/v1/platform/data/backup-status", {
+        headers: orgSession.headers(),
+      })
+    );
+
     expect(exportResponse.status).toBe(403);
+    expect(backupStatusResponse.status).toBe(403);
     expect(userExportResponse.status).toBe(403);
     expect(orgExportResponse.status).toBe(403);
     expect(previewResponse.status).toBe(403);
@@ -903,5 +1235,5 @@ describe("data portability routes", () => {
 
     expect(restoreResponse.status).toBe(400);
     await expect(readFile(configPath, "utf8")).resolves.toBe("keep");
-  });
+  }, 30_000);
 });

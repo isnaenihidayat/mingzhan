@@ -1325,9 +1325,14 @@ function parseWorkflowValue(value) {
 
 // src/ui.tsx
 var inject = ["slots", "host", "styles", "ui"];
+var checkFieldHints = new Map([
+  ["path", "Where to look, like input.ok or steps.fetch_data.count"],
+  ["expected", 'The value it must equal, like true, 3 or "done"']
+]);
 var stepFields = {
-  assert: ["path", "expected"],
-  compare: ["left", "op", "right", "tolerance"],
+  agent: ["prompt", "fields"],
+  assert: ["path", "expected", "onFail"],
+  compare: ["left", "op", "right", "tolerance", "onFail"],
   template: ["template"],
   tool: ["tool", "input"]
 };
@@ -1359,13 +1364,14 @@ function serializeSteps(steps) {
   return steps.map(({ id, kind, fields }) => ({
     id,
     kind,
-    ...Object.fromEntries((stepFields[kind] ?? []).filter((key) => key !== "tolerance" || fields[key]).map((key) => [
+    ...Object.fromEntries((stepFields[kind] ?? []).filter((key) => (key !== "tolerance" || fields[key]) && (key !== "onFail" || fields[key] === "skip")).map((key) => [
       key,
-      key === "input" ? JSON.parse(fields[key] || "{}") : ["left", "right", "expected", "tolerance"].includes(key) ? parseValue(fields[key] ?? "") : fields[key] ?? ""
+      key === "input" || key === "fields" ? JSON.parse(fields[key] || "{}") : ["left", "right", "expected", "tolerance"].includes(key) ? parseValue(fields[key] ?? "") : fields[key] ?? ""
     ]))
   }));
 }
 var kindLabels = new Map([
+  ["agent", "Let the bot decide"],
   ["assert", "Check a rule"],
   ["compare", "Compare"],
   ["summarize", "Ask the bot"],
@@ -1373,6 +1379,9 @@ var kindLabels = new Map([
   ["tool", "Use an app"]
 ]);
 var newStepFields = new Map([
+  ["agent", { fields: `{
+  "decision": "act | ignore"
+}`, prompt: "" }],
   ["assert", { expected: "", path: "" }],
   ["compare", { left: "", op: "eq", right: "" }],
   ["database", { input: '{"sql":"","params":[]}', tool: "sqlite" }],
@@ -1389,6 +1398,18 @@ function toolParts(name) {
     action: titleCase(split === -1 ? name : name.slice(split + 2)),
     app: titleCase(app.replace(/^plugin[_-]+/, ""))
   };
+}
+var kindIcons = new Map([
+  ["assert", "shield"],
+  ["compare", "compare"],
+  ["summarize", "bot"],
+  ["template", "pencil"]
+]);
+function stepIcon(kind, fields) {
+  if (kind === "tool") {
+    return fields.tool === "sqlite" ? "database" : "plug";
+  }
+  return kindIcons.get(kind) ?? "plug";
 }
 function stepApp(kind, fields) {
   if (kind !== "tool") {
@@ -1488,7 +1509,12 @@ var builtInActions = [
     label: "Write a message"
   },
   { hint: "Stop if a value is wrong", kind: "assert", label: "Check a rule" },
-  { hint: "Compare two values", kind: "compare", label: "Compare" }
+  { hint: "Compare two values", kind: "compare", label: "Compare" },
+  {
+    hint: "Get named answers for later steps",
+    kind: "agent",
+    label: "Let the bot decide"
+  }
 ];
 function formatDuration(ms) {
   if (ms < 1000) {
@@ -1497,11 +1523,13 @@ function formatDuration(ms) {
   return ms < 60000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms / 60000)}m`;
 }
 function formatRunTime(iso) {
-  return new Date(iso).toLocaleString(undefined, {
+  const date = new Date(iso);
+  return date.toLocaleString(undefined, {
     day: "numeric",
     hour: "numeric",
     minute: "2-digit",
-    month: "short"
+    month: "short",
+    year: date.getFullYear() === new Date().getFullYear() ? undefined : "numeric"
   });
 }
 function readableError(message) {
@@ -1523,10 +1551,104 @@ function dayGroup(iso) {
   if (day === new Date().toDateString()) {
     return "Today";
   }
-  if (day === new Date(Date.now() - 86400000).toDateString()) {
+  const yesterday = new Date;
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (day === yesterday.toDateString()) {
     return "Yesterday";
   }
   return "Earlier";
+}
+function errorHelp(error, agent, failed) {
+  const missingTool = /^Unknown tool: (.+)$/i.exec(error)?.[1];
+  if (missingTool && agent) {
+    const parts = toolParts(missingTool);
+    return {
+      fix: {
+        href: `/profiles?profile=${encodeURIComponent(agent.id)}&section=tools`,
+        label: "Turn on tool"
+      },
+      missingTool: true,
+      text: `${agent.name} does not have the ${parts.app || parts.action} tool.`
+    };
+  }
+  const server = /^MCP server "([^"]+)" is not connected\.$/.exec(error)?.[1];
+  if (server) {
+    return {
+      fix: { href: "/system?tab=mcp", label: "Open MCP settings" },
+      missingTool: false,
+      text: `${server} isn’t connected.`
+    };
+  }
+  const check = failed?.kind === "assert" ? checkFailure(failed) : failed?.kind === "compare" ? compareFailure(failed) : "";
+  return {
+    missingTool: Boolean(missingTool),
+    text: check || readableError(error)
+  };
+}
+function checkFailure(step) {
+  const input = parseWorkflowValue(step.input);
+  const output = parseWorkflowValue(step.output);
+  const path = isWorkflowRecord(input) ? readWorkflowString(input.path) : null;
+  if (!(path && isWorkflowRecord(input))) {
+    return "";
+  }
+  const actual = isWorkflowRecord(output) ? output.actual : undefined;
+  return `${path} should be ${JSON.stringify(input.expected)}, but it was ${actual === undefined || actual === null ? "missing" : JSON.stringify(actual)}.`;
+}
+function shortValue(value) {
+  const text = value === undefined || value === null ? "nothing" : JSON.stringify(value);
+  return text.length > 80 ? `${text.slice(0, 80)}…` : text;
+}
+function compareFailure(step) {
+  const input = parseWorkflowValue(step.input);
+  const output = parseWorkflowValue(step.output);
+  if (!isWorkflowRecord(input)) {
+    return "";
+  }
+  const left = shortValue(input.left);
+  const right = shortValue(input.right);
+  const diff = isWorkflowRecord(output) ? output.diff : undefined;
+  const reason = isWorkflowRecord(diff) ? readWorkflowString(diff.reason) : null;
+  const op = readWorkflowString(input.op);
+  if (reason === "non-numeric") {
+    return `${left} and ${right} must both be numbers to compare.`;
+  }
+  if (op === "contains") {
+    return `${left} does not contain ${right}.`;
+  }
+  if (op === "near") {
+    return `${left} is not close enough to ${right}.`;
+  }
+  return op === "eq" ? `${left} should equal ${right}.` : "";
+}
+function skipReason(step) {
+  return step.kind === "assert" ? checkFailure(step) : compareFailure(step);
+}
+function failedStep(run) {
+  return run.steps?.find((step) => step.status === "failed");
+}
+var WORKFLOW_DOCS = "https://ahmadrosid.github.io/mingzhan/workflows";
+var DISMISSED_KEY = "mingzhan:workflows:dismissed-runs";
+function loadDismissed() {
+  try {
+    const saved = parseWorkflowValue(JSON.parse(localStorage.getItem(DISMISSED_KEY) ?? "[]"));
+    const ids = Array.isArray(saved) ? saved.map(readWorkflowString) : [];
+    return new Set(ids.filter((id) => id !== null).slice(-50));
+  } catch {
+    return new Set;
+  }
+}
+function saveDismissed(ids) {
+  try {
+    localStorage.setItem(DISMISSED_KEY, JSON.stringify([...ids].slice(-50)));
+  } catch {}
+}
+function runStarted(iso) {
+  const group = dayGroup(iso);
+  return group === "Earlier" ? formatRunTime(iso) : `${group}, ${new Date(iso).toLocaleTimeString(undefined, {
+    hour: "numeric",
+    minute: "2-digit"
+  })}`;
 }
 function readableEntries(value) {
   const short = (entry) => {
@@ -1662,14 +1784,14 @@ function apply(ctx) {
       }), app),
       key: app
     }, entries.map((tool) => {
-      const { action: action2 } = toolParts(tool.name);
+      const { action } = toolParts(tool.name);
       return /* @__PURE__ */ React.createElement(CommandItem, {
         key: tool.name,
-        onSelect: () => onPick({ kind: "tool", label: action2, tool: tool.name }),
-        value: `${app} ${action2} ${tool.name}`
+        onSelect: () => onPick({ kind: "tool", label: action, tool: tool.name }),
+        value: `${app} ${action} ${tool.name}`
       }, /* @__PURE__ */ React.createElement("span", {
         className: "workflow-picker-item"
-      }, /* @__PURE__ */ React.createElement("span", null, action2), tool.description && /* @__PURE__ */ React.createElement("span", {
+      }, /* @__PURE__ */ React.createElement("span", null, action), tool.description && /* @__PURE__ */ React.createElement("span", {
         className: "workflow-empty"
       }, tool.description.split(/(?<=\.)\s/)[0])));
     }))), /* @__PURE__ */ React.createElement(CommandGroup, {
@@ -1810,16 +1932,28 @@ function apply(ctx) {
   }) {
     const paths = {
       add: "M12 5v14M5 12h14",
+      bot: "M8 8h8a3 3 0 0 1 3 3v5a3 3 0 0 1-3 3H8a3 3 0 0 1-3-3v-5a3 3 0 0 1 3-3ZM12 4v4M9.5 13.5h.01M14.5 13.5h.01",
+      check: "m5 12 5 5 9-10",
+      chevronDown: "m6 9 6 6 6-6",
+      chevronRight: "m9 6 6 6-6 6",
+      chevronUp: "m6 15 6-6 6 6",
       close: "m6 6 12 12M6 18 18 6",
       collapse: "M20 10h-6V4M14 10l7-7M4 14h6v6M10 14l-7 7",
+      compare: "M12 4v16M8 20h8M5 8h14M7 8l-3 6h6L7 8ZM17 8l-3 6h6l-3-6Z",
+      database: "M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3ZM4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3",
       delete: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 10v7M14 10v7",
       download: "M12 4v11M7 10l5 5 5-5M5 20h14",
       expand: "M14 4h6v6M20 4l-7 7M10 20H4v-6M4 20l7-7",
       json: "M8 4c-2 0-2 2-2 4s-2 4-2 4 2 2 2 4 0 4 2 4M16 4c2 0 2 2 2 4s2 4 2 4-2 2-2 4 0 4-2 4",
+      minus: "M6 12h12",
       more: "M5 12h.01M12 12h.01M19 12h.01",
+      pencil: "M4 20h4L19 9l-4-4L4 16v4ZM13 7l4 4",
       play: "m8 5 11 7-11 7V5Z",
+      plug: "M9 7V3M15 7V3M7 7h10v4a5 5 0 0 1-10 0V7ZM12 16v5",
+      retry: "M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5",
       rows: "M3 4h18v16H3V4ZM3 9h18M3 14h18",
       schema: "M4 6h16M4 12h10M4 18h6",
+      shield: "M12 3 5 6v5c0 4.5 3 8 7 10 4-2 7-5.5 7-10V6l-7-3ZM9 12l2 2 4-4",
       table: "M3 4h18v16H3V4ZM3 9h18M9 9v11",
       warning: "M12 3 2 21h20L12 3ZM12 9v5M12 17h.01",
       workflow: "M4 3h6v6H4V3ZM14 15h6v6h-6v-6ZM7 9v9h7M10 6h7v9"
@@ -1839,16 +1973,17 @@ function apply(ctx) {
     }));
   }
   ctx.styles(style_default);
+  const dismissedRuns = loadDismissed();
   function WorkflowError({ message }) {
-    const connectionError = /^MCP server "([^"]+)" is not connected\.$/.exec(message);
+    const help = errorHelp(message);
     return /* @__PURE__ */ React.createElement("div", {
       className: "workflow-error",
       role: "alert"
     }, /* @__PURE__ */ React.createElement(Icon, {
       kind: "warning"
-    }), /* @__PURE__ */ React.createElement("p", null, connectionError ? `${connectionError[1]} isn’t connected.` : message), connectionError ? /* @__PURE__ */ React.createElement("a", {
-      href: "/system?tab=mcp"
-    }, "Open MCP settings") : null);
+    }), /* @__PURE__ */ React.createElement("p", null, help.text), help.fix ? /* @__PURE__ */ React.createElement("a", {
+      href: help.fix.href
+    }, help.fix.label) : null);
   }
   const action = (name, input) => ctx.host.call(name, input);
   function WorkflowRunCard({ input, result, status }) {
@@ -1875,7 +2010,7 @@ function apply(ctx) {
               workflowId
             });
             if (active) {
-              setLiveRun(runs.find((run2) => run2.status === "running") ?? null);
+              setLiveRun(runs.find((run) => run.status === "running") ?? null);
             }
           }
         } catch {}
@@ -1893,7 +2028,7 @@ function apply(ctx) {
     const receipts = run?.steps ?? [];
     const steps = workflow?.steps ?? receipts.map((receipt) => ({ id: receipt.stepId, kind: receipt.kind }));
     const complete = receipts.filter((receipt) => receipt.status === "completed").length;
-    const label = run?.status === "failed" || record?.error ? "Failed" : status === "running" ? "Running" : run?.status === "completed" ? "Done" : "Finished";
+    const label = run?.status === "failed" || record?.error ? "Failed" : run?.status === "skipped" ? "Skipped" : status === "running" ? "Running" : run?.status === "completed" ? "Done" : "Finished";
     return /* @__PURE__ */ React.createElement("section", {
       "aria-label": "Workflow run",
       className: "workflow-chat-card"
@@ -1903,10 +2038,10 @@ function apply(ctx) {
       const receipt = receipts.find((item) => item.stepId === step.id);
       const stepStatus = receipt?.status ?? "pending";
       const definition = workflow?.steps.find((item) => item.id === step.id);
-      const detail = definition?.kind === "tool" ? definition.tool : definition?.kind === "summarize" ? definition.prompt : definition?.kind === "template" ? definition.template : step.kind;
+      const detail = definition?.kind === "tool" ? definition.tool : definition?.kind === "summarize" || definition?.kind === "agent" ? definition.prompt : definition?.kind === "template" ? definition.template : step.kind;
       const output = receipt?.output === undefined ? undefined : parseWorkflowValue(receipt.output);
       const content = isWorkflowRecord(output) ? readWorkflowString(output.content) : null;
-      const meta = receipt?.error ?? (content === null ? stepStatus === "completed" ? step.kind === "summarize" ? "Written" : "Done" : stepStatus : `${content.trim().split(/\s+/).filter(Boolean).length} words`);
+      const meta = receipt?.error ?? (content === null ? stepStatus === "completed" ? step.kind === "summarize" ? "Written" : "Done" : stepStatusLabels.get(stepStatus) ?? stepStatus : `${content.trim().split(/\s+/).filter(Boolean).length} words`);
       return /* @__PURE__ */ React.createElement("li", {
         "data-status": stepStatus,
         key: step.id
@@ -1935,9 +2070,9 @@ function apply(ctx) {
           setData({ profiles, workflows });
           setSelectedId(workflows[0]?.id ?? null);
         }
-      }).catch((error2) => {
+      }).catch((error) => {
         if (active) {
-          setError(String(error2.message ?? error2));
+          setError(String(error.message ?? error));
         }
       });
       return () => {
@@ -1961,8 +2096,8 @@ function apply(ctx) {
         setData((current) => current && { ...current, workflows });
         setSelectedId((current) => current === deleteTarget.id ? workflows[0]?.id ?? null : current);
         setDeleteTarget(null);
-      } catch (error2) {
-        setError(error2 instanceof Error ? error2.message : String(error2));
+      } catch (error) {
+        setError(error instanceof Error ? error.message : String(error));
         setDeleteTarget(null);
       } finally {
         setDeleting(false);
@@ -2064,6 +2199,7 @@ function apply(ctx) {
     const [busy, setBusy] = React.useState(false);
     const [error, setError] = React.useState("");
     const [runs, setRuns] = React.useState([]);
+    const [, redraw] = React.useReducer((count) => count + 1, 0);
     const [confirmDelete, setConfirmDelete] = React.useState(false);
     const [view, setView] = React.useState("workflow");
     const [selection, setSelection] = React.useState("");
@@ -2082,9 +2218,9 @@ function apply(ctx) {
         if (active) {
           setTools(result);
         }
-      }).catch((error2) => {
+      }).catch((error) => {
         if (active) {
-          setToolsError(String(error2.message ?? error2));
+          setToolsError(String(error.message ?? error));
         }
       });
       return () => {
@@ -2138,9 +2274,9 @@ function apply(ctx) {
           if (mounted.current) {
             setRuns(result);
           }
-        }).catch((error2) => {
+        }).catch((error) => {
           if (mounted.current) {
-            setError(String(error2.message ?? error2));
+            setError(String(error.message ?? error));
           }
         });
       }
@@ -2157,9 +2293,9 @@ function apply(ctx) {
       setError("");
       try {
         await work();
-      } catch (error2) {
+      } catch (error) {
         if (mounted.current) {
-          setError(error2 instanceof Error ? error2.message : String(error2));
+          setError(error instanceof Error ? error.message : String(error));
         }
       } finally {
         inFlight.current = false;
@@ -2265,14 +2401,35 @@ function apply(ctx) {
       if (mounted.current) {
         setRuns(history);
       }
-      if (result.error) {
+      if (result.error && !history.some((entry) => entry.id === result.run?.id)) {
         throw new Error(result.error);
       }
     });
     const title = titleCase;
     const lastRun = runs[0];
+    const canRun = Boolean(workflow) && !dirty && enabled && !busy;
+    const agent = profiles.find((profile) => profile.id === agentId);
+    const lastFailed = lastRun?.status === "failed" && !dismissedRuns.has(lastRun.id) ? lastRun : undefined;
+    const bannerStep = lastFailed && failedStep(lastFailed);
+    const failedHelp = lastFailed?.error ? errorHelp(lastFailed.error, agent, bannerStep) : undefined;
+    const stoppedAt = bannerStep ? titleCase(bannerStep.stepId) : "";
+    const runBlocked = workflow ? dirty ? "Save your changes to run again." : enabled ? "" : "Turn the workflow on to run again." : "Save the workflow to run it.";
+    const editStep = (stepId) => {
+      const draft = steps.find((step) => step.id === stepId);
+      const key = draft?.key ?? (stepId === summaryStep?.id ? "summary" : "");
+      if (key) {
+        setView("workflow");
+        setSelection(key);
+      }
+    };
+    const canEditStep = (stepId) => steps.some((step) => step.id === stepId) || stepId === summaryStep?.id;
+    const editInput = (input) => {
+      setRunInput(JSON.stringify(input ?? {}, null, 2));
+      setSelection("input");
+    };
     const showPicker = selection === "pick" || picking && Boolean(selectedStep);
-    const drawerApp = selectedStep ? stepApp(selectedStep.kind, selectedStep.fields) : profiles.find((profile) => profile.id === agentId)?.name ?? "Bot";
+    const drawerApp = selectedStep ? stepApp(selectedStep.kind, selectedStep.fields) : agent?.name ?? "Bot";
+    const drawerIcon = selectedStep ? stepIcon(selectedStep.kind, selectedStep.fields) : "bot";
     const valueSources = [
       {
         label: "Run input",
@@ -2285,7 +2442,11 @@ function apply(ctx) {
       ...steps.slice(0, Math.max(selectedIndex, 0)).map((step, index) => {
         const receipt = lastRun?.steps?.find((entry) => entry.stepId === step.id);
         const output = receipt?.output == null ? undefined : parseWorkflowValue(receipt.output);
-        const fieldsOut = isWorkflowRecord(output) ? readableEntries(output) : [];
+        const declared = step.kind === "agent" ? parseInputRecord(step.fields.fields ?? "") : null;
+        const fieldsOut = isWorkflowRecord(output) ? readableEntries(output) : Object.keys(declared ?? {}).map((key) => [
+          key,
+          ""
+        ]);
         return {
           label: `Step ${index + 1} · ${titleCase(step.id)}`,
           options: [
@@ -2310,17 +2471,22 @@ function apply(ctx) {
     const allSteps = [
       ...steps.map((step) => ({
         app: stepApp(step.kind, step.fields),
+        icon: stepIcon(step.kind, step.fields),
         id: step.id,
         key: step.key,
         kind: step.kind
       })),
       {
-        app: profiles.find((profile) => profile.id === agentId)?.name ?? "Bot",
+        app: agent?.name ?? "Bot",
+        icon: "bot",
         id: summaryStep?.id ?? "summary",
         key: "summary",
         kind: "summarize"
       }
     ];
+    const failureInCard = view === "workflow" && Boolean(bannerStep && allSteps.some((entry) => entry.id === bannerStep.stepId));
+    const failedRun = view !== "runs" && !failureInCard ? lastFailed : undefined;
+    const lastStopped = lastRun?.status === "failed" || lastRun?.status === "skipped";
     return /* @__PURE__ */ React.createElement("section", {
       className: "workflow-editor"
     }, /* @__PURE__ */ React.createElement("form", {
@@ -2381,7 +2547,7 @@ function apply(ctx) {
       onClick: () => setConfirmDelete(true),
       variant: "destructive"
     }, "Delete workflow"))), /* @__PURE__ */ React.createElement(Button, {
-      disabled: busy || !workflow || dirty || !enabled,
+      disabled: !canRun,
       onClick: () => runWorkflow(),
       size: "sm",
       type: "button"
@@ -2408,22 +2574,77 @@ function apply(ctx) {
       className: "workflow-tab-badge"
     }, needsLook)))), error && /* @__PURE__ */ React.createElement(WorkflowError, {
       message: error
-    }), view === "runs" && /* @__PURE__ */ React.createElement(RunHistory, {
-      agent: profiles.find((profile) => profile.id === agentId),
-      canRun: Boolean(workflow) && !dirty && enabled && !busy,
+    }), failedRun && /* @__PURE__ */ React.createElement("div", {
+      className: "workflow-error workflow-last-run",
+      "data-fix": Boolean(failedHelp?.fix)
+    }, /* @__PURE__ */ React.createElement("span", {
+      className: "workflow-last-run-icon"
+    }, /* @__PURE__ */ React.createElement(Icon, {
+      kind: "warning"
+    })), /* @__PURE__ */ React.createElement("p", null, /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement("strong", null, "Last run failed"), /* @__PURE__ */ React.createElement("span", {
+      className: "workflow-empty"
+    }, ` · ${runStarted(failedRun.startedAt)}`, stoppedAt && ` · stopped at ${stoppedAt}`)), /* @__PURE__ */ React.createElement("span", null, failedHelp?.text ?? "Stopped")), /* @__PURE__ */ React.createElement("div", {
+      className: "workflow-run-buttons"
+    }, failedHelp?.fix ? /* @__PURE__ */ React.createElement(Button, {
+      render: /* @__PURE__ */ React.createElement("a", {
+        href: failedHelp.fix.href
+      }),
+      size: "sm"
+    }, failedHelp.fix.label) : bannerStep && canEditStep(bannerStep.stepId) ? /* @__PURE__ */ React.createElement(Button, {
+      className: "workflow-view-run",
+      onClick: () => editStep(bannerStep.stepId),
+      size: "sm",
+      type: "button",
+      variant: "ghost"
+    }, "Edit step") : /* @__PURE__ */ React.createElement(Button, {
+      className: "workflow-view-run",
+      onClick: () => {
+        setSelection("");
+        setView("runs");
+      },
+      size: "sm",
+      type: "button",
+      variant: "ghost"
+    }, "View run"), /* @__PURE__ */ React.createElement(Button, {
+      disabled: !canRun,
+      onClick: () => runWorkflow(failedRun.input),
+      size: "sm",
+      title: runBlocked || undefined,
+      type: "button",
+      variant: "outline"
+    }, /* @__PURE__ */ React.createElement(Icon, {
+      kind: "retry"
+    }), "Run again"), /* @__PURE__ */ React.createElement(Button, {
+      "aria-label": "Dismiss",
+      onClick: () => {
+        dismissedRuns.add(failedRun.id);
+        saveDismissed(dismissedRuns);
+        redraw();
+      },
+      size: "icon-lg",
+      type: "button",
+      variant: "ghost"
+    }, /* @__PURE__ */ React.createElement(Icon, {
+      kind: "close"
+    })))), view === "runs" && /* @__PURE__ */ React.createElement(RunHistory, {
+      agent,
+      canEditStep,
+      canRun,
+      onEditInput: editInput,
+      onEditStep: editStep,
       onRunAgain: (input) => runWorkflow(input),
+      runBlocked,
       runs,
-      stepIds: allSteps.map((step) => step.id),
-      stepNames: Object.fromEntries(allSteps.map((step) => [step.id, title(step.id)]))
+      stepIds: allSteps.map((step) => step.id)
     }), view === "data" && /* @__PURE__ */ React.createElement("section", {
       "aria-label": "Workflow data",
       className: "workflow-data-page"
     }, /* @__PURE__ */ React.createElement(DatabasePanel, {
-      canRun: Boolean(workflow) && !dirty && enabled && !busy,
+      canRun,
       onRun: () => runWorkflow(),
       writers: tableWriters
     })), /* @__PURE__ */ React.createElement("div", {
-      className: "workflow-scroll",
+      className: "workflow-scroll workflow-canvas",
       hidden: view !== "workflow"
     }, /* @__PURE__ */ React.createElement("div", {
       className: "workflow-content"
@@ -2438,36 +2659,47 @@ function apply(ctx) {
       className: "workflow-steps"
     }, allSteps.map((step, index) => {
       const timing = lastTimeline.get(step.id);
+      const next = allSteps[index + 1];
+      const notReached = lastStopped && !timing;
+      const failedHere = failureInCard && bannerStep?.stepId === step.id;
+      const status = timing ? `${stepStatusLabels.get(timing.status) ?? timing.status}${timing.duration === null ? "" : ` · ${formatDuration(timing.duration)}`}` : "";
       return /* @__PURE__ */ React.createElement("li", {
         key: step.key
       }, /* @__PURE__ */ React.createElement("div", {
         className: "workflow-step-card",
+        "data-failed": failedHere,
+        "data-not-reached": notReached,
         "data-selected": selection === step.key
+      }, /* @__PURE__ */ React.createElement("div", {
+        className: "workflow-step-row"
       }, /* @__PURE__ */ React.createElement(Button, {
         className: "workflow-step-open",
         onClick: () => setSelection(step.key),
         type: "button",
         variant: "ghost"
-      }, /* @__PURE__ */ React.createElement(AppBadge, {
-        app: step.app
-      }), /* @__PURE__ */ React.createElement("span", {
+      }, /* @__PURE__ */ React.createElement("span", {
+        className: "workflow-step-icon"
+      }, /* @__PURE__ */ React.createElement(Icon, {
+        kind: step.icon
+      })), /* @__PURE__ */ React.createElement("span", {
         className: "workflow-step-text"
       }, /* @__PURE__ */ React.createElement("span", {
-        className: "workflow-step-kind"
-      }, step.key === "summary" ? "Summary" : `Step ${index + 1}`, " ", "· ", step.app), /* @__PURE__ */ React.createElement("span", {
         className: "workflow-step-name"
-      }, title(step.id) || "Untitled step")), timing && /* @__PURE__ */ React.createElement("span", {
-        className: "workflow-step-last",
-        "data-status": timing.status
-      }, /* @__PURE__ */ React.createElement("span", null, timing.status === "completed" && "✓ ", stepStatusLabels.get(timing.status) ?? timing.status, timing.duration !== null && ` · ${formatDuration(timing.duration)}`), /* @__PURE__ */ React.createElement("span", {
-        "aria-hidden": "true",
-        className: "workflow-bar"
-      }, /* @__PURE__ */ React.createElement("span", {
-        style: {
-          left: `${timing.left}%`,
-          width: `${timing.width}%`
-        }
-      })))), /* @__PURE__ */ React.createElement(DropdownMenu, null, /* @__PURE__ */ React.createElement(DropdownMenuTrigger, {
+      }, title(step.id) || "Untitled step"), /* @__PURE__ */ React.createElement("span", {
+        className: "workflow-step-kind"
+      }, step.app, notReached && " · not reached")), timing && /* @__PURE__ */ React.createElement("span", {
+        "aria-label": status,
+        className: "workflow-step-mark",
+        "data-status": timing.status,
+        role: "img",
+        title: status
+      }, timing.status === "completed" && /* @__PURE__ */ React.createElement(Icon, {
+        kind: "check"
+      }), timing.status === "failed" && /* @__PURE__ */ React.createElement(Icon, {
+        kind: "close"
+      }), timing.status === "skipped" && /* @__PURE__ */ React.createElement(Icon, {
+        kind: "minus"
+      }))), /* @__PURE__ */ React.createElement(DropdownMenu, null, /* @__PURE__ */ React.createElement(DropdownMenuTrigger, {
         disabled: busy,
         render: /* @__PURE__ */ React.createElement(Button, {
           "aria-label": `Options for ${title(step.id)}`,
@@ -2490,13 +2722,37 @@ function apply(ctx) {
       }, "Move later"), /* @__PURE__ */ React.createElement(DropdownMenuItem, {
         onClick: () => setSteps((current) => current.filter((entry) => entry.key !== step.key)),
         variant: "destructive"
-      }, "Delete step"))))), index < steps.length && /* @__PURE__ */ React.createElement("div", {
+      }, "Delete step"))))), failedHere && lastFailed && /* @__PURE__ */ React.createElement("div", {
+        className: "workflow-step-failure"
+      }, /* @__PURE__ */ React.createElement("p", null, failedHelp?.text ?? "Stopped"), /* @__PURE__ */ React.createElement("div", {
+        className: "workflow-run-buttons"
+      }, failedHelp?.fix ? /* @__PURE__ */ React.createElement(Button, {
+        render: /* @__PURE__ */ React.createElement("a", {
+          href: failedHelp.fix.href
+        }),
+        size: "sm"
+      }, failedHelp.fix.label) : /* @__PURE__ */ React.createElement(Button, {
+        onClick: () => setSelection(step.key),
+        size: "sm",
+        type: "button"
+      }, "Edit step"), /* @__PURE__ */ React.createElement(Button, {
+        disabled: !canRun,
+        onClick: () => runWorkflow(lastFailed.input),
+        size: "sm",
+        title: runBlocked || undefined,
+        type: "button",
+        variant: "outline"
+      }, /* @__PURE__ */ React.createElement(Icon, {
+        kind: "retry"
+      }), "Run again")))), next && /* @__PURE__ */ React.createElement("span", {
         "aria-hidden": "true",
-        className: "workflow-connector"
-      }));
+        className: "workflow-connector",
+        "data-passed": timing?.status === "completed" && lastTimeline.has(next.id)
+      }, /* @__PURE__ */ React.createElement("span", null), /* @__PURE__ */ React.createElement("span", null), /* @__PURE__ */ React.createElement("span", null)));
     })), /* @__PURE__ */ React.createElement("div", {
       className: "workflow-add-actions"
     }, /* @__PURE__ */ React.createElement(Button, {
+      className: "workflow-add-step",
       onClick: () => setSelection("pick"),
       type: "button",
       variant: "outline"
@@ -2512,9 +2768,11 @@ function apply(ctx) {
       className: "workflow-drawer-header"
     }, showPicker ? /* @__PURE__ */ React.createElement("div", {
       className: "workflow-drawer-title"
-    }, /* @__PURE__ */ React.createElement("p", null, "Step ", selectedStep ? selectedIndex + 1 : steps.length + 1), /* @__PURE__ */ React.createElement("h2", null, "What should this step do?")) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(AppBadge, {
-      app: drawerApp
-    }), /* @__PURE__ */ React.createElement("div", {
+    }, /* @__PURE__ */ React.createElement("p", null, "Step ", selectedStep ? selectedIndex + 1 : steps.length + 1), /* @__PURE__ */ React.createElement("h2", null, "What should this step do?")) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("span", {
+      className: "workflow-drawer-icon"
+    }, /* @__PURE__ */ React.createElement(Icon, {
+      kind: drawerIcon
+    })), /* @__PURE__ */ React.createElement("div", {
       className: "workflow-drawer-title"
     }, /* @__PURE__ */ React.createElement("p", null, selectedStep ? `Step ${selectedIndex + 1}` : "Summary", " ·", " ", drawerApp), /* @__PURE__ */ React.createElement("h2", null, title(selectedStep?.id ?? summaryStep?.id ?? "summary")))), /* @__PURE__ */ React.createElement(Button, {
       "aria-label": expanded ? "Collapse step" : "Expand step",
@@ -2593,7 +2851,20 @@ function apply(ctx) {
       schema: tools.find((tool) => tool.name === selectedStep.fields.tool)?.parameters,
       sources: valueSources,
       text: selectedStep.fields.input ?? ""
-    }) : field === "op" ? /* @__PURE__ */ React.createElement(Choice, {
+    }) : field === "onFail" ? /* @__PURE__ */ React.createElement("label", {
+      className: "workflow-enabled",
+      key: field
+    }, /* @__PURE__ */ React.createElement(Switch, {
+      "aria-label": "Skip the run when false",
+      checked: selectedStep.fields.onFail === "skip",
+      disabled: busy,
+      onCheckedChange: (checked) => updateStep(selectedStep.key, {
+        fields: checked ? {
+          ...selectedStep.fields,
+          onFail: "skip"
+        } : Object.fromEntries(Object.entries(selectedStep.fields).filter(([key]) => key !== "onFail"))
+      })
+    }), "Skip the run when false") : field === "op" ? /* @__PURE__ */ React.createElement(Choice, {
       disabled: busy,
       key: field,
       label: "Operator",
@@ -2610,7 +2881,8 @@ function apply(ctx) {
       value: selectedStep.fields[field] ?? "eq"
     }) : /* @__PURE__ */ React.createElement("label", {
       key: field
-    }, field === "input" ? "Details" : title(field), /* @__PURE__ */ React.createElement(Textarea, {
+    }, field === "input" ? "Details" : field === "fields" ? "Answer fields" : title(field), /* @__PURE__ */ React.createElement(Textarea, {
+      "aria-describedby": checkFieldHints.has(field) ? `check-hint-${field}` : undefined,
       disabled: busy,
       onChange: (event) => updateStep(selectedStep.key, {
         fields: {
@@ -2618,20 +2890,29 @@ function apply(ctx) {
           [field]: event.target.value
         }
       }),
-      rows: field === "input" || field === "template" ? 8 : 2,
+      rows: [
+        "input",
+        "template",
+        "prompt",
+        "fields"
+      ].includes(field) ? 8 : 2,
       value: selectedStep.fields[field] ?? ""
-    })))), selection === "summary" && /* @__PURE__ */ React.createElement("label", null, "What should the bot write?", /* @__PURE__ */ React.createElement(Textarea, {
+    }), checkFieldHints.has(field) && /* @__PURE__ */ React.createElement("span", {
+      className: "workflow-field-hint",
+      id: `check-hint-${field}`
+    }, checkFieldHints.get(field))))), selection === "summary" && /* @__PURE__ */ React.createElement("label", null, "What should the bot write?", /* @__PURE__ */ React.createElement(Textarea, {
       disabled: busy,
       onChange: (event) => setSummary(event.target.value),
       rows: 8,
       value: summary
     }))), panelTab === "database" && /* @__PURE__ */ React.createElement(DatabasePanel, {
-      canRun: Boolean(workflow) && !dirty && enabled && !busy,
+      canRun,
       onRun: () => runWorkflow(),
       writers: tableWriters
     }), panelTab === "test" && (() => {
       const receipt = runs[0]?.steps?.find((step) => step.stepId === (selectedStep?.id ?? summaryStep?.id ?? "summary"));
       const attempt = selectedStep && tried?.key === selectedStep.key ? tried.result : null;
+      const skips = Boolean(selectedStep && attempt?.error && attempt.output !== undefined && selectedStep.fields.onFail === "skip");
       return /* @__PURE__ */ React.createElement("div", {
         className: "workflow-step-fields"
       }, selectedStep && /* @__PURE__ */ React.createElement("section", {
@@ -2645,10 +2926,14 @@ function apply(ctx) {
         kind: "play"
       }), busy ? "Trying…" : "Try this step"), attempt && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("p", {
         className: "workflow-try-status",
-        "data-status": attempt.error ? "failed" : "completed"
-      }, attempt.error ? "Stopped" : "Worked", " in", " ", formatDuration(attempt.durationMs)), /* @__PURE__ */ React.createElement(StepReceipt, {
+        "data-status": skips ? "skipped" : attempt.error ? "failed" : "completed"
+      }, skips ? "Skipped" : attempt.error ? "Stopped" : "Worked", " ", "in ", formatDuration(attempt.durationMs), skips && selectedStep && `. ${skipReason({
+        input: attempt.input,
+        kind: selectedStep.kind,
+        output: attempt.output
+      })}`), /* @__PURE__ */ React.createElement(StepReceipt, {
         receipt: {
-          error: attempt.error ? readableError(attempt.error) : null,
+          error: attempt.error && !skips ? readableError(attempt.error) : null,
           input: attempt.input,
           output: attempt.output
         }
@@ -2683,8 +2968,19 @@ function apply(ctx) {
     }))), /* @__PURE__ */ React.createElement(DialogFooter, null, /* @__PURE__ */ React.createElement(Button, {
       disabled: busy,
       onClick: () => setSelection(""),
+      type: "button",
+      variant: "outline"
+    }, "Done"), /* @__PURE__ */ React.createElement(Button, {
+      disabled: !canRun,
+      onClick: () => {
+        setSelection("");
+        runWorkflow();
+      },
+      title: runBlocked || undefined,
       type: "button"
-    }, "Done")))), /* @__PURE__ */ React.createElement(Dialog, {
+    }, /* @__PURE__ */ React.createElement(Icon, {
+      kind: "play"
+    }), "Run")))), /* @__PURE__ */ React.createElement(Dialog, {
       onOpenChange: (open) => {
         if (!busy) {
           setConfirmDelete(open);
@@ -2748,11 +3044,15 @@ function apply(ctx) {
     runs,
     agent,
     stepIds,
-    stepNames,
     canRun,
+    runBlocked,
+    canEditStep,
+    onEditStep,
+    onEditInput,
     onRunAgain
   }) {
     const [openId, setOpenId] = React.useState();
+    const [onlyFailed, setOnlyFailed] = React.useState(false);
     if (!runs[0]) {
       return /* @__PURE__ */ React.createElement("section", {
         "aria-label": "History",
@@ -2761,103 +3061,179 @@ function apply(ctx) {
         className: "workflow-empty"
       }, "No runs yet."));
     }
-    const open = openId === undefined ? runs[0].status === "completed" ? null : runs[0].id : openId;
-    const name = (stepId) => stepNames[stepId] ?? titleCase(stepId);
-    const days = new Map;
-    for (const run of runs) {
-      const day = new Date(run.startedAt).toDateString();
-      days.set(day, [...days.get(day) ?? [], run]);
-    }
+    const open = openId === undefined ? runs[0].status === "completed" || runs[0].status === "skipped" ? null : runs[0].id : openId;
+    const failedCount = runs.filter((run) => run.status === "failed").length;
+    const shown = onlyFailed ? runs.filter((run) => run.status === "failed") : runs;
     return /* @__PURE__ */ React.createElement("section", {
       "aria-label": "History",
       className: "workflow-scroll"
     }, /* @__PURE__ */ React.createElement("div", {
-      className: "workflow-days"
-    }, [...days.values()].map((entries) => {
-      const worked = entries.filter((entry) => entry.status === "completed").length;
-      const group = dayGroup(entries[0].startedAt);
-      return /* @__PURE__ */ React.createElement("section", {
-        key: entries[0].id
-      }, /* @__PURE__ */ React.createElement("h3", null, group === "Earlier" ? new Date(entries[0].startedAt).toLocaleDateString(undefined, { day: "numeric", month: "short" }) : group, /* @__PURE__ */ React.createElement("span", {
-        className: "workflow-empty"
-      }, entries.length === 1 ? "1 run" : `${entries.length} runs`, worked > 0 && (entries.length === 1 ? " · worked" : ` · ${worked} worked`))), /* @__PURE__ */ React.createElement("ol", {
-        className: "workflow-day-runs"
-      }, entries.map((run) => /* @__PURE__ */ React.createElement(RunRow, {
-        agent,
-        canRun,
-        expanded: run.id === open,
-        key: run.id,
-        name,
-        onRunAgain,
-        onToggle: () => setOpenId(run.id === open ? null : run.id),
-        run,
-        stepIds
-      }))));
-    })));
+      className: "workflow-runs-box"
+    }, runs.length >= 5 && failedCount > 0 && failedCount < runs.length && /* @__PURE__ */ React.createElement("div", {
+      className: "workflow-runs-filter"
+    }, /* @__PURE__ */ React.createElement(Button, {
+      "aria-pressed": !onlyFailed,
+      onClick: () => setOnlyFailed(false),
+      size: "sm",
+      type: "button",
+      variant: onlyFailed ? "ghost" : "secondary"
+    }, "All ", runs.length), /* @__PURE__ */ React.createElement(Button, {
+      "aria-pressed": onlyFailed,
+      onClick: () => setOnlyFailed(true),
+      size: "sm",
+      type: "button",
+      variant: onlyFailed ? "secondary" : "ghost"
+    }, "Failed ", failedCount)), /* @__PURE__ */ React.createElement("table", {
+      className: "workflow-runs"
+    }, runs.length >= 20 && /* @__PURE__ */ React.createElement("caption", null, "Last 20 runs"), /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", {
+      scope: "col"
+    }, "Result"), /* @__PURE__ */ React.createElement("th", {
+      scope: "col"
+    }, "Started"), /* @__PURE__ */ React.createElement("th", {
+      scope: "col"
+    }, "Steps"), /* @__PURE__ */ React.createElement("th", {
+      scope: "col"
+    }, "Time"), /* @__PURE__ */ React.createElement("th", {
+      "aria-label": "Details",
+      scope: "col"
+    }))), /* @__PURE__ */ React.createElement("tbody", null, shown.map((run) => /* @__PURE__ */ React.createElement(RunRow, {
+      agent,
+      canEditStep,
+      canRun,
+      expanded: run.id === open,
+      key: run.id,
+      onEditInput,
+      onEditStep,
+      onRunAgain,
+      onToggle: () => setOpenId(run.id === open ? null : run.id),
+      run,
+      runBlocked,
+      stepIds
+    }))))));
   }
   function RunRow({
     run,
     agent,
     stepIds,
-    name,
     expanded,
     canRun,
+    runBlocked,
+    canEditStep,
+    onEditStep,
+    onEditInput,
     onToggle,
     onRunAgain
   }) {
     const receipts = run.steps ?? [];
     const timeline = runTimeline(run);
-    const failed = receipts.find((step) => step.status === "failed");
-    const missingTool = /^Unknown tool: (.+)$/i.exec(run.error ?? "")?.[1];
-    const missingName = missingTool ? toolParts(missingTool).app || toolParts(missingTool).action : "";
+    const failed = failedStep(run);
+    const stoppedAt = failed ? titleCase(failed.stepId) : "";
+    const filter = run.status === "skipped" ? run.steps?.find((step) => step.status === "skipped") : undefined;
+    const skippedAt = filter ? titleCase(filter.stepId) : "";
+    const skippedWhy = filter ? skipReason(filter) : "";
+    const help = run.error ? errorHelp(run.error, agent, failed) : undefined;
+    const started = runStarted(run.startedAt);
     const recordedIds = receipts.map((step) => step.stepId);
     const ids = recordedIds.some((id) => !stepIds.includes(id)) ? recordedIds : stepIds;
     const reached = ids.filter((id) => timeline.has(id)).length;
-    return /* @__PURE__ */ React.createElement("li", {
+    const notReached = ids.filter((id) => !timeline.has(id));
+    const detailId = `run-detail-${run.id}`;
+    const barsLabel = ids.map((id) => {
+      const status = timeline.get(id)?.status;
+      return `${titleCase(id)}: ${status ? stepStatusLabels.get(status) ?? status : "not reached"}`;
+    }).join(", ");
+    return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("tr", {
       "data-status": run.status
-    }, /* @__PURE__ */ React.createElement("button", {
-      "aria-expanded": expanded,
-      onClick: onToggle,
-      type: "button"
+    }, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", {
+      className: "workflow-run-badge",
+      "data-status": run.status
+    }, run.status === "failed" && /* @__PURE__ */ React.createElement(Icon, {
+      kind: "close"
+    }), run.status === "completed" && /* @__PURE__ */ React.createElement(Icon, {
+      kind: "check"
+    }), run.status === "failed" ? "Failed" : run.status === "running" ? "Running…" : stepStatusLabels.get(run.status) ?? run.status)), /* @__PURE__ */ React.createElement("th", {
+      scope: "row"
+    }, started), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", {
+      className: "workflow-run-steps-cell"
     }, /* @__PURE__ */ React.createElement("span", {
-      className: "workflow-run-time"
-    }, new Date(run.startedAt).toLocaleTimeString(undefined, {
-      hour: "numeric",
-      minute: "2-digit"
-    })), /* @__PURE__ */ React.createElement("span", {
-      "aria-label": `${reached} of ${ids.length} steps ran`,
-      className: "workflow-pips",
+      "aria-label": barsLabel,
+      className: "workflow-run-bars",
       role: "img"
     }, ids.map((id) => /* @__PURE__ */ React.createElement("span", {
       "data-status": timeline.get(id)?.status ?? "pending",
       key: id
     }))), /* @__PURE__ */ React.createElement("span", {
-      className: "workflow-run-text"
-    }, run.status === "failed" ? failed ? `Stopped at ${name(failed.stepId)}` : "Stopped" : run.status === "running" ? "Running…" : stepStatusLabels.get(run.status) ?? run.status), /* @__PURE__ */ React.createElement("span", {
+      "aria-hidden": "true"
+    }, reached, " of ", ids.length), run.status === "failed" && !expanded && /* @__PURE__ */ React.createElement("span", {
+      className: "workflow-empty"
+    }, stoppedAt ? `Stopped at ${stoppedAt}` : "Stopped"), skippedAt && /* @__PURE__ */ React.createElement("span", {
+      className: "workflow-empty"
+    }, `Skipped at ${skippedAt}`))), /* @__PURE__ */ React.createElement("td", {
       className: "workflow-run-took"
-    }, run.completedAt && formatDuration(Date.parse(run.completedAt) - Date.parse(run.startedAt)))), expanded && /* @__PURE__ */ React.createElement("div", {
-      className: "workflow-run-detail"
+    }, run.completedAt && formatDuration(Date.parse(run.completedAt) - Date.parse(run.startedAt))), /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement(Button, {
+      "aria-controls": expanded ? detailId : undefined,
+      "aria-expanded": expanded,
+      "aria-label": `${expanded ? "Hide" : "Open"} run from ${started}`,
+      onClick: onToggle,
+      size: "icon-lg",
+      type: "button",
+      variant: "ghost"
+    }, /* @__PURE__ */ React.createElement(Icon, {
+      kind: expanded ? "chevronUp" : "chevronDown"
+    })))), expanded && /* @__PURE__ */ React.createElement("tr", {
+      className: "workflow-run-detail-row"
+    }, /* @__PURE__ */ React.createElement("td", {
+      colSpan: 5
+    }, /* @__PURE__ */ React.createElement("div", {
+      className: "workflow-run-detail",
+      id: detailId
     }, /* @__PURE__ */ React.createElement("div", {
       className: "workflow-run-actions"
-    }, run.error ? /* @__PURE__ */ React.createElement("p", {
-      "data-missing-tool": Boolean(missingTool),
-      role: "alert"
-    }, missingTool && agent ? `${agent.name} does not have the ${missingName} tool.` : readableError(run.error)) : /* @__PURE__ */ React.createElement("p", {
+    }, help ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(Icon, {
+      kind: "warning"
+    }), /* @__PURE__ */ React.createElement("p", {
+      "data-error": true,
+      "data-missing-tool": help.missingTool
+    }, /* @__PURE__ */ React.createElement("strong", null, stoppedAt ? `${stoppedAt} failed` : "Run failed"), /* @__PURE__ */ React.createElement("span", null, help.text))) : /* @__PURE__ */ React.createElement("p", {
       className: "workflow-empty"
-    }, formatRunTime(run.startedAt)), missingTool && agent && /* @__PURE__ */ React.createElement(Button, {
+    }, skippedWhy ? `Skipped at ${skippedAt}: ${skippedWhy}` : formatRunTime(run.startedAt)), /* @__PURE__ */ React.createElement("div", {
+      className: "workflow-run-buttons"
+    }, help?.fix && /* @__PURE__ */ React.createElement(Button, {
       render: /* @__PURE__ */ React.createElement("a", {
-        href: `/profiles?profile=${encodeURIComponent(agent.id)}&section=tools`
+        href: help.fix.href
       }),
       size: "sm"
-    }, "Turn on tool"), /* @__PURE__ */ React.createElement(Button, {
+    }, help.fix.label), !help?.fix && failed && canEditStep(failed.stepId) && /* @__PURE__ */ React.createElement(Button, {
+      onClick: () => onEditStep(failed.stepId),
+      size: "sm",
+      type: "button"
+    }, "Edit step"), /* @__PURE__ */ React.createElement(Button, {
       disabled: !canRun,
       onClick: () => onRunAgain(run.input),
       size: "sm",
+      title: runBlocked || undefined,
       type: "button",
-      variant: "secondary"
-    }, "Run again")), /* @__PURE__ */ React.createElement("details", {
-      className: "workflow-run-receipts"
-    }, /* @__PURE__ */ React.createElement("summary", null, "Step details"), /* @__PURE__ */ React.createElement("ol", {
+      variant: "outline"
+    }, /* @__PURE__ */ React.createElement(Icon, {
+      kind: "retry"
+    }), "Run again"), /* @__PURE__ */ React.createElement(DropdownMenu, null, /* @__PURE__ */ React.createElement(DropdownMenuTrigger, {
+      render: /* @__PURE__ */ React.createElement(Button, {
+        "aria-label": "More run actions",
+        size: "icon-sm",
+        type: "button",
+        variant: "ghost"
+      })
+    }, /* @__PURE__ */ React.createElement(Icon, {
+      kind: "more"
+    })), /* @__PURE__ */ React.createElement(DropdownMenuContent, {
+      align: "end"
+    }, /* @__PURE__ */ React.createElement(DropdownMenuItem, {
+      onClick: () => onEditInput(run.input)
+    }, "Change input"), failed?.kind === "assert" && /* @__PURE__ */ React.createElement(DropdownMenuItem, {
+      onClick: () => window.open(WORKFLOW_DOCS, "_blank", "noopener,noreferrer")
+    }, "How checks work"))))), runBlocked && /* @__PURE__ */ React.createElement("p", {
+      className: "workflow-empty"
+    }, runBlocked), /* @__PURE__ */ React.createElement("ol", {
       className: "workflow-run-steps"
     }, receipts.map((receipt) => {
       const duration = timeline.get(receipt.stepId)?.duration;
@@ -2867,15 +3243,22 @@ function apply(ctx) {
       }, /* @__PURE__ */ React.createElement("details", null, /* @__PURE__ */ React.createElement("summary", null, /* @__PURE__ */ React.createElement("span", {
         className: "workflow-run-mark",
         "data-status": receipt.status
-      }), /* @__PURE__ */ React.createElement("span", null, name(receipt.stepId)), /* @__PURE__ */ React.createElement("span", {
+      }), /* @__PURE__ */ React.createElement("span", null, titleCase(receipt.stepId)), /* @__PURE__ */ React.createElement("span", {
         className: "workflow-empty"
-      }, stepStatusLabels.get(receipt.status) ?? receipt.status, duration != null && ` · ${formatDuration(duration)}`)), /* @__PURE__ */ React.createElement(StepReceipt, {
+      }, stepStatusLabels.get(receipt.status) ?? receipt.status, duration != null && duration >= 1000 && ` · ${formatDuration(duration)}`), /* @__PURE__ */ React.createElement(Icon, {
+        kind: "chevronRight"
+      })), /* @__PURE__ */ React.createElement(StepReceipt, {
         receipt,
         showError: false
       })));
-    }))), run.status === "completed" && run.output && /* @__PURE__ */ React.createElement("section", {
+    }), run.status !== "running" && notReached.map((id) => /* @__PURE__ */ React.createElement("li", {
+      "data-status": "pending",
+      key: id
+    }, /* @__PURE__ */ React.createElement("span", {
+      className: "workflow-run-mark"
+    }), /* @__PURE__ */ React.createElement("span", null, titleCase(id)), /* @__PURE__ */ React.createElement("span", null, "Not reached")))), run.status === "completed" && run.output && /* @__PURE__ */ React.createElement("section", {
       className: "workflow-history-result"
-    }, /* @__PURE__ */ React.createElement("h4", null, "Result"), /* @__PURE__ */ React.createElement("p", null, run.output))));
+    }, /* @__PURE__ */ React.createElement("h4", null, "Result"), /* @__PURE__ */ React.createElement("p", null, run.output))))));
   }
   function DatabasePanel({
     canRun,
@@ -2902,9 +3285,9 @@ function apply(ctx) {
         if (!table && result.tables[0]) {
           setTable(result.tables[0].name);
         }
-      }).catch((error2) => {
+      }).catch((error) => {
         if (active) {
-          setError(error2 instanceof Error ? error2.message : String(error2));
+          setError(error instanceof Error ? error.message : String(error));
         }
       }).finally(() => {
         if (active) {
@@ -3101,6 +3484,6 @@ function apply(ctx) {
   ctx.slots.register("page", WorkflowsPage);
 }
 export {
-  inject,
-  apply
+  apply,
+  inject
 };

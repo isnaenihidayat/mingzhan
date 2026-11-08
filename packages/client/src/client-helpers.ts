@@ -1,5 +1,9 @@
-import { MíngZhànApiError, readApiErrorDetails } from "@mingzhan/core/api-error";
+import {
+  MíngZhànApiError,
+  readApiErrorDetails,
+} from "@mingzhan/core/api-error";
 import type { OrgPluginSummary } from "@mingzhan/core/contract";
+import type { MíngZhànClientOptions, TransferProgress } from "./types";
 
 export type JsonValue =
   | boolean
@@ -17,9 +21,16 @@ export async function createApiError(
 ): Promise<MíngZhànApiError> {
   const details = await readApiErrorDetails(response);
 
-  return new MíngZhànApiError(details.message, response.status, path, undefined, {
-    totpEnabled: details.totpEnabled,
-  });
+  return new MíngZhànApiError(
+    details.message,
+    response.status,
+    path,
+    undefined,
+    {
+      code: details.code,
+      totpEnabled: details.totpEnabled,
+    }
+  );
 }
 
 export function isMutatingMethod(method: string): boolean {
@@ -57,6 +68,101 @@ export async function encodeArchiveData(
   return Buffer.from(bytes).toString("base64");
 }
 
+/** fetch() reports no upload progress, so a browser upload that wants it uses XHR. */
+export function createUploadFetch(
+  onProgress: TransferProgress
+): NonNullable<MíngZhànClientOptions["fetch"]> {
+  return (input, init) =>
+    new Promise<Response>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const signal = init?.signal;
+
+      if (signal?.aborted) {
+        reject(abortedError());
+
+        return;
+      }
+
+      xhr.open(init?.method ?? "POST", String(input));
+      xhr.withCredentials = init?.credentials === "include";
+
+      for (const [name, value] of new Headers(init?.headers)) {
+        xhr.setRequestHeader(name, value);
+      }
+
+      const abort = () => xhr.abort();
+      signal?.addEventListener("abort", abort, { once: true });
+
+      const fail = (error: Error) => {
+        signal?.removeEventListener("abort", abort);
+        reject(error);
+      };
+
+      const interrupted = () => {
+        fail(
+          new Error(
+            "The upload was interrupted. Check the connection and try again."
+          )
+        );
+      };
+
+      xhr.upload.onprogress = (event) => {
+        onProgress(event.loaded, event.lengthComputable ? event.total : 0);
+      };
+
+      xhr.onerror = interrupted;
+      xhr.ontimeout = interrupted;
+
+      xhr.onabort = () => {
+        if (signal?.aborted) {
+          fail(abortedError());
+        } else {
+          interrupted();
+        }
+      };
+
+      xhr.onload = () => {
+        signal?.removeEventListener("abort", abort);
+        resolve(
+          new Response(
+            NULL_BODY_STATUSES.has(xhr.status) ? null : xhr.responseText,
+            {
+              headers: parseXhrHeaders(xhr.getAllResponseHeaders()),
+              status: xhr.status,
+            }
+          )
+        );
+      };
+
+      // SAFETY: the only caller passes a Blob or BufferSource, both valid for XHR.
+      xhr.send(init?.body as XMLHttpRequestBodyInit);
+    });
+}
+
+function abortedError(): Error {
+  return new DOMException("The upload was aborted.", "AbortError");
+}
+
+// A Response with one of these statuses must not have a body.
+const NULL_BODY_STATUSES = new Set([101, 204, 205, 304]);
+
+function parseXhrHeaders(raw: string): Headers {
+  const headers = new Headers();
+
+  for (const line of raw.trim().split(/[\r\n]+/)) {
+    const separator = line.indexOf(":");
+
+    if (separator > 0) {
+      headers.append(
+        line.slice(0, separator).trim(),
+        line.slice(separator + 1).trim()
+      );
+    }
+  }
+
+  return headers;
+}
+
 export function readContentDispositionFilename(
   headers: Headers
 ): string | null {
@@ -68,4 +174,66 @@ export function readContentDispositionFilename(
 
 function isBlobLike(value: Blob | BufferSource): value is Blob {
   return typeof Blob !== "undefined" && value instanceof Blob;
+}
+
+export async function readBoundedFile(
+  response: Response,
+  options: { maxBytes: number; signal?: AbortSignal }
+): Promise<ArrayBuffer> {
+  const { maxBytes, signal } = options;
+
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    await response.body?.cancel();
+    throw new Error("maxBytes must be a nonnegative integer.");
+  }
+
+  const reader = response.body?.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+
+  const onAbort = () => {
+    void reader?.cancel().catch(() => {});
+  };
+
+  signal?.addEventListener("abort", onAbort, { once: true });
+
+  try {
+    if (Number(response.headers.get("Content-Length")) > maxBytes) {
+      throw new Error("Artifact exceeds the download byte budget.");
+    }
+
+    while (reader) {
+      signal?.throwIfAborted();
+      const { done, value } = await reader.read();
+
+      if (done) {
+        break;
+      }
+
+      size += value.byteLength;
+
+      if (size > maxBytes) {
+        throw new Error("Artifact exceeds the download byte budget.");
+      }
+
+      chunks.push(value);
+    }
+
+    signal?.throwIfAborted();
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+
+    return bytes.buffer;
+  } catch (error) {
+    await reader?.cancel().catch(() => {});
+    throw error;
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+    reader?.releaseLock();
+  }
 }

@@ -345,3 +345,59 @@ describe("usage tracking", () => {
     );
   });
 });
+
+test("logs successful, failed, and cancelled calls without storing content or changing usage totals", async () => {
+  const db = createInMemoryDatabaseAdapter();
+  const tracker = new LlmUsageTracker(db);
+
+  const raw = providerReporting({
+    inputTokens: 3,
+    outputTokens: 2,
+    totalTokens: 5,
+  });
+
+  const error = new Error("private provider error body");
+  raw.generateText = () => Promise.reject(error);
+  raw.streamChat = () => Promise.reject(error);
+
+  const provider = wrapProviderWithUsageTracking(
+    raw,
+    tracker,
+    "fixture-model",
+    {
+      orgId: ORG_ID,
+      sessionId: "session_fixture",
+      userId: "user_test",
+    }
+  );
+
+  const input = { messages: [], system: "private system prompt" };
+  await provider.generateChat(input);
+  await expect(
+    provider.generateText({ prompt: "private prompt", system: "" })
+  ).rejects.toBe(error);
+  await expect(
+    provider.streamChat(
+      { ...input, signal: AbortSignal.abort() },
+      { onChunk() {} }
+    )
+  ).rejects.toBe(error);
+
+  expect(await tracker.getStats(ORG_ID)).toMatchObject({ requestCount: 1 });
+  const log = await db.listLlmRequestLog(ORG_ID, "user_test", {});
+  expect(log.entries.map((entry) => entry.status).sort()).toEqual([
+    "cancelled",
+    "failed",
+    "success",
+  ]);
+  expect(
+    log.entries.find((entry) => entry.status === "failed")?.inputTokens
+  ).toBeNull();
+  expect(log.entries.find((entry) => entry.status === "success")).toMatchObject(
+    { inputTokens: 3, outputTokens: 2 }
+  );
+  expect(log.entries.map((entry) => entry.sessionId)).toEqual(
+    Array(3).fill("session_fixture")
+  );
+  expect(JSON.stringify(log)).not.toContain("private");
+});

@@ -11,6 +11,9 @@ import type {
   SendMessageRequest,
 } from "@mingzhan/core/contract";
 
+/** `total` is 0 when the size is unknown. */
+export type TransferProgress = (loaded: number, total: number) => void;
+
 export interface MíngZhànClientOptions {
   authToken?: string;
   baseUrl?: string;

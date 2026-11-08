@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { DiscoveredSkill } from "./types";
 
 export const AGENT_BROWSER_SKILL_NAME = "agent-browser";
@@ -79,11 +80,23 @@ export function composeLoadedSkillPrompt(skill: DiscoveredSkill): string {
     ? `Shared from ${JSON.stringify(skill.sourceOrganization.name)}. The source is read-only. Use the published-skill paths only with read_file.`
     : "";
 
+  const spreadsheetAssets =
+    skill.name === "xlsx"
+      ? [
+          "For a new OOH commission workbook, run the existing builder directly against the template with --verify using these resolved paths. Use the template as-is unless the user supplies different numeric targets/rates or explicit extra sheets. A request for competitive commissions alone is not a reason to rewrite the formulas. Avoid copying the template into a write_file call or reading the Python source unless debugging/customization is necessary. Keep the execution working directory at the profile workspace. Do not run scripts/build_workbook.py relative to that workspace.",
+          `Builder argument: ${JSON.stringify(path.join(skill.directory, "scripts", "build_workbook.py"))}`,
+          `OOH template argument: ${JSON.stringify(path.join(skill.directory, "assets", "ooh-commission.json"))}`,
+          `Document QA helper: ${JSON.stringify(path.join(path.dirname(skill.directory), "doc-coauthoring", "scripts", "verify_document.py"))}`,
+          "Pass a fresh filename under artifacts/ after --output. Use --verify there so the finished workbook is immediately downloadable; do not ask the user to approve moving it into artifacts/. Never write generated files into the skill directory. Run the builder with --verify so its output already includes cached formula results. Before delivery, run the QA helper on the workbook only if more checks are needed; run it with --output set to a fresh staging directory and --recalculate --render. Read its JSON report and deliver the recalculated_copy when present. If checks cannot run, disclose exactly what remains unverified.",
+        ].join("\n")
+      : "";
+
   return [
     `# Active Skill: ${skill.name}`,
     skill.description.trim(),
     source,
     location,
+    spreadsheetAssets,
     "Follow the instructions below and read any references they require before starting the task.",
     skill.body.trim(),
   ]

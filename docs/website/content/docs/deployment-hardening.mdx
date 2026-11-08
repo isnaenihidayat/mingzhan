@@ -106,10 +106,10 @@ a private listener. The metrics endpoint has no application login when
 `MINGZHAN_METRICS=true`.
 
 Behind a reverse proxy, MíngZhàn's rate limiter sees the proxy address by default.
-Set `MINGZHAN_TRUST_PROXY=true` only when the backend port is private and the
-proxy replaces untrusted `X-Forwarded-For` values. A client that can reach the
-backend or supply the first forwarded address can otherwise choose its own
-rate-limit identity.
+Set `MINGZHAN_TRUST_PROXY=true` only when the backend port is private and a
+single trusted proxy appends or sets the real client address as the last
+`X-Forwarded-For` entry. With multiple proxy hops, configure the last proxy
+to set a verified client address before enabling this setting.
 
 After the proxy is live, set the exact external origin:
 

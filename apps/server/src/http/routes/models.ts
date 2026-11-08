@@ -1,6 +1,7 @@
 import { createRoute, z } from "@hono/zod-openapi";
 import {
   type AgentBrowserStatusResponse,
+  type CheckProviderResponse,
   type ComposioSettingsResponse,
   type ConfigureProviderResponse,
   type CreateProviderResponse,
@@ -15,6 +16,7 @@ import {
   type ListTimezonesResponse,
   type ModelsResponse,
   MíngZhànApiError,
+  type ProviderInstanceSummary,
   reportError,
   resetWhatsAppSessionForReconnect,
   type SendEmailTestRequest,
@@ -82,6 +84,16 @@ import {
   readOptionalJson,
 } from "../shared";
 import type { AppEnv, HonoApp } from "../types";
+
+function providerIdentity(provider: ProviderInstanceSummary) {
+  return {
+    createdAt: provider.createdAt,
+    id: provider.id,
+    label: provider.label,
+    modelCount: provider.modelCount,
+    type: provider.type,
+  };
+}
 
 export function registerModelRoutes(
   app: HonoApp,
@@ -437,6 +449,14 @@ export function registerModelRoutes(
     .passthrough()
     .openapi("CreateProviderRequest");
 
+  const checkProviderKeyRequestSchema = z
+    .object({
+      apiKey: z.string().max(4096),
+      baseUrl: z.string().max(2048).optional(),
+      type: z.enum(USER_PROVIDER_NAMES),
+    })
+    .openapi("CheckProviderKeyRequest");
+
   const updateProviderRequestSchema = z
     .object({})
     .passthrough()
@@ -515,6 +535,10 @@ export function registerModelRoutes(
         400: {
           content: { "application/json": { schema: errorSchema } },
           description: "Error",
+        },
+        410: {
+          content: { "application/json": { schema: errorSchema } },
+          description: "Removed catalog",
         },
         502: {
           content: { "application/json": { schema: errorSchema } },
@@ -635,6 +659,81 @@ export function registerModelRoutes(
         },
       },
       summary: "Update a provider instance",
+      tags: ["Models"],
+    })
+  );
+  app.openAPIRegistry.registerPath(
+    createRoute({
+      method: "post",
+      operationId: "checkProviderKey",
+      path: "/v1/providers/check-key",
+      request: {
+        body: {
+          content: {
+            "application/json": { schema: checkProviderKeyRequestSchema },
+          },
+          required: true,
+        },
+      },
+      responses: {
+        200: {
+          content: {
+            "application/json": {
+              schema: z.object({ status: z.string() }),
+            },
+          },
+          description: "What a live check of the typed key found",
+        },
+      },
+      summary: "Check a key before saving it",
+      tags: ["Models"],
+    })
+  );
+  app.openAPIRegistry.registerPath(
+    createRoute({
+      method: "post",
+      operationId: "setDefaultProvider",
+      path: "/v1/providers/{providerId}/default",
+      request: { params: providerIdParam },
+      responses: {
+        200: {
+          content: {
+            "application/json": { schema: deleteProviderResponseSchema },
+          },
+          description: "The new default provider",
+        },
+      },
+      summary: "Make a provider the default",
+      tags: ["Models"],
+    })
+  );
+  app.openAPIRegistry.registerPath(
+    createRoute({
+      method: "post",
+      operationId: "checkProvider",
+      path: "/v1/providers/{providerId}/check",
+      request: { params: providerIdParam },
+      responses: {
+        200: {
+          content: {
+            "application/json": {
+              schema: z
+                .object({
+                  status: z.enum([
+                    "ok",
+                    "rejected",
+                    "needs-key",
+                    "unreachable",
+                    "unchecked",
+                  ]),
+                })
+                .openapi("CheckProviderResponse"),
+            },
+          },
+          description: "What a live check of the saved key found",
+        },
+      },
+      summary: "Check a provider's saved key",
       tags: ["Models"],
     })
   );
@@ -1763,6 +1862,14 @@ export function registerModelRoutes(
     getRequestAuth(c);
     const catalogId = decodeURIComponent(c.req.param("catalogId"));
 
+    // A web page opened before the upgrade can still ask for this one.
+    if (catalogId === "models-dev") {
+      return errorResponse(
+        "This model catalog was removed. Reload the page.",
+        410
+      );
+    }
+
     if (!isExternalModelCatalogId(catalogId)) {
       return errorResponse("Unknown model catalog.", 400);
     }
@@ -1777,15 +1884,26 @@ export function registerModelRoutes(
   });
 
   app.get("/v1/models", async (c) => {
-    getRequestAuth(c);
+    const auth = getRequestAuth(c);
     const source = c.req.query("source");
 
     const modelsSource =
       source === "remote" ? ("remote" as const) : ("catalog" as const);
 
-    return json<ModelsResponse>(
-      await agent.getModels({ source: modelsSource })
-    );
+    const result = await agent.getModels({ source: modelsSource });
+
+    if (auth.isPlatformAdmin) {
+      return json<ModelsResponse>(result);
+    }
+
+    // Same redaction as GET /v1/providers: the model picker only needs the
+    // identifying fields, not the endpoint, key status or custom inventory.
+    const { baseUrl: _baseUrl, customModels: _customModels, ...rest } = result;
+
+    return json<ModelsResponse>({
+      ...rest,
+      providers: result.providers.map(providerIdentity),
+    });
   });
 
   app.post("/v1/models/discover", async (c) => {
@@ -1807,13 +1925,7 @@ export function registerModelRoutes(
     // inventory, or routing details.
     const providers = auth.isPlatformAdmin
       ? result.providers
-      : result.providers.map((provider) => ({
-          createdAt: provider.createdAt,
-          id: provider.id,
-          label: provider.label,
-          modelCount: provider.modelCount,
-          type: provider.type,
-        }));
+      : result.providers.map(providerIdentity);
 
     return json<ListProvidersResponse>({
       defaultProviderId: result.defaultProviderId,
@@ -1857,6 +1969,47 @@ export function registerModelRoutes(
       const message = error instanceof Error ? error.message : String(error);
 
       return errorResponse(message, 400);
+    }
+  });
+
+  app.post("/v1/providers/check-key", async (c) => {
+    requirePlatformAdminFromContext(c);
+    const body = await readJson(c.req.raw, checkProviderKeyRequestSchema);
+
+    return json<CheckProviderResponse>(await agent.checkProviderKey(body));
+  });
+
+  app.post("/v1/providers/:providerId/default", async (c) => {
+    requirePlatformAdminFromContext(c);
+
+    try {
+      return json<DeleteProviderResponse>(
+        await agent.setDefaultProvider(
+          decodeURIComponent(c.req.param("providerId"))
+        )
+      );
+    } catch (error) {
+      if (error instanceof MíngZhànApiError) {
+        return errorResponse(error.message, error.status);
+      }
+
+      throw error;
+    }
+  });
+
+  app.post("/v1/providers/:providerId/check", async (c) => {
+    requirePlatformAdminFromContext(c);
+
+    try {
+      return json<CheckProviderResponse>(
+        await agent.checkProvider(decodeURIComponent(c.req.param("providerId")))
+      );
+    } catch (error) {
+      if (error instanceof MíngZhànApiError) {
+        return errorResponse(error.message, error.status);
+      }
+
+      throw error;
     }
   });
 

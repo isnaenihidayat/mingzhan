@@ -26,3 +26,30 @@ export function extractExplicitSkillName(message: string): string | null {
 
   return match?.[1]?.toLowerCase() ?? null;
 }
+
+/** Preload an assigned spreadsheet workflow for an explicit workbook creation request. */
+export function findSpreadsheetCreationSkill(
+  skills: DiscoveredSkill[],
+  userMessage: string
+): DiscoveredSkill | null {
+  if (extractExplicitSkillName(userMessage)) {
+    return null;
+  }
+
+  const createsFile =
+    /\b(?:(?:di)?buat(?:kan)?|rancang|simpan|ekspor|export|create|generate|write|save|convert|konversi)\b/i.test(
+      userMessage
+    );
+
+  const requestsWorkbook = /\b(?:xlsx|xlxs|excel)\b/i.test(userMessage);
+
+  if (!(createsFile && requestsWorkbook)) {
+    return null;
+  }
+
+  return (
+    skills.find(
+      (skill) => skill.name === "xlsx" && !skill.disableModelInvocation
+    ) ?? null
+  );
+}

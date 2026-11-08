@@ -1,4 +1,5 @@
 import { hasActiveAgentQuestionnaire } from "@mingzhan/core/agent-questionnaire";
+import { MíngZhànApiError } from "@mingzhan/core/api-error";
 import type {
   AgentQuestionAnswer,
   AgentQuestionnaire,
@@ -17,7 +18,6 @@ import { cn } from "@mingzhan/ui/utils";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CheckmarkCircle01Icon,
-  Copy01Icon,
   Edit03Icon,
   GitBranchIcon,
   MoreHorizontalIcon,
@@ -27,7 +27,6 @@ import {
   forwardRef,
   type MouseEvent,
   useCallback,
-  useEffect,
   useMemo,
   useRef,
   useState,
@@ -41,7 +40,10 @@ import {
 } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { VisualQuestionSubmitContext } from "@/components/ai-elements/visual-block.shared";
-import { ComposioToolkitLogo } from "@/components/ComposioToolkitLogo";
+import {
+  ComposioCustomAuthSteps,
+  ComposioToolkitLogo,
+} from "@/components/ComposioToolkitLogo";
 import {
   AgentQuestionnaireAnswers,
   AgentQuestionnairePanel,
@@ -58,14 +60,22 @@ import { ToolCredentialCard } from "@/components/chat/chat-add-capabilities-dial
 import { ChatUsageBadge } from "@/components/chat/chat-usage-badge";
 import { DocumentAttachmentPreview } from "@/components/chat/document-attachment-preview";
 import { ImageAttachmentPreview } from "@/components/chat/image-attachment-preview";
+import {
+  CopyMessageButton,
+  MessageSpeechProvider,
+  MessageTime,
+  messageActionClass,
+  messageActionRowClass,
+  ReadAloudButton,
+} from "@/components/chat/message-actions";
 import { PluginDrafts } from "@/components/chat/PluginDraftCard";
-import { TextAttachmentPreview } from "@/components/chat/text-attachment-preview";
 import { readRecord, readString } from "@/components/chat/web-search.shared";
 import { useAuth } from "@/context/use-auth";
 import { useOptionalChatAttachmentPanel } from "@/context/use-chat-attachment-panel";
 import { useProfileQuery } from "@/hooks/use-app-queries";
 import {
   connectComposioApp,
+  needsComposioCustomAuth,
   profileComposioToolkitsQueryOptions,
   useComposioToolkits,
 } from "@/hooks/use-composio";
@@ -91,7 +101,6 @@ import {
 import { sumChatUsage } from "@/lib/chat-usage";
 import { formatError } from "@/lib/client";
 import { formatElapsedSeconds, useElapsedSeconds } from "@/lib/elapsed-time";
-import { isPastedTextDocument } from "@/lib/pasted-text";
 import { canManageAgent } from "@/lib/profiles";
 import { invalidateQueries } from "@/lib/query-client";
 import { queryKeys } from "@/lib/query-keys";
@@ -177,6 +186,7 @@ interface ChatMessageListProps {
   onEditMessage?: (message: ChatListItem, text: string) => void;
   onRetryMessage?: (message: ChatListItem) => void;
   onSubmitQuestionnaire?: (answers: AgentQuestionAnswer[]) => void;
+  onSwitchModel?: () => void;
   profileId?: string | null;
   questionnaire?: AgentQuestionnaire | null;
   readOnly?: boolean;
@@ -193,7 +203,11 @@ interface ChatMessageListProps {
 export function ChatMessageList(props: ChatMessageListProps) {
   const sessionAnchor = props.sessionId ?? props.messages[0]?.id ?? "empty";
 
-  return <ChatMessageListSession key={sessionAnchor} {...props} />;
+  return (
+    <MessageSpeechProvider key={sessionAnchor}>
+      <ChatMessageListSession {...props} />
+    </MessageSpeechProvider>
+  );
 }
 
 function useListPinning() {
@@ -326,6 +340,7 @@ function ChatMessageListSession({
   onBranchMessage,
   onEditMessage,
   onRetryMessage,
+  onSwitchModel,
   onSubmitQuestionnaire,
   questionnaire,
   emptyMessage,
@@ -422,6 +437,7 @@ function ChatMessageListSession({
             onSubmitQuestionnaire={
               turnIndex === turns.length - 1 ? onSubmitQuestionnaire : undefined
             }
+            onSwitchModel={onSwitchModel}
             profileId={profileId}
             questionnaire={
               turnIndex === turns.length - 1 ? questionnaire : null
@@ -457,6 +473,7 @@ function ChatMessageListSession({
       onBranchMessage,
       onEditMessage,
       onRetryMessage,
+      onSwitchModel,
       onSubmitQuestionnaire,
       openCitationPreview,
       profileId,
@@ -540,6 +557,7 @@ function visualQuestionSubmit(
     : submit;
 }
 
+// eslint-disable-next-line react-doctor/no-high-complexity-react-function -- The turn keeps rendering order for tool groups, output, and actions together.
 function AssistantTurn({
   readOnly = false,
   sessionId,
@@ -558,6 +576,7 @@ function AssistantTurn({
   onBranchMessage,
   onOpenFileCitation,
   onRetryMessage,
+  onSwitchModel,
   onSubmitQuestionnaire,
   questionnaire,
   questionnaireAnswers,
@@ -580,6 +599,7 @@ function AssistantTurn({
   onBranchMessage?: (message: ChatListItem) => void;
   onOpenFileCitation?: (path: string) => void;
   onRetryMessage?: (message: ChatListItem) => void;
+  onSwitchModel?: () => void;
   onSubmitQuestionnaire?: (answers: AgentQuestionAnswer[]) => void;
   questionnaire?: AgentQuestionnaire | null;
   questionnaireAnswers?: AgentQuestionAnswer[];
@@ -631,6 +651,7 @@ function AssistantTurn({
             modelLabel={modelLabel}
             onOpenFileCitation={onOpenFileCitation}
             onRetryMessage={onRetryMessage}
+            onSwitchModel={onSwitchModel}
             profileId={profileId}
             retryDisabled={retryDisabled}
             segment={segment}
@@ -687,6 +708,10 @@ function AssistantTurn({
             onRetryMessage={onRetryMessage}
             usage={turnUsage}
           />
+        ) : turnComplete && anchorMessage?.createdAt ? (
+          <div className={messageActionRowClass}>
+            <MessageTime createdAt={anchorMessage.createdAt} />
+          </div>
         ) : null}
       </div>
     </VisualQuestionSubmitContext.Provider>
@@ -762,7 +787,7 @@ function TurnArtifacts({
   turnKey: string;
 }) {
   return (
-    <div className="flex flex-wrap gap-2">
+    <div className="grid w-full min-w-0 grid-cols-1 gap-2">
       {artifacts.map((artifact) => {
         const chipId = `${turnKey}:${artifact.ownerProfileId ?? profileId}:${artifact.path}`;
 
@@ -902,7 +927,8 @@ function describeComposioApp(
   toolkits: ListComposioToolkitsResponse | undefined,
   toolkitSlug: string,
   displayName: string,
-  access: { canManage: boolean; isOrgAdmin: boolean; onAgent: boolean }
+  access: { canManage: boolean; isOrgAdmin: boolean; onAgent: boolean },
+  agent: { error: Error | null; loaded: boolean }
 ) {
   const catalogItem = toolkits?.catalog.find(
     (item) => item.slug === toolkitSlug
@@ -928,6 +954,18 @@ function describeComposioApp(
     blockedReason = `Ask the agent owner to add ${name}.`;
   }
 
+  // A member on a shared agent cannot read it (403); they cannot manage it.
+  const agentForbidden =
+    agent.error instanceof MíngZhànApiError && agent.error.status === 403;
+
+  const ready = Boolean(toolkits && (agent.loaded || agentForbidden));
+
+  let notice: string | null = ready ? blockedReason : null;
+
+  if (agent.error && !agentForbidden) {
+    notice = formatError(agent.error);
+  }
+
   return {
     blockedReason,
     // The agent can use the app only when it is on the agent too.
@@ -935,6 +973,8 @@ function describeComposioApp(
       access.onAgent && isComposioToolkitConnected(toolkits, toolkitSlug),
     logoUrl: catalogItem?.logoUrl,
     name,
+    notice,
+    ready,
   };
 }
 
@@ -969,9 +1009,13 @@ function ComposioConnectCard({
     refetchOnWindowFocus: true,
   });
 
-  const { data: profile } = useProfileQuery(profileId);
+  const { data: profile, error: profileError } = useProfileQuery(profileId);
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+
+  const [error, setError] = useState<{
+    customAuth: boolean;
+    message: string;
+  } | null>(null);
 
   const canManage = canManageAgent(profile, user, isOrgAdmin);
 
@@ -985,14 +1029,14 @@ function ComposioConnectCard({
     agentApps?.assignments.some((item) => item.toolkitSlug === toolkitSlug) ??
     onAgentAtCall;
 
-  const ready = Boolean(toolkits && (!profileId || profile));
-
-  const { blockedReason, connected, logoUrl, name } = describeComposioApp(
-    toolkits,
-    toolkitSlug,
-    displayName,
-    { canManage, isOrgAdmin, onAgent }
-  );
+  const { blockedReason, connected, logoUrl, name, notice, ready } =
+    describeComposioApp(
+      toolkits,
+      toolkitSlug,
+      displayName,
+      { canManage, isOrgAdmin, onAgent },
+      { error: profileError, loaded: !profileId || Boolean(profile) }
+    );
 
   async function connect() {
     if (!(toolkits && ready)) {
@@ -1034,7 +1078,12 @@ function ComposioConnectCard({
       );
     } catch (connectError) {
       tab?.close();
-      setError(formatError(connectError));
+      setError({
+        customAuth:
+          connectError instanceof Error &&
+          needsComposioCustomAuth(connectError),
+        message: formatError(connectError),
+      });
     } finally {
       setPending(false);
     }
@@ -1067,12 +1116,48 @@ function ComposioConnectCard({
           </Button>
         )}
       </div>
-      {connected || !ready || !(blockedReason || error) ? null : (
-        <p className="text-muted-foreground text-xs" role="status">
-          {error ?? blockedReason}
-        </p>
+      {connected || !(error || notice) ? null : (
+        <ComposioConnectCardStatus
+          error={error}
+          isOrgAdmin={isOrgAdmin}
+          name={name}
+          notice={notice}
+        />
       )}
     </div>
+  );
+}
+
+/** Kept apart from the card so the card stays under the complexity limit. */
+function ComposioConnectCardStatus({
+  error,
+  isOrgAdmin,
+  name,
+  notice,
+}: {
+  error: { customAuth: boolean; message: string } | null;
+  isOrgAdmin: boolean;
+  name: string;
+  notice: string | null;
+}) {
+  // Composio has no shared OAuth app for this toolkit. Only an admin can fix it.
+  if (error?.customAuth) {
+    return isOrgAdmin ? (
+      <div className="flex flex-col gap-2" role="status">
+        <p className="text-sm">{name} needs a custom auth config</p>
+        <ComposioCustomAuthSteps name={name} />
+      </div>
+    ) : (
+      <p className="text-muted-foreground text-xs" role="status">
+        Ask an org admin to add a custom auth config for {name} in Composio.
+      </p>
+    );
+  }
+
+  return (
+    <p className="text-muted-foreground text-xs" role="status">
+      {error?.message ?? notice}
+    </p>
   );
 }
 
@@ -1172,21 +1257,34 @@ function ChatMessageRow({
       className="mr-0 ml-auto min-w-0 max-w-full items-end justify-end overflow-visible"
       from="user"
     >
-      <MessageContent className="ml-auto min-w-0 max-w-full overflow-visible group-[.is-user]:ml-auto">
+      <MessageContent
+        className={cn(
+          "ml-auto min-w-0 max-w-full overflow-visible group-[.is-user]:ml-auto",
+          Boolean(
+            message.documents?.length ||
+              message.images?.length ||
+              message.imageAttachments?.length
+          ) && "w-full"
+        )}
+      >
         <UserMessageContent message={message} />
       </MessageContent>
-      {canEdit ? (
-        <button
-          aria-label="Edit message"
-          className="mr-1 inline-flex size-8 items-center justify-center self-end rounded-lg text-muted-foreground opacity-0 transition-colors transition-opacity hover:bg-muted hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-40 group-focus-within:opacity-100 group-hover:opacity-60 group-hover:hover:opacity-100"
-          disabled={busy}
-          onClick={() => setDraft(message.content)}
-          title="Edit message"
-          type="button"
-        >
-          <Edit03Icon aria-hidden className="size-4" />
-        </button>
-      ) : null}
+      <div className={cn(messageActionRowClass, "self-end")}>
+        <MessageTime createdAt={message.createdAt} />
+        <CopyMessageButton label="Copy message" text={message.content} />
+        {canEdit ? (
+          <button
+            aria-label="Edit message"
+            className={messageActionClass}
+            disabled={busy}
+            onClick={() => setDraft(message.content)}
+            title="Edit message"
+            type="button"
+          >
+            <Edit03Icon aria-hidden className="size-4" />
+          </button>
+        ) : null}
+      </div>
     </Message>
   );
 }
@@ -1257,109 +1355,61 @@ function AssistantMessageActions({
   onRetryMessage?: (message: ChatListItem) => void;
   usage?: ChatUsage;
 }) {
-  const [copied, setCopied] = useState(false);
-  const copyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(
-    () => () => {
-      if (copyTimeoutRef.current) {
-        clearTimeout(copyTimeoutRef.current);
-      }
-    },
-    []
-  );
-
-  async function copyMessage() {
-    const content = copyContent.trim();
-
-    if (!content) {
-      return;
-    }
-
-    try {
-      await navigator.clipboard.writeText(content);
-      setCopied(true);
-
-      if (copyTimeoutRef.current) {
-        clearTimeout(copyTimeoutRef.current);
-      }
-
-      copyTimeoutRef.current = setTimeout(() => {
-        setCopied(false);
-        copyTimeoutRef.current = null;
-      }, 2000);
-    } catch {
-      // Clipboard may be unavailable outside secure contexts.
-    }
-  }
-
   const branchCreatedAt = isBranchableAssistantMessage(message)
     ? message.createdAt
     : null;
 
   return (
-    <div className="flex items-center gap-1 pt-1 opacity-60 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 group-active:opacity-100">
+    <div className="flex flex-wrap items-center gap-1 pt-1">
       {usage ? <ChatUsageBadge usage={usage} /> : null}
-      <button
-        aria-label={copied ? "Copied" : "Copy response"}
-        className={cn(
-          "inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-40",
-          copied && "text-emerald-600 dark:text-emerald-400"
-        )}
-        disabled={!copyContent.trim()}
-        onClick={() => void copyMessage()}
-        title={copied ? "Copied" : "Copy response"}
-        type="button"
-      >
-        {copied ? (
-          <CheckmarkCircle01Icon aria-hidden className="size-4" />
-        ) : (
-          <Copy01Icon aria-hidden className="size-4" />
-        )}
-      </button>
-      {onRetryMessage ? (
-        <button
-          aria-label="Try again"
-          className="inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-40"
-          disabled={busy || actionsDisabled}
-          onClick={() => onRetryMessage(message)}
-          title="Try again"
-          type="button"
-        >
-          <Rotate02Icon aria-hidden className="size-4" />
-        </button>
-      ) : null}
-      {onBranchMessage && branchCreatedAt ? (
-        <DropdownMenu>
-          <DropdownMenuTrigger
-            render={
-              <button
-                aria-label="Message actions"
-                className={cn(
-                  "inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
-                  busy && "pointer-events-none opacity-60"
-                )}
-                type="button"
-              />
-            }
+      <div className={messageActionRowClass}>
+        <CopyMessageButton label="Copy response" text={copyContent} />
+        {onRetryMessage ? (
+          <button
+            aria-label="Try again"
+            className="inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-40"
+            disabled={busy || actionsDisabled}
+            onClick={() => onRetryMessage(message)}
+            title="Try again"
+            type="button"
           >
-            <MoreHorizontalIcon aria-hidden className="size-4" />
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="w-56 min-w-56 p-1.5">
-            <div className="px-2 py-1 text-muted-foreground text-xs">
-              {formatSessionTimestamp(branchCreatedAt)}
-            </div>
-            <DropdownMenuItem
-              className="gap-2"
-              disabled={busy}
-              onClick={() => onBranchMessage(message)}
+            <Rotate02Icon aria-hidden className="size-4" />
+          </button>
+        ) : null}
+        <ReadAloudButton id={message.id} text={copyContent} />
+        {onBranchMessage && branchCreatedAt ? (
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={
+                <button
+                  aria-label="Message actions"
+                  className={cn(
+                    "inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+                    busy && "pointer-events-none opacity-60"
+                  )}
+                  type="button"
+                />
+              }
             >
-              <GitBranchIcon aria-hidden className="size-4" />
-              <span>Branch in new chat</span>
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      ) : null}
+              <MoreHorizontalIcon aria-hidden className="size-4" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="w-56 min-w-56 p-1.5">
+              <div className="px-2 py-1 text-muted-foreground text-xs">
+                {formatSessionTimestamp(branchCreatedAt)}
+              </div>
+              <DropdownMenuItem
+                className="gap-2"
+                disabled={busy}
+                onClick={() => onBranchMessage(message)}
+              >
+                <GitBranchIcon aria-hidden className="size-4" />
+                <span>Branch in new chat</span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        ) : null}
+        <MessageTime createdAt={message.createdAt} />
+      </div>
     </div>
   );
 }
@@ -1390,56 +1440,56 @@ function UserMessageContent({ message }: { message: ChatListItem }) {
     );
   }
 
-  const pastedTextDocuments =
-    message.documents?.filter((document) =>
-      isPastedTextDocument(document.filename, document.mediaType)
-    ) ?? [];
-
-  const otherDocuments =
-    message.documents?.filter(
-      (document) => !isPastedTextDocument(document.filename, document.mediaType)
-    ) ?? [];
+  const otherDocuments = message.documents ?? [];
 
   return (
     <div className="space-y-2">
       {message.imageAttachments?.length ? (
-        <div className="flex flex-wrap gap-2">
-          {message.imageAttachments.map((image) => (
-            <ImageAttachmentPreview
-              description={image.description}
-              key={
-                image.url ??
-                `image-attachment-${message.id}-${image.description ?? "unnamed"}`
-              }
-              url={image.url}
-            />
-          ))}
+        <div className="flex w-full min-w-0 flex-col gap-2">
+          {message.imageAttachments.map((image, index) =>
+            image.url ? (
+              <div className="space-y-2" key={image.url}>
+                <DocumentAttachmentPreview
+                  document={{
+                    filename: `Image ${index + 1}`,
+                    mediaType: image.mediaType,
+                    url: image.url,
+                  }}
+                />
+                {image.description?.trim() ? (
+                  <p className="whitespace-pre-wrap text-sm">
+                    {image.description.trim()}
+                  </p>
+                ) : null}
+              </div>
+            ) : (
+              <ImageAttachmentPreview
+                description={image.description}
+                key={image.description}
+              />
+            )
+          )}
         </div>
       ) : null}
       {message.images?.length ? (
-        <div className="flex flex-wrap gap-2">
-          {message.images.map((image) => (
-            <img
-              alt=""
-              className="max-h-40 max-w-full rounded-md border border-border object-contain"
+        <div className="flex w-full min-w-0 flex-col gap-2">
+          {message.images.map((image, index) => (
+            <DocumentAttachmentPreview
+              document={{
+                attachmentId: /^\/v1\/attachments\/([^/]+)\/content$/.exec(
+                  image.url
+                )?.[1],
+                filename: `Image ${index + 1}`,
+                mediaType: image.mediaType,
+                url: image.url,
+              }}
               key={image.url}
-              src={image.url}
-            />
-          ))}
-        </div>
-      ) : null}
-      {pastedTextDocuments.length ? (
-        <div className="flex flex-wrap gap-2">
-          {pastedTextDocuments.map((document) => (
-            <TextAttachmentPreview
-              filename={document.filename}
-              key={`${document.filename}-${document.mediaType}`}
             />
           ))}
         </div>
       ) : null}
       {otherDocuments.length ? (
-        <div className="flex flex-wrap gap-2">
+        <div className="flex w-full min-w-0 flex-col gap-2">
           {otherDocuments.map((document) => (
             <DocumentAttachmentPreview
               document={document}

@@ -7,7 +7,9 @@ import {
   validateCustomModels,
 } from "@mingzhan/core";
 import {
+  commandCodeModelSupportsVision,
   NETRA_AGENT_MODEL_ID,
+  netraModelSupportsVision,
   resolveNetraModelId,
 } from "@mingzhan/core/discovery-providers";
 import {
@@ -218,7 +220,9 @@ export function getDefaultModel(
   customModels?: CustomModelEntry[]
 ): string {
   if (provider === "netra") {
-    return NETRA_AGENT_MODEL_ID;
+    return customModels?.length
+      ? resolveNetraModelId(resolveCompatibleDefaultModel(customModels))
+      : NETRA_AGENT_MODEL_ID;
   }
 
   if (isDiscoveryModelProvider(provider) || provider === "xai_oauth") {
@@ -323,10 +327,20 @@ export function modelSupportsVision(
   provider: ProviderName,
   customModels?: CustomModelEntry[]
 ): boolean | undefined {
+  // For the models Netra's own catalog knows, it wins over saved entries,
+  // which may carry a stale flag or none.
+  if (provider === "netra" && netraModelSupportsVision(modelId)) {
+    return true;
+  }
+
   const custom = findCustomModel(customModels, modelId);
 
   if (custom?.supportsVision !== undefined) {
     return custom.supportsVision;
+  }
+
+  if (provider === "command_code") {
+    return commandCodeModelSupportsVision(modelId);
   }
 
   if (

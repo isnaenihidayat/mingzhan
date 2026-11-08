@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { ChatListItem } from "@/lib/chat-history";
+import { type ChatListItem, chatMessagesToListItems } from "@/lib/chat-history";
 import {
   extractArtifactPathsFromText,
   extractTurnArtifacts,
@@ -502,5 +502,152 @@ describe("extractArtifactPathsFromText", () => {
       [undefined, "report.md"],
       ["video-producer", "report.md"],
     ]);
+  });
+});
+
+describe("workbooks produced by command-line helpers", () => {
+  const manifest = {
+    bytes: 16_686,
+    formulas: 37,
+    path: "artifacts/ooh-komisi-sales.xlsx",
+    recalculated: true,
+    sheets: ["Asumsi", "KPI", "Tiering", "Simulasi", "Ketentuan"],
+  };
+
+  type CommandResult = {
+    exitCode: number;
+    stdout: string;
+    timedOut?: boolean;
+    stderr?: string;
+    error?: string;
+  };
+
+  function bashMessage(
+    result: CommandResult,
+    toolStatus: "running" | "done" = "done"
+  ): ChatListItem {
+    return {
+      content: "",
+      id: "build",
+      role: "tool",
+      tool: "bash",
+      toolResult: result,
+      toolStatus,
+    };
+  }
+
+  test("recovers the artifact after reloading stored command history", () => {
+    const items = chatMessagesToListItems([
+      {
+        content: JSON.stringify({
+          exitCode: 0,
+          stderr: "",
+          stdout: JSON.stringify(manifest) + "\n",
+          timedOut: false,
+        }),
+        name: "bash",
+        role: "tool",
+        toolCallId: "create-workbook",
+      },
+      {
+        content:
+          "File `ooh-komisi-sales.xlsx` built and verified with 5 sheets.",
+        role: "assistant",
+      },
+    ]);
+
+    expect(extractTurnArtifacts(items)).toEqual([
+      expect.objectContaining({
+        filename: "ooh-komisi-sales.xlsx",
+        sizeBytes: 16_686,
+      }),
+    ]);
+  });
+
+  test("shows a workbook card when bash reports the artifact but the reply names only the file", () => {
+    const artifacts = extractTurnArtifacts([
+      bashMessage({
+        exitCode: 0,
+        stderr: "",
+        stdout: JSON.stringify(manifest) + "\n",
+        timedOut: false,
+      }),
+      {
+        content:
+          "File `ooh-komisi-sales.xlsx` built and verified with 5 sheets.",
+        id: "reply",
+        role: "assistant",
+      },
+    ]);
+
+    expect(artifacts).toEqual([
+      {
+        filename: "ooh-komisi-sales.xlsx",
+        mimeType:
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        path: "ooh-komisi-sales.xlsx",
+        savedAt: "",
+        sizeBytes: 16_686,
+      },
+    ]);
+  });
+
+  test("handles JSON after log lines and deduplicates explicit artifact mentions", () => {
+    const artifacts = extractTurnArtifacts([
+      bashMessage({
+        exitCode: 0,
+        stdout: "Building…\n" + JSON.stringify(manifest) + "\n",
+      }),
+      {
+        content: "Download artifacts/ooh-komisi-sales.xlsx",
+        id: "reply",
+        role: "assistant",
+      },
+    ]);
+
+    expect(artifacts).toHaveLength(1);
+    expect(artifacts[0]?.sizeBytes).toBe(16_686);
+  });
+
+  test("does not treat failed, timed-out, unstructured or incomplete commands as saved files", () => {
+    for (const result of [
+      { exitCode: 1, stdout: JSON.stringify(manifest) },
+      { exitCode: 0, stdout: JSON.stringify(manifest), timedOut: true },
+      { error: "Failed", exitCode: 0, stdout: JSON.stringify(manifest) },
+      {
+        exitCode: 0,
+        stdout:
+          "python scripts/build.py --output artifacts/ooh-komisi-sales.xlsx",
+      },
+      {
+        exitCode: 0,
+        stdout: JSON.stringify({ bytes: 100, path: "staging/ooh.xlsx" }),
+      },
+      {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          bytes: 100,
+          path: "artifacts/../secrets.txt",
+        }),
+      },
+      {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          bytes: 100,
+          path: "artifacts/report.xlsx.mingzhan-meta.json",
+        }),
+      },
+    ]) {
+      expect(extractTurnArtifacts([bashMessage(result)])).toEqual([]);
+    }
+
+    expect(
+      extractTurnArtifacts([
+        bashMessage(
+          { exitCode: 0, stdout: JSON.stringify(manifest) },
+          "running"
+        ),
+      ])
+    ).toEqual([]);
   });
 });

@@ -93,3 +93,43 @@ test("does not pass the master key to child processes", () => {
     }
   }
 });
+
+describe("getToolExecutionEnv keeps MíngZhàn credentials out of tools", () => {
+  const LEAKED = [
+    "MINGZHAN_LOCAL_AUTH_TOKEN",
+    "MINGZHAN_PLUGIN_NPM_TOKEN",
+    "MINGZHAN_EMAIL_ATTACHMENT_SECRET",
+    "MINGZHAN_TELEGRAM_MANAGER_BOT_TOKEN",
+    "TELEGRAM_MANAGER_WEBHOOK_SECRET",
+    "MINGZHAN_WHATSAPP_CONTEXT_TOKEN",
+    "MINGZHAN_SEED_ADMIN_PASSWORD",
+  ];
+
+  afterEach(() => {
+    for (const key of [...LEAKED, "GITHUB_TOKEN", "MINGZHAN_PORT"]) {
+      delete process.env[key];
+    }
+  });
+
+  test("strips MíngZhàn's own tokens and secrets", () => {
+    for (const key of LEAKED) {
+      process.env[key] = "secret-value";
+    }
+
+    const env = getToolExecutionEnv();
+
+    for (const key of LEAKED) {
+      expect({ key, value: env[key] }).toEqual({ key, value: undefined });
+    }
+  });
+
+  test("keeps a user's own token and ordinary MíngZhàn settings", () => {
+    process.env.GITHUB_TOKEN = "user-token";
+    process.env.MINGZHAN_PORT = "4310";
+
+    const env = getToolExecutionEnv();
+
+    expect(env.GITHUB_TOKEN).toBe("user-token");
+    expect(env.MINGZHAN_PORT).toBe("4310");
+  });
+});

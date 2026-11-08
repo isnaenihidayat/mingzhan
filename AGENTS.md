@@ -85,7 +85,7 @@ at build time. To change them, edit the manifest, regenerate the lockfile for bo
 image architectures, and commit both files:
 
 ```bash
-cd .docker/runtime-deps   # or .docker/meet-deps for the optional Meet build
+cd .docker/runtime-deps
 bun install --lockfile-only --os=linux --cpu='*'
 ```
 

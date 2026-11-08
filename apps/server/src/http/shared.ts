@@ -8,7 +8,6 @@ import {
   MíngZhànApiError,
   PLAIN_BROWSER_SESSION_COOKIE_NAMES,
   browserSessionCookieNames as resolveBrowserSessionCookieNames,
-  type StreamEvent,
   verifyLocalAuthToken,
 } from "@mingzhan/core";
 import type {
@@ -21,10 +20,12 @@ import type { Context } from "hono";
 import type { ZodType } from "zod";
 import type { AuthService } from "../services/auth-service";
 import { loadMfaPolicy } from "../services/mfa-config";
-import { sessionTurnRegistry } from "../services/session-turn-registry";
 import type { AppEnv } from "./types";
 
 const LEGACY_COOKIE_NAMES = PLAIN_BROWSER_SESSION_COOKIE_NAMES;
+
+/** Large-body routes use this cap; JSON import bodies must not exceed it. */
+export const MAX_HTTP_REQUEST_BODY_LIMIT_BYTES = 140 * 1024 * 1024;
 
 const HOST_BOUND_COOKIE_NAMES = HOST_BOUND_BROWSER_SESSION_COOKIE_NAMES;
 
@@ -302,7 +303,8 @@ export async function authenticateRequest(
 
   await databaseAdapter.updateBrowserSessionLastUsedAt(
     session.id,
-    new Date().toISOString()
+    new Date().toISOString(),
+    session.userAgent ? null : request.headers.get("user-agent")
   );
 
   return {
@@ -423,6 +425,7 @@ export async function createBrowserSessionResponse(
     lastUsedAt: now,
     revokedAt: null,
     sessionTokenHash: authService.hashToken(session.sessionToken),
+    userAgent: options.request.headers.get("user-agent"),
     userId: user.id,
   };
 
@@ -488,23 +491,106 @@ export function clearBrowserSessionCookies(headers: Headers): void {
  * forces the preflight, and nothing here answers one.
  */
 export function assertJsonRequest(request: Request): void {
-  const contentType = request.headers
-    .get("content-type")
-    ?.split(";")[0]
-    ?.trim()
-    .toLowerCase();
-
-  if (contentType !== "application/json") {
+  if (readMediaType(request) !== "application/json") {
     throw new MíngZhànApiError("Content-Type must be application/json.", 415);
   }
 }
 
+function readMediaType(request: Request): string | undefined {
+  return request.headers
+    .get("content-type")
+    ?.split(";")[0]
+    ?.trim()
+    .toLowerCase();
+}
+
+/** application/zip is not a CORS-simple type, so it needs a preflight like JSON. */
+export function isArchiveRequest(request: Request): boolean {
+  return readMediaType(request) === "application/zip";
+}
+
+/**
+ * Bun can leave a body read pending forever when the client hangs up, which
+ * would pin whatever the caller holds, such as the restore lock.
+ */
+export function readUntilClientGone<T>(
+  request: Request,
+  read: Promise<T>
+): Promise<T> {
+  const gone = new Promise<never>((_resolve, reject) => {
+    const rejectGone = () => {
+      reject(new MíngZhànApiError("The client closed the request.", 400));
+    };
+
+    if (request.signal.aborted) {
+      rejectGone();
+    }
+
+    request.signal.addEventListener("abort", rejectGone, { once: true });
+  });
+
+  return Promise.race([read, gone]);
+}
+
+async function readJsonBodyWithLimit<T>(
+  request: Request,
+  maxBytes: number
+): Promise<T> {
+  const contentLength = Number(request.headers.get("content-length") ?? "");
+
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    throw new MíngZhànApiError("Request body is too large.", 413);
+  }
+
+  if (!request.body) {
+    return undefined;
+  }
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+
+      if (done) {
+        break;
+      }
+
+      bytes += value.byteLength;
+
+      if (bytes > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new MíngZhànApiError("Request body is too large.", 413);
+      }
+
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const text = Buffer.concat(
+    chunks.map((chunk) => Buffer.from(chunk))
+  ).toString("utf8");
+
+  // SAFETY: the caller's schema validates this parsed value before use.
+  return JSON.parse(text) as T;
+}
+
 export async function readJson<T>(
   request: Request,
-  schema?: ZodType<T>
+  schema?: ZodType<T>,
+  maxBytes?: number
 ): Promise<T> {
   try {
-    const body = await request.json();
+    const body = maxBytes
+      ? await readUntilClientGone(
+          request,
+          readJsonBodyWithLimit<T>(request, maxBytes)
+        )
+      : await readUntilClientGone(request, request.json());
 
     if (!schema) {
       return body;
@@ -646,102 +732,4 @@ export function parseChannel(value: string | undefined): AgentChannel {
   throw new MíngZhànApiError(`Invalid channel. Expected ${CHANNEL_LIST}.`, 400);
 }
 
-const SSE_HEADERS = {
-  "Cache-Control": "no-cache, no-transform",
-  Connection: "keep-alive",
-  "Content-Type": "text/event-stream; charset=utf-8",
-};
-
-export function streamTurnSubscribe(sessionId: string): Response | null {
-  if (!sessionTurnRegistry.isActive(sessionId)) {
-    return null;
-  }
-
-  const encoder = new TextEncoder();
-  const keepaliveIntervalMs = 4000;
-
-  const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      const subscription = sessionTurnRegistry.subscribe(sessionId, (event) => {
-        try {
-          controller.enqueue(
-            encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
-          );
-
-          if (event.type === "done" || event.type === "error") {
-            subscription?.unsubscribe();
-            controller.close();
-          }
-        } catch {
-          subscription?.unsubscribe();
-        }
-      });
-
-      if (!subscription) {
-        controller.close();
-
-        return;
-      }
-
-      const keepalive = setInterval(() => {
-        try {
-          controller.enqueue(encoder.encode(": ping\n\n"));
-        } catch {
-          clearInterval(keepalive);
-          subscription.unsubscribe();
-        }
-      }, keepaliveIntervalMs);
-    },
-  });
-
-  return new Response(stream, { headers: SSE_HEADERS });
-}
-
-/**
- * SSE framing for a turn. Events written before `respond` wait in the stream,
- * and cancelling the response aborts `signal`, which stops the turn.
- */
-export function createTurnStream() {
-  const encoder = new TextEncoder();
-  const cancel = new AbortController();
-  // start() runs inside the constructor, so this is set before first use.
-  let controller!: ReadableStreamDefaultController<Uint8Array>;
-
-  const stream = new ReadableStream<Uint8Array>({
-    cancel() {
-      cancel.abort();
-    },
-    start(streamController) {
-      controller = streamController;
-    },
-  });
-
-  const enqueue = (text: string) => {
-    try {
-      controller.enqueue(encoder.encode(text));
-    } catch {
-      // The client went away. The turn keeps running for registry subscribers.
-    }
-  };
-
-  return {
-    onEvent: (event: StreamEvent) =>
-      enqueue(`data: ${JSON.stringify(event)}\n\n`),
-    respond(done: Promise<unknown>): Response {
-      const keepalive = setInterval(() => enqueue(": ping\n\n"), 4000);
-
-      void done.finally(() => {
-        clearInterval(keepalive);
-
-        try {
-          controller.close();
-        } catch {
-          // Already closed by the client cancelling the stream.
-        }
-      });
-
-      return new Response(stream, { headers: SSE_HEADERS });
-    },
-    signal: cancel.signal,
-  };
-}
+export { createTurnStream, streamTurnSubscribe } from "./turn-stream";

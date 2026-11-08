@@ -1,7 +1,14 @@
+import { Button } from "@mingzhan/ui/button";
 import { DropdownMenuItem } from "@mingzhan/ui/dropdown-menu";
 import { toast } from "@mingzhan/ui/toast";
-import { Pdf01Icon, PencilEdit01Icon } from "hugeicons-react";
-import { useEffect, useState } from "react";
+import {
+  ArrowExpand01Icon,
+  ArrowShrink02Icon,
+  Download04Icon,
+  Pdf01Icon,
+  PencilEdit01Icon,
+} from "hugeicons-react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { ArtifactAttachmentPanelActions } from "@/components/chat/artifact-attachment-panel-actions";
 import { ArtifactAttachmentPanelBody } from "@/components/chat/artifact-attachment-panel-body";
 import {
@@ -33,6 +40,7 @@ import {
   printArtifactHtml,
   resolveArtifactHtmlAssets,
 } from "@/lib/artifact-html-preview";
+import { isXlsxFile } from "@/lib/artifact-spreadsheet";
 import {
   artifactCodeLanguage,
   buildArtifactContentUrl,
@@ -49,6 +57,11 @@ import {
   resolveArtifactMimeType,
 } from "@/lib/chat-artifacts";
 import { client, formatError } from "@/lib/client";
+
+const ArtifactWorkbookPreview = lazy(async () => ({
+  default: (await import("@/components/chat/artifact-workbook-preview"))
+    .ArtifactWorkbookPreview,
+}));
 
 type EditMode = null | "markdown" | "spreadsheet";
 
@@ -200,6 +213,7 @@ export function useArtifactAttachmentPreviewPanel({
   const open = activeId === id;
   const [fullscreen, setFullscreen] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [downloading, setDownloading] = useState(false);
 
   const [previewMode, setPreviewMode] =
     useState<ArtifactPreviewMode>("preview");
@@ -216,6 +230,7 @@ export function useArtifactAttachmentPreviewPanel({
     artifact.filename
   );
 
+  const isWorkbook = isXlsxFile(artifact.filename, mimeType);
   const isHtml = isHtmlArtifactMimeType(mimeType);
   const isImage = isImageArtifactMimeType(mimeType);
   const isVideo = isVideoArtifactMimeType(mimeType);
@@ -244,6 +259,7 @@ export function useArtifactAttachmentPreviewPanel({
   const language = artifactCodeLanguage(artifact.filename);
 
   const canPreview =
+    isWorkbook ||
     isHtml ||
     isImage ||
     isVideo ||
@@ -267,7 +283,7 @@ export function useArtifactAttachmentPreviewPanel({
     setContent,
   } = useArtifactPreviewContent({
     artifact,
-    canPreview,
+    canPreview: canPreview && !isWorkbook,
     isHtml,
     isImage,
     isPdf,
@@ -286,6 +302,34 @@ export function useArtifactAttachmentPreviewPanel({
 
     return () => window.clearTimeout(timeout);
   }, [copied]);
+
+  async function downloadFile() {
+    setDownloading(true);
+
+    try {
+      const result = await client.readProfileArtifactContent(
+        profileId,
+        artifact.path,
+        { maxBytes: 100 * 1024 * 1024 }
+      );
+
+      const url = URL.createObjectURL(
+        new Blob([result.data], { type: mimeType })
+      );
+
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = artifact.filename;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (reason) {
+      toast(formatError(reason));
+    } finally {
+      setDownloading(false);
+    }
+  }
 
   async function saveDraft(nextContent: string) {
     if (editMode === null) {
@@ -364,6 +408,20 @@ export function useArtifactAttachmentPreviewPanel({
           onChange={setDraft}
           onSave={() => void saveDraft(draft)}
         />
+      );
+    }
+
+    if (isWorkbook) {
+      return (
+        <Suspense
+          fallback={
+            <div className="p-4 text-muted-foreground text-sm">
+              Loading workbook…
+            </div>
+          }
+        >
+          <ArtifactWorkbookPreview artifact={artifact} profileId={profileId} />
+        </Suspense>
       );
     }
 
@@ -460,14 +518,41 @@ export function useArtifactAttachmentPreviewPanel({
               isHtml,
               isImage,
               isMarkdown,
-              isSpreadsheet,
+              isSpreadsheet: isSpreadsheet || isWorkbook,
               isVideo,
               previewMode: mode,
             })
           : "flex flex-col overflow-hidden p-0",
       content: buildPanelBody(undefined, mode),
       fullscreen,
-      headerActions: (
+      headerActions: isWorkbook ? (
+        <>
+          <Button
+            aria-label="Download workbook"
+            className="max-md:size-11"
+            disabled={downloading}
+            onClick={() => void downloadFile()}
+            size="icon-sm"
+            title="Download workbook"
+            variant="ghost"
+          >
+            <Download04Icon aria-hidden className="size-4" />
+          </Button>
+          <Button
+            aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+            className="max-md:size-11"
+            onClick={() => setFullscreen((value) => !value)}
+            size="icon-sm"
+            variant="ghost"
+          >
+            {fullscreen ? (
+              <ArrowShrink02Icon aria-hidden className="size-4" />
+            ) : (
+              <ArrowExpand01Icon aria-hidden className="size-4" />
+            )}
+          </Button>
+        </>
+      ) : (
         <ArtifactAttachmentPreviewHeaderActions
           artifactPath={artifact.path}
           canEdit={canEdit}
@@ -540,6 +625,8 @@ export function useArtifactAttachmentPreviewPanel({
     isVideo,
     isMarkdown,
     isSpreadsheet,
+    isWorkbook,
+    downloading,
     language,
     mimeType,
     loading,
@@ -608,6 +695,8 @@ export function useArtifactAttachmentPreviewPanel({
   );
 
   return {
+    downloadFile,
+    downloading,
     imagePreviewUrl,
     isImage,
     isVideo,

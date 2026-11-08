@@ -9,13 +9,30 @@ import {
 } from "@mingzhan/core";
 import type { DatabaseAdapter } from "@mingzhan/db";
 import {
-  decodeArchiveRequestData,
-  previewMíngZhànDataImport,
-  restoreMíngZhànDataImport,
+  MAX_IMPORT_ARCHIVE_BYTES,
+  previewMíngZhànDataImportFile,
+  restoreMíngZhànDataImportFile,
+  SETUP_IMPORT_LIMITS,
 } from "../../services/data-portability";
 import type { ServerOptions } from "../context";
-import { assertJsonRequest, errorResponse, json, readJson } from "../shared";
+import {
+  assertJsonRequest,
+  errorResponse,
+  isArchiveRequest,
+  json,
+  MAX_HTTP_REQUEST_BODY_LIMIT_BYTES,
+  readJson,
+} from "../shared";
 import type { HonoApp } from "../types";
+import {
+  importArchiveBodySchema,
+  importConfirmQuerySchema,
+  readImportRequest,
+} from "./data-portability";
+
+// The body limit in app.ts and the archive size check. Settings has the same cap
+// (#2257), so the way past it is outside MíngZhàn.
+export const SETUP_BACKUP_TOO_LARGE = `This backup is over the ${MAX_IMPORT_ARCHIVE_BYTES / (1024 * 1024)} MB first-run restore limit. Sign in and restore it from Settings, or restore the data folder from a filesystem or volume backup instead.`;
 
 export function registerSetupImportRoutes(
   app: HonoApp,
@@ -57,7 +74,10 @@ export function registerSetupImportRoutes(
       path: "/v1/auth/setup/import/preview",
       request: {
         body: {
-          content: { "application/json": { schema: importRequestSchema } },
+          content: {
+            "application/json": { schema: importRequestSchema },
+            "application/zip": { schema: importArchiveBodySchema },
+          },
           required: true,
         },
       },
@@ -95,9 +115,13 @@ export function registerSetupImportRoutes(
       path: "/v1/auth/setup/import/restore",
       request: {
         body: {
-          content: { "application/json": { schema: restoreRequestSchema } },
+          content: {
+            "application/json": { schema: restoreRequestSchema },
+            "application/zip": { schema: importArchiveBodySchema },
+          },
           required: true,
         },
+        query: importConfirmQuerySchema,
       },
       responses: {
         200: {
@@ -131,24 +155,33 @@ export function registerSetupImportRoutes(
       return errorResponse("Authentication not configured", 500);
     }
 
-    assertJsonRequest(c.req.raw);
+    assertImportContentType(c.req.raw);
 
     await assertSetupImportAllowed(databaseAdapter);
 
-    const body = await readJson<PreviewDataImportRequest>(
+    // Read outside the catch so an oversized archive keeps its 413.
+    const archive = await readImportRequest(
       c.req.raw,
-      importRequestSchema
+      () =>
+        readJson<PreviewDataImportRequest>(
+          c.req.raw,
+          importRequestSchema,
+          MAX_HTTP_REQUEST_BODY_LIMIT_BYTES
+        ),
+      SETUP_IMPORT_LIMITS,
+      SETUP_BACKUP_TOO_LARGE
     );
 
-    // Decoded outside the catch so an oversized archive keeps its 413.
-    const archive = decodeArchiveRequestData(body.data);
-
     try {
-      const preview = await previewMíngZhànDataImport(archive);
+      const preview = await previewMíngZhànDataImportFile(archive.path, {
+        limits: SETUP_IMPORT_LIMITS,
+      });
 
       return json<DataImportPreviewResponse>(preview);
     } catch (error) {
       return errorResponse(formatServerError(error), 400);
+    } finally {
+      await archive.cleanup();
     }
   });
 
@@ -157,48 +190,65 @@ export function registerSetupImportRoutes(
       return errorResponse("Authentication not configured", 500);
     }
 
-    assertJsonRequest(c.req.raw);
+    assertImportContentType(c.req.raw);
 
     await assertSetupImportAllowed(databaseAdapter);
 
-    const body = await readJson<RestoreDataImportRequest>(
+    const archive = await readImportRequest(
       c.req.raw,
-      restoreRequestSchema
+      () =>
+        readJson<RestoreDataImportRequest>(
+          c.req.raw,
+          restoreRequestSchema,
+          MAX_HTTP_REQUEST_BODY_LIMIT_BYTES
+        ),
+      SETUP_IMPORT_LIMITS,
+      SETUP_BACKUP_TOO_LARGE
     );
 
-    const archive = decodeArchiveRequestData(body.data);
-
-    let restore;
-
     try {
-      restore = await restoreMíngZhànDataImport(archive, {
-        afterFailedReplace: options.onDataRestored,
-        beforeReplace: options.onBeforeDataRestore,
-        confirm: body.confirm,
-      });
-    } catch (error) {
-      return errorResponse(formatServerError(error), 400);
-    }
+      let restore;
 
-    let requiresRestart = !options.onDataRestored;
-
-    if (options.onDataRestored) {
       try {
-        await options.onDataRestored();
-        requiresRestart = false;
-      } catch {
-        requiresRestart = true;
+        restore = await restoreMíngZhànDataImportFile(archive.path, {
+          afterFailedReplace: options.onDataRestored,
+          beforeReplace: options.onBeforeDataRestore,
+          confirm: archive.confirm,
+          limits: SETUP_IMPORT_LIMITS,
+        });
+      } catch (error) {
+        return errorResponse(formatServerError(error), 400);
       }
-    }
 
-    return json<SetupRestoreDataImportResponse>({
-      ...restore,
-      requiresRestart,
-    });
+      let requiresRestart = !options.onDataRestored;
+
+      if (options.onDataRestored) {
+        try {
+          await options.onDataRestored();
+          requiresRestart = false;
+        } catch {
+          requiresRestart = true;
+        }
+      }
+
+      return json<SetupRestoreDataImportResponse>({
+        ...restore,
+        requiresRestart,
+      });
+    } finally {
+      await archive.cleanup();
+    }
   });
 }
 
-async function assertSetupImportAllowed(
+// These routes run before any login, so a cross-site form must not reach them.
+function assertImportContentType(request: Request): void {
+  if (!isArchiveRequest(request)) {
+    assertJsonRequest(request);
+  }
+}
+
+export async function assertSetupImportAllowed(
   databaseAdapter: DatabaseAdapter
 ): Promise<void> {
   const humanUserCount = await databaseAdapter.countHumanUsers();

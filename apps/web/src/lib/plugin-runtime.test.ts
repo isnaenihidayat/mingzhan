@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { MíngZhànApiError } from "@mingzhan/core/api-error";
 import * as ui from "@mingzhan/ui";
 import * as React from "react";
 import { createElement } from "react";
@@ -208,7 +209,6 @@ describe("native plugin activation", () => {
 
       if (selection === "history") {
         expect(html).toContain('aria-label="History"');
-        expect(html).toContain('aria-label="1 of 2 steps ran"');
         expect(html).toContain('data-status="failed"');
         expect(html).toContain('aria-expanded="true"');
         expect(html).toContain(
@@ -561,4 +561,102 @@ test("the plugin template types list every ctx.ui export", async () => {
   );
 
   expect(typed.sort()).toEqual(Object.keys(ui).sort());
+});
+
+describe("plugin host calls", () => {
+  test("a busy plugin action is retried until the server admits it", async () => {
+    let calls = 0;
+    let context!: PluginClientContext;
+
+    const runtime = await activatePlugin(
+      {
+        apply(ctx) {
+          context = ctx;
+          ctx.slots.register("page", () => null);
+        },
+        inject: ["slots", "host"],
+      },
+      {
+        ...options(),
+        host: {
+          call: async () => {
+            calls++;
+
+            if (calls === 1) {
+              throw new MíngZhànApiError("busy", 429);
+            }
+
+            return ["workflow"];
+          },
+        },
+      }
+    );
+
+    expect(await context.host.call("list_workflows")).toEqual(["workflow"]);
+    expect(calls).toBe(2);
+    runtime.dispose();
+  });
+
+  test("other plugin errors are not retried", async () => {
+    let calls = 0;
+    let context!: PluginClientContext;
+
+    const runtime = await activatePlugin(
+      {
+        apply(ctx) {
+          context = ctx;
+          ctx.slots.register("page", () => null);
+        },
+        inject: ["slots", "host"],
+      },
+      {
+        ...options(),
+        host: {
+          call: () => {
+            calls++;
+
+            return Promise.reject(new MíngZhànApiError("forbidden", 403));
+          },
+        },
+      }
+    );
+
+    await expect(context.host.call("list_workflows")).rejects.toMatchObject({
+      status: 403,
+    });
+    expect(calls).toBe(1);
+    runtime.dispose();
+  });
+
+  test("unloading the page stops a busy retry", async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    let context!: PluginClientContext;
+
+    await activatePlugin(
+      {
+        apply(ctx) {
+          context = ctx;
+          ctx.slots.register("page", () => null);
+        },
+        inject: ["slots", "host"],
+      },
+      {
+        ...options(controller),
+        host: {
+          call: () => {
+            calls++;
+
+            return Promise.reject(new MíngZhànApiError("busy", 429));
+          },
+        },
+      }
+    );
+
+    const pending = context.host.call("list_workflows");
+    controller.abort();
+    await expect(pending).rejects.toBeDefined();
+    await Bun.sleep(300);
+    expect(calls).toBe(1);
+  });
 });

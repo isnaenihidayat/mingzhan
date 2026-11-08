@@ -11,6 +11,8 @@ export const DEFAULT_BUNDLED_SKILL_NAMES = [
   "pdf",
   "docx",
   "xlsx",
+  "data-analysis",
+  "interactive-visualizations",
   "pptx",
   "doc-coauthoring",
   "internal-comms",
@@ -20,6 +22,7 @@ export const DEFAULT_BUNDLED_SKILL_NAMES = [
   "canvas-design",
   "algorithmic-art",
   "slack-gif-creator",
+  "grounded-research",
 ] as const;
 
 export const SUPER_MINGZHAN_BUNDLED_SKILL_NAMES = [

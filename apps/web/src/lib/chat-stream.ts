@@ -659,6 +659,9 @@ export function finalizeStreamingMessages(
     ) {
       return {
         ...message,
+        createdAt:
+          message.createdAt ??
+          (message.content.trim() ? new Date().toISOString() : undefined),
         streaming: false,
         thinkingStreaming: false,
       };
@@ -786,6 +789,7 @@ export function buildStreamHandlers(
           next[next.length - 1] = {
             ...last,
             content: last.content + delta,
+            createdAt: last.createdAt ?? new Date().toISOString(),
             streaming: true,
             // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- This optional field must stay absent when no value exists to preserve the wire payload contract.
             ...(last.thinkingStreaming ? { thinkingStreaming: false } : {}),
@@ -796,6 +800,7 @@ export function buildStreamHandlers(
 
         next.push({
           content: delta,
+          createdAt: new Date().toISOString(),
           id: createClientId(),
           role: "assistant",
           streaming: true,
@@ -886,7 +891,15 @@ export function buildStreamHandlers(
       setMessages((current) => {
         const next = current.map((message) =>
           message.role === "assistant" && message.streaming
-            ? { ...message, streaming: false }
+            ? {
+                ...message,
+                createdAt:
+                  message.createdAt ??
+                  (message.content.trim()
+                    ? new Date().toISOString()
+                    : undefined),
+                streaming: false,
+              }
             : message
         );
 
@@ -970,6 +983,7 @@ function buildOutgoingUserMessage(
 ): ChatListItem {
   return {
     content: text,
+    createdAt: new Date().toISOString(),
     documents: documents.length > 0 ? documents : undefined,
     id: createClientId(),
     imageAttachments:

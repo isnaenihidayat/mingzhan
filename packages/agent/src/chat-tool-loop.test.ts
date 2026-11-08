@@ -162,12 +162,50 @@ describe("agent chat tool loop", () => {
 
     const reply = await session.send("Do the plan");
 
-    expect(reply).toBe("stop 3");
+    expect(reply).toStartWith("stop 3");
+    expect(reply).toContain("Work incomplete");
     expect(prompts).toHaveLength(3);
     expect(prompts[0]).not.toContain("OPEN TODOS");
     expect(prompts[1]).toContain("OPEN TODOS");
     expect(prompts[2]).toContain("OPEN TODOS");
-    expect(reminders).toBe(2);
+    expect(reminders).toBe(3);
+  });
+
+  test("recovers a second save without replaying the first save", async () => {
+    const writes: unknown[] = [];
+
+    const responses = [
+      toolTurn([{ arguments: { message: "first" }, id: "1", name: "sample" }]),
+      textReply("second.md</arg_value></tool_call>"),
+      toolTurn([{ arguments: { message: "second" }, id: "2", name: "sample" }]),
+      textReply("Both saved"),
+    ];
+
+    const generateChat = spyOn(
+      {
+        next: () =>
+          Promise.resolve(responses.shift() ?? textReply("Unexpected")),
+      },
+      "next"
+    );
+
+    const session = createAgentChatSession({
+      provider: { ...createMockProvider([]), generateChat },
+      tools: [
+        {
+          ...sampleTool,
+          run(input) {
+            writes.push(input);
+
+            return Promise.resolve(input);
+          },
+        },
+      ],
+    });
+
+    expect(await session.send("Save both")).toBe("Both saved");
+    expect(writes).toEqual([{ message: "first" }, { message: "second" }]);
+    expect(generateChat).toHaveBeenCalledTimes(4);
   });
 
   test("ends the turn when no todos are open", async () => {

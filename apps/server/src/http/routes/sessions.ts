@@ -199,7 +199,7 @@ export function registerSessionRoutes(
     .openapi("AcpSessionSettingRequest");
 
   const branchSessionResponseSchema = z
-    .object({ sessionId: z.string() })
+    .object({ channel: agentChannelSchema, sessionId: z.string() })
     .openapi("BranchSessionResponse");
 
   const updateSessionRequestSchema = z
@@ -393,7 +393,13 @@ export function registerSessionRoutes(
       method: "get",
       operationId: "getChatImageAttachment",
       path: "/v1/attachments/{attachmentId}/content",
-      request: { params: z.object({ attachmentId: z.string() }) },
+      request: {
+        params: z.object({ attachmentId: z.string() }),
+        query: z.object({
+          preview: z.enum(["1"]).optional(),
+          render: z.enum(["markdown"]).optional(),
+        }),
+      },
       responses: {
         200: {
           description: "Attachment bytes",
@@ -404,6 +410,7 @@ export function registerSessionRoutes(
         401: { description: "Authentication required" },
         403: { description: "Profile access denied" },
         404: { description: "Attachment not found" },
+        413: { description: "File exceeds the preview byte limit" },
       },
       summary: "Read a file attached to chat",
       tags: ["Chat"],
@@ -675,7 +682,11 @@ export function registerSessionRoutes(
     const attachment = await agent.readChatAttachment(
       requireActiveOrgIdFromContext(c),
       c.req.param("attachmentId"),
-      getRequestAuth(c)
+      getRequestAuth(c),
+      {
+        preview: c.req.query("preview") === "1",
+        render: c.req.query("render") === "markdown" ? "markdown" : undefined,
+      }
     );
 
     if (!attachment) {

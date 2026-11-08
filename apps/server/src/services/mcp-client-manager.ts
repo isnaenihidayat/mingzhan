@@ -17,6 +17,13 @@ import {
 import type { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { z } from "zod";
+import { fetchMcpRemote } from "./mcp-fetch";
+import {
+  formatToolContent,
+  formatToolContentResult,
+  isJsonValue,
+  parseJsonValue,
+} from "./mcp-tool-result";
 
 /** A server that does not answer `initialize` must not hold a connect open. */
 const CONNECT_TIMEOUT_MS = 30_000;
@@ -26,16 +33,15 @@ const CONNECT_TIMEOUT_MS = 30_000;
  * token only when `onprogress` is set.
  */
 const CALL_TOOL_OPTIONS: RequestOptions = {
+  // Progress resets the per-request timeout, so without a ceiling a server
+  // that keeps reporting progress holds the turn forever.
+  maxTotalTimeout: 30 * 60_000,
   onprogress: () => {},
   resetTimeoutOnProgress: true,
 };
 
-// Tool image limits, as pi's tool-result image pass: longest side and base64 size.
-const MODEL_IMAGE_MAX_SIDE = 2000;
-
-const MODEL_IMAGE_MAX_BASE64 = 4.5 * 1024 * 1024;
-
-const MODEL_IMAGE_JPEG_QUALITIES = [80, 85, 70, 55, 40];
+/** Past this, a tool result is replaced by a note instead of reaching the model. */
+const MAX_TOOL_RESULT_CHARS = 1_000_000;
 
 export type JsonValue =
   | boolean
@@ -263,20 +269,20 @@ export class McpClientManager {
     );
 
     if ("toolResult" in result) {
-      return parseJsonValue(result.toolResult);
+      return boundToolResult(parseJsonValue(result.toolResult));
     }
 
     if (result.isError) {
-      return {
+      return boundToolResult({
         error: formatToolContent(result.content),
-      };
+      });
     }
 
     if (result.structuredContent !== undefined) {
-      return parseJsonValue(result.structuredContent);
+      return boundToolResult(parseJsonValue(result.structuredContent));
     }
 
-    return await formatToolContentResult(result.content);
+    return boundToolResult(await formatToolContentResult(result.content));
   }
 
   async testConnection(
@@ -315,6 +321,7 @@ export class McpClientManager {
     await this.disconnectKey(connectionKey);
 
     const transport = new StreamableHTTPClientTransport(new URL(url), {
+      fetch: fetchMcpRemote,
       requestInit: {
         headers,
       },
@@ -371,20 +378,20 @@ export class McpClientManager {
     );
 
     if ("toolResult" in result) {
-      return parseJsonValue(result.toolResult);
+      return boundToolResult(parseJsonValue(result.toolResult));
     }
 
     if (result.isError) {
-      return {
+      return boundToolResult({
         error: formatToolContent(result.content),
-      };
+      });
     }
 
     if (result.structuredContent !== undefined) {
-      return parseJsonValue(result.structuredContent);
+      return boundToolResult(parseJsonValue(result.structuredContent));
     }
 
-    return await formatToolContentResult(result.content);
+    return boundToolResult(await formatToolContentResult(result.content));
   }
 
   async disconnectHttpEndpoint(connectionKey: string): Promise<void> {
@@ -475,8 +482,12 @@ function createTransport(
     return new StreamableHTTPClientTransport(
       new URL(http.url),
       options?.authProvider
-        ? { authProvider: options.authProvider, requestInit }
-        : { requestInit }
+        ? {
+            authProvider: options.authProvider,
+            fetch: fetchMcpRemote,
+            requestInit,
+          }
+        : { fetch: fetchMcpRemote, requestInit }
     );
   }
 
@@ -582,194 +593,18 @@ export function parseMcpToolArguments<T>(input: T) {
   return Object.fromEntries(entries);
 }
 
-function parseJsonValue<T>(value: T): JsonValue {
-  if (!isJsonValue(value)) {
-    throw new Error("MCP tool result is not a JSON value.");
-  }
+function boundToolResult(value: JsonValue): JsonValue {
+  // Fitted images are already capped by MODEL_IMAGE_MAX_BASE64 each.
+  const { images: _images, ...rest } =
+    value instanceof Object && !Array.isArray(value) ? value : { value };
 
-  return value;
-}
+  const size = JSON.stringify(rest).length;
 
-function isJsonValue<T>(
-  value: T,
-  seen = new WeakSet<object>()
-): value is T & JsonValue {
-  if (value === null || value === true || value === false || isString(value)) {
-    return true;
-  }
-
-  if (
-    Object.prototype.toString.call(value) === "[object Number]" &&
-    !(value instanceof Number)
-  ) {
-    return Number.isFinite(value);
-  }
-
-  if (Array.isArray(value)) {
-    if (seen.has(value)) {
-      return false;
-    }
-
-    seen.add(value);
-    const valid = value.every((entry) => isJsonValue(entry, seen));
-    seen.delete(value);
-
-    return valid;
-  }
-
-  if (!(value instanceof Object) || seen.has(value)) {
-    return false;
-  }
-
-  const prototype = Object.getPrototypeOf(value);
-
-  if (prototype !== Object.prototype && prototype !== null) {
-    return false;
-  }
-
-  seen.add(value);
-  const valid = Object.values(value).every((entry) => isJsonValue(entry, seen));
-  seen.delete(value);
-
-  return valid;
-}
-
-interface McpContentPart {
-  data?: string;
-  mimeType?: string;
-  text?: string;
-  type: string;
-}
-
-interface ModelImage {
-  data: string;
-  mediaType: string;
-  note?: string;
-}
-
-/**
- * Images go out as `images`, which the chat loop sends to the model as image
- * input. Inline base64 reached the model as text: one screenshot was ~1M tokens.
- */
-async function formatToolContentResult(
-  content: McpContentPart[]
-): Promise<JsonValue> {
-  const images: JsonValue[] = [];
-  const parts: JsonValue[] = [];
-  const notes: string[] = [];
-
-  for (const part of content) {
-    if (
-      part.type === "image" &&
-      isString(part.data) &&
-      isString(part.mimeType)
-    ) {
-      const { note, ...image } = await fitImageForModel(
-        part.data,
-        part.mimeType
-      );
-
-      images.push(image);
-      parts.push({ mimeType: image.mediaType, type: "image" });
-
-      if (note) {
-        parts.push({ text: note, type: "text" });
-        notes.push(note);
+  return size > MAX_TOOL_RESULT_CHARS
+    ? {
+        error: `MCP tool result was ${size} characters, over the ${MAX_TOOL_RESULT_CHARS} limit, and was dropped.`,
       }
-
-      continue;
-    }
-
-    parts.push(parseJsonValue(part));
-  }
-
-  const text = [formatToolContent(content), ...notes].join("\n");
-
-  return images.length > 0
-    ? { content: parts, images, text }
-    : { content: parts, text };
-}
-
-/** Scale down and re-encode until the image fits; PNG first, then JPEG. */
-async function fitImageForModel(
-  data: string,
-  mimeType: string
-): Promise<ModelImage> {
-  try {
-    const bytes = Buffer.from(data, "base64");
-    const { height, width } = await new Bun.Image(bytes).metadata();
-
-    if (
-      width <= MODEL_IMAGE_MAX_SIDE &&
-      height <= MODEL_IMAGE_MAX_SIDE &&
-      data.length < MODEL_IMAGE_MAX_BASE64
-    ) {
-      return { data, mediaType: mimeType };
-    }
-
-    const scale = Math.min(1, MODEL_IMAGE_MAX_SIDE / Math.max(width, height));
-    let targetWidth = Math.max(1, Math.round(width * scale));
-    let targetHeight = Math.max(1, Math.round(height * scale));
-
-    while (true) {
-      const resized = () =>
-        new Bun.Image(bytes).resize(targetWidth, targetHeight, {
-          fit: "fill",
-        });
-
-      const encodings: Array<[string, () => Promise<Uint8Array>]> = [
-        ["image/png", () => resized().png().bytes()],
-        ...MODEL_IMAGE_JPEG_QUALITIES.map(
-          (quality): [string, () => Promise<Uint8Array>] => [
-            "image/jpeg",
-            () => resized().jpeg({ quality }).bytes(),
-          ]
-        ),
-      ];
-
-      for (const [mediaType, encode] of encodings) {
-        const encoded = Buffer.from(await encode()).toString("base64");
-
-        if (encoded.length < MODEL_IMAGE_MAX_BASE64) {
-          return {
-            data: encoded,
-            mediaType,
-            note: `[Image: original ${width}x${height}, displayed at ${targetWidth}x${targetHeight}. Multiply coordinates by ${(width / targetWidth).toFixed(2)} to map to original image.]`,
-          };
-        }
-      }
-
-      if (targetWidth === 1 && targetHeight === 1) {
-        return { data, mediaType: mimeType };
-      }
-
-      targetWidth = Math.max(1, Math.floor(targetWidth * 0.75));
-      targetHeight = Math.max(1, Math.floor(targetHeight * 0.75));
-    }
-  } catch {
-    // A format Bun cannot decode goes out as the tool sent it.
-    return { data, mediaType: mimeType };
-  }
-}
-
-function formatToolContent(content: McpContentPart[] | undefined): string {
-  if (!content || content.length === 0) {
-    return "Tool completed with no content.";
-  }
-
-  return content
-    .map((part) => {
-      if (part.type === "text" && isString(part.text)) {
-        return part.text;
-      }
-
-      if (part.type === "image") {
-        return `[${part.mimeType ?? "image"}]`;
-      }
-
-      return JSON.stringify(part);
-    })
-    .join("\n");
+    : value;
 }
 
 export function toCachedMcpToolSummaries(
@@ -780,8 +615,4 @@ export function toCachedMcpToolSummaries(
     inputSchema: tool.inputSchema,
     name: tool.name,
   }));
-}
-
-function isString<T>(value: T): value is T & string {
-  return Object.prototype.toString.call(value) === "[object String]";
 }

@@ -17,6 +17,7 @@ import {
   fetchWithoutIdleTimeout,
   messagesIncludeUserDocuments,
   messagesIncludeUserImages,
+  normalizeBaseUrl,
   toOpenAIChatUserContent,
 } from "@mingzhan/core";
 import { z } from "zod";
@@ -142,10 +143,6 @@ export function createOpenAIProvider(
   };
 }
 
-function normalizeBaseUrl(baseUrl: string): string {
-  return baseUrl.replace(/\/+$/, "");
-}
-
 function providerLabel(providerName: ProviderName): string {
   if (providerName === "anthropic") {
     return "Anthropic";
@@ -153,6 +150,10 @@ function providerLabel(providerName: ProviderName): string {
 
   if (providerName === "opencode_go") {
     return "OpenCode Go";
+  }
+
+  if (providerName === "command_code") {
+    return "Command Code";
   }
 
   if (providerName === "deepseek") {

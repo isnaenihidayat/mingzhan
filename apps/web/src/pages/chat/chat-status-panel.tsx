@@ -25,6 +25,7 @@ import {
   useState,
 } from "react";
 import { useArtifactAttachmentPreviewPanel } from "@/components/chat/use-artifact-attachment-preview-panel";
+import type { AgentActivity } from "@/components/moodstone";
 import { ProfileAvatar } from "@/components/ProfileAvatar";
 import { useAuth } from "@/context/use-auth";
 import { useChatAttachmentPanel } from "@/context/use-chat-attachment-panel";
@@ -125,6 +126,7 @@ function mcpStatusDotClass(server: McpServerSummary) {
 
 /** Chat state the status panel shows. */
 export interface ChatStatusData {
+  activity?: AgentActivity;
   busy: boolean;
   channel: AgentChannel;
   contextUsage: ChatContextUsage | null;
@@ -457,6 +459,7 @@ function ChatStatusConnectors({ profileId }: { profileId: string }) {
 function ChatStatusBody() {
   const {
     data: {
+      activity,
       busy,
       channel,
       contextUsage,
@@ -488,7 +491,16 @@ function ChatStatusBody() {
     <>
       <ChatStatusSection title="Environment">
         <ChatStatusRow
-          icon={profile ? <ProfileAvatar profile={profile} size="xxs" /> : null}
+          icon={
+            profile ? (
+              <ProfileAvatar
+                active
+                activity={activity}
+                profile={profile}
+                size="xxs"
+              />
+            ) : null
+          }
         >
           {profile?.name ?? "Agent"}
         </ChatStatusRow>

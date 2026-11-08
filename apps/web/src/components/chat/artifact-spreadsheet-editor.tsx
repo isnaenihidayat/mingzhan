@@ -202,16 +202,22 @@ export function ArtifactSpreadsheetEditor({
   onCancel: () => void;
   onSave: (nextContent: string) => void;
 }) {
-  const [rows, setRows] = useState<SpreadsheetRows>(() =>
-    artifactSpreadsheet.parseSpreadsheetText(filename, content)
+  const [rows, setRows] = useState<SpreadsheetRows>(
+    () => artifactSpreadsheet.parseSpreadsheetText(filename, content).rows
   );
 
   const [baseRows, setBaseRows] = useState<SpreadsheetRows>(() =>
-    structuredClone(artifactSpreadsheet.parseSpreadsheetText(filename, content))
+    structuredClone(
+      artifactSpreadsheet.parseSpreadsheetText(filename, content).rows
+    )
   );
 
   useEffect(() => {
-    const next = artifactSpreadsheet.parseSpreadsheetText(filename, content);
+    const next = artifactSpreadsheet.parseSpreadsheetText(
+      filename,
+      content
+    ).rows;
+
     setRows(next);
     setBaseRows(structuredClone(next));
   }, [content, filename]);
@@ -220,7 +226,7 @@ export function ArtifactSpreadsheetEditor({
 
   function updateCell(rowIndex: number, columnIndex: number, value: string) {
     setRows((current) =>
-      artifactSpreadsheet.normalizeSpreadsheetShape(
+      artifactSpreadsheet.normalizeSpreadsheetRows(
         current.map((row, currentRowIndex) => {
           if (currentRowIndex !== rowIndex) {
             return row;
@@ -240,7 +246,7 @@ export function ArtifactSpreadsheetEditor({
 
   function addRow() {
     setRows((current) =>
-      artifactSpreadsheet.normalizeSpreadsheetShape([
+      artifactSpreadsheet.normalizeSpreadsheetRows([
         ...current,
         Array.from({ length: Math.max(1, current[0]?.length ?? 1) }, () => ""),
       ])
@@ -249,7 +255,7 @@ export function ArtifactSpreadsheetEditor({
 
   function addColumn() {
     setRows((current) =>
-      artifactSpreadsheet.normalizeSpreadsheetShape(
+      artifactSpreadsheet.normalizeSpreadsheetRows(
         current.map((row) => [...row, ""])
       )
     );

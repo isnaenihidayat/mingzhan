@@ -60,6 +60,7 @@ describe("finalizeStreamingMessages", () => {
       },
       {
         content: "still open",
+        createdAt: "2026-11-08T06:27:00Z",
         id: "a2",
         role: "assistant",
         streaming: true,
@@ -88,7 +89,9 @@ describe("finalizeStreamingMessages", () => {
       streaming: false,
       thinkingStreaming: false,
     });
+    expect(next[1]?.createdAt).toBeDefined();
     expect(next[3]).toMatchObject({
+      createdAt: "2026-11-08T06:27:00Z",
       id: "a2",
       streaming: false,
       thinkingStreaming: false,
@@ -99,6 +102,7 @@ describe("finalizeStreamingMessages", () => {
       id: "t2",
       toolStatus: "done",
     });
+    expect(next[5]?.createdAt).toBeUndefined();
     expect(next[5]).toMatchObject({
       id: "a3",
       streaming: false,

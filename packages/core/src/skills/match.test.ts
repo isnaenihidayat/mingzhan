@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { findExplicitSkill } from "./match";
+import { findExplicitSkill, findSpreadsheetCreationSkill } from "./match";
 import type { DiscoveredSkill } from "./types";
 
 const weatherSkill: DiscoveredSkill = {
@@ -60,5 +60,39 @@ describe("findExplicitSkill", () => {
     expect(
       findExplicitSkill([createWorkflow], "/skill create-workflow")?.name
     ).toBe("create-workflow");
+  });
+});
+
+describe("spreadsheet creation workflow", () => {
+  const xlsx: DiscoveredSkill = { ...weatherSkill, name: "xlsx" };
+
+  test.each([
+    "Rancang struktur KPI dan dibuat ke dalam file xlxs",
+    "Buatkan laporan Excel",
+    "Create a commission workbook as .xlsx",
+  ])("loads the assigned workflow for %s", (message) => {
+    expect(findSpreadsheetCreationSkill([xlsx], message)).toBe(xlsx);
+  });
+
+  test.each([
+    "Apa itu Excel?",
+    "Explain the xlsx format",
+    "/skill weather buat file xlsx",
+    "Please use skill weather and create xlsx",
+  ])(
+    "keeps conceptual questions and explicit selections intact: %s",
+    (message) => {
+      expect(findSpreadsheetCreationSkill([xlsx], message)).toBeNull();
+    }
+  );
+
+  test("requires an assigned implicitly enabled skill", () => {
+    expect(findSpreadsheetCreationSkill([], "buat xlsx")).toBeNull();
+    expect(
+      findSpreadsheetCreationSkill(
+        [{ ...xlsx, disableModelInvocation: true }],
+        "buat xlsx"
+      )
+    ).toBeNull();
   });
 });

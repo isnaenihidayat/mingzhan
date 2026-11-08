@@ -280,29 +280,38 @@ export function getModelsForProviderInstance(
     }));
 
   if (instance.type === "netra") {
+    const entries = instance.customModels ?? [];
+
+    // A retired ID shows as V4.1 Flash once, unless V4.1 Flash is saved too.
+    const firstRetired = entries.findIndex(
+      (entry) =>
+        entry.id !== NETRA_AGENT_MODEL_ID &&
+        resolveNetraModelId(entry.id) === NETRA_AGENT_MODEL_ID
+    );
+
+    const hasAgentModel = entries.some(
+      (entry) => entry.id === NETRA_AGENT_MODEL_ID
+    );
+
     return annotate(
       customModelsToCatalog(
-        (instance.customModels ?? [])
-          .filter(
-            (entry) => resolveNetraModelId(entry.id) === NETRA_AGENT_MODEL_ID
-          )
-          .filter(
-            (entry, index, entries) =>
-              entry.id === NETRA_AGENT_MODEL_ID ||
-              (!entries.some((item) => item.id === NETRA_AGENT_MODEL_ID) &&
-                index === 0)
-          )
-          .map((entry) =>
-            entry.id === NETRA_AGENT_MODEL_ID
-              ? entry
-              : {
+        entries.flatMap((entry, index) => {
+          if (resolveNetraModelId(entry.id) === entry.id) {
+            return [entry];
+          }
+
+          return index === firstRetired && !hasAgentModel
+            ? [
+                {
                   default: entry.default,
                   id: NETRA_AGENT_MODEL_ID,
                   name: "DeepSeek V4.1 Flash",
                   supportsThinking: true,
                   supportsVision: false,
-                }
-          ),
+                },
+              ]
+            : [];
+        }),
         "netra"
       )
     );
@@ -675,6 +684,17 @@ export async function fetchNetraModels(
     }));
 }
 
+// A model list that takes longer is not coming; say so instead of spinning.
+const MODEL_LIST_TIMEOUT_MS = 10_000;
+
+function endpointHost(baseUrl: string): string {
+  try {
+    return new URL(baseUrl).host;
+  } catch {
+    return baseUrl;
+  }
+}
+
 async function fetchRemoteOpenAIModelsRaw(
   baseUrl: string,
   apiKey: string,
@@ -691,7 +711,10 @@ async function fetchRemoteOpenAIModelsRaw(
 
     response = await fetch(`${baseUrl}/models`, { headers, signal });
   } catch {
-    throw new MíngZhànApiError("Could not reach the model endpoint.", 502);
+    throw new MíngZhànApiError(
+      `Cannot reach ${endpointHost(baseUrl)}. Check the base URL and that the server is running.`,
+      502
+    );
   }
 
   if (!response.ok) {

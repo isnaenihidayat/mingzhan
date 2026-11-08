@@ -73,7 +73,7 @@ Use this map when the user asks where something is in MíngZhàn. Do not guess f
 
 | User asks | Answer |
 |---|---|
-| Set the image generation model | Control center → AI Providers (`/customize/providers`), card **Image generation model**. Platform admin only. The agent also needs the `generate_image` tool (Agent → Tools) |
+| Set the image generation model | Control center → AI Providers (`/customize/providers`), card **Image generation**. Platform admin only. With ChatGPT signed in, no model is needed; **Off** turns images off. The agent also needs the `generate_image` tool (Agent → Tools); new agents have it |
 | Set voice message transcription | Control center → AI Providers, card **Audio transcription model**. Platform admin only |
 | Let a text-only model read images | Control center → AI Providers, card **Image parsing model**. Platform admin only |
 | Add or fix an API key, reconnect ChatGPT or Grok | Control center → AI Providers. Platform admin only |

@@ -1,4 +1,8 @@
-import { type CustomModelEntry, normalizeBaseUrl } from "@mingzhan/core";
+import {
+  type CustomModelEntry,
+  MíngZhànApiError,
+  normalizeBaseUrl,
+} from "@mingzhan/core";
 import { fetchRemoteOpenAIModels } from "../compatible-models";
 
 interface OllamaTagsResponse {
@@ -27,7 +31,20 @@ async function fetchOllamaTagsModels(
     headers.set("Authorization", `Bearer ${apiKey.trim()}`);
   }
 
-  const response = await fetch(ollamaTagsUrl(baseUrl), { headers });
+  const tagsUrl = ollamaTagsUrl(baseUrl);
+  let response: Response;
+
+  try {
+    response = await fetch(tagsUrl, {
+      headers,
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch {
+    throw new MíngZhànApiError(
+      `Cannot reach Ollama at ${new URL(tagsUrl).host}. Start Ollama, then refresh.`,
+      502
+    );
+  }
 
   if (!response.ok) {
     throw new Error(

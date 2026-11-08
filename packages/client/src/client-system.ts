@@ -1,8 +1,10 @@
 import type {
   AutomationWorkerSettingsResponse,
+  BackupStatusResponse,
   ChatgptOAuthDeviceCompleteRequest,
   ChatgptOAuthDeviceCompleteResponse,
   ChatgptOAuthDeviceStartResponse,
+  CheckProviderResponse,
   CodingHarnessSettingsResponse,
   ConfigureProviderRequest,
   ConfigureProviderResponse,
@@ -12,15 +14,15 @@ import type {
   DeleteProviderResponse,
   HealthResponse,
   ListProvidersResponse,
+  LlmRequestLogFilters,
+  LlmRequestLogPage,
   ModelsResponse,
   MíngZhànUpgradeResponse,
   MíngZhànVersionResponse,
   PluginWorkerStatus,
-  PreviewDataImportRequest,
   ProfilePackImportRequest,
   ProfilePackImportResponse,
   ProfilePackPreviewResponse,
-  RestoreDataImportRequest,
   RestoreDataImportResponse,
   SetupRestoreDataImportResponse,
   SystemStatusResponse,
@@ -37,9 +39,11 @@ import type {
 import { MíngZhànClientCore } from "./client-core";
 import type { JsonValue } from "./client-helpers";
 import {
+  createUploadFetch,
   encodeArchiveData,
   readContentDispositionFilename,
 } from "./client-helpers";
+import type { TransferProgress } from "./types";
 
 /** Server status, data import and export, workers, models, and providers. */
 export class SystemClient extends MíngZhànClientCore {
@@ -50,6 +54,20 @@ export class SystemClient extends MíngZhànClientCore {
   async getSystemStatus(profileId?: string): Promise<SystemStatusResponse> {
     return this.request<SystemStatusResponse>(
       `/v1/system/status?profileId=${encodeURIComponent(profileId ?? "")}`
+    );
+  }
+
+  async listLlmRequestLog(userId: string, filters: LlmRequestLogFilters) {
+    const query = new URLSearchParams();
+
+    for (const [key, value] of Object.entries(filters)) {
+      if (value !== undefined && value !== "") {
+        query.set(key, String(value));
+      }
+    }
+
+    return this.request<LlmRequestLogPage>(
+      `/v1/system/usage/users/${encodeURIComponent(userId)}/requests?${query}`
     );
   }
 
@@ -126,18 +144,14 @@ export class SystemClient extends MíngZhànClientCore {
     });
   }
 
-  async exportData(): Promise<{
-    filename: string;
-    data: ArrayBuffer;
-  }> {
-    const response = await this.fetchRaw("/v1/platform/data/export");
+  async getBackupStatus(): Promise<BackupStatusResponse> {
+    return this.request<BackupStatusResponse>(
+      "/v1/platform/data/backup-status"
+    );
+  }
 
-    return {
-      data: await response.arrayBuffer(),
-      filename:
-        readContentDispositionFilename(response.headers) ??
-        "mingzhan-export.zip",
-    };
+  exportDataResponse(): Promise<Response> {
+    return this.fetchRaw("/v1/platform/data/export");
   }
 
   async exportUserData(userId: string): Promise<{
@@ -156,71 +170,64 @@ export class SystemClient extends MíngZhànClientCore {
     };
   }
 
-  async previewDataImport(
-    data: Blob | BufferSource | string
-  ): Promise<DataImportPreviewResponse> {
-    const request: PreviewDataImportRequest = {
-      data: await encodeArchiveData(data),
-    };
-
-    return this.request<DataImportPreviewResponse>(
-      "/v1/platform/data/import/preview",
-      {
-        body: JSON.stringify(request),
-        method: "POST",
-      }
-    );
-  }
-
-  async restoreDataImport(
+  previewDataImport(
     data: Blob | BufferSource | string,
-    options: { confirm: boolean }
-  ): Promise<RestoreDataImportResponse> {
-    const request: RestoreDataImportRequest = {
-      confirm: options.confirm,
-      data: await encodeArchiveData(data),
-    };
-
-    return this.request<RestoreDataImportResponse>(
-      "/v1/platform/data/import/restore",
-      {
-        body: JSON.stringify(request),
-        method: "POST",
-      }
-    );
+    options: { onProgress?: TransferProgress } = {}
+  ): Promise<DataImportPreviewResponse> {
+    return this.sendArchive("/v1/platform/data/import/preview", data, options);
   }
 
-  async previewSetupDataImport(
+  restoreDataImport(
+    data: Blob | BufferSource | string,
+    options: { confirm: boolean; onProgress?: TransferProgress }
+  ): Promise<RestoreDataImportResponse> {
+    return this.sendArchive("/v1/platform/data/import/restore", data, options);
+  }
+
+  previewSetupDataImport(
     data: Blob | BufferSource | string
   ): Promise<DataImportPreviewResponse> {
-    const request: PreviewDataImportRequest = {
-      data: await encodeArchiveData(data),
-    };
-
-    return this.request<DataImportPreviewResponse>(
-      "/v1/auth/setup/import/preview",
-      {
-        body: JSON.stringify(request),
-        method: "POST",
-      }
-    );
+    return this.sendArchive("/v1/auth/setup/import/preview", data, {});
   }
 
-  async restoreSetupDataImport(
+  restoreSetupDataImport(
     data: Blob | BufferSource | string,
     options: { confirm: boolean }
   ): Promise<SetupRestoreDataImportResponse> {
-    const request: RestoreDataImportRequest = {
-      confirm: options.confirm,
-      data: await encodeArchiveData(data),
-    };
+    return this.sendArchive("/v1/auth/setup/import/restore", data, options);
+  }
 
-    return this.request<SetupRestoreDataImportResponse>(
-      "/v1/auth/setup/import/restore",
-      {
-        body: JSON.stringify(request),
+  // A string is already base64 and keeps the JSON form. Bytes go up as a raw ZIP.
+  private sendArchive<T>(
+    path: string,
+    data: Blob | BufferSource | string,
+    options: { confirm?: boolean; onProgress?: TransferProgress }
+  ): Promise<T> {
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- This public helper accepts a typed string-or-binary union, not untrusted JSON.
+    if (typeof data === "string") {
+      return this.request<T>(path, {
+        body: JSON.stringify({ confirm: options.confirm, data }),
         method: "POST",
-      }
+      });
+    }
+
+    const { onProgress } = options;
+
+    const uploadFetch =
+      // oxlint-disable-next-line anti-slop/no-runtime-typeof -- Feature detection: the CLI has no XHR and sends through fetch.
+      onProgress && typeof XMLHttpRequest !== "undefined"
+        ? createUploadFetch(onProgress)
+        : undefined;
+
+    return this.request<T>(
+      options.confirm ? `${path}?confirm=true` : path,
+      {
+        body: data,
+        headers: { "Content-Type": "application/zip" },
+        method: "POST",
+      },
+      false,
+      uploadFetch
     );
   }
 
@@ -383,7 +390,7 @@ export class SystemClient extends MíngZhànClientCore {
   }
 
   async getExternalModelCatalog(
-    catalogId: "models-dev" | "openrouter" | "cerebras"
+    catalogId: "openrouter" | "cerebras" | "models-dev"
   ): Promise<JsonValue> {
     return this.request<JsonValue>(
       `/v1/model-catalogs/${encodeURIComponent(catalogId)}`
@@ -454,7 +461,35 @@ export class SystemClient extends MíngZhànClientCore {
   ): Promise<UpdateProviderResponse> {
     return this.request<UpdateProviderResponse>(
       `/v1/providers/${encodeURIComponent(providerId)}/secret${action === "use-stored" ? "/use-stored" : ""}`,
-      { method: action === "clear" ? "DELETE" : "POST" }
+      // keepalive: a clear sent while the tab closes must still land.
+      { keepalive: true, method: action === "clear" ? "DELETE" : "POST" }
+    );
+  }
+
+  async checkProviderKey(request: {
+    apiKey: string;
+    baseUrl?: string;
+    type: string;
+  }): Promise<CheckProviderResponse> {
+    return this.request<CheckProviderResponse>("/v1/providers/check-key", {
+      body: JSON.stringify(request),
+      method: "POST",
+    });
+  }
+
+  async setDefaultProvider(
+    providerId: string
+  ): Promise<DeleteProviderResponse> {
+    return this.request<DeleteProviderResponse>(
+      `/v1/providers/${encodeURIComponent(providerId)}/default`,
+      { method: "POST" }
+    );
+  }
+
+  async checkProvider(providerId: string): Promise<CheckProviderResponse> {
+    return this.request<CheckProviderResponse>(
+      `/v1/providers/${encodeURIComponent(providerId)}/check`,
+      { method: "POST" }
     );
   }
 

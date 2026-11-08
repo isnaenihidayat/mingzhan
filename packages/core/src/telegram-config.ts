@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { z } from "zod";
 import {
   assertChannelPath,
+  botTokenSecretRef,
   type ChannelConfigScope,
   claimChannelIdentity,
   createPairingCodeSecret,
@@ -138,6 +139,7 @@ export async function loadTelegramConfigFile(
     configPath: getTelegramConfigPath(orgId),
     defaultProfileId: DEFAULT_TELEGRAM_PROFILE_ID,
     parseUserIds: parseAllowedUserIds,
+    secret: botTokenSecretRef("telegram", orgId),
   });
 }
 
@@ -227,6 +229,7 @@ async function writeTelegramConfigFile(
     configDir: getTelegramConfigDir(orgId),
     configPath: getTelegramConfigPath(orgId),
     label: "Telegram",
+    secret: botTokenSecretRef("telegram", orgId),
   });
 }
 

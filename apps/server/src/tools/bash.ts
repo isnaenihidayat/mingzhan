@@ -8,14 +8,10 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { homedir } from "node:os";
 import path from "node:path";
 import {
-  comparablePath,
   getProfileSoulDir,
-  getUserConfigDir,
   guardFilePath,
-  resolveWithRealpath,
   type ToolContext,
   type ToolDefinition,
 } from "@mingzhan/core";
@@ -28,6 +24,7 @@ import {
   TENANT_BASH_DISABLED,
 } from "./bash-config";
 import { remoteBashDescription, runRemoteBash } from "./bash-remote";
+import { refuseMíngZhànStateAccess } from "./bash-state-paths";
 import {
   commandLooksLikeCursorAgent,
   formatCodingAgentBashStdout,
@@ -205,132 +202,6 @@ export async function runBash(
 }
 
 /** Names that only MíngZhàn's own secret state uses, refused wherever they appear. */
-const MINGZHAN_SECRET_FILE_PATTERN =
-  /(?:^|[\s/=:<>(`])(?:config\.ini|local-auth-token|tool-credentials\.key|whatsapp-context-token|mingzhan\.(?:sqlite|db))(?=$|[\s;|&)<>`])/i;
-
-/** Credential or database shapes, refused when the command also reaches the config dir. */
-const MINGZHAN_STATE_PATTERN =
-  /\.(?:sqlite3?|db|ini|key)\b|\bsqlite3\b|token|\/auth\b/i;
-
-const SHELL_WORD_DELIMITER = /[\s;|&<>()`]+/;
-
-const OTHER_WORKSPACE_REFUSAL =
-  "Refused: this command reaches into MíngZhàn's org data outside this profile's workspace. Bash can only read this profile's own files. Use the MíngZhàn tools assigned to this profile for anything else.";
-
-const MINGZHAN_STATE_REFUSAL =
-  "Refused: this command reads MíngZhàn's internal state (local auth token, config.ini, credential keys, or server SQLite databases). The bash tool cannot call the MíngZhàn API or read its databases. Use the MíngZhàn tools assigned to this profile; if no tool fits, tell the user what is missing.";
-
-/**
- * Defense in depth, not a sandbox: refuse commands that name MíngZhàn's secret
- * files or reach into the config dir for credentials and databases. Profile
- * workspaces under the config dir stay usable.
- */
-function refuseMíngZhànStateAccess(
-  command: string,
-  cwd: string,
-  workspaceDirs: string[]
-): void {
-  // Fold quoting, backslashes, and ${VAR} into one shape before matching.
-  const normalized = command
-    .replaceAll("\\", "/")
-    .replace(/["']/g, "")
-    .replace(/\$\{(\w+)\}/g, "$$$1");
-
-  if (MINGZHAN_SECRET_FILE_PATTERN.test(normalized)) {
-    throw new Error(MINGZHAN_STATE_REFUSAL);
-  }
-
-  if (
-    MINGZHAN_STATE_PATTERN.test(normalized) &&
-    reachesMíngZhànConfigDir(normalized, cwd, workspaceDirs)
-  ) {
-    throw new Error(MINGZHAN_STATE_REFUSAL);
-  }
-
-  // Other orgs' and profiles' files hold no secret-shaped name, so the
-  // pattern gate above never sees them. Anything under orgs/ outside this
-  // profile's workspace is refused.
-  if (reachesMíngZhànConfigDir(normalized, cwd, workspaceDirs, "orgs")) {
-    throw new Error(OTHER_WORKSPACE_REFUSAL);
-  }
-}
-
-function reachesMíngZhànConfigDir(
-  command: string,
-  cwd: string,
-  workspaceDirs: string[],
-  subdir = ""
-): boolean {
-  const configDir = path.resolve(getUserConfigDir());
-  const configRoots = [configDir, resolveWithRealpath(configDir)];
-  const scopes = configRoots.map((root) => path.join(root, subdir));
-
-  const exemptDirs = workspaceDirs
-    .flatMap((dir) => [path.resolve(dir), resolveWithRealpath(dir)])
-    .filter((dir) =>
-      configRoots.some((root) => isInsideDir(dir, root) && dir !== root)
-    );
-
-  // With a subdir, a parent of it inside the config dir counts too:
-  // `grep -r x ~/.mingzhan` reads orgs/.
-  const reachesState = (target: string) =>
-    configRoots.some((root) => isInsideDir(target, root)) &&
-    scopes.some(
-      (scope) =>
-        isInsideDir(target, scope) ||
-        (subdir !== "" && isInsideDir(scope, target))
-    ) &&
-    !exemptDirs.some((dir) => isInsideDir(target, dir));
-
-  const homeRelative = path
-    .relative(homedir(), configDir)
-    .replaceAll("\\", "/");
-
-  const prefixes = new Map<string, string>([["$MINGZHAN_CONFIG_DIR", configDir]]);
-
-  for (const root of configRoots) {
-    prefixes.set(root.replaceAll("\\", "/"), root);
-  }
-
-  if (homeRelative && !homeRelative.startsWith("..")) {
-    for (const home of ["~", "$HOME"]) {
-      prefixes.set(`${home}/${homeRelative}`, configDir);
-    }
-  }
-
-  for (const [prefix, root] of prefixes) {
-    let index = command.indexOf(prefix);
-
-    while (index !== -1) {
-      const rest = command.slice(index + prefix.length);
-      const tail = rest.split(SHELL_WORD_DELIMITER)[0] ?? "";
-
-      if (
-        (tail === "" || tail.startsWith("/")) &&
-        reachesState(path.join(root, tail))
-      ) {
-        return true;
-      }
-
-      index = command.indexOf(prefix, index + prefix.length);
-    }
-  }
-
-  return command
-    .split(SHELL_WORD_DELIMITER)
-    .some(
-      (word) => word.includes("..") && reachesState(path.resolve(cwd, word))
-    );
-}
-
-function isInsideDir(target: string, dir: string): boolean {
-  const relative = path.relative(comparablePath(dir), comparablePath(target));
-
-  return (
-    relative === "" || !(relative.startsWith("..") || path.isAbsolute(relative))
-  );
-}
-
 export function resolveHostBash(
   platform: NodeJS.Platform = process.platform,
   env: NodeJS.ProcessEnv = process.env,

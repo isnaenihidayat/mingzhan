@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ToolDefinition } from "@mingzhan/core";
+import { getProfileSoulDir, type ToolDefinition } from "@mingzhan/core";
 import { emailTool } from "@mingzhan/core/tools/email";
 import {
   BROWSER_TOOL_IDS,
@@ -294,5 +294,116 @@ describe("resolveProfileStoredTools web_search", () => {
     expect(webSearch).toHaveLength(1);
     expect(webSearch[0]?.hosted).toBe(false);
     expect(webSearch[0]?.description).toContain("Exa");
+  });
+});
+
+describe("CLI-generated artifact ownership", () => {
+  let configDir = "";
+  let previousConfig: string | undefined;
+  let db: ReturnType<typeof createInMemoryDatabaseAdapter>;
+  let bash: ToolDefinition;
+  let workspace = "";
+  const manifest = JSON.stringify({ bytes: 7, path: "artifacts/report.xlsx" });
+
+  beforeEach(async () => {
+    previousConfig = process.env.MINGZHAN_CONFIG_DIR;
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-cli-artifact-owner-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+    db = createInMemoryDatabaseAdapter();
+    const now = new Date().toISOString();
+    await db.upsertOrganization({
+      createdAt: now,
+      id: "org",
+      name: "Org",
+      slug: "org",
+      updatedAt: now,
+    });
+    await db.upsertProfile({
+      createdAt: now,
+      id: "profile",
+      isDefault: true,
+      isSuper: false,
+      model: null,
+      name: "Profile",
+      orgId: "org",
+      systemPrompt: "",
+      updatedAt: now,
+    });
+
+    for (const id of ["ana", "bo"]) {
+      await db.createUser({
+        createdAt: now,
+        email: `${id}@example.com`,
+        id,
+        passwordHash: "unused",
+        updatedAt: now,
+      });
+    }
+
+    await upsertTool(db, { handlerType: "bash", id: "bash", name: "bash" });
+    [bash] = await resolveToolsFromStorage(await db.listTools(), db);
+    workspace = getProfileSoulDir("org", "profile");
+    await mkdir(workspace, { recursive: true });
+  });
+
+  afterEach(async () => {
+    if (previousConfig === undefined) {
+      delete process.env.MINGZHAN_CONFIG_DIR;
+    } else {
+      process.env.MINGZHAN_CONFIG_DIR = previousConfig;
+    }
+
+    await rm(configDir, { force: true, recursive: true });
+  });
+
+  function context(userId: string) {
+    return {
+      orgId: "org",
+      profileId: "profile",
+      userId,
+      workspaceRoot: workspace,
+    };
+  }
+
+  test("records a new CLI workbook under the authenticated creator", async () => {
+    await bash.run(
+      {
+        command: `mkdir -p artifacts && printf payload > artifacts/report.xlsx && printf '%s\\n' '${manifest}'`,
+      },
+      context("ana")
+    );
+    expect(
+      await db.getArtifactRecord("org", "profile", "report.xlsx")
+    ).toMatchObject({ filename: "report.xlsx", userId: "ana" });
+  });
+
+  test("a later command cannot take another member's artifact ownership", async () => {
+    await bash.run(
+      {
+        command: `mkdir -p artifacts && printf payload > artifacts/report.xlsx && printf '%s\\n' '${manifest}'`,
+      },
+      context("ana")
+    );
+    await bash.run(
+      {
+        command: `touch artifacts/report.xlsx && printf '%s\\n' '${manifest}'`,
+      },
+      context("bo")
+    );
+    expect(
+      (await db.getArtifactRecord("org", "profile", "report.xlsx"))?.userId
+    ).toBe("ana");
+  });
+
+  test("does not publish ownership for a failed builder", async () => {
+    await bash.run(
+      {
+        command: `mkdir -p artifacts && printf payload > artifacts/report.xlsx && printf '%s\\n' '${manifest}' && exit 1`,
+      },
+      context("ana")
+    );
+    expect(
+      await db.getArtifactRecord("org", "profile", "report.xlsx")
+    ).toBeNull();
   });
 });

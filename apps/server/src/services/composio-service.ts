@@ -1,5 +1,6 @@
-import { createCipheriv, createHash, randomBytes } from "node:crypto";
+import { createCipheriv, hkdfSync, randomBytes } from "node:crypto";
 import {
+  COMPOSIO_CUSTOM_AUTH_REQUIRED,
   type ComposioCatalogToolkitSummary,
   type ComposioConnectResponse,
   type ComposioToolkitSummary,
@@ -34,10 +35,14 @@ import {
   ComposioApiClient,
   type ComposioSessionMcpEndpoint,
   findRejectedConnectedAccountIds,
+  isComposioDefaultAuthConfigMissing,
 } from "./composio-api-client";
+import { withClaimedOAuthState } from "./oauth-callback-claim";
 
+// HKDF, not a bare hash, to turn the API key into an AES key. Nothing reads
+// `sessionIdEnc` back, so rows written with the old key need no migration.
 function deriveKey(secret: string): Buffer {
-  return createHash("sha256").update(`mingzhan-composio:${secret}`).digest();
+  return Buffer.from(hkdfSync("sha256", secret, "", "mingzhan-composio", 32));
 }
 
 function encryptComposioSecret(plaintext: string, secret: string): string {
@@ -70,6 +75,41 @@ const STALE_CONNECTION_ERROR =
 const MEET_RECORDING_TOOLKITS = new Set(["gmail", "googledrive"]);
 
 const MEET_RETURN_PATH = "/google-meet?import=recording";
+
+const COMPOSIO_KEY_REJECTED =
+  "Composio rejected the project API key. Check the key in Composio, then save it again.";
+
+function httpStatusOf(error: Error): number | undefined {
+  if (!("status" in error)) {
+    return undefined;
+  }
+
+  const { status } = error;
+
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- The Composio SDK puts an untyped HTTP status on the cause; there is no schema to parse it with.
+  return typeof status === "number" ? status : undefined;
+}
+
+/**
+ * The SDK wraps every toolkit-list failure as "Failed to fetch toolkits", so
+ * the HTTP status on the cause is the only way to tell a rejected key from a
+ * network problem.
+ */
+function isComposioAuthFailure(error: Error): boolean {
+  let current: Error | undefined = error;
+
+  while (current) {
+    const status = httpStatusOf(current);
+
+    if (status === 401 || status === 403) {
+      return true;
+    }
+
+    current = current.cause instanceof Error ? current.cause : undefined;
+  }
+
+  return false;
+}
 
 /**
  * A path on this site, never another origin: the OAuth callback redirects to
@@ -529,9 +569,9 @@ export class ComposioService {
       await client.listCatalogToolkits({ limit: 1 });
     } catch (error) {
       throw new MíngZhànApiError(
-        error instanceof Error
-          ? error.message
-          : "Failed to validate Composio API key.",
+        error instanceof Error && isComposioAuthFailure(error)
+          ? COMPOSIO_KEY_REJECTED
+          : "Could not reach Composio to check the project API key. Check your network and the key in Composio, then save it again.",
         400
       );
     }
@@ -619,9 +659,9 @@ export class ComposioService {
       };
     } catch (error) {
       const catalogError =
-        error instanceof Error
-          ? error.message
-          : "Failed to load Composio toolkit catalog.";
+        error instanceof Error && isComposioAuthFailure(error)
+          ? COMPOSIO_KEY_REJECTED
+          : "Check your network and the project API key in Composio, then try again.";
 
       return {
         catalog: [],
@@ -842,11 +882,25 @@ export class ComposioService {
 
     const callbackUrl = `${callbackBaseUrl.replace(/\/$/, "")}/v1/composio/oauth/callback?state=${encodeURIComponent(state)}`;
 
-    const link = await apiClient.linkToolkitAccount(
-      composioUserId(actingUserId),
-      toolkitSlug,
-      callbackUrl
-    );
+    const link = await apiClient
+      .linkToolkitAccount(
+        composioUserId(actingUserId),
+        toolkitSlug,
+        callbackUrl
+      )
+      .catch((error: Error) => {
+        if (isComposioDefaultAuthConfigMissing(error)) {
+          throw new MíngZhànApiError(
+            `Composio has no managed auth for ${orgToolkit.displayName}. An org admin must add a custom auth config for it in Composio.`,
+            422,
+            undefined,
+            undefined,
+            { code: COMPOSIO_CUSTOM_AUTH_REQUIRED }
+          );
+        }
+
+        throw error;
+      });
 
     const connection: StoredComposioUserConnectionRecord = {
       connectedAccountId:
@@ -870,9 +924,20 @@ export class ComposioService {
     return { redirectUrl: link.redirectUrl };
   }
 
-  async completeOAuth(
+  completeOAuth(
     state: string,
     options: { connectedAccountId?: string | null } = {}
+  ): Promise<{ orgId: string; returnTo?: string; toolkitSlug: string }> {
+    return withClaimedOAuthState(
+      `composio:${state}`,
+      () => new MíngZhànApiError("Invalid OAuth state.", 400),
+      () => this.completeClaimedOAuth(state, options)
+    );
+  }
+
+  private async completeClaimedOAuth(
+    state: string,
+    options: { connectedAccountId?: string | null }
   ): Promise<{ orgId: string; returnTo?: string; toolkitSlug: string }> {
     await this.requireAvailable();
 
@@ -1656,6 +1721,13 @@ function findMeetMessages(value: unknown): Record<string, unknown>[] {
   return found;
 }
 
+/** Google Drive and Docs file links; group 1 is the file id. */
+const DRIVE_FILE_LINK_PATTERNS = [
+  /drive\.google\.com\/file\/d\/([A-Za-z0-9_-]{10,})/g,
+  /drive\.google\.com\/(?:open|uc)\?[^\s"'<>]*?id=([A-Za-z0-9_-]{10,})/g,
+  /docs\.google\.com\/[A-Za-z]+\/d\/([A-Za-z0-9_-]{10,})/g,
+];
+
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Composio tool payloads are untyped JSON that this function inspects structurally.
 function extractMeetDriveIds(value: unknown): string[] {
   const ids = new Set<string>();
@@ -1680,7 +1752,9 @@ function extractMeetDriveIds(value: unknown): string[] {
           "base64"
         ).toString("utf8");
 
-        if (decoded.includes("drive.google.com")) {
+        if (
+          DRIVE_FILE_LINK_PATTERNS.some((pattern) => decoded.match(pattern))
+        ) {
           text = decoded;
         }
       }
@@ -1693,11 +1767,7 @@ function extractMeetDriveIds(value: unknown): string[] {
         /* Keep original text. */
       }
 
-      for (const pattern of [
-        /drive\.google\.com\/file\/d\/([A-Za-z0-9_-]{10,})/g,
-        /drive\.google\.com\/(?:open|uc)\?[^\s"'<>]*?id=([A-Za-z0-9_-]{10,})/g,
-        /docs\.google\.com\/[A-Za-z]+\/d\/([A-Za-z0-9_-]{10,})/g,
-      ]) {
+      for (const pattern of DRIVE_FILE_LINK_PATTERNS) {
         for (const match of text.matchAll(pattern)) {
           ids.add(match[1]!);
         }

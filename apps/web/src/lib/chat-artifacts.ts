@@ -1,6 +1,8 @@
 import { inferArtifactMimeType } from "@mingzhan/core/artifact-mime";
 import type { ChatListItem } from "@/lib/chat-history";
 
+export const FILE_PREVIEW_MAX_BYTES = 8 * 1024 * 1024;
+
 export {
   artifactCodeLanguage,
   inferArtifactMimeType,
@@ -394,6 +396,96 @@ function inferredMetaForPath(
   };
 }
 
+/** CLI document builders report their saved artifact as JSON on stdout. */
+/* oxlint-disable anti-slop/no-runtime-typeof -- Decode untrusted command output at this boundary. */
+function artifactsFromCommand(message: ChatListItem): ChatArtifactRef[] {
+  if (
+    message.role !== "tool" ||
+    message.tool !== "bash" ||
+    message.toolStatus === "running"
+  ) {
+    return [];
+  }
+
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- Command output is an external JSON boundary.
+  if (typeof message.toolResult !== "object" || message.toolResult === null) {
+    return [];
+  }
+
+  // SAFETY: The result object is checked above and each field is validated below.
+  const result = message.toolResult as {
+    exitCode?: number;
+    timedOut?: boolean;
+    error?: unknown;
+    stdout?: unknown;
+  };
+
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- Only bounded stdout from successful commands is decoded.
+  if (
+    result.exitCode !== 0 ||
+    result.timedOut ||
+    result.error ||
+    typeof result.stdout !== "string" ||
+    result.stdout.length > 1_048_576
+  ) {
+    return [];
+  }
+
+  const refs: ChatArtifactRef[] = [];
+
+  const candidates = [
+    result.stdout.trim(),
+    ...result.stdout.split("\n").filter((line) => line.trim().startsWith("{")),
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      // SAFETY: JSON is treated as untrusted; paths and byte counts are checked before use.
+      const record = JSON.parse(candidate) as {
+        path?: unknown;
+        bytes?: unknown;
+        bytesWritten?: unknown;
+        error?: unknown;
+      } | null;
+
+      // oxlint-disable-next-line anti-slop/no-runtime-typeof -- Validate the manifest before creating a preview/download reference.
+      if (!record || typeof record.path !== "string" || record.error) {
+        continue;
+      }
+
+      const relativePath = toArtifactsRelativePath(record.path);
+
+      if (
+        !relativePath ||
+        isArtifactMetaRelativePath(relativePath) ||
+        relativePath
+          .split("/")
+          .some((part) => !part || part === "." || part === "..") ||
+        relativePath.includes("\\")
+      ) {
+        continue;
+      }
+
+      const bytes = record.bytes ?? record.bytesWritten;
+
+      // oxlint-disable-next-line anti-slop/no-runtime-typeof -- The manifest's byte count is optional, but must be a valid size when supplied.
+      const size =
+        typeof bytes === "number" && Number.isSafeInteger(bytes) && bytes >= 0
+          ? bytes
+          : 0;
+
+      refs.push(
+        buildArtifactRef(relativePath, inferredMetaForPath(relativePath, size))
+      );
+    } catch {
+      // A command can log progress before emitting its JSON manifest.
+    }
+  }
+
+  return refs;
+}
+
+/* oxlint-enable anti-slop/no-runtime-typeof */
 /**
  * Extract `artifacts/...` and `profiles/<id>/artifacts/...` mentions from
  * assistant message text.
@@ -512,6 +604,14 @@ export function extractTurnArtifacts(
         inferredMetaForPath(contentWrite.relativePath, contentWrite.sizeBytes)
       )
     );
+  }
+
+  for (const message of messages) {
+    for (const artifact of artifactsFromCommand(message)) {
+      if (!artifactsByPath.has(artifact.path)) {
+        artifactsByPath.set(artifact.path, artifact);
+      }
+    }
   }
 
   for (const message of messages) {

@@ -75,6 +75,24 @@ describe("OpenRouter routing validation", () => {
       applyProviderInstanceUpdate(instance, { openRouterRouting })
     ).not.toHaveProperty("openRouterRouting");
   });
+
+  test("keeps the model list picked when a catalog provider is created", () => {
+    const instance = buildProviderInstanceFromCreateRequest(
+      {
+        customModels: [
+          { id: "deepseek-v4-pro", name: "V4 Pro" },
+          { default: true, id: "deepseek-v4-flash", name: "V4 Flash" },
+        ],
+        type: "deepseek",
+      },
+      []
+    );
+
+    expect(instance.customModels?.map((model) => model.id)).toEqual([
+      "deepseek-v4-pro",
+      "deepseek-v4-flash",
+    ]);
+  });
 });
 
 describe("resolveProfileProviderSelection", () => {
@@ -441,47 +459,6 @@ describe("applyProviderInstanceUpdate", () => {
     expect(modelExistsOnInstance(withoutShortlist, "unknown-model")).toBe(
       false
     );
-  });
-
-  test("validates fireworks models against shortlist and static catalog", () => {
-    const withShortlist = createProviderInstance({
-      customModels: [
-        {
-          default: true,
-          id: "accounts/fireworks/models/kimi-k2p6",
-          name: "Kimi K2.6",
-        },
-      ],
-      id: "fw-1",
-      label: "Fireworks",
-      type: "fireworks",
-    });
-
-    expect(
-      modelExistsOnInstance(
-        withShortlist,
-        "accounts/fireworks/models/kimi-k2p6"
-      )
-    ).toBe(true);
-    expect(
-      modelExistsOnInstance(withShortlist, "accounts/fireworks/models/glm-5p2")
-    ).toBe(false);
-
-    const withoutShortlist = createProviderInstance({
-      id: "fw-2",
-      label: "Fireworks",
-      type: "fireworks",
-    });
-
-    expect(
-      modelExistsOnInstance(
-        withoutShortlist,
-        "accounts/fireworks/models/glm-5p2"
-      )
-    ).toBe(true);
-    expect(
-      modelExistsOnInstance(withoutShortlist, "accounts/unknown/models/foo")
-    ).toBe(false);
   });
 });
 

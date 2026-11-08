@@ -107,6 +107,7 @@ const PROVIDER_TYPE_LABELS: Record<UserProviderName, string> = {
   chatgpt: "ChatGPT (Plus/Pro)",
   cheaper_inference: "Cheaper Inference",
   cloudflare: "Cloudflare Worker AI",
+  command_code: "Command Code",
   deepseek: "DeepSeek",
   doubao: "Doubao (Volcengine)",
   fireworks: "Fireworks",
@@ -623,7 +624,7 @@ export async function saveUserWebPublicUrl(
   const trimmed = webPublicUrl.trim();
 
   if (!(trimmed && isValidBaseUrl(trimmed))) {
-    throw new Error("webPublicUrl must be a valid http or https URL.");
+    throw new Error("Public web URL must be a valid http or https URL.");
   }
 
   const normalized = normalizeBaseUrl(trimmed);
@@ -732,6 +733,7 @@ export function parseIniWithSections(raw: string): ParsedIniFile {
   const global: Record<string, string> = {};
   const sections: Record<string, Record<string, string>> = {};
   let currentSection: string | null = null;
+  let skipSection = false;
 
   for (const line of raw.split(/\r?\n/)) {
     const trimmed = line.trim();
@@ -743,14 +745,23 @@ export function parseIniWithSections(raw: string): ParsedIniFile {
     const sectionMatch = trimmed.match(/^\[([^\]]+)\]$/);
 
     if (sectionMatch) {
-      currentSection = sectionMatch[1]!.trim();
-      sections[currentSection] ??= {};
+      const name = sectionMatch[1]!.trim();
+      // These names resolve to Object.prototype members, so writing keys
+      // under them would pollute every object in the process.
+      skipSection =
+        name === "__proto__" || name === "constructor" || name === "prototype";
+      currentSection = skipSection ? null : name;
+
+      if (currentSection) {
+        sections[currentSection] ??= {};
+      }
+
       continue;
     }
 
     const separator = trimmed.indexOf("=");
 
-    if (separator <= 0) {
+    if (skipSection || separator <= 0) {
       continue;
     }
 

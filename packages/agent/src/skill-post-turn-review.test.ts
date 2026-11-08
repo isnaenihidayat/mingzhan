@@ -54,7 +54,15 @@ describe("generateSkillConsolidateMarkdown", () => {
 });
 
 describe("parseSkillPostTurnReviewResponse", () => {
-  const catalogNames = new Set(["deploy-checklist"]);
+  const catalog = [
+    {
+      description: "Deploy steps",
+      name: "deploy-checklist",
+      skillMarkdown:
+        "---\nname: deploy-checklist\ndescription: Deploy steps\n---\n\nstep 1\n",
+    },
+    { description: "Release notes", name: "release-notes" },
+  ];
 
   test("accepts valid create", () => {
     const outcome = parseSkillPostTurnReviewResponse(
@@ -64,7 +72,7 @@ describe("parseSkillPostTurnReviewResponse", () => {
           "---\nname: triage-support\ndescription: Triage tickets\n---\n\nSteps",
         name: "triage-support",
       }),
-      { catalogNames }
+      { catalog }
     );
 
     expect(outcome).toEqual({
@@ -83,10 +91,68 @@ describe("parseSkillPostTurnReviewResponse", () => {
         newString: "step 1 updated",
         oldString: "step 1",
       }),
-      { catalogNames }
+      { catalog }
     );
 
     expect(outcome.action).toBe("patch");
+  });
+
+  test("refuses a patch to a skill the turn did not load", () => {
+    expect(
+      parseSkillPostTurnReviewResponse(
+        JSON.stringify({
+          action: "patch",
+          name: "release-notes",
+          newString: "b",
+          oldString: "a",
+        }),
+        { catalog }
+      )
+    ).toEqual({ action: "noop", reason: "patch_skill_not_loaded" });
+  });
+
+  test("refuses a patch whose oldString is past the SKILL.md cut", () => {
+    expect(
+      parseSkillPostTurnReviewResponse(
+        JSON.stringify({
+          action: "patch",
+          name: "deploy-checklist",
+          newString: "b",
+          oldString: "hidden-tail-marker",
+        }),
+        {
+          catalog: [
+            {
+              description: "Deploy steps",
+              name: "deploy-checklist",
+              skillMarkdown: `${"x".repeat(6000)}hidden-tail-marker`,
+            },
+          ],
+        }
+      )
+    ).toEqual({ action: "noop", reason: "patch_old_string_not_shown" });
+  });
+
+  test("refuses a patch whose oldString repeats past the cut", () => {
+    expect(
+      parseSkillPostTurnReviewResponse(
+        JSON.stringify({
+          action: "patch",
+          name: "deploy-checklist",
+          newString: "b",
+          oldString: "## Steps",
+        }),
+        {
+          catalog: [
+            {
+              description: "Deploy steps",
+              name: "deploy-checklist",
+              skillMarkdown: `## Steps${"x".repeat(6000)}## Steps`,
+            },
+          ],
+        }
+      )
+    ).toEqual({ action: "noop", reason: "patch_old_string_not_unique" });
   });
 
   test("rejects delete", () => {
@@ -94,7 +160,7 @@ describe("parseSkillPostTurnReviewResponse", () => {
       parseSkillPostTurnReviewResponse(
         JSON.stringify({ action: "delete", name: "x" }),
         {
-          catalogNames,
+          catalog,
         }
       )
     ).toEqual({ action: "noop", reason: "delete_forbidden" });
@@ -108,15 +174,13 @@ describe("parseSkillPostTurnReviewResponse", () => {
           content: "---\nname: manage-skills\ndescription: x\n---\n",
           name: "manage-skills",
         }),
-        { catalogNames }
+        { catalog }
       )
     ).toEqual({ action: "noop", reason: "bundled_forbidden" });
   });
 
   test("rejects malformed json", () => {
-    expect(
-      parseSkillPostTurnReviewResponse("not json", { catalogNames })
-    ).toEqual({
+    expect(parseSkillPostTurnReviewResponse("not json", { catalog })).toEqual({
       action: "noop",
       reason: "malformed_json",
     });
@@ -141,5 +205,37 @@ describe("buildSkillPostTurnReviewPrompt", () => {
     expect(prompt).toContain("deploy-checklist");
     expect(prompt).toContain("bash");
     expect(prompt).toContain("deploy staging");
+  });
+
+  test("includes the full SKILL.md of loaded skills past the turn budget", () => {
+    const tail = "tail-step-marker";
+
+    const prompt = buildSkillPostTurnReviewPrompt({
+      catalog: [
+        {
+          description: "Deploy steps",
+          name: "deploy-checklist",
+          skillMarkdown: `---\nname: deploy-checklist\ndescription: Deploy steps\n---\n\n${"x".repeat(4500)}\n${tail}\n`,
+        },
+      ],
+      turnMessages: [{ content: "deploy staging", role: "user" }],
+    });
+
+    expect(prompt).toContain(tail);
+  });
+
+  test("cuts a SKILL.md at the limit", () => {
+    const prompt = buildSkillPostTurnReviewPrompt({
+      catalog: [
+        {
+          description: "Deploy steps",
+          name: "deploy-checklist",
+          skillMarkdown: `${"x".repeat(6000)}hidden-tail-marker`,
+        },
+      ],
+      turnMessages: [{ content: "deploy staging", role: "user" }],
+    });
+
+    expect(prompt).not.toContain("hidden-tail-marker");
   });
 });

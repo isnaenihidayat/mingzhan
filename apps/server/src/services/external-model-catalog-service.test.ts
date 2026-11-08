@@ -13,7 +13,7 @@ afterEach(() => {
 
 describe("isExternalModelCatalogId", () => {
   test("accepts supported catalog ids", () => {
-    expect(isExternalModelCatalogId("models-dev")).toBe(true);
+    expect(isExternalModelCatalogId("models-dev")).toBe(false);
     expect(isExternalModelCatalogId("openrouter")).toBe(true);
     expect(isExternalModelCatalogId("cerebras")).toBe(true);
   });
@@ -27,13 +27,13 @@ describe("getExternalModelCatalog", () => {
   test("fetches and returns catalog payload", async () => {
     globalThis.fetch = asTestFetch(
       async () =>
-        new Response(JSON.stringify({ openai: { models: {} } }), {
+        new Response(JSON.stringify({ data: [] }), {
           status: 200,
         })
     );
 
-    await expect(getExternalModelCatalog("models-dev")).resolves.toEqual({
-      openai: { models: {} },
+    await expect(getExternalModelCatalog("cerebras")).resolves.toEqual({
+      data: [],
     });
   });
 
@@ -45,5 +45,16 @@ describe("getExternalModelCatalog", () => {
     await expect(getExternalModelCatalog("openrouter")).rejects.toThrow(
       "Failed to fetch model catalog (502)"
     );
+  });
+});
+
+describe("isExternalModelCatalogId", () => {
+  test("accepts known catalogs and rejects object built-ins", () => {
+    expect(isExternalModelCatalogId("openrouter")).toBe(true);
+    expect(isExternalModelCatalogId("cerebras")).toBe(true);
+
+    for (const id of ["models-dev", "constructor", "toString", "__proto__"]) {
+      expect(isExternalModelCatalogId(id)).toBe(false);
+    }
   });
 });

@@ -51,7 +51,8 @@ export class MíngZhànClientCore {
   protected async request<T>(
     path: string,
     init?: RequestInit,
-    retried = false
+    retried = false,
+    fetchImpl: MíngZhànClientOptions["fetch"] = this.fetchImpl
   ): Promise<T> {
     const method = (init?.method ?? "GET").toUpperCase();
 
@@ -59,7 +60,7 @@ export class MíngZhànClientCore {
       hasBody: init?.body != null,
     });
 
-    const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
+    const response = await fetchImpl(`${this.baseUrl}${path}`, {
       ...init,
       credentials: this.credentials,
       headers,
@@ -77,7 +78,7 @@ export class MíngZhànClientCore {
           if (freshToken && freshToken !== this.authToken) {
             this.authToken = freshToken;
 
-            return this.request(path, init, true);
+            return this.request(path, init, true, fetchImpl);
           }
         }
 

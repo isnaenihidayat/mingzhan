@@ -1,17 +1,27 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import type { TransferProgress } from "@mingzhan/client";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { client } from "@/lib/client";
 import { invalidateQueries } from "@/lib/query-client";
 import { queryKeys } from "@/lib/query-keys";
 
-export function useExportData() {
-  return useMutation({
-    mutationFn: () => client.exportData(),
+/** Read once when Settings opens; a scheduled backup runs at most once a day. */
+export function useBackupStatusQuery() {
+  return useQuery({
+    queryFn: () => client.getBackupStatus(),
+    queryKey: queryKeys.backupStatus,
+    staleTime: Number.POSITIVE_INFINITY,
   });
 }
 
 export function usePreviewDataImport() {
   return useMutation({
-    mutationFn: (file: File) => client.previewDataImport(file),
+    mutationFn: ({
+      file,
+      onProgress,
+    }: {
+      file: File;
+      onProgress?: TransferProgress;
+    }) => client.previewDataImport(file, { onProgress }),
   });
 }
 
@@ -19,8 +29,15 @@ export function useRestoreDataImport() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: ({ file, confirm }: { file: File; confirm: boolean }) =>
-      client.restoreDataImport(file, { confirm }),
+    mutationFn: ({
+      file,
+      confirm,
+      onProgress,
+    }: {
+      file: File;
+      confirm: boolean;
+      onProgress?: TransferProgress;
+    }) => client.restoreDataImport(file, { confirm, onProgress }),
     onSuccess: async () => {
       await invalidateQueries(queryClient, queryKeys.health);
       await queryClient.invalidateQueries();

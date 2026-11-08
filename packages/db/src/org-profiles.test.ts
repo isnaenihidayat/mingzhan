@@ -7,6 +7,7 @@ import {
 import { createInMemoryDatabaseAdapter } from "./index";
 import {
   ensureBundledSkillsAssigned,
+  ensureGenerateImageToolDefinition,
   ensureOrgSuperMingzhanProfiles,
   seedOrgDefaultProfile,
   seedOrgSuperMingzhanProfile,
@@ -261,21 +262,6 @@ describe("seedOrgSuperMingzhanProfile", () => {
     expect(skillNames).toContain("archive-profile-memory");
     expect(skillNames).toContain("artifact-design");
   });
-
-  test("backfills super mingzhan bundled skills on existing super mingzhan", async () => {
-    const db = createInMemoryDatabaseAdapter();
-
-    const profile = await seedOrgSuperMingzhanProfile(db, "org_a");
-    await upsertSkill(db, "create-profile");
-
-    await seedOrgSuperMingzhanProfile(db, "org_a");
-
-    const skillNames = (await db.listSkillsForProfile(profile.id)).map(
-      (skill) => skill.name
-    );
-
-    expect(skillNames).toContain("create-profile");
-  });
 });
 
 describe("seedOrgSuperMingzhanProfile with bash turned off", () => {
@@ -425,50 +411,18 @@ test("shared listing is seeded and assigned to fresh profiles, without restoring
   }
 });
 
-describe("profile ACP agent", () => {
-  test("keeps the ACP agent command across a save and read", async () => {
+describe("generate_image on by default", () => {
+  const toolIdsOf = async (
+    db: ReturnType<typeof createInMemoryDatabaseAdapter>,
+    profileId: string
+  ) => (await db.listToolsForProfile(profileId)).map((tool) => tool.id);
+
+  test("a new default profile gets generate_image", async () => {
     const db = createInMemoryDatabaseAdapter();
-    const now = new Date().toISOString();
+    await ensureGenerateImageToolDefinition(db);
+    const profile = await seedOrgDefaultProfile(db, "org_a");
 
-    await db.upsertProfile({
-      acpAgent: {
-        args: ["-y", "@agentclientprotocol/claude-agent-acp@0.88.0"],
-        command: "npx",
-      },
-      createdAt: now,
-      id: "profile_acp",
-      isSuper: false,
-      model: null,
-      name: "ACP",
-      orgId: "org_a",
-      systemPrompt: "",
-      updatedAt: now,
-    });
-
-    const saved = await db.getProfileForOrg("profile_acp", "org_a");
-    expect(saved?.acpAgent).toEqual({
-      args: ["-y", "@agentclientprotocol/claude-agent-acp@0.88.0"],
-      command: "npx",
-    });
-  });
-
-  test("reads a profile without an ACP agent as null", async () => {
-    const db = createInMemoryDatabaseAdapter();
-    const now = new Date().toISOString();
-
-    await db.upsertProfile({
-      createdAt: now,
-      id: "profile_plain",
-      isSuper: false,
-      model: null,
-      name: "Plain",
-      orgId: "org_a",
-      systemPrompt: "",
-      updatedAt: now,
-    });
-
-    const saved = await db.getProfileForOrg("profile_plain", "org_a");
-    expect(saved?.acpAgent).toBeNull();
+    expect(await toolIdsOf(db, profile.id)).toContain(GENERATE_IMAGE_TOOL_ID);
   });
 });
 

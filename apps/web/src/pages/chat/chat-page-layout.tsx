@@ -126,7 +126,7 @@ function rippleWave(
   return wave;
 }
 
-function ChatDitherBackground() {
+export function ChatDitherBackground() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -308,7 +308,7 @@ export function ChatPageColumn({
           : "flex-1 px-3 sm:px-6",
         // No room for two columns on a phone, so an open panel takes over.
         attachmentPanel.isOpen &&
-          "max-sm:pointer-events-none max-sm:w-0 max-sm:flex-none max-sm:overflow-hidden max-sm:px-0 max-sm:opacity-0",
+          "max-md:pointer-events-none max-md:w-0 max-md:flex-none max-md:overflow-hidden max-md:px-0 max-md:opacity-0",
         centered && "justify-center"
       )}
     >
@@ -522,7 +522,7 @@ export function ChatQuickStarters({
   };
 
   return (
-    <div className="w-full rounded-2xl border border-border/80 bg-card/70 p-3 shadow-xs backdrop-blur-md transition-all duration-200">
+    <div className="w-full rounded-2xl border border-border/80 bg-card/70 p-3 shadow-xs backdrop-blur-md">
       {/* Category Tab Pills */}
       <div className="scrollbar-none flex items-center gap-1.5 overflow-x-auto pb-2">
         {SUGGESTION_CATEGORIES.map((category) => {
@@ -532,7 +532,7 @@ export function ChatQuickStarters({
           return (
             <button
               className={cn(
-                "flex shrink-0 items-center gap-1.5 rounded-full px-3 py-1 font-medium text-xs transition-all duration-150",
+                "flex shrink-0 items-center gap-1.5 rounded-full px-3 py-1 font-medium text-xs transition-colors duration-150",
                 isActive
                   ? "border border-border bg-background text-foreground shadow-2xs"
                   : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
@@ -550,13 +550,13 @@ export function ChatQuickStarters({
 
       {/* Suggestion Rows List */}
       <div className="mt-1 flex flex-col gap-1">
-        {currentCategory.items.map((item, idx) => {
+        {currentCategory.items.map((item) => {
           const ItemIcon = item.icon;
 
           return (
             <button
-              className="group flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2.5 text-left transition-all duration-150 hover:bg-muted/60 dark:hover:bg-muted/40"
-              key={idx}
+              className="group flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2.5 text-left transition-colors duration-150 hover:bg-muted/60 dark:hover:bg-muted/40"
+              key={item.prompt}
               onClick={() => handleClick(item.prompt)}
               type="button"
             >
@@ -566,7 +566,7 @@ export function ChatQuickStarters({
                   {item.text}
                 </span>
               </div>
-              <ArrowRight01Icon className="size-4 shrink-0 -translate-x-1 text-muted-foreground opacity-0 transition-all duration-150 group-hover:translate-x-0 group-hover:text-foreground group-hover:opacity-100" />
+              <ArrowRight01Icon className="size-4 shrink-0 -translate-x-1 text-muted-foreground opacity-0 transition-[translate,color,opacity] duration-150 group-hover:translate-x-0 group-hover:text-foreground group-hover:opacity-100" />
             </button>
           );
         })}

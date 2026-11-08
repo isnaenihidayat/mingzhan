@@ -3,10 +3,26 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getUserConfigDir, saveUserConfig } from "@mingzhan/core";
+import {
+  getUserConfigDir,
+  MíngZhànApiError,
+  saveUserConfig,
+} from "@mingzhan/core";
 import { MíngZhànAuthExpiredError, MíngZhànClient } from "./index";
 
 const organizationRequests = [
+  {
+    body: null,
+    call: (client: MíngZhànClient) =>
+      client.forOrg("team/a?").regenerateTeamsHandshake("agent/a?"),
+    method: "POST",
+    path: "/v1/settings/teams/handshake?profileId=agent%2Fa%3F",
+    response: {
+      configured: true,
+      handshakeCode: "A".repeat(32),
+      pairedUserIds: [],
+    },
+  },
   {
     body: null,
     call: (client: MíngZhànClient) => client.getTool("tool/a?", "team/a?"),
@@ -541,6 +557,25 @@ test("plugin access requests retain their explicit organization", async () => {
   ]);
 });
 
+test("an API error keeps the server's error code", async () => {
+  const client = new MíngZhànClient({
+    baseUrl: "http://localhost:4310",
+    fetch: async () =>
+      Response.json(
+        { code: "COMPOSIO_CUSTOM_AUTH_REQUIRED", error: "No managed auth." },
+        { status: 422 }
+      ),
+  });
+
+  const connect = client.connectComposioToolkit("googleforms");
+
+  await expect(connect).rejects.toBeInstanceOf(MíngZhànApiError);
+  await expect(connect).rejects.toMatchObject({
+    code: "COMPOSIO_CUSTOM_AUTH_REQUIRED",
+    status: 422,
+  });
+});
+
 test("official plugin reinstall sends revision and explicit organization", async () => {
   let request!: Request;
 
@@ -790,7 +825,7 @@ test("non-browser clients send local auth as a bearer token", async () => {
   expect(headers.get("Content-Type")).toBeNull();
 });
 
-test("data export downloads zip bytes with filename metadata", async () => {
+test("data export returns the raw ZIP stream with filename metadata", async () => {
   const fetchCalls: Array<{ input: RequestInfo | URL; init?: RequestInit }> =
     [];
 
@@ -810,7 +845,7 @@ test("data export downloads zip bytes with filename metadata", async () => {
     },
   });
 
-  const result = await client.exportData();
+  const response = await client.exportDataResponse();
 
   expect(fetchCalls[0]!.input.toString()).toBe(
     "http://localhost:4310/v1/platform/data/export"
@@ -818,8 +853,12 @@ test("data export downloads zip bytes with filename metadata", async () => {
   const headers = new Headers(fetchCalls[0]!.init?.headers);
   expect(headers.get("Authorization")).toBe("Bearer local-auth-token");
   expect(headers.get("Content-Type")).toBeNull();
-  expect(result.filename).toBe("mingzhan-export-test.zip");
-  expect(Array.from(new Uint8Array(result.data))).toEqual([1, 2, 3]);
+  expect(response.headers.get("Content-Disposition")).toBe(
+    'attachment; filename="mingzhan-export-test.zip"'
+  );
+  expect(Array.from(new Uint8Array(await response.arrayBuffer()))).toEqual([
+    1, 2, 3,
+  ]);
 });
 
 test("user data export scopes the download path to the requested user", async () => {
@@ -979,7 +1018,7 @@ test("hasProfileArtifact reads a 404 as deleted and rethrows other failures", as
   expect(methods).toEqual(["HEAD", "HEAD", "HEAD"]);
 });
 
-test("data import helpers upload base64 archive data", async () => {
+test("data import helpers upload bytes as a raw ZIP and strings as JSON", async () => {
   const fetchCalls: Array<{ input: RequestInfo | URL; init?: RequestInit }> =
     [];
 
@@ -1016,16 +1055,76 @@ test("data import helpers upload base64 archive data", async () => {
     client.restoreDataImport(new Uint8Array([4, 5, 6]), { confirm: true })
   ).resolves.toMatchObject({ restoredFileCount: 1 });
 
-  expect(JSON.parse(String(fetchCalls[0]!.init?.body))).toEqual({
-    data: "AQID",
-  });
-  expect(JSON.parse(String(fetchCalls[1]!.init?.body))).toEqual({
+  await client.restoreDataImport("BAUG", { confirm: true });
+
+  expect(new Headers(fetchCalls[0]!.init?.headers).get("Content-Type")).toBe(
+    "application/zip"
+  );
+  expect(fetchCalls[0]!.init?.body).toEqual(new Uint8Array([1, 2, 3]));
+  expect(fetchCalls[1]!.input.toString()).toEndWith(
+    "/v1/platform/data/import/restore?confirm=true"
+  );
+  expect(fetchCalls[1]!.init?.body).toEqual(new Uint8Array([4, 5, 6]));
+  expect(fetchCalls[2]!.input.toString()).toEndWith(
+    "/v1/platform/data/import/restore"
+  );
+  expect(JSON.parse(String(fetchCalls[2]!.init?.body))).toEqual({
     confirm: true,
     data: "BAUG",
   });
   expect(new Headers(fetchCalls[1]!.init?.headers).get("Authorization")).toBe(
     "Bearer local-auth-token"
   );
+});
+
+test("an upload with onProgress goes through XHR and keeps the API error", async () => {
+  const sent: Uint8Array[] = [];
+  const opened: string[] = [];
+
+  class FakeXhr {
+    onerror = () => {};
+    onload = () => {};
+    responseText = JSON.stringify({ error: "Too big." });
+    status = 413;
+    upload = {
+      onprogress: (_event: {
+        lengthComputable: boolean;
+        loaded: number;
+        total: number;
+      }) => {},
+    };
+    withCredentials = false;
+    getAllResponseHeaders = () => "content-type: application/json\r\n";
+    open = (method: string, url: string) => opened.push(`${method} ${url}`);
+    setRequestHeader = () => {};
+    send = (body: Uint8Array) => {
+      sent.push(body);
+      this.upload.onprogress({ lengthComputable: true, loaded: 3, total: 3 });
+      this.onload();
+    };
+  }
+
+  const original = globalThis.XMLHttpRequest;
+  Object.assign(globalThis, { XMLHttpRequest: FakeXhr });
+
+  try {
+    const seen: Array<[number, number]> = [];
+    const client = new MíngZhànClient({ baseUrl: "http://localhost:4310" });
+
+    await expect(
+      client.restoreDataImport(new Uint8Array([1, 2, 3]), {
+        confirm: true,
+        onProgress: (loaded, total) => seen.push([loaded, total]),
+      })
+    ).rejects.toMatchObject({ status: 413 });
+    expect(opened).toEqual([
+      "POST http://localhost:4310/v1/platform/data/import/restore?confirm=true",
+    ]);
+    expect(sent).toEqual([new Uint8Array([1, 2, 3])]);
+    expect(seen).toEqual([[3, 3]]);
+  } finally {
+    globalThis.XMLHttpRequest = original;
+  }
 });
 
 test("non-browser clients reload the local auth token once after a 401", async () => {
@@ -1328,6 +1427,35 @@ test("artifact download budget stops declared and chunked oversize bodies", asyn
       ).data
     )
   ).toBe("1234");
+});
+
+test("attachment previews keep org scope and bound bytes", async () => {
+  const requests: Request[] = [];
+
+  const client = new MíngZhànClient({
+    fetch: async (input, init) => {
+      requests.push(new Request(input, init));
+
+      return new Response("1234", {
+        headers: { "Content-Type": "text/markdown" },
+      });
+    },
+  }).forOrg("org-preview");
+
+  const blob = await client.readAttachmentContent("a/b", {
+    maxBytes: 4,
+    render: "markdown",
+  });
+
+  expect(await blob.text()).toBe("1234");
+  expect(blob.type).toBe("text/markdown");
+  expect(requests[0].headers.get("X-Org-Id")).toBe("org-preview");
+  expect(new URL(requests[0].url).searchParams.get("preview")).toBe("1");
+  expect(new URL(requests[0].url).searchParams.get("render")).toBe("markdown");
+  await expect(
+    client.readAttachmentContent("id", { maxBytes: 3 })
+  ).rejects.toThrow();
+  expect(await (await client.readAttachmentContent("id")).text()).toBe("1234");
 });
 
 test("artifact download cancellation aborts a pending body read and forwards the signal", async () => {

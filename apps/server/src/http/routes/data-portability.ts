@@ -1,23 +1,128 @@
 import { createRoute, z } from "@hono/zod-openapi";
-import type {
-  DataImportPreviewResponse,
-  PreviewDataImportRequest,
-  RestoreDataImportRequest,
-  RestoreDataImportResponse,
+import {
+  type BackupStatusResponse,
+  type DataImportPreviewResponse,
+  MíngZhànApiError,
+  type PreviewDataImportRequest,
+  type RestoreDataImportRequest,
+  type RestoreDataImportResponse,
 } from "@mingzhan/core";
 import {
-  createMíngZhànDataExport,
+  type CreateDataExportFileResult,
+  createMíngZhànDataExportFile,
   createMíngZhànOrgDataExport,
   createMíngZhànUserDataExport,
   decodeArchiveRequestData,
-  previewMíngZhànDataImport,
-  restoreMíngZhànDataImport,
+  getDataImportLimits,
+  type ImportLimits,
+  openImportArchive,
+  previewMíngZhànDataImportFile,
+  restoreMíngZhànDataImportFile,
+  spoolImportArchive,
+  writeTempImportArchive,
 } from "../../services/data-portability";
 import { runWithPluginExportBarrier } from "../../services/plugin-service";
+import { readBackupError } from "../../services/scheduled-backup";
 import type { ServerOptions } from "../context";
 import { requirePlatformAdminFromContext } from "../org-guards";
-import { errorResponse, json, readJson } from "../shared";
+import {
+  errorResponse,
+  isArchiveRequest,
+  json,
+  MAX_HTTP_REQUEST_BODY_LIMIT_BYTES,
+  readJson,
+  readUntilClientGone,
+} from "../shared";
 import type { HonoApp } from "../types";
+
+/** A raw ZIP body, the form browsers send. */
+export const importArchiveBodySchema = z.string().openapi({ format: "binary" });
+
+/** Only read for an application/zip body; JSON carries `confirm` itself. */
+export const importConfirmQuerySchema = z.object({
+  confirm: z.enum(["true"]).optional(),
+});
+
+export interface ImportRequestArchive {
+  cleanup: () => Promise<void>;
+  confirm: boolean;
+  path: string;
+}
+
+/**
+ * Reads an import body as a raw ZIP or as the JSON `{ data, confirm }` form.
+ * Browsers send the raw ZIP because base64-encoding a large file in a tab takes
+ * minutes. A raw body carries `confirm` in the query string.
+ */
+export async function readImportRequest(
+  request: Request,
+  readJsonBody: () => Promise<{ confirm?: boolean; data: string }>,
+  limits: ImportLimits,
+  tooLargeMessage?: string
+): Promise<ImportRequestArchive> {
+  const archiveRequest = isArchiveRequest(request);
+  const declaredLength = Number(request.headers.get("content-length") ?? "");
+
+  // Base64 carries 3 bytes per 4 characters, plus room for JSON wrapping.
+  const jsonBodyLimit = Math.ceil(limits.archiveBytes / 3) * 4 + 64 * 1024;
+
+  const bodyLimit = archiveRequest
+    ? limits.archiveBytes
+    : Math.min(jsonBodyLimit, MAX_HTTP_REQUEST_BODY_LIMIT_BYTES);
+
+  if (Number.isFinite(declaredLength) && declaredLength > bodyLimit) {
+    throw new MíngZhànApiError(
+      tooLargeMessage ??
+        `Import archive must be at most ${Math.floor(
+          limits.archiveBytes / (1024 * 1024)
+        )} MB.`,
+      413
+    );
+  }
+
+  if (!archiveRequest) {
+    const body = await readJsonBody();
+
+    const temp = await writeTempImportArchive(
+      decodeArchiveRequestData(body.data, tooLargeMessage)
+    );
+
+    return {
+      cleanup: temp.cleanup,
+      confirm: body.confirm === true,
+      path: temp.path,
+    };
+  }
+
+  if (!request.body) {
+    throw new MíngZhànApiError("Import archive data is required.", 400);
+  }
+
+  const spooled = await readUntilClientGone(
+    request,
+    spoolImportArchive(request.body, {
+      limits,
+      signal: request.signal,
+      tooLargeMessage,
+    })
+  );
+
+  try {
+    const opened = await openImportArchive(spooled.path);
+
+    return {
+      cleanup: async () => {
+        await opened.cleanup();
+        await spooled.cleanup();
+      },
+      confirm: new URL(request.url).searchParams.get("confirm") === "true",
+      path: opened.path,
+    };
+  } catch (error) {
+    await spooled.cleanup();
+    throw error;
+  }
+}
 
 export function registerDataPortabilityRoutes(
   app: HonoApp,
@@ -160,12 +265,45 @@ export function registerDataPortabilityRoutes(
 
   app.openAPIRegistry.registerPath(
     createRoute({
+      method: "get",
+      operationId: "getPlatformBackupStatus",
+      path: "/v1/platform/data/backup-status",
+      responses: {
+        200: {
+          content: {
+            "application/json": {
+              schema: z
+                .object({
+                  lastError: z
+                    .object({ at: z.string(), message: z.string() })
+                    .nullable(),
+                })
+                .openapi("BackupStatusResponse"),
+            },
+          },
+          description: "The last scheduled backup's 409, or null",
+        },
+        403: {
+          content: { "application/json": { schema: errorSchema } },
+          description: "Error",
+        },
+      },
+      summary: "Get the scheduled backup status",
+      tags: ["Platform"],
+    })
+  );
+
+  app.openAPIRegistry.registerPath(
+    createRoute({
       method: "post",
       operationId: "previewPlatformDataImport",
       path: "/v1/platform/data/import/preview",
       request: {
         body: {
-          content: { "application/json": { schema: importRequestSchema } },
+          content: {
+            "application/json": { schema: importRequestSchema },
+            "application/zip": { schema: importArchiveBodySchema },
+          },
           required: true,
         },
       },
@@ -203,9 +341,13 @@ export function registerDataPortabilityRoutes(
       path: "/v1/platform/data/import/restore",
       request: {
         body: {
-          content: { "application/json": { schema: restoreRequestSchema } },
+          content: {
+            "application/json": { schema: restoreRequestSchema },
+            "application/zip": { schema: importArchiveBodySchema },
+          },
           required: true,
         },
+        query: importConfirmQuerySchema,
       },
       responses: {
         200: {
@@ -267,93 +409,162 @@ export function registerDataPortabilityRoutes(
 
     const result = options.googleMeetService
       ? await options.googleMeetService.withSnapshot(() =>
-          createMíngZhànDataExport()
+          createMíngZhànDataExportFile()
         )
-      : await createMíngZhànDataExport();
+      : await createMíngZhànDataExportFile();
 
-    return new Response(new Uint8Array(result.data), {
-      headers: {
-        "Content-Disposition": `attachment; filename="${result.filename}"`,
-        "Content-Type": "application/zip",
-      },
+    return serveExportFile(result);
+  });
+
+  app.get("/v1/platform/data/backup-status", async (c) => {
+    requirePlatformAdminFromContext(c);
+    const dir = process.env.MINGZHAN_BACKUP_DIR?.trim();
+
+    return json<BackupStatusResponse>({
+      lastError: dir ? await readBackupError(dir) : null,
     });
   });
 
   app.post("/v1/platform/data/import/preview", async (c) => {
     requirePlatformAdminFromContext(c);
 
-    const body = await readJson<PreviewDataImportRequest>(
+    // Read outside the catch so an oversized archive keeps its 413.
+    const archive = await readImportRequest(
       c.req.raw,
-      importRequestSchema
+      () =>
+        readJson<PreviewDataImportRequest>(
+          c.req.raw,
+          importRequestSchema,
+          MAX_HTTP_REQUEST_BODY_LIMIT_BYTES
+        ),
+      getDataImportLimits()
     );
 
-    // Decoded outside the catch so an oversized archive keeps its 413.
-    const archive = decodeArchiveRequestData(body.data);
-
     try {
-      const preview = await previewMíngZhànDataImport(archive);
+      const preview = await previewMíngZhànDataImportFile(archive.path);
 
       return json<DataImportPreviewResponse>(preview);
     } catch (error) {
       return errorResponse(formatImportError(error), 400);
+    } finally {
+      await archive.cleanup();
     }
   });
 
   app.post("/v1/platform/data/import/restore", async (c) => {
     requirePlatformAdminFromContext(c);
 
-    const body = await readJson<RestoreDataImportRequest>(
+    const archive = await readImportRequest(
       c.req.raw,
-      restoreRequestSchema
+      () =>
+        readJson<RestoreDataImportRequest>(
+          c.req.raw,
+          restoreRequestSchema,
+          MAX_HTTP_REQUEST_BODY_LIMIT_BYTES
+        ),
+      getDataImportLimits()
     );
 
-    const archive = decodeArchiveRequestData(body.data);
-
-    let restore;
-
     try {
-      const restoreOperation = () =>
-        runWithPluginExportBarrier(async () => {
-          const { onBeforeDataRestore } = options;
-          let databaseReleased = false;
+      let restore;
 
-          const result = await restoreMíngZhànDataImport(archive, {
-            afterFailedReplace: options.onDataRestored,
-            beforeReplace: onBeforeDataRestore
-              ? async () => {
-                  databaseReleased = true;
-                  await onBeforeDataRestore();
-                }
-              : undefined,
-            confirm: body.confirm,
-          });
+      try {
+        const restoreOperation = () =>
+          runWithPluginExportBarrier(async () => {
+            const { onBeforeDataRestore } = options;
+            let databaseReleased = false;
 
-          // Drop registrations before reloading restored data; restored plugins stay disabled.
-          try {
-            await options.workerManager.clearPluginWorkers?.();
-          } catch (error) {
-            // The restore committed with the database released; reopen it before failing.
-            if (databaseReleased) {
-              await options.onDataRestored?.().catch(() => undefined);
+            const result = await restoreMíngZhànDataImportFile(archive.path, {
+              afterFailedReplace: options.onDataRestored,
+              beforeReplace: onBeforeDataRestore
+                ? async () => {
+                    databaseReleased = true;
+                    await onBeforeDataRestore();
+                  }
+                : undefined,
+              confirm: archive.confirm,
+            });
+
+            // Drop registrations before reloading restored data; restored plugins stay disabled.
+            try {
+              await options.workerManager.clearPluginWorkers?.();
+            } catch (error) {
+              // The restore committed with the database released; reopen it before failing.
+              if (databaseReleased) {
+                await options.onDataRestored?.().catch(() => undefined);
+              }
+
+              throw error;
             }
 
-            throw error;
-          }
+            await options.onDataRestored?.();
 
-          await options.onDataRestored?.();
+            return result;
+          });
 
-          return result;
-        });
+        restore = options.googleMeetService
+          ? await options.googleMeetService.withSnapshot(restoreOperation)
+          : await restoreOperation();
+      } catch (error) {
+        return errorResponse(formatImportError(error), 400);
+      }
 
-      restore = options.googleMeetService
-        ? await options.googleMeetService.withSnapshot(restoreOperation)
-        : await restoreOperation();
-    } catch (error) {
-      return errorResponse(formatImportError(error), 400);
+      return json<RestoreDataImportResponse>(restore);
+    } finally {
+      await archive.cleanup();
+    }
+  });
+}
+
+function serveExportFile(result: CreateDataExportFileResult): Response {
+  const file = Bun.file(result.path);
+  const reader = file.stream().getReader();
+  let cleaned = false;
+
+  const cleanup = async () => {
+    if (cleaned) {
+      return;
     }
 
-    return json<RestoreDataImportResponse>(restore);
-  });
+    cleaned = true;
+    await result.cleanup();
+  };
+
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        try {
+          const { done, value } = await reader.read();
+
+          if (done) {
+            controller.close();
+            await cleanup();
+
+            return;
+          }
+
+          controller.enqueue(value);
+        } catch (error) {
+          await cleanup();
+          controller.error(error);
+        }
+      },
+      async cancel() {
+        try {
+          await reader.cancel();
+        } finally {
+          await cleanup();
+        }
+      },
+    }),
+    {
+      headers: {
+        "Content-Disposition": `attachment; filename="${result.filename}"`,
+        "Content-Length": String(file.size),
+        "Content-Type": "application/zip",
+      },
+    }
+  );
 }
 
 function formatImportError<T>(error: T): string {

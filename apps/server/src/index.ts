@@ -50,8 +50,10 @@ import {
   loadConfig,
   MINGZHAN_API_VERSION,
   setManagedSecretResolver,
+  setManagedSecretWriter,
   writeRuntimeServerUrl,
 } from "@mingzhan/core";
+import { migrateChannelBotTokens } from "@mingzhan/core/channel-config-shared";
 import {
   createDatabase,
   type Database,
@@ -77,7 +79,9 @@ import { claimLegacyCustomTools } from "./services/custom-tool-handlers";
 import { setToolSecrets } from "./services/custom-tool-shared";
 
 import {
-  createMíngZhànDataExport,
+  cleanupDataPortabilityTempDirs,
+  createMíngZhànDataExportFile,
+  getDataImportLimits,
   retireAppUserData,
 } from "./services/data-portability";
 import { openaiProviderKey } from "./services/google-meet/actions";
@@ -89,6 +93,7 @@ import {
   createMcpAwareEmailOutboundAdapter,
   hasAutomationEmailDeliveryPath,
 } from "./services/mcp-email-delivery";
+import { installMcpSecretStore } from "./services/mcp-secret-store";
 import { McpService } from "./services/mcp-service";
 import { cleanupInterruptedMeetImports } from "./services/meet-recording-import";
 import { OrgMemoryService } from "./services/org-memory-service";
@@ -162,6 +167,12 @@ await seedDatabase(database.adapter, { grantBash: isTenantBashEnabled() });
 
 await cleanupInterruptedMeetImports();
 
+try {
+  await cleanupDataPortabilityTempDirs(getUserConfigDir());
+} catch (error) {
+  console.warn("Could not remove stale data portability temp dirs:", error);
+}
+
 await claimLegacyCustomTools(database.adapter);
 
 await retireAppUserData(
@@ -174,6 +185,10 @@ let managedSecrets: ManagedSecrets;
 try {
   managedSecrets = new ManagedSecrets(database.adapter);
   await managedSecrets.migrateLegacyFiles();
+
+  if (process.env.MINGZHAN_SECRETS_KEY) {
+    setManagedSecretWriter(managedSecrets);
+  }
 } catch (error) {
   // Saved keys stay in config.ini until the migration succeeds, so print the
   // fix instead of a stack trace and let the operator restart.
@@ -201,6 +216,8 @@ if (process.env.MINGZHAN_SECRETS_KEY_NEXT) {
 }
 
 setToolSecrets(managedSecrets);
+
+await installMcpSecretStore(database.adapter, managedSecrets);
 
 setManagedSecretResolver(
   async (scope, name, envNames) =>
@@ -258,6 +275,8 @@ agent.setServerTools({
     db: database.adapter,
     ensureSettingsLoaded: () => agent.ensureImageGenerationSettingsLoaded(),
     getUserConfig: () => agent.getUserConfig(),
+    onChatgptTokenRefresh: (instanceId, oauth) =>
+      agent.persistChatgptOAuth(instanceId, oauth),
     recordUsage: (
       modelId,
       inputTokens,
@@ -270,6 +289,7 @@ agent.setServerTools({
         pricingContext: { providerInstance },
       });
     },
+    usageTracker: llmUsageTracker,
   }),
   googleMeet: googleMeetService.tools(),
   saveArtifact: createSaveArtifactTool({ db: database.adapter }),
@@ -451,9 +471,10 @@ if (backupDir) {
     assertBackupDirOutsideRoot(backupDir, getUserConfigDir());
     await startScheduledBackups({
       dir: backupDir,
-      exportZip: async () =>
-        (await googleMeetService.withSnapshot(() => createMíngZhànDataExport()))
-          .data,
+      exportFile: async () =>
+        await googleMeetService.withSnapshot(() =>
+          createMíngZhànDataExportFile()
+        ),
       key: decodeSecretsKey(process.env.MINGZHAN_SECRETS_KEY ?? ""),
     });
   } catch (error) {
@@ -573,6 +594,7 @@ const app = createHonoApp({
     await database.reopen();
     await agent.reloadAfterDataRestore();
     await googleMeetService.reopen();
+    await migrateChannelBotTokens();
     await workerManager.recoverDesiredWorkers();
   },
   orgMemoryService,
@@ -630,6 +652,8 @@ void initializeOptionalServices({
 try {
   workerRecovery = (async () => {
     await workerManager.recoverDesiredWorkers();
+    // After recovery restarted workers that read the token only from config.ini.
+    await migrateChannelBotTokens();
     await pluginService.recoverPluginWorkers();
   })();
   await workerRecovery;
@@ -729,7 +753,10 @@ function startServer(options: {
         },
         hostname: options.host,
         idleTimeout: 255,
-        maxRequestBodySize: MAX_HTTP_REQUEST_BODY_LIMIT_BYTES,
+        maxRequestBodySize: Math.max(
+          MAX_HTTP_REQUEST_BODY_LIMIT_BYTES,
+          getDataImportLimits().archiveBytes + 64 * 1024 * 1024
+        ),
         port,
       });
     } catch (error) {

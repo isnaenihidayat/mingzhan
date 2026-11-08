@@ -1,11 +1,9 @@
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@mingzhan/ui/select";
+import { toast } from "@mingzhan/ui/toast";
 import { useEffect, useMemo, useState } from "react";
+import {
+  type SettingsModelOption,
+  SettingsModelSelect,
+} from "@/components/settings/settings-model-select";
 import { SettingsModelTile } from "@/components/settings/settings-model-tile";
 import {
   useImageGenerationSettings,
@@ -23,6 +21,137 @@ import {
 
 const CLEAR_IMAGE_GENERATION_MODEL_VALUE = "__image_generation_unset__";
 
+/** Saved model that turns image generation off (server: IMAGE_GENERATION_OFF). */
+const IMAGE_GENERATION_OFF_VALUE = "off";
+
+type ImageGenerationChoice = SettingsModelOption;
+
+interface ImageGenerationProviderSummary {
+  hasApiKey: boolean;
+  id: string;
+  type: string;
+}
+
+/**
+ * The picker's choices and labels. Every ChatGPT model makes images with the
+ * same hosted tool, so each signed-in ChatGPT account is one choice, not one
+ * per chat model; with a single account, the unset default already covers it.
+ */
+function imageGenerationChoices(
+  models: Parameters<typeof groupModelsByProvider>[0],
+  providers: ImageGenerationProviderSummary[],
+  selection: string
+) {
+  const groups = groupModelsByProvider(models);
+
+  // The catalog lists ChatGPT models even when no ChatGPT is signed in, so
+  // only providers the server reports as connected count.
+  const connectedChatgptIds = new Set(
+    providers.flatMap((provider) =>
+      provider.type === "chatgpt" && provider.hasApiKey ? [provider.id] : []
+    )
+  );
+
+  const chatgptGroups = groups.filter(
+    (group) =>
+      connectedChatgptIds.has(group.providerId) &&
+      group.models.some((model) => model.provider === "chatgpt")
+  );
+
+  const openaiAvailable = groups.some((group) =>
+    group.models.some((model) => model.provider === "openai")
+  );
+
+  // Any custom model on an OpenAI-compatible provider may speak the Images
+  // API; the server posts the one picked to `<baseUrl>/images/generations`.
+  const compatibleGroups = groups.filter((group) =>
+    group.models.some((model) => model.provider === "openai_compatible")
+  );
+
+  const labelGroups = [
+    ...(openaiAvailable
+      ? [
+          {
+            models: IMAGE_GENERATION_MODEL_OPTIONS.map((option) => ({
+              id: option.id,
+              name: option.name,
+              provider: "openai" as const,
+            })),
+            providerId: "openai",
+            providerLabel: "OpenAI",
+          },
+        ]
+      : []),
+    ...compatibleGroups,
+  ];
+
+  // With nothing saved, the server makes images with a connected ChatGPT.
+  const chatgptAvailable = chatgptGroups.length > 0;
+  const providerAvailable = chatgptAvailable || labelGroups.length > 0;
+  const unsetLabel = chatgptAvailable ? "Automatic · ChatGPT" : "None";
+
+  const chatgptGroupOf = (model: string) =>
+    chatgptGroups.find((group) => model.startsWith(`${group.providerId}::`));
+
+  const choices: ImageGenerationChoice[] = [
+    { label: unsetLabel, value: CLEAR_IMAGE_GENERATION_MODEL_VALUE },
+    ...(chatgptGroups.length > 1
+      ? chatgptGroups.map((group) => ({
+          label: group.providerLabel,
+          // A saved ChatGPT pick keeps its own value, so it shows selected.
+          value:
+            chatgptGroupOf(selection) === group
+              ? selection
+              : encodeModelSelection(
+                  group.providerId,
+                  (
+                    group.models.find((model) => model.default) ??
+                    group.models[0]
+                  ).id
+                ),
+        }))
+      : []),
+    ...(openaiAvailable
+      ? [
+          {
+            label: `OpenAI: ${IMAGE_GENERATION_MODEL_OPTIONS[0].name}`,
+            name: IMAGE_GENERATION_MODEL_OPTIONS[0].name,
+            provider: { id: "openai", label: "OpenAI" },
+            value: IMAGE_GENERATION_SELECTION,
+          },
+        ]
+      : []),
+    ...compatibleGroups.flatMap((group) =>
+      group.models.map((model) => ({
+        label: `${group.providerLabel}: ${model.name}`,
+        name: model.name,
+        provider: { id: group.providerId, label: group.providerLabel },
+        value: encodeModelSelection(group.providerId, model.id),
+      }))
+    ),
+    ...(chatgptAvailable
+      ? [{ label: "Off", value: IMAGE_GENERATION_OFF_VALUE }]
+      : []),
+  ];
+
+  const labelOf = (model: string | null) => {
+    if (!model) {
+      return providerAvailable ? unsetLabel : "No image provider";
+    }
+
+    if (model === IMAGE_GENERATION_OFF_VALUE) {
+      return "Off";
+    }
+
+    return (
+      chatgptGroupOf(model)?.providerLabel ??
+      profileModelLabel(model, labelGroups)
+    );
+  };
+
+  return { choices, labelOf, providerAvailable };
+}
+
 export function ImageGenerationSettingsCard() {
   const [formError, setFormError] = useState<string | null>(null);
   const [selection, setSelection] = useState<string>("");
@@ -31,52 +160,15 @@ export function ImageGenerationSettingsCard() {
   const { data: imageGenerationSettings } = useImageGenerationSettings();
   const saveImageGenerationMutation = useSaveImageGenerationSettings();
 
-  const providerModelGroups = useMemo(
-    () => groupModelsByProvider(modelsResponse?.models ?? []),
-    [modelsResponse?.models]
-  );
-
-  const openaiAvailable = useMemo(
+  const { choices, labelOf, providerAvailable } = useMemo(
     () =>
-      providerModelGroups.some((group) =>
-        group.models.some((model) => model.provider === "openai")
+      imageGenerationChoices(
+        modelsResponse?.models ?? [],
+        modelsResponse?.providers ?? [],
+        selection
       ),
-    [providerModelGroups]
+    [modelsResponse?.models, modelsResponse?.providers, selection]
   );
-
-  // Any custom model on an OpenAI-compatible provider may speak the Images
-  // API; the server posts the one picked to `<baseUrl>/images/generations`.
-  const compatibleModelGroups = useMemo(
-    () =>
-      providerModelGroups.filter((group) =>
-        group.models.some((model) => model.provider === "openai_compatible")
-      ),
-    [providerModelGroups]
-  );
-
-  const imageModelGroups = useMemo(
-    () => [
-      ...(openaiAvailable
-        ? [
-            {
-              models: IMAGE_GENERATION_MODEL_OPTIONS.map((option) => ({
-                id: option.id,
-                name: option.name,
-                provider: "openai" as const,
-              })),
-              providerId: "openai",
-              providerLabel: "OpenAI",
-            },
-          ]
-        : []),
-      ...compatibleModelGroups,
-    ],
-    [openaiAvailable, compatibleModelGroups]
-  );
-
-  const providerAvailable = imageModelGroups.length > 0;
-
-  const selectionValue = selection || CLEAR_IMAGE_GENERATION_MODEL_VALUE;
 
   useEffect(() => {
     setSelection(imageGenerationSettings?.model ?? "");
@@ -115,7 +207,8 @@ export function ImageGenerationSettingsCard() {
       }
       title="Image generation model"
     >
-      <Select
+      <SettingsModelSelect
+        ariaLabel="Image generation model"
         disabled={saveImageGenerationMutation.isPending || !providerAvailable}
         onValueChange={(value) => {
           if (!value) {
@@ -129,6 +222,9 @@ export function ImageGenerationSettingsCard() {
           setSelection(model ?? "");
           setSavedHint(null);
 
+          // A change can be undone from the toast.
+          const previous = imageGenerationSettings?.model ?? null;
+
           saveImageGenerationMutation.mutate(model, {
             onError: (error) => {
               setSelection(imageGenerationSettings?.model ?? "");
@@ -136,52 +232,26 @@ export function ImageGenerationSettingsCard() {
             },
             onSuccess: (saved) => {
               setSelection(saved.model ?? "");
-              setSavedHint(
-                saved.model
-                  ? `Saved · ${profileModelLabel(saved.model, imageModelGroups)}`
-                  : "Cleared"
-              );
+
+              if (previous !== (saved.model ?? null)) {
+                toast("Image generation model changed.", 8000, {
+                  label: "Undo",
+                  onClick: () =>
+                    saveImageGenerationMutation.mutate(previous, {
+                      onSuccess: (restored) =>
+                        setSelection(restored.model ?? ""),
+                    }),
+                });
+              }
+
+              setSavedHint(`Saved · ${labelOf(saved.model)}`);
             },
           });
         }}
-        value={selectionValue}
-      >
-        <SelectTrigger
-          aria-label="Image generation model"
-          className="h-9 w-full"
-        >
-          <SelectValue placeholder="Select image generation model">
-            {selection
-              ? profileModelLabel(selection, imageModelGroups)
-              : providerAvailable
-                ? "Not configured"
-                : "No image provider"}
-          </SelectValue>
-        </SelectTrigger>
-        <SelectContent
-          alignItemWithTrigger={false}
-          className="w-max min-w-72 max-w-[min(24rem,92vw)]"
-        >
-          <SelectItem value={CLEAR_IMAGE_GENERATION_MODEL_VALUE}>
-            Not configured
-          </SelectItem>
-          {openaiAvailable ? (
-            <SelectItem value={IMAGE_GENERATION_SELECTION}>
-              OpenAI: {IMAGE_GENERATION_MODEL_OPTIONS[0].name}
-            </SelectItem>
-          ) : null}
-          {compatibleModelGroups.flatMap((group) =>
-            group.models.map((model) => (
-              <SelectItem
-                key={`${group.providerId}::${model.id}`}
-                value={encodeModelSelection(group.providerId, model.id)}
-              >
-                {group.providerLabel}: {model.name}
-              </SelectItem>
-            ))
-          )}
-        </SelectContent>
-      </Select>
+        options={choices}
+        triggerLabel={labelOf(selection)}
+        value={selection || CLEAR_IMAGE_GENERATION_MODEL_VALUE}
+      />
     </SettingsModelTile>
   );
 }

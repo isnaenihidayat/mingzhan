@@ -396,3 +396,25 @@ test("a package installed in the skill's own environment is not reported, a miss
     }
   }
 });
+
+test("ignores AppleDouble metadata beside runnable scripts", async () => {
+  const directory = await skillDir({
+    "scripts/._helper.py": "AppleDouble metadata",
+    "scripts/helper.py": BODY,
+  });
+
+  try {
+    const resolved = await resolveSkillScripts({
+      body: "python scripts/helper.py",
+      declared: [],
+      directory,
+      skillName: "calc",
+      toolPath: null,
+    });
+
+    expect(resolved.issues).toEqual([]);
+    expect(resolved.tools).toEqual([]);
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});

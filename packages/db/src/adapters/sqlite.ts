@@ -14,6 +14,7 @@ import {
   MíngZhànApiError,
   PRIVATE_FILE_MODE,
 } from "@mingzhan/core";
+import type { LlmRequestLogEntry } from "@mingzhan/core/contract";
 import { LOCAL_CLIENT_USER_ID } from "@mingzhan/core/local-auth";
 import { LLM_USAGE_STATS_ID, WORKSPACE_SETTINGS_ID } from "../constants";
 import { ensureDatabaseDirectory, resolveDatabasePath } from "../database-url";
@@ -57,6 +58,7 @@ import type {
   StoredProfileRecord,
   StoredProjectFileRecord,
   StoredProjectRecord,
+  StoredRegressionCaseRecord,
   StoredSessionMessageRecord,
   StoredSessionRecord,
   StoredSessionSummaryRecord,
@@ -482,6 +484,7 @@ interface BrowserSessionRow {
   last_used_at: string | null;
   revoked_at: string | null;
   session_token_hash: string;
+  user_agent?: string | null;
   user_id: string;
 }
 
@@ -621,6 +624,20 @@ interface ArtifactShareRow {
   source_path: string;
   storage_path: string;
   token_hash: string;
+}
+
+interface RegressionCaseRow {
+  created_at: string;
+  created_by_user_id: string | null;
+  expected_result: string;
+  id: string;
+  input: string;
+  org_id: string;
+  private_to_user_id: string | null;
+  profile_id: string;
+  source_automation_id: string | null;
+  source_id: string;
+  source_type: string;
 }
 
 /**
@@ -1543,6 +1560,19 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
     SELECT * FROM session_messages
     WHERE session_id = ? AND EXISTS (SELECT 1 FROM sessions WHERE id = session_id AND app_user_id IS NULL)
     ORDER BY seq ASC
+  `);
+
+  /** One row instead of the whole transcript, which can carry base64 payloads. */
+  const getLastUserMessageForSessionStmt = db.prepare<
+    SessionMessageRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT * FROM session_messages
+    WHERE session_id = ?
+      AND json_extract(payload, '$.role') = 'user'
+      AND EXISTS (SELECT 1 FROM sessions WHERE id = session_id AND app_user_id IS NULL)
+    ORDER BY seq DESC
+    LIMIT 1
   `);
 
   const appendMessageStmt = db.prepare(`
@@ -2718,10 +2748,31 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
     WHERE id = ?
   `);
 
-  const disableUserStmt = db.prepare(`
+  // disableMember checks the last-admin rules before it writes, so a
+  // concurrent disable, remove or demote can pass the same check. One
+  // statement re-checks both install-wide rules: every live org the user
+  // administers keeps another usable admin, and a platform admin leaves
+  // another usable platform admin. The org filter matches listUserOrganizations.
+  const disableUserUnlessLastAdminStmt = db.prepare(`
     UPDATE users
     SET disabled_at = ?, updated_at = ?
     WHERE id = ?
+      AND NOT EXISTS (
+        SELECT 1 FROM org_members om
+        INNER JOIN organizations o ON o.id = om.org_id
+        WHERE om.user_id = users.id AND om.role = 'admin'
+          AND o.archived_at IS NULL
+          AND NOT EXISTS (SELECT 1 FROM org_team_creation_requests WHERE team_org_id = o.id AND completed_at IS NULL)
+          AND NOT EXISTS (
+            SELECT 1 FROM org_members other
+            JOIN users u ON u.id = other.user_id
+            WHERE other.org_id = om.org_id AND other.role = 'admin'
+              AND other.user_id != users.id AND u.disabled_at IS NULL))
+      AND (is_platform_admin = 0
+        OR EXISTS (
+          SELECT 1 FROM users u
+          WHERE u.is_platform_admin = 1 AND u.id != users.id
+            AND u.disabled_at IS NULL))
   `);
 
   const enableUserStmt = db.prepare(`
@@ -2796,6 +2847,18 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       passwordHash: string;
       updatedAt: string;
     }) => {
+      // Erasing drops admin rows and the platform flag, so it must pass the
+      // same last-admin rule as a disable before anything else is written.
+      if (
+        disableUserUnlessLastAdminStmt.run(
+          input.updatedAt,
+          input.updatedAt,
+          input.id
+        ).changes === 0
+      ) {
+        return 0;
+      }
+
       clearErasedUserSessionsStmt.run(input.id);
       clearErasedUserOrgMemoryProposalsStmt.run(
         input.id,
@@ -2892,9 +2955,10 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       expires_at,
       revoked_at,
       last_used_at,
-      active_org_id
+      active_org_id,
+      user_agent
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const getBrowserSessionByTokenHashStmt = db.prepare<
@@ -2941,7 +3005,7 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
 
   const updateBrowserSessionLastUsedAtStmt = db.prepare(`
     UPDATE browser_sessions
-    SET last_used_at = ?
+    SET last_used_at = ?, user_agent = COALESCE(user_agent, ?)
     WHERE id = ?
   `);
 
@@ -3132,6 +3196,7 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       for (const table of [
         "llm_turn_usage",
         "llm_usage_actor_stats",
+        "llm_request_log",
         "llm_usage_daily_stats",
         "llm_usage_stats",
         "llm_usage_model_stats",
@@ -3620,6 +3685,17 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
     WHERE a.org_id = ? AND a.profile_id = ?
   `);
 
+  const getArtifactRecordStmt = db.prepare<
+    ArtifactOwnerRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT
+      org_id, profile_id, filename, session_id, user_id, channel, created_at,
+      NULL AS user_name
+    FROM artifacts
+    WHERE org_id = ? AND profile_id = ? AND filename = ?
+  `);
+
   const deleteArtifactRecordStmt = db.prepare(`
     DELETE FROM artifacts WHERE org_id = ? AND profile_id = ? AND filename = ?
   `);
@@ -3790,6 +3866,32 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
 
   const updateSessionProjectStmt = db.prepare(`
     UPDATE sessions SET project_id = ? WHERE id = ? AND app_user_id IS NULL
+  `);
+
+  const createRegressionCaseStmt = db.prepare(`
+    INSERT INTO regression_cases (
+      id, org_id, profile_id, source_type, source_id, source_automation_id,
+      input, expected_result, created_by_user_id, private_to_user_id, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const getRegressionCaseStmt = db.prepare<
+    RegressionCaseRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT * FROM regression_cases
+    WHERE org_id = ? AND profile_id = ? AND id = ?
+    LIMIT 1
+  `);
+
+  const listRegressionCasesForProfileStmt = db.prepare<
+    RegressionCaseRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT * FROM regression_cases
+    WHERE org_id = ? AND profile_id = ?
+    ORDER BY created_at DESC, id DESC
+    LIMIT ? OFFSET ?
   `);
 
   const getOrgMemberStmt = db.prepare<
@@ -4791,7 +4893,8 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
         record.expiresAt,
         record.revokedAt,
         record.lastUsedAt,
-        record.activeOrgId ?? null
+        record.activeOrgId ?? null,
+        capSessionUserAgent(record.userAgent)
       );
     },
 
@@ -4937,6 +5040,22 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       );
 
       return record;
+    },
+
+    async createRegressionCase(record) {
+      createRegressionCaseStmt.run(
+        record.id,
+        record.orgId,
+        record.profileId,
+        record.sourceType,
+        record.sourceId,
+        record.sourceAutomationId,
+        record.input,
+        record.expectedResult,
+        record.createdByUserId,
+        record.privateToUserId,
+        record.createdAt
+      );
     },
 
     async createSharedAgentInstance(
@@ -5162,8 +5281,14 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       return result.changes > 0;
     },
 
-    async disableUser(id, disabledAt) {
-      disableUserStmt.run(disabledAt, disabledAt, id);
+    async disableUserUnlessLastAdmin(id, disabledAt) {
+      const result = disableUserUnlessLastAdminStmt.run(
+        disabledAt,
+        disabledAt,
+        id
+      );
+
+      return result.changes > 0;
     },
 
     async enableUser(id) {
@@ -5212,6 +5337,12 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       const row = getActiveConversationShareBySessionStmt.get(orgId, sessionId);
 
       return row ? toConversationShareRecord(row) : null;
+    },
+
+    async getArtifactRecord(orgId, profileId, filename) {
+      const row = getArtifactRecordStmt.get(orgId, profileId, filename);
+
+      return row ? toArtifactOwnerRecord(row) : null;
     },
 
     async getArtifactShareById(orgId, profileId, shareId) {
@@ -5295,12 +5426,18 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
 
       return row ? toProfileRecord(row) : null;
     },
+    async getLastUserMessageForSession(sessionId) {
+      const row = getLastUserMessageForSessionStmt.get(sessionId);
+
+      return row ? toSessionMessageRecord(row) : null;
+    },
 
     async getLlmUsageStats(orgId) {
       const row = getLlmUsageStatsStmt.get(orgId, LLM_USAGE_STATS_ID);
 
       return row ? toLlmUsageStatsRecord(row) : null;
     },
+
     async getManagedSecret(scope, name) {
       // SAFETY: managed_secrets columns and its source constraint match this row type.
       const row = getManagedSecretStmt.get(scope, name) as {
@@ -5490,6 +5627,12 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       const row = getProjectFileStmt.get(orgId, projectId, id);
 
       return row ? toProjectFileRecord(row) : null;
+    },
+
+    async getRegressionCase(orgId, profileId, caseId) {
+      const row = getRegressionCaseStmt.get(orgId, profileId, caseId);
+
+      return row ? toRegressionCaseRecord(row) : null;
     },
 
     async getSession(id) {
@@ -5779,6 +5922,28 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       );
     },
 
+    async insertLlmRequestLog(orgId, userId, entry) {
+      db.query(`
+        INSERT INTO llm_request_log (
+          org_id, user_id, profile_id, session_id, started_at, duration_ms, provider,
+          model_id, status, input_tokens, output_tokens, estimated_cost_usd
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        orgId,
+        userId,
+        entry.profileId,
+        entry.sessionId ?? null,
+        entry.startedAt,
+        entry.durationMs,
+        entry.provider,
+        entry.modelId,
+        entry.status,
+        entry.inputTokens,
+        entry.outputTokens,
+        entry.estimatedCostUsd
+      );
+    },
+
     async insertWorkflowRun(record) {
       insertWorkflowRunStmt.run(
         record.id,
@@ -5909,6 +6074,73 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
         )
         .all(orgId, userId, profileId)
         .map((row) => row.path);
+    },
+
+    async listLlmRequestLog(orgId, userId, filters) {
+      const conditions = ["r.org_id = ?", "r.user_id = ?"];
+      const values: (string | number)[] = [orgId, userId];
+
+      if (filters.before !== undefined) {
+        conditions.push(`(r.started_at, r.id) < (
+          SELECT started_at, id FROM llm_request_log
+          WHERE org_id = ? AND user_id = ? AND id = ?
+        )`);
+        values.push(orgId, userId, filters.before);
+      }
+
+      if (filters.from) {
+        conditions.push("r.started_at >= ?");
+        values.push(filters.from);
+      }
+
+      if (filters.to) {
+        conditions.push("r.started_at <= ?");
+        values.push(`${filters.to}T23:59:59.999Z`);
+      }
+
+      if (filters.model) {
+        conditions.push("r.model_id = ?");
+        values.push(filters.model);
+      }
+
+      if (filters.status) {
+        conditions.push("r.status = ?");
+        values.push(filters.status);
+      }
+
+      const pageSize = 25;
+
+      const rows = db
+        .query<
+          LlmRequestLogEntry & { sessionId: string | null },
+          (string | number)[]
+        >(`
+        SELECT r.id, r.started_at AS startedAt, r.duration_ms AS durationMs,
+          r.profile_id AS profileId, r.session_id AS sessionId, p.name AS agentName, r.provider,
+          r.model_id AS modelId, r.status, r.input_tokens AS inputTokens,
+          r.output_tokens AS outputTokens, r.estimated_cost_usd AS estimatedCostUsd
+        FROM llm_request_log r
+        LEFT JOIN profiles p ON p.id = r.profile_id AND p.org_id = r.org_id
+        WHERE ${conditions.join(" AND ")}
+        ORDER BY r.started_at DESC, r.id DESC LIMIT ?
+      `)
+        .all(...values, pageSize + 1);
+
+      const entries = rows.slice(0, pageSize);
+
+      const first = db
+        .query<{ startedAt: string }, [string, string]>(`
+        SELECT started_at AS startedAt FROM llm_request_log
+        WHERE org_id = ? AND user_id = ? ORDER BY started_at ASC, id ASC LIMIT 1
+      `)
+        .get(orgId, userId);
+
+      return {
+        entries,
+        nextCursor:
+          rows.length > pageSize ? (entries.at(-1)?.id ?? null) : null,
+        recordedSince: first?.startedAt ?? null,
+      };
     },
 
     async listLlmTurnUsage(orgId) {
@@ -6124,6 +6356,12 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       const rows = listProjectsStmt.all(orgId);
 
       return rows.map(toProjectRecord);
+    },
+
+    async listRegressionCasesForProfile(orgId, profileId, options = {}) {
+      return listRegressionCasesForProfileStmt
+        .all(orgId, profileId, options.limit ?? 50, options.offset ?? 0)
+        .map((row) => toRegressionCaseRecord(row));
     },
 
     async listSessionSummaries(profileId, channels, options = {}) {
@@ -6532,8 +6770,12 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       updateBrowserSessionActiveOrgIdStmt.run(activeOrgId, id);
     },
 
-    async updateBrowserSessionLastUsedAt(id, lastUsedAt) {
-      updateBrowserSessionLastUsedAtStmt.run(lastUsedAt, id);
+    async updateBrowserSessionLastUsedAt(id, lastUsedAt, userAgent) {
+      updateBrowserSessionLastUsedAtStmt.run(
+        lastUsedAt,
+        capSessionUserAgent(userAgent),
+        id
+      );
     },
 
     async updateOrgMemberRole(orgId, userId, role) {
@@ -8059,6 +8301,34 @@ function toArtifactShareRecord(
   };
 }
 
+const MAX_SESSION_USER_AGENT_LENGTH = 512;
+
+/** Capped so a client cannot grow the session row with a huge header. */
+function capSessionUserAgent(userAgent: string | null | undefined) {
+  const trimmed = userAgent?.trim();
+
+  return trimmed ? trimmed.slice(0, MAX_SESSION_USER_AGENT_LENGTH) : null;
+}
+
+function toRegressionCaseRecord(
+  row: RegressionCaseRow
+): StoredRegressionCaseRecord {
+  return {
+    createdAt: row.created_at,
+    createdByUserId: row.created_by_user_id,
+    expectedResult: row.expected_result,
+    id: row.id,
+    input: row.input,
+    orgId: row.org_id,
+    privateToUserId: row.private_to_user_id,
+    profileId: row.profile_id,
+    sourceAutomationId: row.source_automation_id,
+    sourceId: row.source_id,
+    // SAFETY: The table CHECK constrains this column to the union values.
+    sourceType: row.source_type as StoredRegressionCaseRecord["sourceType"],
+  };
+}
+
 function toBrowserSessionRecord(
   row: BrowserSessionRow
 ): StoredBrowserSessionRecord {
@@ -8071,6 +8341,7 @@ function toBrowserSessionRecord(
     lastUsedAt: row.last_used_at,
     revokedAt: row.revoked_at,
     sessionTokenHash: row.session_token_hash,
+    userAgent: row.user_agent ?? null,
     userId: row.user_id,
   };
 }

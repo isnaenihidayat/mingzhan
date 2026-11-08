@@ -11,6 +11,14 @@ import {
 /** Bundled skills whose installed SKILL.md must be overwritten on startup (content drift). */
 const FORCE_REFRESH_BUNDLED_SKILL_NAMES = new Set<string>([
   "manage-skills",
+  "docx",
+  "xlsx",
+  "pptx",
+  "pdf",
+  "doc-coauthoring",
+  "web-artifacts-builder",
+  "data-analysis",
+  "interactive-visualizations",
   "coding-agent",
   "composio-integrations",
   "create-plugin",
@@ -21,6 +29,7 @@ const FORCE_REFRESH_BUNDLED_SKILL_NAMES = new Set<string>([
   "slide-deck-design",
   "archive-profile-memory",
   "mingzhan-guide",
+  "grounded-research",
 ]);
 
 const RENAMED_BUNDLED_SKILL_DIRS = [
@@ -80,7 +89,11 @@ async function copyBundledSkillAssets(
     const from = path.join(entry.parentPath, entry.name);
     const relative = path.relative(source, from);
 
-    if (!entry.isFile() || relative === SKILL_FILE_NAME) {
+    if (
+      !entry.isFile() ||
+      entry.name.startsWith("._") ||
+      relative === SKILL_FILE_NAME
+    ) {
       continue;
     }
 

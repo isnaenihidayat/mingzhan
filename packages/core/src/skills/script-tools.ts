@@ -219,6 +219,10 @@ async function listSkillScripts(directory: string): Promise<string[]> {
     const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
 
     for (const entry of entries) {
+      if (entry.name.startsWith("._")) {
+        continue;
+      }
+
       const full = path.join(dir, entry.name);
 
       if (entry.isDirectory()) {
