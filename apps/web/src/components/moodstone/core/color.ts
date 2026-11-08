@@ -8,21 +8,19 @@ export function parseColor(c: string): RGB {
   "worklet";
   if (c.charAt(0) === "#") {
     if (c.length === 4) {
-      const r = Number.parseInt(c.charAt(1), 16);
-      const g = Number.parseInt(c.charAt(2), 16);
-      const b = Number.parseInt(c.charAt(3), 16);
+      const r = parseInt(c.charAt(1), 16);
+      const g = parseInt(c.charAt(2), 16);
+      const b = parseInt(c.charAt(3), 16);
       return [r * 17, g * 17, b * 17];
     }
     return [
-      Number.parseInt(c.slice(1, 3), 16),
-      Number.parseInt(c.slice(3, 5), 16),
-      Number.parseInt(c.slice(5, 7), 16),
+      parseInt(c.slice(1, 3), 16),
+      parseInt(c.slice(3, 5), 16),
+      parseInt(c.slice(5, 7), 16),
     ];
   }
   const m = c.match(/\d+(\.\d+)?/g);
-  if (m && m.length >= 3) {
-    return [+m[0], +m[1], +m[2]];
-  }
+  if (m && m.length >= 3) return [+m[0], +m[1], +m[2]];
   return [128, 128, 128];
 }
 
@@ -56,38 +54,22 @@ export function hexToHsl(c: string): [number, number, number] {
   const min = Math.min(r, g, b);
   const l = (max + min) / 2;
   const d = max - min;
-  if (d < 1e-6) {
-    return [0, 0, l];
-  }
+  if (d < 1e-6) return [0, 0, l];
   const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
   let h: number;
-  if (max === r) {
-    h = (g - b) / d + (g < b ? 6 : 0);
-  } else if (max === g) {
-    h = (b - r) / d + 2;
-  } else {
-    h = (r - g) / d + 4;
-  }
+  if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+  else if (max === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
   return [h * 60, s, l];
 }
 
 function hueChannel(p: number, q: number, t: number): number {
   "worklet";
-  if (t < 0) {
-    t += 1;
-  }
-  if (t > 1) {
-    t -= 1;
-  }
-  if (t < 1 / 6) {
-    return p + (q - p) * 6 * t;
-  }
-  if (t < 1 / 2) {
-    return q;
-  }
-  if (t < 2 / 3) {
-    return p + (q - p) * (2 / 3 - t) * 6;
-  }
+  if (t < 0) t += 1;
+  if (t > 1) t -= 1;
+  if (t < 1 / 6) return p + (q - p) * 6 * t;
+  if (t < 1 / 2) return q;
+  if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
   return p;
 }
 
@@ -96,9 +78,7 @@ export function hslToHex(h: number, s: number, l: number): string {
   const hh = (((h % 360) + 360) % 360) / 360;
   const ss = clamp(s, 0, 1);
   const ll = clamp(l, 0, 1);
-  if (ss < 1e-6) {
-    return toHex([ll * 255, ll * 255, ll * 255]);
-  }
+  if (ss < 1e-6) return toHex([ll * 255, ll * 255, ll * 255]);
   const q = ll < 0.5 ? ll * (1 + ss) : ll + ss - ll * ss;
   const p = 2 * ll - q;
   return toHex([
@@ -112,9 +92,7 @@ export function hslToHex(h: number, s: number, l: number): string {
 export function hueToward(h: number, target: number, amount: number): number {
   "worklet";
   let d = ((target - h + 540) % 360) - 180;
-  if (Math.abs(d) < amount) {
-    return target;
-  }
+  if (Math.abs(d) < amount) return target;
   d = d > 0 ? amount : -amount;
   return h + d;
 }
@@ -165,11 +143,9 @@ export function rainbowAt(phase: number): string {
 export function celebrationColor(
   base: string,
   phase: number,
-  amount: number
+  amount: number,
 ): string {
   "worklet";
-  if (amount <= 0) {
-    return base;
-  }
+  if (amount <= 0) return base;
   return mixColor(base, rainbowAt(phase * 2), amount);
 }

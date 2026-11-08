@@ -49,49 +49,49 @@ type Window = readonly [
 
 /** Where a mood is in its loop, plus what the moods need from the spec. */
 interface Moment {
-  /** The spec's surface colour. */
-  color: string;
-  /** Content scale, for marks placed outside the eyes. */
-  cs: number;
-  /** Seconds per eye cycle. */
-  cycle: number;
-  /** 0..1 within the whole loop. */
-  loop: number;
   /** 0..1 within the current eye cycle. */
   p: number;
+  /** 0..1 within the whole loop. */
+  loop: number;
+  /** Seconds per eye cycle. */
+  cycle: number;
+  /** Content scale, for marks placed outside the eyes. */
+  cs: number;
+  /** The spec's surface colour. */
+  color: string;
 }
 
 /** What a mood decides for one moment. */
 interface MoodState {
-  /** Surface colour. */
-  color: string;
-  /** Light revolutions so far this loop. Whole turns per loop keep it seamless. */
-  lightTurns: number;
+  /** Up to four eyes. */
+  poses: Pose[];
+  /** Body rotation in degrees about the centre. */
+  tilt: number;
   /** Body translation, box units. */
   offset: [number, number];
   /** 1 open, 0 shut. */
   openness: number;
-  /** Up to four eyes. */
-  poses: Pose[];
-  sleepMarks: SleepMark[];
+  /** Light revolutions so far this loop. Whole turns per loop keep it seamless. */
+  lightTurns: number;
+  /** Surface colour. */
+  color: string;
   /** 0..1, how far the eyes have turned into dizzy swirls. */
   swirl: number;
-  /** Body rotation in degrees about the centre. */
-  tilt: number;
+  sleepMarks: SleepMark[];
 }
 
 /** The state every mood starts from: level, centred, eyes open, light still. Moods override what they change. */
 function calm(m: Moment, poses: Pose[]): MoodState {
   "worklet";
   return {
-    color: m.color,
-    lightTurns: 0,
+    poses,
+    tilt: 0,
     offset: [0, 0],
     openness: 1,
-    poses,
-    sleepMarks: [],
+    lightTurns: 0,
+    color: m.color,
     swirl: 0,
-    tilt: 0,
+    sleepMarks: [],
   };
 }
 
@@ -99,38 +99,38 @@ function calm(m: Moment, poses: Pose[]): MoodState {
 function restPose(side: 0 | 1, dx: number, dy: number): Pose {
   "worklet";
   return {
-    alpha: 1,
     cx: (side === 1 ? EYE.cxR : EYE.cxL) + dx,
     cy: EYE.cy + dy,
+    w: EYE.w,
     h: EYE.h,
     r: EYE.r,
     rot: 0,
-    w: EYE.w,
+    alpha: 1,
   };
 }
 
 /** A round dot of diameter `d` centred at (cx, cy). */
 function dotPose(cx: number, cy: number, d: number): Pose {
   "worklet";
-  return { alpha: 1, cx, cy, h: d, r: d / 2, rot: 0, w: d };
+  return { cx, cy, w: d, h: d, r: d / 2, rot: 0, alpha: 1 };
 }
 
 function lerpPose(a: Pose, b: Pose, u: number): Pose {
   "worklet";
   return {
-    alpha: lerp(a.alpha, b.alpha, u),
     cx: lerp(a.cx, b.cx, u),
     cy: lerp(a.cy, b.cy, u),
+    w: lerp(a.w, b.w, u),
     h: lerp(a.h, b.h, u),
     r: lerp(a.r, b.r, u),
     rot: lerp(a.rot, b.rot, u),
-    w: lerp(a.w, b.w, u),
+    alpha: lerp(a.alpha, b.alpha, u),
   };
 }
 
 function hiddenEye(): EyeRect {
   "worklet";
-  return { alpha: 0, cx: CENTER, cy: CENTER, h: 0, r: 0, rot: 0, w: 0 };
+  return { cx: CENTER, cy: CENTER, w: 0, h: 0, r: 0, rot: 0, alpha: 0 };
 }
 
 /* ---- gaze: keyframed eye offsets, eased between keys ---- */
@@ -180,9 +180,7 @@ const BLINK_BEFORE_REACTION: readonly number[] = [0.07];
 /** Openness at `d` cycles from a blink's shut moment; `closeN` and `openN` are the shut and reopen spans in cycles. */
 function blinkCurve(d: number, closeN: number, openN: number): number {
   "worklet";
-  if (d < -closeN || d > openN) {
-    return 1;
-  }
+  if (d < -closeN || d > openN) return 1;
   if (d < 0) {
     const ph = (d + closeN) / closeN;
     return 0.5 * (1 + Math.cos(Math.PI * ph));
@@ -196,7 +194,7 @@ function opennessAt(
   p: number,
   cycle: number,
   blinks: readonly number[],
-  durationScale: number
+  durationScale: number,
 ): number {
   "worklet";
   let o = 1;
@@ -204,12 +202,8 @@ function opennessAt(
   const oN = (BLINK_OPEN * durationScale) / cycle;
   for (let i = 0; i < blinks.length; i++) {
     let d = p - blinks[i];
-    if (d > 0.5) {
-      d -= 1;
-    }
-    if (d < -0.5) {
-      d += 1;
-    }
+    if (d > 0.5) d -= 1;
+    if (d < -0.5) d += 1;
     o = Math.min(o, blinkCurve(d, cN, oN));
   }
   return clamp(o, 0, 1);
@@ -230,8 +224,8 @@ function idle(m: Moment): MoodState {
   const [ldx, ldy, rdx, rdy] = gazeAt(IDLE_TRACK, m.p);
   return {
     ...calm(m, [restPose(0, ldx, ldy), restPose(1, rdx, rdy)]),
-    lightTurns: m.loop,
     openness: opennessAt(m.p, m.cycle, IDLE_BLINKS, 1),
+    lightTurns: m.loop,
   };
 }
 
@@ -264,16 +258,13 @@ function observing(m: Moment): MoodState {
   const left = restPose(0, ldx, ldy);
   const right = restPose(1, rdx, rdy);
   // The eye on the side the head turns toward is further away, so it narrows.
-  if (look > 0) {
-    right.w *= narrow;
-  } else if (look < 0) {
-    left.w *= narrow;
-  }
+  if (look > 0) right.w *= narrow;
+  else if (look < 0) left.w *= narrow;
   return {
     ...calm(m, [left, right]),
-    lightTurns: m.loop,
-    openness: opennessAt(m.p, m.cycle, OBSERVE_BLINKS, 1),
     tilt: -look * OBSERVE_TILT,
+    openness: opennessAt(m.p, m.cycle, OBSERVE_BLINKS, 1),
+    lightTurns: m.loop,
   };
 }
 
@@ -307,9 +298,9 @@ function thinking(m: Moment): MoodState {
       lerpPose(restPose(0, 0, 0), dot, merge),
       lerpPose(restPose(1, 0, 0), dot, merge),
     ]),
-    lightTurns: pwl(m.p, THINK_LIGHT_TURNS),
     offset: [0, bob > 0 && bob < 1 ? THINK_BOB_BODY * wave : 0],
     openness: opennessAt(m.p, m.cycle, BLINK_BEFORE_MERGE, 1),
+    lightTurns: pwl(m.p, THINK_LIGHT_TURNS),
   };
 }
 
@@ -344,14 +335,14 @@ function processing(m: Moment): MoodState {
     const dot = dotPose(
       CENTER + PROCESS_ORBIT * Math.cos(a),
       CENTER + PROCESS_ORBIT * Math.sin(a),
-      PROCESS_DOT_SIZE
+      PROCESS_DOT_SIZE,
     );
     poses.push(lerpPose(restPose(i < 2 ? 0 : 1, 0, 0), dot, split));
   }
   return {
     ...calm(m, poses),
-    lightTurns: m.loop,
     openness: opennessAt(m.p, m.cycle, BLINK_BEFORE_MERGE, 1),
+    lightTurns: m.loop,
   };
 }
 
@@ -383,9 +374,9 @@ function working(m: Moment): MoodState {
   }
   return {
     ...calm(m, [restPose(0, dx, dy), restPose(1, dx, dy)]),
-    lightTurns: m.loop,
-    openness: opennessAt(m.p, m.cycle, WORK_BLINKS, 0.7), // quicker blinks while busy
     tilt: -WORK_TILT * dx,
+    openness: opennessAt(m.p, m.cycle, WORK_BLINKS, 0.7), // quicker blinks while busy
+    lightTurns: m.loop,
   };
 }
 
@@ -417,13 +408,13 @@ function done(m: Moment): MoodState {
     const rest = restPose(i === 1 ? 1 : 0, 0, 0);
     // A flat slit tilted toward the middle: the eyes' "^ ^".
     const slit: Pose = {
-      alpha: 1,
       cx: rest.cx,
       cy: rest.cy - 0.5,
+      w: 6.2,
       h: 2.4,
       r: 1.2,
       rot: i === 1 ? 0.34 : -0.34,
-      w: 6.2,
+      alpha: 1,
     };
     const e = lerpPose(rest, slit, squint);
     e.cx += joy * DONE_WIGGLE * wave;
@@ -432,9 +423,9 @@ function done(m: Moment): MoodState {
   }
   return {
     ...calm(m, poses),
+    tilt: joy * DONE_TILT * wave,
     color: celebrationColor(m.color, p, joy),
     lightTurns: m.loop,
-    tilt: joy * DONE_TILT * wave,
   };
 }
 
@@ -464,20 +455,16 @@ function bounceHeight(u: number): number {
   // Each bounce keeps r of the speed, so it lasts r times as long and rises r² as high.
   const durs = [1, 2 * r, 2 * r * r, 2 * r * r * r, 2 * r * r * r * r];
   let total = 0;
-  for (let i = 0; i < durs.length; i++) {
-    total += durs[i];
-  }
+  for (let i = 0; i < durs.length; i++) total += durs[i];
   const t = u * total;
   let acc = 0;
   for (let k = 0; k < durs.length; k++) {
     const d = durs[k];
     if (t <= acc + d) {
       const seg = (t - acc) / d;
-      if (k === 0) {
-        return 1 - seg * seg;
-      }
-      const hk = r ** (2 * k);
-      return hk * (1 - (2 * seg - 1) ** 2);
+      if (k === 0) return 1 - seg * seg;
+      const hk = Math.pow(r, 2 * k);
+      return hk * (1 - Math.pow(2 * seg - 1, 2));
     }
     acc += d;
   }
@@ -487,25 +474,19 @@ function bounceHeight(u: number): number {
 /** Eye centre y at phase `p`. */
 function fallenEyeY(p: number): number {
   "worklet";
-  if (p < FALL_START) {
-    return FALL_TOP;
-  }
-  if (p < FALL_SETTLED) {
+  if (p < FALL_START) return FALL_TOP;
+  if (p < FALL_SETTLED)
     return (
       FALL_FLOOR -
       bounceHeight((p - FALL_START) / (FALL_SETTLED - FALL_START)) * FALL_DROP
     );
-  }
-  if (p < FALL_RISE[0]) {
-    return FALL_FLOOR;
-  }
-  if (p < FALL_RISE[1]) {
+  if (p < FALL_RISE[0]) return FALL_FLOOR;
+  if (p < FALL_RISE[1])
     return lerp(
       FALL_FLOOR,
       FALL_TOP,
-      easeBack((p - FALL_RISE[0]) / (FALL_RISE[1] - FALL_RISE[0]))
+      easeBack((p - FALL_RISE[0]) / (FALL_RISE[1] - FALL_RISE[0])),
     );
-  }
   return FALL_TOP;
 }
 
@@ -522,13 +503,13 @@ function failed(m: Moment): MoodState {
   const h = EYE.h * sy;
   const r = Math.min(EYE.r, w / 2, h / 2);
   const poses: Pose[] = [
-    { alpha: 1, cx: EYE.cxL, cy: y, h, r, rot: 0, w },
-    { alpha: 1, cx: EYE.cxR, cy: y, h, r, rot: 0, w },
+    { cx: EYE.cxL, cy: y, w, h, r, rot: 0, alpha: 1 },
+    { cx: EYE.cxR, cy: y, w, h, r, rot: 0, alpha: 1 },
   ];
   const offset: [number, number] = [0, 0];
   if (p >= FAIL_SHAKE_START && p <= FAIL_SHAKE_START + FAIL_SHAKE_LENGTH) {
     const u = (p - FAIL_SHAKE_START) / FAIL_SHAKE_LENGTH;
-    const fade = (1 - u) ** 2;
+    const fade = Math.pow(1 - u, 2);
     offset[0] = FAIL_SHAKE * 0.5 * fade * Math.sin(TAU * 8 * u + 1);
     offset[1] = FAIL_SHAKE * fade * Math.sin(TAU * 9 * u);
   }
@@ -560,7 +541,7 @@ function invalid(m: Moment): MoodState {
     p < shakeStart || p > shakeEnd
       ? 0
       : Math.sin(
-          TAU * INVALID_SHAKES * ((p - shakeStart) / (shakeEnd - shakeStart))
+          TAU * INVALID_SHAKES * ((p - shakeStart) / (shakeEnd - shakeStart)),
         );
   const left = restPose(0, INVALID_SWING_EYES * shake, 0);
   const right = restPose(1, INVALID_SWING_EYES * shake, 0);
@@ -592,11 +573,11 @@ function sleepMarksAt(p: number, cs: number): SleepMark[] {
     const a = ph < 0.16 ? ph / 0.16 : ph > 0.72 ? (1 - ph) / 0.28 : 1;
     const size = (5 + ph * 4) * cs;
     marks.push({
-      alpha: clamp(a, 0, 1) * 0.92,
-      size,
-      strokeWidth: Math.max(0.6, size * 0.22),
       x: CENTER + (x - CENTER) * cs,
       y: CENTER + (y - CENTER) * cs,
+      size,
+      strokeWidth: Math.max(0.6, size * 0.22),
+      alpha: clamp(a, 0, 1) * 0.92,
     });
   }
   return marks;
@@ -647,7 +628,7 @@ function finishEye(pose: Pose, cs: number, sx: number, sy: number): EyeRect {
   const w = pose.w * cs * sx;
   const h = pose.h * cs * sy;
   const r = Math.min(pose.r * cs * Math.min(sx, sy), w / 2, h / 2);
-  return { alpha: pose.alpha, cx, cy, h, r: Math.max(0, r), rot: pose.rot, w };
+  return { cx, cy, w, h, r: Math.max(0, r), rot: pose.rot, alpha: pose.alpha };
 }
 
 /** Stroke width of the dizzy swirls, box units. */
@@ -712,15 +693,15 @@ export function computeFrame(spec: AvatarSpec, t: number): Frame {
   const L = cycle * reps;
   const tl = ((t % L) + L) % L; // seconds into the loop
   const cs =
-    spec.contentScale === undefined
-      ? CUTS[spec.cut].contentScale
-      : spec.contentScale;
+    spec.contentScale !== undefined
+      ? spec.contentScale
+      : CUTS[spec.cut].contentScale;
   const moment: Moment = {
-    color: spec.color,
-    cs,
-    cycle,
-    loop: tl / L,
     p: wrap01(tl / cycle),
+    loop: tl / L,
+    cycle,
+    cs,
+    color: spec.color,
   };
   const s = moodState(spec.mood, moment);
 
@@ -736,51 +717,50 @@ export function computeFrame(spec: AvatarSpec, t: number): Frame {
     hiddenEye(),
     hiddenEye(),
   ];
-  for (let i = 0; i < s.poses.length && i < 4; i++) {
+  for (let i = 0; i < s.poses.length && i < 4; i++)
     eyes[i] = finishEye(s.poses[i], cs, sx, sy);
-  }
 
   // Dizzy swirls take over from the eyes as `swirl` rises: the eyes shrink and fade while the spirals grow and unwind.
   const swirls: Swirl[] = [];
   if (s.swirl > 0.001) {
     const grow = smoothstep((s.swirl - 0.12) / 0.88);
-    const rot = 1.75 * TAU * (1 - s.swirl) ** 3;
+    const rot = 1.75 * TAU * Math.pow(1 - s.swirl, 3);
     const eyeScale = clamp(1 - s.swirl * 1.3, 0, 1);
     const eyeAlpha = clamp(1 - s.swirl * 1.6, 0, 1);
     const alpha = clamp(s.swirl * 2.5, 0, 1);
     for (let i = 0; i < 2; i++) {
       const e = eyes[i];
       swirls.push({
-        alpha,
         cx: e.cx,
         cy: e.cy,
+        radius: 3.6 * cs,
         dir: i === 0 ? -1 : 1,
         grow,
-        radius: 3.6 * cs,
         rot,
+        alpha,
       });
       eyes[i] = {
         ...e,
-        alpha: eyeAlpha,
+        w: e.w * eyeScale,
         h: e.h * eyeScale,
         r: e.r * eyeScale,
-        w: e.w * eyeScale,
+        alpha: eyeAlpha,
       };
     }
   }
 
   return {
+    t: tl,
+    phase: moment.p,
     color: s.color,
-    eyes,
+    tilt: s.tilt,
+    offset: s.offset,
     light,
     lit,
-    offset: s.offset,
-    phase: moment.p,
     shade,
-    sleepMarks: s.sleepMarks,
+    eyes,
     swirls,
-    t: tl,
-    tilt: s.tilt,
+    sleepMarks: s.sleepMarks,
   };
 }
 
@@ -788,15 +768,15 @@ export function computeFrame(spec: AvatarSpec, t: number): Frame {
 
 /** Where each mood's key pose falls in its eye cycle: the moment that shows the mood best. */
 const KEY_POSE: Readonly<Record<Mood, number>> = {
+  idle: 0, // at rest
+  observing: 0.25, // looking up and right, head turned
+  thinking: 0.57, // the merged dot, centred
+  processing: 0.59, // four dots square to the axes, one spin done
+  working: 0.137, // mid-sweep along the first line
   done: 0.286, // squinting with the eyes up, the wiggle level
   failed: 0.37, // flattened on the floor, before the swirls
-  idle: 0, // at rest
-  inactive: 0.12, // asleep, all three "z"s in view
   invalid: 0.41, // narrowed, the head centred mid-shake
-  observing: 0.25, // looking up and right, head turned
-  processing: 0.59, // four dots square to the axes, one spin done
-  thinking: 0.57, // the merged dot, centred
-  working: 0.137, // mid-sweep along the first line
+  inactive: 0.12, // asleep, all three "z"s in view
 };
 
 /**

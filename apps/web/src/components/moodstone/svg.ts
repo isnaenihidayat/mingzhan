@@ -1,7 +1,7 @@
 import {
   computeFrame,
-  SWIRL_STROKE,
   sleepMarkPoints,
+  SWIRL_STROKE,
   swirlPoints,
 } from "./core/frame";
 import {
@@ -29,11 +29,11 @@ const keyTime = (u: number) => String(+u.toFixed(5));
 const RAD2DEG = 180 / Math.PI;
 /** Stand-in for a sleep mark missing from a frame: invisible, at the centre. */
 const NO_MARK: SleepMark = {
-  alpha: 0,
-  size: 0,
-  strokeWidth: 0.6,
   x: CENTER,
   y: CENTER,
+  size: 0,
+  strokeWidth: 0.6,
+  alpha: 0,
 };
 
 const cutClip = (spec: AvatarSpec) =>
@@ -44,10 +44,9 @@ const cutClip = (spec: AvatarSpec) =>
  * one document then never resolve `url(#…)` to each other's clip or gradient.
  */
 function hash(s: string): string {
-  let h = 0x81_1c_9d_c5;
-  for (let i = 0; i < s.length; i++) {
-    h = Math.imul(h ^ s.charCodeAt(i), 0x01_00_01_93);
-  }
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++)
+    h = Math.imul(h ^ s.charCodeAt(i), 0x01000193);
   return (h >>> 0).toString(36);
 }
 
@@ -62,17 +61,16 @@ const grainRect = () =>
 
 function polylineD(flat: number[]): string {
   let d = "";
-  for (let i = 0; i < flat.length; i += 2) {
+  for (let i = 0; i < flat.length; i += 2)
     d += (i === 0 ? "M" : "L") + f(flat[i]) + " " + f(flat[i + 1]);
-  }
   return d;
 }
 
 export interface SvgOptions {
-  /** Optional solid background. */
-  background?: string;
   /** Output width/height in px. Default 240. */
   size?: number;
+  /** Optional solid background. */
+  background?: string;
 }
 
 /**
@@ -83,7 +81,7 @@ export interface SvgOptions {
 export function renderAvatarSvg(
   spec: AvatarSpec,
   frame: Frame,
-  opts: SvgOptions = {}
+  opts: SvgOptions = {},
 ): string {
   const size = opts.size ?? 240;
   const clipId = clipIdFor(spec);
@@ -98,9 +96,9 @@ export function renderAvatarSvg(
     .filter((e) => e.alpha > 0 && e.w > 0 && e.h > 0)
     .map((e) => {
       const rot =
-        e.rot === 0
-          ? ""
-          : ` transform="rotate(${f(e.rot * RAD2DEG)} ${f(e.cx)} ${f(e.cy)})"`;
+        e.rot !== 0
+          ? ` transform="rotate(${f(e.rot * RAD2DEG)} ${f(e.cx)} ${f(e.cy)})"`
+          : "";
       const op = e.alpha < 1 ? ` opacity="${f(e.alpha)}"` : "";
       return `<rect x="${f(e.cx - e.w / 2)}" y="${f(e.cy - e.h / 2)}" width="${f(e.w)}" height="${f(e.h)}" rx="${f(e.r)}" fill="${spec.eyeColor}"${rot}${op}/>`;
     })
@@ -108,13 +106,13 @@ export function renderAvatarSvg(
   const swirls = frame.swirls
     .map(
       (sw) =>
-        `<path d="${polylineD(swirlPoints(sw))}" fill="none" stroke="${spec.eyeColor}" stroke-width="${SWIRL_STROKE}" stroke-linecap="round" stroke-linejoin="round" opacity="${f(sw.alpha)}"/>`
+        `<path d="${polylineD(swirlPoints(sw))}" fill="none" stroke="${spec.eyeColor}" stroke-width="${SWIRL_STROKE}" stroke-linecap="round" stroke-linejoin="round" opacity="${f(sw.alpha)}"/>`,
     )
     .join("");
   const zs = frame.sleepMarks
     .map(
       (m) =>
-        `<path d="${polylineD(sleepMarkPoints(m))}" fill="none" stroke="${spec.eyeColor}" stroke-width="${f(m.strokeWidth)}" stroke-linecap="round" stroke-linejoin="round" opacity="${f(m.alpha)}"/>`
+        `<path d="${polylineD(sleepMarkPoints(m))}" fill="none" stroke="${spec.eyeColor}" stroke-width="${f(m.strokeWidth)}" stroke-linecap="round" stroke-linejoin="round" opacity="${f(m.alpha)}"/>`,
     )
     .join("");
   const bg = opts.background
@@ -130,7 +128,7 @@ export function renderAvatarSvg(
     eyes +
     swirls +
     zs +
-    "</g></svg>"
+    `</g></svg>`
   );
 }
 
@@ -147,16 +145,14 @@ export interface AnimatedSvgOptions extends SvgOptions {
  */
 export function renderAnimatedAvatarSvg(
   spec: AvatarSpec,
-  opts: AnimatedSvgOptions = {}
+  opts: AnimatedSvgOptions = {},
 ): string {
   spec = resolveSpec(spec); // a custom shape needs its face scale before any frame is sampled
   const size = opts.size ?? 240;
   const L = loopLength(spec.mood);
   const N = clamp(Math.round(L * (opts.fps ?? 24)), 24, 240);
   const frames: Frame[] = [];
-  for (let i = 0; i <= N; i++) {
-    frames.push(computeFrame(spec, (i / N) * L));
-  }
+  for (let i = 0; i <= N; i++) frames.push(computeFrame(spec, (i / N) * L));
   const keyTimes = frames.map((_, i) => keyTime(i / N)).join(";");
   const dur = `${f(L)}s`;
   const anim = (name: string, values: string[]) =>
@@ -175,13 +171,13 @@ export function renderAnimatedAvatarSvg(
     varies(tx) || varies(ty)
       ? animT(
           "translate",
-          frames.map((fr) => `${f(fr.offset[0])} ${f(fr.offset[1])}`)
+          frames.map((fr) => `${f(fr.offset[0])} ${f(fr.offset[1])}`),
         )
       : "";
   const rotateAnim = varies(tilt)
     ? animT(
         "rotate",
-        tilt.map((v) => `${f(v)} ${CENTER} ${CENTER}`)
+        tilt.map((v) => `${f(v)} ${CENTER} ${CENTER}`),
       )
     : "";
 
@@ -210,7 +206,7 @@ export function renderAnimatedAvatarSvg(
   // Eyes: one rect per slot that is ever visible.
   const eyes = [0, 1, 2, 3]
     .filter((k) =>
-      frames.some((fr) => fr.eyes[k].alpha > 0 && fr.eyes[k].w > 0)
+      frames.some((fr) => fr.eyes[k].alpha > 0 && fr.eyes[k].w > 0),
     )
     .map((k) => {
       const es = frames.map((fr) => fr.eyes[k]);
@@ -221,36 +217,36 @@ export function renderAnimatedAvatarSvg(
         `<rect x="${f(e0.cx - e0.w / 2)}" y="${f(e0.cy - e0.h / 2)}" width="${f(e0.w)}" height="${f(e0.h)}" rx="${f(e0.r)}" ry="${f(e0.r)}" fill="${spec.eyeColor}">` +
         anim(
           "x",
-          es.map((e) => f(e.cx - e.w / 2))
+          es.map((e) => f(e.cx - e.w / 2)),
         ) +
         anim(
           "y",
-          es.map((e) => f(e.cy - e.h / 2))
+          es.map((e) => f(e.cy - e.h / 2)),
         ) +
         anim(
           "width",
-          es.map((e) => f(e.w))
+          es.map((e) => f(e.w)),
         ) +
         anim(
           "height",
-          es.map((e) => f(e.h))
+          es.map((e) => f(e.h)),
         ) +
         anim(
           "rx",
-          es.map((e) => f(e.r))
+          es.map((e) => f(e.r)),
         ) +
         anim(
           "ry",
-          es.map((e) => f(e.r))
+          es.map((e) => f(e.r)),
         ) +
         (varies(alphas) ? anim("opacity", alphas.map(f)) : "") +
         (varies(rots)
           ? animT(
               "rotate",
-              es.map((e) => `${f(e.rot * RAD2DEG)} ${f(e.cx)} ${f(e.cy)}`)
+              es.map((e) => `${f(e.rot * RAD2DEG)} ${f(e.cx)} ${f(e.cy)}`),
             )
           : "") +
-        "</rect>"
+        `</rect>`
       );
     })
     .join("");
@@ -261,20 +257,18 @@ export function renderAnimatedAvatarSvg(
     for (let j = 0; j < 2; j++) {
       const ds = frames.map((fr) => {
         const s = fr.swirls[j];
-        if (s) {
-          return polylineD(swirlPoints(s));
-        }
+        if (s) return polylineD(swirlPoints(s));
         const e = fr.eyes[j];
         return polylineD(
           swirlPoints({
-            alpha: 0,
             cx: e.cx,
             cy: e.cy,
+            radius: 0,
             dir: j === 0 ? -1 : 1,
             grow: 0,
-            radius: 0,
             rot: 0,
-          })
+            alpha: 0,
+          }),
         );
       });
       const alphas = frames.map((fr) => fr.swirls[j]?.alpha ?? 0);
@@ -306,6 +300,6 @@ export function renderAnimatedAvatarSvg(
     eyes +
     swirls +
     zs +
-    "</g></g></svg>"
+    `</g></g></svg>`
   );
 }

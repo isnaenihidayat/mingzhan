@@ -2,11 +2,11 @@ import type { Mood } from "./types";
 
 /** How a mood is presented and timed. */
 export interface MoodInfo {
-  /** Seconds per eye cycle. */
-  cycle: number;
   key: Mood;
   /** Display name. */
   label: string;
+  /** Seconds per eye cycle. */
+  cycle: number;
   /** Eye cycles per seamless loop. */
   reps: number;
 }
@@ -16,15 +16,15 @@ export interface MoodInfo {
  * A plain record, so worklets can read it on the UI runtime.
  */
 export const MOOD_TABLE: Readonly<Record<Mood, Omit<MoodInfo, "key">>> = {
-  done: { cycle: 3.2, label: "Done", reps: 1 },
-  failed: { cycle: 5.5, label: "Failed", reps: 1 },
-  idle: { cycle: 5.5, label: "Idle", reps: 2 },
-  inactive: { cycle: 3.4, label: "Inactive", reps: 1 },
-  invalid: { cycle: 4, label: "Invalid", reps: 1 },
-  observing: { cycle: 6.5, label: "Observing", reps: 2 },
-  processing: { cycle: 9, label: "Processing", reps: 1 },
-  thinking: { cycle: 5.5, label: "Thinking", reps: 1 },
-  working: { cycle: 3.75, label: "Working", reps: 1 },
+  idle: { label: "Idle", cycle: 5.5, reps: 2 },
+  observing: { label: "Observing", cycle: 6.5, reps: 2 },
+  thinking: { label: "Thinking", cycle: 5.5, reps: 1 },
+  processing: { label: "Processing", cycle: 9, reps: 1 },
+  working: { label: "Working", cycle: 3.75, reps: 1 },
+  done: { label: "Done", cycle: 3.2, reps: 1 },
+  failed: { label: "Failed", cycle: 5.5, reps: 1 },
+  invalid: { label: "Invalid", cycle: 4, reps: 1 },
+  inactive: { label: "Inactive", cycle: 3.4, reps: 1 },
 };
 
 /** Mood names in display order. */

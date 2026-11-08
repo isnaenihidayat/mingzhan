@@ -11,40 +11,40 @@ export const SHAPE_SAMPLES = 240;
 export const BODY_RADIUS = 28;
 
 export interface ShapeParams {
-  /** Superellipse width relative to its height: above 1 is wider, below 1 taller. */
-  ax: number;
-  /** How far lobes push out and valleys cut in, as a fraction of the radius. */
-  depth: number;
-  /** Number of lobes around the edge, 0 for none. */
-  lobes: number;
   /** Superellipse exponent: 2 circle, ~4.5 squircle, 9 soft square, 16 square. */
   n: number;
+  /** Superellipse width relative to its height: above 1 is wider, below 1 taller. */
+  ax: number;
   /** Rotation of the whole shape, degrees. */
   rot: number;
-  /** Polygon corner rounding, from 0 sharp to 0.5 fully rounded. */
-  round: number;
+  /** Number of lobes around the edge, 0 for none. */
+  lobes: number;
+  /** How far lobes push out and valleys cut in, as a fraction of the radius. */
+  depth: number;
   /** Lobe profile: 1 is a wave, below 1 gives broad lobes and narrow valleys, above 1 narrow spikes and broad valleys. */
   sharp: number;
   /** Regular polygon sides, or 0 to use the superellipse. */
   sides: number;
+  /** Polygon corner rounding, from 0 sharp to 0.5 fully rounded. */
+  round: number;
 }
 
 export const SHAPE_DEFAULTS: ShapeParams = {
-  ax: 1,
-  depth: 0,
-  lobes: 0,
   n: 2,
+  ax: 1,
   rot: 0,
-  round: 0.3,
+  lobes: 0,
+  depth: 0,
   sharp: 1,
   sides: 0,
+  round: 0.3,
 };
 
 /** Superellipse radius at angle `t`, before normalisation. */
 function superRadius(n: number, ax: number, t: number): number {
   const c = Math.abs(Math.cos(t)) / ax;
   const s = Math.abs(Math.sin(t));
-  return (c ** n + s ** n) ** (-1 / n);
+  return Math.pow(Math.pow(c, n) + Math.pow(s, n), -1 / n);
 }
 
 /** Points per corner curve and per straight edge in a polygon outline. */
@@ -101,7 +101,7 @@ function polarResample(outline: [number, number][], count: number): number[] {
         [((Math.atan2(y, x) % TAU) + TAU) % TAU, Math.hypot(x, y)] as [
           number,
           number,
-        ]
+        ],
     )
     .sort((p, q) => p[0] - q[0]);
   const m = polar.length;
@@ -110,20 +110,14 @@ function polarResample(outline: [number, number][], count: number): number[] {
   let j = -1;
   for (let i = 0; i < count; i++) {
     const t = (i / count) * TAU;
-    while (j < m - 1 && polar[j + 1][0] <= t) {
-      j++;
-    }
+    while (j < m - 1 && polar[j + 1][0] <= t) j++;
     // The neighbours on either side of t, wrapping across 2π at both ends.
     const a = polar[(j + m) % m];
     const b = polar[(j + 1) % m];
     let span = b[0] - a[0];
     let off = t - a[0];
-    if (span <= 0) {
-      span += TAU;
-    }
-    if (off < 0) {
-      off += TAU;
-    }
+    if (span <= 0) span += TAU;
+    if (off < 0) off += TAU;
     out.push(a[1] + (b[1] - a[1]) * clamp(off / span, 0, 1));
   }
   return out;
@@ -151,7 +145,7 @@ export function shapeRadii(params: Partial<ShapeParams>): number[] {
     }
     if (p.lobes > 0) {
       const w = (Math.cos(p.lobes * tl) + 1) / 2;
-      const lobe = w ** p.sharp * 2 - 1;
+      const lobe = Math.pow(w, p.sharp) * 2 - 1;
       r *= 1 + p.depth * lobe;
     }
     radii.push(r);
@@ -162,13 +156,11 @@ export function shapeRadii(params: Partial<ShapeParams>): number[] {
     ext = Math.max(
       ext,
       Math.abs(radii[i] * Math.cos(t)),
-      Math.abs(radii[i] * Math.sin(t))
+      Math.abs(radii[i] * Math.sin(t)),
     );
   }
   const s = BODY_RADIUS / ext;
-  for (let i = 0; i < N; i++) {
-    radii[i] *= s;
-  }
+  for (let i = 0; i < N; i++) radii[i] *= s;
   return radii;
 }
 
@@ -185,22 +177,19 @@ export function radiiToPoints(radii: number[]): number[] {
 
 /** The smallest radius: the largest circle about the centre that fits inside the outline. */
 export function inscribedRadius(radii: number[]): number {
-  let m = Number.POSITIVE_INFINITY;
-  for (let i = 0; i < radii.length; i++) {
-    m = Math.min(m, radii[i]);
-  }
+  let m = Infinity;
+  for (let i = 0; i < radii.length; i++) m = Math.min(m, radii[i]);
   return m;
 }
 
 /** SVG path data for an outline. */
 export function pointsToPathD(points: number[]): string {
   let d = "";
-  for (let i = 0; i < points.length; i += 2) {
+  for (let i = 0; i < points.length; i += 2)
     d +=
       (i === 0 ? "M" : "L") +
       points[i].toFixed(2) +
       " " +
       points[i + 1].toFixed(2);
-  }
   return d + "Z";
 }
