@@ -130,6 +130,7 @@ export interface RegressionCase {
   expectedResult: string;
   id: string;
   input: string;
+  latestRun?: RegressionCaseRun | null;
   profileId: string;
   source: RegressionCaseSource;
 }
@@ -141,7 +142,7 @@ export type CreateRegressionCaseRequest =
   | {
       expectedResult: string;
       /** The reply's index in the session history; its input is the user message before it. */
-      messageIndex: number;
+      messageIndex?: number;
       sourceId: string;
       sourceType: "session";
     }

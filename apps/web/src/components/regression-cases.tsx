@@ -2,6 +2,7 @@ import {
   type CreateRegressionCaseRequest,
   type ListRegressionCasesResponse,
   MAX_REGRESSION_EXPECTED_RESULT_LENGTH,
+  type RegressionCaseRun,
   type RegressionCaseVerdict,
 } from "@mingzhan/core/contract";
 import { Button } from "@mingzhan/ui/button";
@@ -180,9 +181,11 @@ function SaveRegressionCaseForm({
 function RegressionCaseActions({
   profileId,
   caseId,
+  latestRun,
 }: {
   profileId: string;
   caseId: string;
+  latestRun?: RegressionCaseRun | null;
 }) {
   const queryClient = useQueryClient();
 
@@ -207,7 +210,7 @@ function RegressionCaseActions({
     onSuccess: invalidateCases,
   });
 
-  const run = rerun.data?.run;
+  const run = latestRun ?? rerun.data?.run;
   const markedRun = mark.data?.run;
   const verdict = markedRun?.id === run?.id ? markedRun?.verdict : run?.verdict;
   const busy = rerun.isPending || mark.isPending;
@@ -309,7 +312,11 @@ export function RegressionCasesList({ profileId }: { profileId: string }) {
             <p className="line-clamp-3 whitespace-pre-wrap border-border border-l-2 pl-3 text-muted-foreground text-sm">
               {item.expectedResult}
             </p>
-            <RegressionCaseActions caseId={item.id} profileId={profileId} />
+            <RegressionCaseActions
+              caseId={item.id}
+              latestRun={item.latestRun}
+              profileId={profileId}
+            />
           </li>
         ))}
       </ul>

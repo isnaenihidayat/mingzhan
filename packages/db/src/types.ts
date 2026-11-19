@@ -1190,6 +1190,10 @@ export interface DatabaseAdapter {
     tokenHash: string
   ): Promise<StoredConversationShareRecord | null>;
   getDefaultProfileForOrg(orgId: string): Promise<StoredProfileRecord | null>;
+  getLatestRegressionCaseRun(
+    orgId: string,
+    caseId: string
+  ): Promise<StoredRegressionCaseRunRecord | null>;
 
   getLlmUsageStats(orgId: string): Promise<StoredLlmUsageStatsRecord | null>;
   getManagedSecret(

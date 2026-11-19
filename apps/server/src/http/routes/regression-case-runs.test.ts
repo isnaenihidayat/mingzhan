@@ -126,6 +126,14 @@ describe("regression case run routes", () => {
     expect(
       await databaseAdapter.getRegressionCaseRun(admin.orgId, caseId, run.id)
     ).toMatchObject({ verdict: "pass", verdictByUserId: admin.userId });
+
+    const list = await call("agent_1/regression-cases", "GET");
+
+    expect(list.status).toBe(200);
+    expect((await list.json()).cases[0].latestRun).toMatchObject({
+      id: run.id,
+      verdict: "pass",
+    });
   });
 
   test("a run that fails after it starts is stored and cannot be marked", async () => {

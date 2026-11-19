@@ -3904,6 +3904,16 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
+  const getLatestRegressionCaseRunStmt = db.prepare<
+    RegressionCaseRunRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT * FROM regression_case_runs
+    WHERE org_id = ? AND case_id = ?
+    ORDER BY created_at DESC, id DESC
+    LIMIT 1
+  `);
+
   const getRegressionCaseRunStmt = db.prepare<
     RegressionCaseRunRow,
     SQLQueryBindings[]
@@ -5470,6 +5480,12 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       const row = getDefaultProfileForOrgStmt.get(orgId);
 
       return row ? toProfileRecord(row) : null;
+    },
+
+    async getLatestRegressionCaseRun(orgId, caseId) {
+      const row = getLatestRegressionCaseRunStmt.get(orgId, caseId);
+
+      return row ? toRegressionCaseRunRecord(row) : null;
     },
     async getLlmUsageStats(orgId) {
       const row = getLlmUsageStatsStmt.get(orgId, LLM_USAGE_STATS_ID);

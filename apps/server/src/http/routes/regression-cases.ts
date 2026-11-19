@@ -1,13 +1,17 @@
 import { createRoute, z } from "@hono/zod-openapi";
-import { createId, getUserMessageText } from "@mingzhan/core";
+import { createId, getUserMessageText, MíngZhànApiError } from "@mingzhan/core";
 import { findAgentQuestionnaireAnswers } from "@mingzhan/core/agent-questionnaire";
 import {
   type ListRegressionCasesResponse,
   MAX_REGRESSION_EXPECTED_RESULT_LENGTH,
   type RegressionCase,
   type RegressionCaseResponse,
+  type RegressionCaseRun,
 } from "@mingzhan/core/contract";
-import type { StoredRegressionCaseRecord } from "@mingzhan/db";
+import type {
+  StoredRegressionCaseRecord,
+  StoredRegressionCaseRunRecord,
+} from "@mingzhan/db";
 import { DatabaseAutomationStore } from "@mingzhan/db";
 import { sessionTurnRegistry } from "../../services/session-turn-registry";
 import type { ServerOptions } from "../context";
@@ -52,7 +56,7 @@ const createRegressionCaseSchema = z
           .trim()
           .min(1)
           .max(MAX_REGRESSION_EXPECTED_RESULT_LENGTH),
-        messageIndex: z.number().int().min(0),
+        messageIndex: z.number().int().min(0).optional(),
         sourceId: z.string().trim().min(1),
         sourceType: z.literal("session"),
       })
@@ -72,6 +76,26 @@ const createRegressionCaseSchema = z
   ])
   .openapi("CreateRegressionCaseRequest");
 
+export const regressionCaseRunSchema = z.object({
+  caseId: z.string(),
+  createdAt: z.string(),
+  createdByUserId: z.string().nullable(),
+  error: z.string().nullable(),
+  id: z.string(),
+  output: z.string().nullable(),
+  status: z.enum(["completed", "failed"]),
+  verdict: z.enum(["pass", "fail"]).nullable(),
+  verdictAt: z.string().nullable(),
+  verdictByUserId: z.string().nullable(),
+});
+
+export function toRegressionCaseRun({
+  orgId: _orgId,
+  ...run
+}: StoredRegressionCaseRunRecord): RegressionCaseRun {
+  return run;
+}
+
 const regressionCaseSchema = z
   .object({
     createdAt: z.string(),
@@ -79,6 +103,7 @@ const regressionCaseSchema = z
     expectedResult: z.string(),
     id: z.string(),
     input: z.string(),
+    latestRun: regressionCaseRunSchema.optional(),
     profileId: z.string(),
     source: z.object({
       automationId: z.string().nullable(),
@@ -201,6 +226,28 @@ function inputBeforeReply(
   }
 
   return null;
+}
+
+function readSessionInput(payloads: unknown[], index?: number): string | null {
+  if (index === undefined) {
+    const last = payloads.findLast(
+      (payload) => storedRoleSchema.safeParse(payload).data?.role === "user"
+    );
+
+    const parsed = storedUserMessageSchema.safeParse(last);
+
+    return parsed.success
+      ? getUserMessageText(parsed.data.content).trim()
+      : null;
+  }
+
+  const reply = storedRoleSchema.safeParse(payloads[index]);
+
+  if (!reply.success || reply.data.role !== "assistant") {
+    throw new MíngZhànApiError("messageIndex must point at a reply.", 400);
+  }
+
+  return inputBeforeReply(payloads, index);
 }
 
 export function registerRegressionCaseRoutes(
@@ -348,18 +395,14 @@ export function registerRegressionCaseRoutes(
         return errorResponse("Source chat is still running.", 409);
       }
 
-      // Same index space as branching: the web sends the reply's historyIndex.
-      const payloads = (
-        await databaseAdapter.listMessagesForSession(body.sourceId)
-      ).map((message) => message.payload);
+      const messages = await databaseAdapter.listMessagesForSession(
+        body.sourceId
+      );
 
-      const reply = storedRoleSchema.safeParse(payloads[body.messageIndex]);
-
-      if (!reply.success || reply.data.role !== "assistant") {
-        return errorResponse("messageIndex must point at a reply.", 400);
-      }
-
-      const text = inputBeforeReply(payloads, body.messageIndex);
+      const text = readSessionInput(
+        messages.map((message) => message.payload),
+        body.messageIndex
+      );
 
       if (!text) {
         return errorResponse(
@@ -456,10 +499,24 @@ export function registerRegressionCaseRoutes(
       { limit, offset }
     );
 
-    return json<ListRegressionCasesResponse>({
-      cases: records
+    const cases = await Promise.all(
+      records
         .filter((record) => canReadRegressionCase(record, auth))
-        .map(toRegressionCase),
+        .map(async (record) => {
+          const run = await databaseAdapter.getLatestRegressionCaseRun(
+            orgId,
+            record.id
+          );
+
+          return {
+            ...toRegressionCase(record),
+            latestRun: run ? toRegressionCaseRun(run) : undefined,
+          };
+        })
+    );
+
+    return json<ListRegressionCasesResponse>({
+      cases,
       nextOffset: records.length === limit ? offset + records.length : null,
     });
   });

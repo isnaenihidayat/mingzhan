@@ -385,7 +385,7 @@ describe("createOpenRouterProvider", () => {
         const headers = request.headers;
         expect(headers.get("Authorization")).toBe("Bearer sk-or-v1-test");
         expect(headers.get("HTTP-Referer")).toBe(
-          "https://github.com/ahmadrosid/mingzhan"
+          "https://github.com/isnaenihidayat/mingzhan"
         );
         expect(headers.get("X-OpenRouter-Title")).toBe("MíngZhàn");
 
