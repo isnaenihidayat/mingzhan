@@ -9,8 +9,8 @@ import {
   type AuthContextValue,
 } from "@/context/auth-context-shared";
 import { ThemeProvider } from "@/context/theme-context";
+import { formatMessageTime } from "@/lib/chat-history";
 import { ChatMessageList } from "./chat-message-list";
-import { formatMessageTime } from "./message-actions";
 
 class TestUtterance {
   onend?: () => void;

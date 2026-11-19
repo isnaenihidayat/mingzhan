@@ -16,6 +16,7 @@ import {
   useState,
 } from "react";
 
+import { formatMessageTime } from "@/lib/chat-history";
 import { copyText } from "@/lib/copy-text";
 
 export const messageActionClass =
@@ -23,46 +24,6 @@ export const messageActionClass =
 
 export const messageActionRowClass =
   "flex min-h-8 flex-wrap items-center gap-1 transition-opacity [@media(hover:hover)]:opacity-0 group-focus-within:opacity-100 group-hover:opacity-100";
-
-const timeFormatter = new Intl.DateTimeFormat("en-US", {
-  hour: "2-digit",
-  hour12: true,
-  minute: "2-digit",
-});
-
-const weekdayFormatter = new Intl.DateTimeFormat("en-US", { weekday: "short" });
-
-const olderDateFormatter = new Intl.DateTimeFormat("en-US", {
-  day: "2-digit",
-  month: "short",
-});
-
-const clock24Formatter = new Intl.DateTimeFormat("en-GB", {
-  hour: "2-digit",
-  hourCycle: "h23",
-  minute: "2-digit",
-});
-
-function calendarDay(date: Date): number {
-  return (
-    Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / 86_400_000
-  );
-}
-
-export function formatMessageTime(date: Date, now = new Date()): string {
-  const age = calendarDay(now) - calendarDay(date);
-  const clock = timeFormatter.format(date);
-
-  if (age === 0) {
-    return clock;
-  }
-
-  if (age > 0 && age <= 7) {
-    return `${weekdayFormatter.format(date)} ${clock}`;
-  }
-
-  return `${olderDateFormatter.format(date)}, ${clock24Formatter.format(date)}`;
-}
 
 export function MessageTime({ createdAt }: { createdAt?: string }) {
   if (!createdAt) {
