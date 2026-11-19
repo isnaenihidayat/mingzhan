@@ -20,6 +20,7 @@ import {
   readChatgptOAuthFromInstance,
   readXaiOAuthFromInstance,
   saveUserConfig,
+  saveUserThinkingSettings,
   saveUserTimezone,
   saveUserWebPublicUrl,
   validateProviderApiKeyFormat,
@@ -143,6 +144,39 @@ describe("user config multi-provider", () => {
     delete process.env.MINGZHAN_CONFIG_DIR;
   });
 
+  test("keeps a provider that is saved during a thinking settings save", async () => {
+    configDir = await mkdtemp(join(tmpdir(), "mingzhan-config-save-race-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const first = {
+      apiKey: "",
+      createdAt: "2026-06-07T10:00:00.000Z",
+      id: createProviderInstanceId(),
+      label: "First",
+      type: "groq" as const,
+    };
+
+    const second = {
+      ...first,
+      id: createProviderInstanceId(),
+      label: "Second",
+    };
+
+    const config = { defaultProviderId: first.id, providers: [first] };
+    await saveUserConfig(config);
+
+    await Promise.all([
+      saveUserThinkingSettings({ effort: "high", enabled: true }),
+      saveUserConfig({ ...config, providers: [first, second] }),
+    ]);
+
+    const loaded = await loadUserConfig();
+    expect(loaded!.providers.map((provider) => provider.id)).toEqual([
+      first.id,
+      second.id,
+    ]);
+  });
+
   test("round-trips multiple provider instances", async () => {
     configDir = await mkdtemp(join(tmpdir(), "mingzhan-config-"));
     process.env.MINGZHAN_CONFIG_DIR = configDir;
@@ -178,17 +212,19 @@ describe("user config multi-provider", () => {
           wireApi: "responses",
         },
       ],
-      thinkingEffort: "medium",
+      thinkingEffort: "xhigh",
       thinkingEnabled: true,
       timezone: "UTC",
     });
 
     const raw = await readFile(getUserConfigPath(), "utf8");
+    expect(raw).toContain("thinking_effort=xhigh");
     expect(raw).toContain(`[provider.${openaiId}]`);
     expect(raw).toContain("label=Ollama");
     expect(raw).toContain("default_provider_id=");
 
     const loaded = await loadUserConfig();
+    expect(loaded?.thinkingEffort).toBe("xhigh");
     expect(loaded?.providers).toHaveLength(2);
     expect(loaded?.defaultProviderId).toBe(openaiId);
     expect(loaded?.providers[1]?.baseUrl).toBe("http://localhost:11434/v1");

@@ -32,7 +32,8 @@ export function resolveRequestClientOrigin(
   // Only the zero-user setup route may bootstrap a direct deployment's URL.
   // Keep the stricter OAuth/share allowlist for every other caller, and never
   // replace an operator-provisioned URL or trust unverified forwarding headers.
-  const initialSetup = options.initialSetup && !resolveWebPublicUrl();
+  const configured = resolveWebPublicUrl();
+  const initialSetup = options.initialSetup && !configured;
   const browserOrigin = request?.headers.get("origin");
 
   if (initialSetup && browserOrigin && !sameOrigin(candidate, browserOrigin)) {
@@ -48,10 +49,22 @@ export function resolveRequestClientOrigin(
   }
 
   if (!isAllowedClientOrigin(candidate, request)) {
-    throw new MíngZhànApiError("Origin is not allowed.", 400);
+    throw new MíngZhànApiError(originNotAllowedMessage(configured), 400);
   }
 
   return candidate;
+}
+
+function originNotAllowedMessage(configured: string | undefined): string {
+  if (configured) {
+    return "Origin is not allowed. Open the configured public web URL or update MINGZHAN_WEB_PUBLIC_URL in System → Preferences → Public web URL.";
+  }
+
+  if (trustForwardedHeaders()) {
+    return "Origin is not allowed. Check the proxy's X-Forwarded-Host and X-Forwarded-Proto headers, or configure MINGZHAN_WEB_PUBLIC_URL.";
+  }
+
+  return "Origin is not allowed. Set MINGZHAN_WEB_PUBLIC_URL to the address you use to open MingZhan.";
 }
 
 function readClaimedOrigin(

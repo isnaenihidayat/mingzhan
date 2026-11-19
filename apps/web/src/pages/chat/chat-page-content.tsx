@@ -23,9 +23,14 @@ import { ArtifactStreamingPanelBridge } from "@/components/chat/artifact-streami
 import { BrowserLiveViewPanelBridge } from "@/components/chat/browser-live-view-panel-bridge";
 import { ChatCognitoControl } from "@/components/chat/chat-cognito-control";
 import { ChatComposer } from "@/components/chat/chat-composer";
-import { ChatMessageList } from "@/components/chat/chat-message-list";
+import {
+  ChatMessageList,
+  type SaveCaseReply,
+} from "@/components/chat/chat-message-list";
 import type { AgentActivity } from "@/components/moodstone";
+import { SaveRegressionCaseDialog } from "@/components/regression-cases";
 import { ChatAttachmentPanelProvider } from "@/context/chat-attachment-panel-context";
+import { useAuth } from "@/context/use-auth";
 import { useChatUsageVisible } from "@/hooks/use-chat-usage-visible";
 import { usePostTurnSkillReviewOverlay } from "@/hooks/use-post-turn-skill-review-overlay";
 import type { ChatListItem } from "@/lib/chat-history";
@@ -297,6 +302,21 @@ export function ChatPageContent({
   );
 }
 
+function useChatRegressionCase(state: ChatPageState) {
+  const { activeOrg } = useAuth();
+
+  const [caseDraft, setCaseDraft] = useState<
+    (SaveCaseReply & { sessionId: string }) | null
+  >(null);
+
+  const caseSessionId =
+    !(state.cognito || state.readOnlySession) && activeOrg?.role
+      ? state.session?.id
+      : undefined;
+
+  return { caseDraft, caseSessionId, setCaseDraft };
+}
+
 function ChatConversation({
   below,
   cognitoControl,
@@ -334,6 +354,9 @@ function ChatConversation({
     showThinking,
     turnStartedAt,
   } = state;
+
+  const { caseDraft, caseSessionId, setCaseDraft } =
+    useChatRegressionCase(state);
 
   // Cognito chats are not kept, so neither is their open panel.
   const rememberId = session && !state.cognito ? session.id : undefined;
@@ -400,11 +423,7 @@ function ChatConversation({
                 branchingMessageId={branchingMessageId}
                 contentClassName="mx-auto w-full max-w-3xl px-4"
                 messages={messages}
-                modelLabel={
-                  currentModelSelection
-                    ? renderModelLabel(currentModelSelection)
-                    : null
-                }
+                modelLabel={modelLabel}
                 onBranchMessage={(message) => void handleBranchMessage(message)}
                 onContinueToolSetup={async (setupId) => {
                   await sendMessage(
@@ -417,6 +436,12 @@ function ChatConversation({
                 }
                 onRetryMessage={(message) =>
                   void handleTryAgainMessage(message)
+                }
+                onSaveAsCase={
+                  caseSessionId
+                    ? (reply) =>
+                        setCaseDraft({ ...reply, sessionId: caseSessionId })
+                    : undefined
                 }
                 onSubmitQuestionnaire={(answers) => {
                   void sendMessage(
@@ -444,6 +469,25 @@ function ChatConversation({
               <div className="mx-auto w-full max-w-3xl">{composer}</div>
             </div>
           </div>
+          {caseDraft &&
+            caseSessionId &&
+            caseDraft.sessionId === caseSessionId && (
+              <SaveRegressionCaseDialog
+                expectedResult={caseDraft.expectedResult}
+                onOpenChange={(open) => {
+                  if (!open) {
+                    setCaseDraft(null);
+                  }
+                }}
+                open
+                profileId={profileId}
+                source={{
+                  messageIndex: caseDraft.messageIndex,
+                  sourceId: caseSessionId,
+                  sourceType: "session",
+                }}
+              />
+            )}
         </ChatPageColumn>
       </ChatAttachmentPanelProvider>
     </ChatStatusProvider>

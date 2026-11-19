@@ -130,12 +130,55 @@ export interface RegressionCase {
   expectedResult: string;
   id: string;
   input: string;
+  latestRun?: RegressionCaseRun | null;
   profileId: string;
   source: RegressionCaseSource;
 }
 
+/** The cap on a case's `expectedResult`, in UTF-16 code units. */
+export const MAX_REGRESSION_EXPECTED_RESULT_LENGTH = 20_000;
+
+export type CreateRegressionCaseRequest =
+  | {
+      expectedResult: string;
+      /** The reply's index in the session history; its input is the user message before it. */
+      messageIndex?: number;
+      sourceId: string;
+      sourceType: "session";
+    }
+  | {
+      automationId: string;
+      expectedResult: string;
+      sourceId: string;
+      sourceType: "automation_run";
+    };
+
 export interface RegressionCaseResponse {
   case: RegressionCase;
+}
+
+export type RegressionCaseRunStatus = "completed" | "failed";
+
+export type RegressionCaseVerdict = "pass" | "fail";
+
+/** One rerun of a case against its profile's current config. */
+export interface RegressionCaseRun {
+  caseId: string;
+  createdAt: string;
+  createdByUserId: string | null;
+  /** Set when the run failed; `output` is then null. */
+  error: string | null;
+  id: string;
+  output: string | null;
+  status: RegressionCaseRunStatus;
+  /** A member's mark. Nothing grades a run automatically. */
+  verdict: RegressionCaseVerdict | null;
+  verdictAt: string | null;
+  verdictByUserId: string | null;
+}
+
+export interface RegressionCaseRunResponse {
+  run: RegressionCaseRun;
 }
 
 export interface ListRegressionCasesResponse {
@@ -1673,7 +1716,7 @@ export interface UpdateTimezoneRequest {
   timezone: string;
 }
 
-export type ThinkingEffort = "low" | "medium" | "high";
+export type ThinkingEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface ThinkingSettings {
   effort: ThinkingEffort;
@@ -1736,7 +1779,7 @@ export interface UpdateImageGenerationRequest {
 }
 
 /** Search back-end that replaces the provider-hosted `web_search` tool. */
-export type WebSearchProvider = "exa" | "firecrawl" | "serply";
+export type WebSearchProvider = "exa" | "firecrawl" | "serply" | "keenable";
 
 export interface WebSearchSettingsResponse {
   apiKeyMasked: string | null;
@@ -2196,6 +2239,8 @@ export interface ProviderInstanceSummary {
   /** The last 4 characters of the saved key, for admins only. */
   apiKeyEnding?: string;
   baseUrl?: string | null;
+  /** The connected ChatGPT account's plan, such as `"free"` or `"plus"`. */
+  chatgptPlanType?: string;
   createdAt: string;
   customModels?: CustomModelEntry[];
   hasApiKey: boolean;
@@ -3118,6 +3163,7 @@ export type ProviderName =
   | "xai"
   | "groq"
   | "cheaper_inference"
+  | "standardcompute"
   | "together"
   | "xiaomi"
   | "meta"
@@ -3477,6 +3523,11 @@ export interface ToolDefinition<Input = unknown, Output = unknown> {
   /** When true, this tool may run concurrently with other parallelSafe tools in the same turn. */
   parallelSafe?: boolean;
   parameters?: JsonSchema;
+  /**
+   * Set from an MCP server's `readOnlyHint`. A regression rerun runs only
+   * these and its allowlisted tools.
+   */
+  readOnly?: boolean;
   run(input: Input, context: ToolContext): Promise<Output>;
 }
 

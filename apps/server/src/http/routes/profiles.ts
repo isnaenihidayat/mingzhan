@@ -49,6 +49,7 @@ import {
   requireOrgMemberFromContext,
   requirePlatformAdminFromContext,
   requireProfileManageFromContext,
+  requireRootOrgSharedSetAccess,
 } from "../org-guards";
 import { getRequestAuth, json, readJson, readOptionalJson } from "../shared";
 import type { AppEnv, HonoApp } from "../types";
@@ -1834,7 +1835,18 @@ export function registerProfileRoutes(
         profileId
       );
 
-      const document = sharedDocumentIds.includes(documentId)
+      const shared = sharedDocumentIds.includes(documentId);
+
+      // The shared branch reads the org store; the root-org rule for the
+      // shared set applies on this path too.
+      if (shared) {
+        requireRootOrgSharedSetAccess(
+          getRequestAuth(c),
+          await options.databaseAdapter?.getOrganizationById(orgId)
+        );
+      }
+
+      const document = shared
         ? await readOrganizationKnowledgeBaseDocumentContent(
             orgId,
             documentId,
@@ -1952,6 +1964,13 @@ export function registerProfileRoutes(
         throw new MíngZhànApiError("Not found", 404);
       }
 
+      // A root org's published set is admin-only, same as its direct reads and
+      // the published-skill sibling route (`skills.ts`).
+      requireRootOrgSharedSetAccess(
+        auth,
+        await options.databaseAdapter?.getOrganizationById(orgId)
+      );
+
       const document = await agent.readPublishedKnowledgeBaseDocument(
         orgId,
         decodeURIComponent(c.req.param("publicationId")),
@@ -1975,6 +1994,13 @@ export function registerProfileRoutes(
       const profileId = decodeURIComponent(c.req.param("profileId"));
       const documentId = decodeURIComponent(c.req.param("documentId"));
       await agent.getProfile(orgId, profileId);
+
+      // Attaching is a read path into the org's shared set, so the root-org
+      // rule applies here too (#2431 closed only the direct reads).
+      requireRootOrgSharedSetAccess(
+        getRequestAuth(c),
+        await options.databaseAdapter?.getOrganizationById(orgId)
+      );
 
       try {
         await attachSharedKnowledgeBaseDocument(orgId, profileId, documentId);
@@ -2002,6 +2028,11 @@ export function registerProfileRoutes(
       const documentId = decodeURIComponent(c.req.param("documentId"));
       await agent.getProfile(orgId, profileId);
 
+      requireRootOrgSharedSetAccess(
+        getRequestAuth(c),
+        await options.databaseAdapter?.getOrganizationById(orgId)
+      );
+
       const detached = await detachSharedKnowledgeBaseDocument(
         orgId,
         profileId,
@@ -2020,6 +2051,7 @@ export function registerProfileRoutes(
   );
 
   app.get("/v1/profiles/:profileId/avatar", async (c) => {
+    await requireProfileRead(c);
     const orgId = requireActiveOrgIdFromContext(c);
     const profileId = decodeURIComponent(c.req.param("profileId"));
     const avatar = await agent.getProfileAvatar(orgId, profileId);

@@ -19,6 +19,10 @@ import {
   resolveComposioCallbackBaseUrl,
 } from "./composio-callback-url";
 
+import { ManagedSecrets } from "./managed-secrets";
+
+const CONVERSATION_SHARE_SECRET_SCOPE = "conversation-share";
+
 function resolveConversationShareBaseUrl(options: {
   clientOrigin?: string;
   request?: Request;
@@ -50,10 +54,18 @@ const publicMessagePayloadSchema = z.object({
 });
 
 export class ConversationShareService {
+  private readonly secrets: ManagedSecrets;
+  private readonly canRecover: boolean;
+
   constructor(
     private readonly db: DatabaseAdapter,
     private readonly authService: AuthService
-  ) {}
+  ) {
+    const key = process.env.MINGZHAN_SECRETS_KEY;
+
+    this.secrets = new ManagedSecrets(db, key);
+    this.canRecover = Boolean(key);
+  }
 
   async publishConversationShare(input: {
     orgId: string;
@@ -101,37 +113,41 @@ export class ConversationShareService {
       input.sessionId
     );
 
-    let token: string | null = null;
-    let shareId: string;
-    let createdAt: string;
+    const token = generateConversationShareToken();
+    const shareId = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
 
-    if (existing) {
-      shareId = existing.id;
-      createdAt = existing.created_at;
-      // When publishing again, we revoke previous or generate a fresh token to guarantee link possession
-      token = generateConversationShareToken();
-      await this.db.revokeConversationShare(
-        input.orgId,
-        existing.id,
-        new Date().toISOString()
-      );
+    if (this.canRecover) {
+      await this.secrets.save(CONVERSATION_SHARE_SECRET_SCOPE, shareId, token);
     }
 
-    token = generateConversationShareToken();
-    shareId = crypto.randomUUID();
-    createdAt = new Date().toISOString();
+    try {
+      if (existing) {
+        await this.db.revokeConversationShare(
+          input.orgId,
+          existing.id,
+          createdAt
+        );
+      }
 
-    await this.db.createConversationShare({
-      created_at: createdAt,
-      created_by_user_id: input.userId,
-      id: shareId,
-      org_id: input.orgId,
-      revoked_at: null,
-      session_id: input.sessionId,
-      snapshot_payload: JSON.stringify(sanitizedMessages),
-      title: session.title || "Percakapan MíngZhàn",
-      token_hash: this.authService.hashToken(token),
-    });
+      await this.db.createConversationShare({
+        created_at: createdAt,
+        created_by_user_id: input.userId,
+        id: shareId,
+        org_id: input.orgId,
+        revoked_at: null,
+        session_id: input.sessionId,
+        snapshot_payload: JSON.stringify(sanitizedMessages),
+        title: session.title || "Percakapan MíngZhàn",
+        token_hash: this.authService.hashToken(token),
+      });
+    } catch (error) {
+      if (this.canRecover) {
+        await this.secrets.delete(CONVERSATION_SHARE_SECRET_SCOPE, shareId);
+      }
+
+      throw error;
+    }
 
     const baseUrl = resolveConversationShareBaseUrl({
       clientOrigin: input.clientOrigin,
@@ -176,12 +192,22 @@ export class ConversationShareService {
       request: input.request,
     });
 
+    const { value: token } = await this.secrets.resolve(
+      CONVERSATION_SHARE_SECRET_SCOPE,
+      existing.id
+    );
+
+    const sharePath =
+      token && this.authService.hashToken(token) === existing.token_hash
+        ? buildConversationSharePath(token)
+        : "";
+
     return {
       active: true,
       createdAt: existing.created_at,
       id: existing.id,
-      sharePath: "",
-      shareUrl: null,
+      sharePath,
+      shareUrl: sharePath ? `${baseUrl}${sharePath}` : null,
       title: existing.title,
       webPublicUrlConfigured: !isLoopbackComposioCallbackBaseUrl(baseUrl),
     };

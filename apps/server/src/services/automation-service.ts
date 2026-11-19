@@ -21,6 +21,7 @@ import {
   validateAutomationDelivery,
   validateAutomationInput,
 } from "@mingzhan/core";
+import { createChatLock } from "@mingzhan/core/channel-chat-lock";
 import { canAccessSuperMingzhanProfile } from "@mingzhan/core/profiles";
 import { BUILTIN_TOOL_IDS } from "@mingzhan/core/tools/protected";
 import { type DatabaseAdapter, DatabaseAutomationStore } from "@mingzhan/db";
@@ -43,6 +44,7 @@ export interface AutomationServiceOptions {
 }
 
 export class AutomationService {
+  private readonly mutationLock = createChatLock();
   private readonly runProgress = new Map<
     string,
     Pick<AutomationRunRecord, "output" | "progress">
@@ -209,6 +211,21 @@ export class AutomationService {
     input: UpdateAutomationRequest,
     access?: ProfileAccess
   ): Promise<StoredAutomation> {
+    const updated = await this.mutationLock.withLock(id, () =>
+      this.applyUpdate(id, orgId, input, access)
+    );
+
+    await this.notifyChange();
+
+    return this.enrichAutomation(updated);
+  }
+
+  private async applyUpdate(
+    id: string,
+    orgId: string,
+    input: UpdateAutomationRequest,
+    access?: ProfileAccess
+  ): Promise<StoredAutomation> {
     const existing = await this.get(id, orgId);
 
     if (!existing) {
@@ -300,19 +317,18 @@ export class AutomationService {
     };
 
     await this.store.save(updated);
-    await this.notifyChange();
 
-    return this.enrichAutomation(updated);
+    return updated;
   }
 
   async delete(id: string, orgId: string): Promise<boolean> {
-    const existing = await this.get(id, orgId);
+    const deleted = await this.mutationLock.withLock(id, async () => {
+      const existing = await this.store.get(id);
 
-    if (!existing) {
-      return false;
-    }
-
-    const deleted = await this.store.delete(id);
+      return existing && automationBelongsToOrg(existing, orgId)
+        ? this.store.delete(id)
+        : false;
+    });
 
     if (deleted) {
       await this.notifyChange();

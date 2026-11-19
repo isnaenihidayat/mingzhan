@@ -8,6 +8,7 @@ import type {
   ProviderChatOptions,
   ProviderClient,
   StreamChatHandlers,
+  ThinkingEffort,
   WireApi,
 } from "@mingzhan/core";
 import {
@@ -27,6 +28,7 @@ import {
   buildChatCompletionResult,
   buildProviderHttpError,
   buildProviderResponseError,
+  dropEmptyToolEnumMembers,
   extractOpenAITokenUsage,
   finalizePendingToolCalls,
   mergePendingToolCall,
@@ -80,7 +82,12 @@ export function createOpenAICompatibleProvider(
   const useResponsesApi = options.wireApi === "responses";
 
   return {
-    generateChat(input: GenerateChatInput) {
+    generateChat(chatInput: GenerateChatInput) {
+      const input = {
+        ...chatInput,
+        tools: dropEmptyToolEnumMembers(chatInput.tools, label),
+      };
+
       if (useResponsesApi) {
         return generateOpenAIResponsesChat({
           apiKey,
@@ -88,6 +95,7 @@ export function createOpenAICompatibleProvider(
           input,
           label,
           model,
+          provider: options.providerName ?? "openai_compatible",
           stream: false,
           supportsThinking: options.supportsThinking,
         });
@@ -98,6 +106,7 @@ export function createOpenAICompatibleProvider(
         messages: input.messages,
         model,
         netra: options.providerName === "netra",
+        provider: options.providerName ?? "openai_compatible",
         resolveMaxOutputTokens: options.resolveMaxOutputTokens,
         signal: input.signal,
         system: input.system,
@@ -158,7 +167,12 @@ export function createOpenAICompatibleProvider(
       });
     },
     name: options.providerName ?? "openai_compatible",
-    streamChat(input: GenerateChatInput, handlers: StreamChatHandlers) {
+    streamChat(chatInput: GenerateChatInput, handlers: StreamChatHandlers) {
+      const input = {
+        ...chatInput,
+        tools: dropEmptyToolEnumMembers(chatInput.tools, label),
+      };
+
       if (useResponsesApi) {
         return generateOpenAIResponsesChat({
           apiKey,
@@ -167,6 +181,7 @@ export function createOpenAICompatibleProvider(
           input,
           label,
           model,
+          provider: options.providerName ?? "openai_compatible",
           stream: true,
           supportsThinking: options.supportsThinking,
         });
@@ -181,6 +196,7 @@ export function createOpenAICompatibleProvider(
         messages: input.messages,
         model,
         netra: options.providerName === "netra",
+        provider: options.providerName ?? "openai_compatible",
         resolveMaxOutputTokens: options.resolveMaxOutputTokens,
         signal: input.signal,
         system: input.system,
@@ -271,17 +287,35 @@ function readReasoningDetails<ProviderPayload>(
 
 function buildThinkingBody(
   thinking: ProviderChatOptions["thinking"] | undefined,
-  options: { model: string; hasTools: boolean; netra?: boolean }
+  options: {
+    model: string;
+    hasTools: boolean;
+    netra?: boolean;
+    provider: string;
+  }
 ): Pick<
   OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
   "reasoning_effort"
 > & {
-  reasoning?: { effort?: "low" | "medium" | "high"; enabled?: boolean };
+  reasoning?: { effort?: ThinkingEffort; enabled?: boolean };
 } {
   if (options.netra) {
-    return thinking?.enabled
-      ? { reasoning: { effort: thinking.effort === "low" ? "low" : "high" } }
-      : { reasoning: { enabled: false } };
+    if (!thinking?.enabled) {
+      return { reasoning: { enabled: false } };
+    }
+
+    // Netra's V4.1 Flash has low/high/max tiers, so medium and xhigh go to high.
+    const effort = normalizeThinkingEffort(
+      thinking.effort,
+      options.model,
+      options.provider
+    );
+
+    return {
+      reasoning: {
+        effort: effort === "low" || effort === "max" ? effort : "high",
+      },
+    };
   }
 
   if (
@@ -304,7 +338,11 @@ function buildThinkingBody(
     return {};
   }
 
-  const effort = normalizeThinkingEffort(thinking.effort);
+  const effort = normalizeThinkingEffort(
+    thinking.effort,
+    options.model,
+    options.provider
+  );
 
   return {
     reasoning: { effort },
@@ -326,6 +364,7 @@ async function requestChatCompletion(
     tools?: LlmToolDefinition[];
     thinking?: ProviderChatOptions["thinking"];
     netra?: boolean;
+    provider: string;
   }
 ): Promise<ChatCompletionResult> {
   try {
@@ -340,6 +379,7 @@ async function requestChatCompletion(
         hasTools: Boolean(options.tools?.length),
         model: options.model,
         netra: options.netra,
+        provider: options.provider,
       }),
     };
 
@@ -409,6 +449,7 @@ async function streamChatCompletion(options: {
   tools?: LlmToolDefinition[];
   thinking?: ProviderChatOptions["thinking"];
   netra?: boolean;
+  provider: string;
   handlers: StreamChatHandlers;
   signal?: AbortSignal;
 }): Promise<ChatCompletionResult> {
@@ -425,6 +466,7 @@ async function streamChatCompletion(options: {
       hasTools: Boolean(options.tools?.length),
       model: options.model,
       netra: options.netra,
+      provider: options.provider,
     }),
   };
 

@@ -324,7 +324,35 @@ describe("file builtin tools", () => {
     }
   });
 
-  test("write_file allows the org's own custom tool modules outside profile workspace", async () => {
+  test("write_file refuses the org's custom tool modules for a member", async () => {
+    tempDir = await mkdtemp(path.join(os.tmpdir(), "mingzhan-write-"));
+    configDir = await mkdtemp(path.join(os.tmpdir(), "mingzhan-config-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const toolsDir = path.join(
+      configDir,
+      "orgs",
+      PROFILE_CONTEXT.orgId,
+      "tools"
+    );
+
+    await mkdir(toolsDir, { recursive: true });
+
+    const targetPath = path.join(toolsDir, "echo.js");
+
+    await expect(
+      runWriteFile(
+        {
+          content: "export async function run() { return null; }",
+          path: targetPath,
+        },
+        { ...PROFILE_CONTEXT, orgRole: "member" },
+        { workspaceRoot: tempDir }
+      )
+    ).rejects.toThrow(PathGuardError);
+  });
+
+  test("write_file allows the org's custom tool modules for an org admin", async () => {
     tempDir = await mkdtemp(path.join(os.tmpdir(), "mingzhan-write-"));
     configDir = await mkdtemp(path.join(os.tmpdir(), "mingzhan-config-"));
     process.env.MINGZHAN_CONFIG_DIR = configDir;
@@ -345,7 +373,7 @@ describe("file builtin tools", () => {
         content: "export async function run() { return null; }",
         path: targetPath,
       },
-      PROFILE_CONTEXT,
+      { ...PROFILE_CONTEXT, orgRole: "admin" },
       { workspaceRoot: tempDir }
     );
 
@@ -1299,7 +1327,9 @@ describe("file builtin tools", () => {
   test.skipIf(process.platform !== "win32")(
     "file tools refuse NTFS stream names that alias protected files on Windows",
     async () => {
-      tempDir = await mkdtemp(path.join(os.tmpdir(), "mingzhan-skill-tool-ads-"));
+      tempDir = await mkdtemp(
+        path.join(os.tmpdir(), "mingzhan-skill-tool-ads-")
+      );
       await mkdir(path.join(tempDir, "skills", "notes"), { recursive: true });
 
       // NTFS writes `tool.js::$DATA` to tool.js itself, and `notes 10:30.md`
@@ -1434,7 +1464,7 @@ describe("file builtin tools", () => {
     expect(result.content).toBe("relative");
   });
 
-  test("read_file allows custom tool modules outside profile workspace", async () => {
+  test("read_file refuses custom tool modules for a member", async () => {
     tempDir = await mkdtemp(path.join(os.tmpdir(), "mingzhan-read-"));
     configDir = await mkdtemp(path.join(os.tmpdir(), "mingzhan-config-"));
     process.env.MINGZHAN_CONFIG_DIR = configDir;
@@ -1451,9 +1481,39 @@ describe("file builtin tools", () => {
     const targetPath = path.join(toolsDir, "echo.js");
     await writeFile(targetPath, "export async function run() {}", "utf8");
 
-    const result = await runReadFile({ path: targetPath }, PROFILE_CONTEXT, {
-      workspaceRoot: tempDir,
-    });
+    await expect(
+      runReadFile(
+        { path: targetPath },
+        { ...PROFILE_CONTEXT, orgRole: "member" },
+        {
+          workspaceRoot: tempDir,
+        }
+      )
+    ).rejects.toBeInstanceOf(PathGuardError);
+  });
+
+  test("read_file allows custom tool modules for an org admin", async () => {
+    tempDir = await mkdtemp(path.join(os.tmpdir(), "mingzhan-read-"));
+    configDir = await mkdtemp(path.join(os.tmpdir(), "mingzhan-config-"));
+    process.env.MINGZHAN_CONFIG_DIR = configDir;
+
+    const toolsDir = path.join(
+      configDir,
+      "orgs",
+      PROFILE_CONTEXT.orgId,
+      "tools"
+    );
+
+    await mkdir(toolsDir, { recursive: true });
+
+    const targetPath = path.join(toolsDir, "echo.js");
+    await writeFile(targetPath, "export async function run() {}", "utf8");
+
+    const result = await runReadFile(
+      { path: targetPath },
+      { ...PROFILE_CONTEXT, orgRole: "admin" },
+      { workspaceRoot: tempDir }
+    );
 
     expect(result.path).toBe(await realpath(targetPath));
     expect(result.content).toContain("export async function run");

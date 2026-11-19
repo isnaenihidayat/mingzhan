@@ -16,17 +16,14 @@ import {
   useState,
 } from "react";
 
+import { formatMessageTime } from "@/lib/chat-history";
+import { copyText } from "@/lib/copy-text";
+
 export const messageActionClass =
   "inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:opacity-40";
 
 export const messageActionRowClass =
   "flex min-h-8 flex-wrap items-center gap-1 transition-opacity [@media(hover:hover)]:opacity-0 group-focus-within:opacity-100 group-hover:opacity-100";
-
-const timeFormatter = new Intl.DateTimeFormat("en-US", {
-  hour: "numeric",
-  hour12: true,
-  minute: "2-digit",
-});
 
 export function MessageTime({ createdAt }: { createdAt?: string }) {
   if (!createdAt) {
@@ -44,7 +41,7 @@ export function MessageTime({ createdAt }: { createdAt?: string }) {
       className="whitespace-nowrap px-1 text-muted-foreground text-xs tabular-nums"
       dateTime={createdAt}
     >
-      {timeFormatter.format(date)}
+      {formatMessageTime(date)}
     </time>
   );
 }
@@ -70,7 +67,7 @@ export function CopyMessageButton({
 
   async function copy() {
     try {
-      await navigator.clipboard.writeText(text);
+      await copyText(text);
       setFeedback("copied");
     } catch {
       setFeedback("failed");

@@ -395,10 +395,10 @@ setInterval(() => {}, 1000);
     // Hangs on --version and swallows SIGTERM, so only the SIGKILL escalation
     // ends it. It records its own pid because the probe never exposes the child.
     const pidFile = join(binDir, "pid");
-    script = `#!${process.execPath}
-require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
-process.on("SIGTERM", () => {});
-setInterval(() => {}, 1000);
+    script = `#!/bin/sh
+trap '' TERM
+echo "$$" > ${JSON.stringify(pidFile)}
+while :; do /bin/sleep 0.05; done
 `;
   }
 

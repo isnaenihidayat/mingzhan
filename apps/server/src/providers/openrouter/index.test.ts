@@ -385,7 +385,7 @@ describe("createOpenRouterProvider", () => {
         const headers = request.headers;
         expect(headers.get("Authorization")).toBe("Bearer sk-or-v1-test");
         expect(headers.get("HTTP-Referer")).toBe(
-          "https://github.com/ahmadrosid/mingzhan"
+          "https://github.com/isnaenihidayat/mingzhan"
         );
         expect(headers.get("X-OpenRouter-Title")).toBe("MíngZhàn");
 
@@ -561,6 +561,53 @@ describe("createOpenRouterProvider", () => {
         arguments: { path: "a.txt" },
         id: "call_1",
         name: "write_file",
+      },
+    ]);
+  });
+
+  test("drops empty enum members from tool schemas", async () => {
+    let sentBody: ProviderJsonRecord = {};
+
+    const provider = createOpenRouterProvider({
+      apiKey: "sk-or-v1-test",
+      fetcher: async (input, init) => {
+        const request =
+          input instanceof Request ? input : new Request(input, init);
+
+        sentBody = parseJsonRecord(await request.text());
+
+        return new Response(chatCompletionResponse("Answer"), {
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    });
+
+    await provider.generateChat({
+      messages: [{ content: "Plan", role: "user" }],
+      system: "You are helpful.",
+      tools: [
+        {
+          description: "Plan a trial",
+          name: "plan_trial",
+          parameters: {
+            properties: { mode: { enum: ["", "auto"], type: "string" } },
+            type: "object",
+          },
+        },
+      ],
+    });
+
+    expect(sentBody.tools).toEqual([
+      {
+        function: {
+          description: "Plan a trial",
+          name: "plan_trial",
+          parameters: {
+            properties: { mode: { enum: ["auto"], type: "string" } },
+            type: "object",
+          },
+        },
+        type: "function",
       },
     ]);
   });

@@ -32,6 +32,7 @@ import {
 import { toOpenAIMessages } from "../openai";
 import {
   buildChatCompletionResult,
+  dropEmptyToolEnumMembers,
   extractOpenAITokenUsage,
   finalizePendingToolCalls,
   mergePendingToolCall,
@@ -45,7 +46,7 @@ import {
 } from "../shared";
 import { openRouterModelSupportsThinking } from "./thinking";
 
-const OPENROUTER_REFERER = "https://github.com/ahmadrosid/mingzhan";
+const OPENROUTER_REFERER = "https://github.com/isnaenihidayat/mingzhan";
 
 const OPENROUTER_APP_TITLE = "MíngZhàn";
 
@@ -123,7 +124,7 @@ function toSdkTools(
     return;
   }
 
-  return tools.map((tool) => ({
+  return dropEmptyToolEnumMembers(tools, PROVIDER_LABEL)?.map((tool) => ({
     function: {
       description: tool.description,
       name: tool.name,
@@ -269,7 +270,11 @@ function buildOpenRouterReasoningRequest(
   }
 
   const reasoning: ChatRequestReasoning = {
-    effort: normalizeThinkingEffort(providerOptions.thinking.effort),
+    effort: normalizeThinkingEffort(
+      providerOptions.thinking.effort,
+      model,
+      "openrouter"
+    ),
     summary: "auto",
   };
 

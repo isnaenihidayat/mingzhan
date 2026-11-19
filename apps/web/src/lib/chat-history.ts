@@ -807,6 +807,46 @@ export function chatMessagesToListItems(
   return items;
 }
 
+const timeFormatter = new Intl.DateTimeFormat("en-US", {
+  hour: "2-digit",
+  hour12: true,
+  minute: "2-digit",
+});
+
+const weekdayFormatter = new Intl.DateTimeFormat("en-US", { weekday: "short" });
+
+const olderDateFormatter = new Intl.DateTimeFormat("en-US", {
+  day: "2-digit",
+  month: "short",
+});
+
+const clock24Formatter = new Intl.DateTimeFormat("en-GB", {
+  hour: "2-digit",
+  hourCycle: "h23",
+  minute: "2-digit",
+});
+
+function calendarDay(date: Date): number {
+  return (
+    Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / 86_400_000
+  );
+}
+
+export function formatMessageTime(date: Date, now = new Date()): string {
+  const age = calendarDay(now) - calendarDay(date);
+  const clock = timeFormatter.format(date);
+
+  if (age === 0) {
+    return clock;
+  }
+
+  if (age > 0 && age <= 7) {
+    return `${weekdayFormatter.format(date)} ${clock}`;
+  }
+
+  return `${olderDateFormatter.format(date)}, ${clock24Formatter.format(date)}`;
+}
+
 export function formatSessionTimestamp(value: string): string {
   const date = new Date(value);
 

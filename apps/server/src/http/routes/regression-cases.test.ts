@@ -683,9 +683,32 @@ describe("regression case routes", () => {
     );
 
     expect(foreignRun.status).toBe(404);
+
+    // The session and profile both belong to org A.
+    const foreignProfileRun = await app.fetch(
+      new Request(
+        "http://localhost:4310/v1/profiles/agent_a/regression-cases",
+        {
+          body: JSON.stringify({
+            expectedResult: "Health check failed.",
+            messageIndex: 1,
+            sourceId: "session_a",
+            sourceType: "session",
+          }),
+          headers: headersB,
+          method: "POST",
+        }
+      )
+    );
+
+    expect(foreignProfileRun.status).toBe(404);
+    expect((await foreignProfileRun.json()).case).toBeUndefined();
+    expect(
+      await databaseAdapter.listRegressionCasesForProfile(orgB.orgId, "agent_a")
+    ).toEqual([]);
   });
 
-  test("a user without an org role cannot create a case", async () => {
+  test("blocks users outside the org", async () => {
     const { app, databaseAdapter, authService } = createApp();
 
     const { orgId } = await seedOrgAdmin(databaseAdapter, {

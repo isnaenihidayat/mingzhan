@@ -30,6 +30,14 @@ export const POPULAR_SERVERS: readonly McpLibraryPreset[] = [
     viewBox: "0 0 24 24",
   },
   {
+    abilities: ["Schedule social posts", "Reply to comments and messages"],
+    description: "Schedule social posts and respond to comments and messages",
+    name: "Eksis",
+    path: serverIconPath,
+    url: "https://api.eksis.io/mcp",
+    viewBox: "0 0 24 24",
+  },
+  {
     abilities: [
       "Search your designs",
       "Create and edit designs",
