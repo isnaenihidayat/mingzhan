@@ -10,6 +10,7 @@ import {
 } from "@/context/auth-context-shared";
 import { ThemeProvider } from "@/context/theme-context";
 import { ChatMessageList } from "./chat-message-list";
+import { formatMessageTime } from "./message-actions";
 
 class TestUtterance {
   onend?: () => void;
@@ -62,8 +63,9 @@ test("chat actions show the local timestamp, copy the prompt, and switch or stop
       `button[aria-label="${label}"]`
     )[index];
 
-  const createdAt = "2026-11-08T06:26:00";
-  const later = "2026-11-08T06:27:00";
+  const today = new Date();
+  const createdAt = new Date(today.setHours(6, 26, 0, 0)).toISOString();
+  const later = new Date(today.setMinutes(27)).toISOString();
 
   try {
     await act(async () =>
@@ -114,7 +116,7 @@ test("chat actions show the local timestamp, copy the prompt, and switch or stop
       );
 
     expect(labels(button("Copy message")?.parentElement)).toEqual([
-      "6:26 AM",
+      "06:26 AM",
       "Copy message",
       "Edit message",
     ]);
@@ -123,7 +125,7 @@ test("chat actions show the local timestamp, copy the prompt, and switch or stop
       "Try again",
       "Read aloud",
       "Message actions",
-      "6:27 AM",
+      "06:27 AM",
     ]);
     expect(container.querySelectorAll("time")).toHaveLength(2);
 
@@ -163,4 +165,19 @@ test("chat actions show the local timestamp, copy the prompt, and switch or stop
       }
     }
   }
+});
+
+test("message time uses local calendar days across the one-week boundary", () => {
+  const now = new Date(2026, 10, 9, 0, 10);
+
+  expect(formatMessageTime(new Date(2026, 10, 9, 0, 1), now)).toBe("12:01 AM");
+  expect(formatMessageTime(new Date(2026, 10, 8, 23, 55), now)).toBe(
+    "Sun 11:55 PM"
+  );
+  expect(formatMessageTime(new Date(2026, 10, 2, 18, 26), now)).toBe(
+    "Mon 06:26 PM"
+  );
+  expect(formatMessageTime(new Date(2026, 10, 1, 18, 26), now)).toBe(
+    "Nov 01, 18:26"
+  );
 });

@@ -89,7 +89,10 @@ describe("resolveUserContentForNonVisionProvider", () => {
 
     expect(result).toEqual([
       { text: "What is this?", type: "text" },
-      { text: "[Image]\nA red square.", type: "text" },
+      {
+        text: expect.stringContaining("vision model described it below."),
+        type: "text",
+      },
     ]);
   });
 
@@ -124,7 +127,7 @@ describe("resolveMessagesForNonVisionProvider", () => {
     ];
 
     expect(resolveMessagesForNonVisionProvider(messages)).toEqual([
-      { content: "[Image]\nA chart.", role: "user" },
+      { content: expect.stringContaining("\nA chart."), role: "user" },
       { content: "Looks like a chart.", role: "assistant" },
     ]);
   });

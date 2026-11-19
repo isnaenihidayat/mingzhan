@@ -114,7 +114,11 @@ export function registerConversationShareRoutes(
       request: c.req.raw,
     });
 
-    return json<ConversationShareStatusResponse | null>(status);
+    return json<ConversationShareStatusResponse | null>(
+      status,
+      200,
+      new Headers({ "Cache-Control": "private, no-store" })
+    );
   });
 
   app.delete("/v1/sessions/:sessionId/share/:shareId", async (c) => {

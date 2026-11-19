@@ -6,6 +6,7 @@ import type {
   CreateMcpServerRequest,
   CreateProfileRequest,
   CreateProfileWithSuperMingzhanRequest,
+  CreateRegressionCaseRequest,
   CreateSkillRequest,
   CreateToolRequest,
   ImageAttachment,
@@ -13,6 +14,7 @@ import type {
   ListMcpServersResponse,
   ListProfileChangeHistoryResponse,
   ListProfilesResponse,
+  ListRegressionCasesResponse,
   ListSkillsResponse,
   ListSkillVersionsResponse,
   ListToolsResponse,
@@ -21,6 +23,10 @@ import type {
   MoveProfileRequest,
   PatchSkillRequest,
   ProfileResponse,
+  RegressionCase,
+  RegressionCaseResponse,
+  RegressionCaseRunResponse,
+  RegressionCaseVerdict,
   RunToolRequest,
   RunToolResponse,
   SkillFileResponse,
@@ -549,6 +555,48 @@ export class ProfilesClient extends SettingsClient {
         headers: orgId ? { "X-Org-Id": orgId } : undefined,
         method: "DELETE",
       }
+    );
+  }
+  async createRegressionCase(
+    profileId: string,
+    request: CreateRegressionCaseRequest
+  ): Promise<RegressionCase> {
+    const response = await this.request<RegressionCaseResponse>(
+      `/v1/profiles/${encodeURIComponent(profileId)}/regression-cases`,
+      { body: JSON.stringify(request), method: "POST" }
+    );
+
+    return response.case;
+  }
+
+  async listRegressionCases(
+    profileId: string,
+    offset = 0
+  ): Promise<ListRegressionCasesResponse> {
+    return this.request<ListRegressionCasesResponse>(
+      `/v1/profiles/${encodeURIComponent(profileId)}/regression-cases?offset=${offset}`
+    );
+  }
+
+  rerunRegressionCase(
+    profileId: string,
+    caseId: string
+  ): Promise<RegressionCaseRunResponse> {
+    return this.request(
+      `/v1/profiles/${encodeURIComponent(profileId)}/regression-cases/${encodeURIComponent(caseId)}/runs`,
+      { method: "POST" }
+    );
+  }
+
+  markRegressionCaseRun(
+    profileId: string,
+    caseId: string,
+    runId: string,
+    verdict: RegressionCaseVerdict
+  ): Promise<RegressionCaseRunResponse> {
+    return this.request(
+      `/v1/profiles/${encodeURIComponent(profileId)}/regression-cases/${encodeURIComponent(caseId)}/runs/${encodeURIComponent(runId)}`,
+      { body: JSON.stringify({ verdict }), method: "PATCH" }
     );
   }
 }

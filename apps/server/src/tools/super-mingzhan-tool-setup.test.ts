@@ -336,7 +336,7 @@ describe("super mingzhan create_tool setup", () => {
           content: "export async function run(input) { return input; }",
           path: path.join(toolsDir, "echo.js"),
         },
-        { orgId: ORG_ID, profileId: "super_mingzhan" }
+        { orgId: ORG_ID, orgRole: "admin", profileId: "super_mingzhan" }
       );
 
       const capturedRequests: CreateToolRequest[] = [];

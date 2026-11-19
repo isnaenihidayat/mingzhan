@@ -19,9 +19,22 @@ describe("conversation share routes", () => {
   });
 
   test("member can publish conversation and visitor can read it publicly", async () => {
-    const { app, databaseAdapter, authService } = createMinimalHonoApp({
-      databaseAdapter: createInMemoryDatabaseAdapter(),
-    });
+    const savedKey = process.env.MINGZHAN_SECRETS_KEY;
+    process.env.MINGZHAN_SECRETS_KEY = Buffer.alloc(32, 12).toString("base64");
+
+    const { app, databaseAdapter, authService } = (() => {
+      try {
+        return createMinimalHonoApp({
+          databaseAdapter: createInMemoryDatabaseAdapter(),
+        });
+      } finally {
+        if (savedKey === undefined) {
+          delete process.env.MINGZHAN_SECRETS_KEY;
+        } else {
+          process.env.MINGZHAN_SECRETS_KEY = savedKey;
+        }
+      }
+    })();
 
     const session = await setupFreshInstallSession(app, databaseAdapter);
     const orgId = session.orgId!;
@@ -120,6 +133,19 @@ describe("conversation share routes", () => {
     expect(published.token).toBeDefined();
     expect(published.sharePath).toBe(`/c/${published.token}`);
     expect(published.status.title).toBe("Diskusi Arsitektur MíngZhàn");
+
+    const reopened = await app.request(
+      `http://localhost:4310/v1/sessions/${sessionId}/share/status`,
+      { headers: session.headers({}, orgId) }
+    );
+
+    expect(reopened.status).toBe(200);
+    expect(reopened.headers.get("Cache-Control")).toBe("private, no-store");
+    expect(await reopened.json()).toMatchObject({
+      active: true,
+      sharePath: published.sharePath,
+      shareUrl: `http://localhost:4310${published.sharePath}`,
+    });
 
     // 2. Visitor reads public share without any auth headers
     const publicRes = await app.request(

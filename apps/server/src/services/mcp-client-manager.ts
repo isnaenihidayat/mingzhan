@@ -563,6 +563,7 @@ function readHttpConfig(value: StoredMcpServerRecord["config"]): McpHttpConfig {
 
 function normalizeListedTools(
   tools: Array<{
+    annotations?: { readOnlyHint?: boolean };
     name: string;
     description?: string;
     inputSchema?: unknown;
@@ -572,6 +573,7 @@ function normalizeListedTools(
     description: tool.description?.trim() || tool.name,
     inputSchema: tool.inputSchema,
     name: tool.name,
+    ...(tool.annotations?.readOnlyHint === true && { readOnlyHint: true }),
   }));
 }
 

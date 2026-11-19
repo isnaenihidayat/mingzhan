@@ -39,17 +39,23 @@ import {
   Delete02Icon,
   Loading03Icon,
   Search01Icon,
+  TestTube01Icon,
 } from "hugeicons-react";
-import { type ReactNode, useMemo, useState } from "react";
+import { type ReactNode, useContext, useMemo, useState } from "react";
 import { ChatMessageList } from "@/components/chat/chat-message-list";
 import { ProfileAvatar } from "@/components/ProfileAvatar";
+import { SaveRegressionCaseDialog } from "@/components/regression-cases";
 import { TimezoneSelect } from "@/components/TimezoneSelect";
+import { AuthContext } from "@/context/auth-context-shared";
+import { ChatAttachmentPanelProvider } from "@/context/chat-attachment-panel-context";
+import { useChatAttachmentPanel } from "@/context/use-chat-attachment-panel";
 import { useUserTimezone } from "@/hooks/use-timezones";
 import {
   formatFutureRelativeTime,
   formatSessionRelativeTime,
   formatSessionTimestamp,
 } from "@/lib/chat-history";
+import { canAccessIntegrationsPage } from "@/lib/navigation";
 import {
   automationRunMessages,
   formatRunDuration,
@@ -975,6 +981,33 @@ function RunStatusBar({
   );
 }
 
+function CopyRunIdButton({ runId }: { runId: string }) {
+  const [copiedRunId, setCopiedRunId] = useState<string | null>(null);
+
+  return (
+    <Button
+      aria-label={copiedRunId === runId ? "Copied run ID" : "Copy run ID"}
+      onClick={async () => {
+        try {
+          await navigator.clipboard.writeText(runId);
+          setCopiedRunId(runId);
+        } catch {
+          // Clipboard may be unavailable outside a secure context.
+        }
+      }}
+      size="icon-sm"
+      type="button"
+      variant="ghost"
+    >
+      {copiedRunId === runId ? (
+        <CheckmarkCircle01Icon aria-hidden className="size-4" />
+      ) : (
+        <Copy01Icon aria-hidden className="size-4" />
+      )}
+    </Button>
+  );
+}
+
 function RunDetailPopup({
   selectedRun,
   busy,
@@ -988,10 +1021,19 @@ function RunDetailPopup({
   profileId: string;
   onRerun: () => void;
 }) {
-  const [copiedRunId, setCopiedRunId] = useState<string | null>(null);
+  // Tied to the run it came from, so switching runs closes it
+  const [caseRunId, setCaseRunId] = useState<string | null>(null);
+
+  // Read without useAuth: the drawer also renders where no auth provider is mounted.
+  const orgRole = useContext(AuthContext)?.activeOrg?.role;
+
+  const canSaveCase =
+    canAccessIntegrationsPage(orgRole) &&
+    selectedRun?.status === "completed" &&
+    Boolean(selectedRun.output?.trim());
 
   return (
-    <DialogPrimitive.Popup className="fixed inset-y-0 right-0 z-50 flex w-full max-w-3xl translate-x-0 flex-col border-border border-l bg-background shadow-xl outline-none transition-transform duration-200 ease-out data-[ending-style]:translate-x-full data-[starting-style]:translate-x-full motion-reduce:transition-none">
+    <DialogPrimitive.Popup className="fixed inset-y-0 right-0 z-50 flex w-full max-w-3xl translate-x-0 flex-col border-border border-l bg-background shadow-xl outline-none transition-transform duration-200 ease-out has-[[data-slot=attachment-detail-panel]]:max-w-full data-[ending-style]:translate-x-full data-[starting-style]:translate-x-full motion-reduce:transition-none md:has-[[data-slot=attachment-detail-panel]:not([data-fullscreen])]:w-fit">
       <div className="flex shrink-0 items-center gap-3 border-border border-b px-4 py-3">
         {selectedRun ? <RunStatusIcon status={selectedRun.status} /> : null}
         <DialogTitle className="min-w-0 flex-1 truncate text-sm">
@@ -999,28 +1041,17 @@ function RunDetailPopup({
             ? `${runStatusLabel(selectedRun.status)} · ${formatSessionTimestamp(selectedRun.startedAt)}`
             : "Run conversation"}
         </DialogTitle>
-        {selectedRun ? (
+        {selectedRun ? <CopyRunIdButton runId={selectedRun.id} /> : null}
+        {canSaveCase ? (
           <Button
-            aria-label={
-              copiedRunId === selectedRun.id ? "Copied run ID" : "Copy run ID"
-            }
-            onClick={async () => {
-              try {
-                await navigator.clipboard.writeText(selectedRun.id);
-                setCopiedRunId(selectedRun.id);
-              } catch {
-                // Clipboard may be unavailable outside a secure context.
-              }
-            }}
+            aria-label="Save as test case"
+            onClick={() => setCaseRunId(selectedRun?.id ?? null)}
             size="icon-sm"
+            title="Save as test case"
             type="button"
             variant="ghost"
           >
-            {copiedRunId === selectedRun.id ? (
-              <CheckmarkCircle01Icon aria-hidden className="size-4" />
-            ) : (
-              <Copy01Icon aria-hidden className="size-4" />
-            )}
+            <TestTube01Icon aria-hidden className="size-4" />
           </Button>
         ) : null}
         {selectedRun?.status === "failed" ? (
@@ -1051,23 +1082,62 @@ function RunDetailPopup({
         </p>
       ) : null}
       {selectedRun ? (
-        <ChatMessageList
-          actionsDisabled
-          className="min-h-0 flex-1"
-          emptyMessage={
-            selectedRun.status === "running"
-              ? "Waiting for output…"
-              : "No output returned."
-          }
-          key={selectedRun.id}
-          messages={automationRunMessages(selectedRun)}
+        <ChatAttachmentPanelProvider key={selectedRun.id}>
+          <RunConversation profileId={profileId} run={selectedRun} />
+        </ChatAttachmentPanelProvider>
+      ) : null}
+      {canSaveCase && selectedRun ? (
+        <SaveRegressionCaseDialog
+          expectedResult={selectedRun.output ?? ""}
+          onOpenChange={(open) => setCaseRunId(open ? selectedRun.id : null)}
+          open={caseRunId === selectedRun.id}
           profileId={profileId}
-          readOnly
-          streamActive={selectedRun.status === "running"}
-          turnStartedAt={selectedRun.startedAt}
+          source={{
+            automationId: selectedRun.automationId,
+            sourceId: selectedRun.id,
+            sourceType: "automation_run",
+          }}
         />
       ) : null}
     </DialogPrimitive.Popup>
+  );
+}
+
+/**
+ * An open file panel sits beside a 24rem conversation, the room the panel
+ * column leaves for it, and the drawer grows to fit both.
+ */
+function RunConversation({
+  run,
+  profileId,
+}: {
+  run: AutomationRunRecord;
+  profileId: string;
+}) {
+  const { isFullscreen, isOpen } = useChatAttachmentPanel();
+
+  return (
+    <ChatMessageList
+      actionsDisabled
+      className={cn(
+        "min-h-0",
+        isFullscreen
+          ? "pointer-events-none w-0 flex-none overflow-hidden opacity-0"
+          : isOpen
+            ? "w-96 flex-none"
+            : "flex-1",
+        isOpen &&
+          "max-md:pointer-events-none max-md:w-0 max-md:flex-none max-md:overflow-hidden max-md:opacity-0"
+      )}
+      emptyMessage={
+        run.status === "running" ? "Waiting for output…" : "No output returned."
+      }
+      messages={automationRunMessages(run)}
+      profileId={profileId}
+      readOnly
+      streamActive={run.status === "running"}
+      turnStartedAt={run.startedAt}
+    />
   );
 }
 

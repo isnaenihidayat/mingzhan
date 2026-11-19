@@ -107,6 +107,8 @@ export const queryKeys = {
     all: ["profiles"] as const,
     detail: (profileId: string) => ["profiles", profileId] as const,
     history: (profileId: string) => ["profiles", profileId, "history"] as const,
+    regressionCases: (profileId: string) =>
+      ["profiles", profileId, "regressionCases"] as const,
   },
   projects: {
     all: ["projects"] as const,

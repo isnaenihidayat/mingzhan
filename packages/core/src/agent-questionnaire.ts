@@ -245,6 +245,17 @@ function resolveQuestionAnswer(
   return trimmed;
 }
 
+export function findAgentQuestionnaireAnswers(
+  value: string
+): AgentQuestionAnswer[] | null {
+  const lines = value.split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim() === ANSWERS_HEADER);
+
+  return start === -1
+    ? null
+    : parseAgentQuestionnaireAnswersMessage(lines.slice(start).join("\n"));
+}
+
 function choiceLetter(index: number): string {
   return String.fromCharCode("a".charCodeAt(0) + index);
 }

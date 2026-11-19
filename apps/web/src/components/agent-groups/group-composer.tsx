@@ -3,6 +3,7 @@ import type { DocumentAttachment } from "@mingzhan/core/contract";
 import {
   MAX_DOCUMENT_BYTES,
   parseDataUrl,
+  parseDocumentDataUrl,
 } from "@mingzhan/core/message-content";
 import { Button } from "@mingzhan/ui/button";
 import { toast } from "@mingzhan/ui/toast";
@@ -195,7 +196,11 @@ function GroupComposerForm({
       ) : null}
       <GroupAttachmentSummary />
       <PromptInput
-        accept={allowDocuments ? ALL_ATTACHMENT_ACCEPT : undefined}
+        accept={
+          allowDocuments
+            ? `${ALL_ATTACHMENT_ACCEPT},.zip,application/zip,application/x-zip-compressed`
+            : undefined
+        }
         className={cn(
           GROUP_SHELL_CLASS,
           attachments.files.length > 0 &&
@@ -220,6 +225,17 @@ function GroupComposerForm({
               return image
                 ? [{ ...image, filename: file.filename ?? "image.png" }]
                 : [];
+            }),
+            ...files.flatMap((file) => {
+              const filename = file.filename?.trim();
+
+              if (!filename?.toLowerCase().endsWith(".zip")) {
+                return [];
+              }
+
+              const zip = parseDocumentDataUrl(file.url, filename);
+
+              return zip ? [{ ...zip, mediaType: "application/zip" }] : [];
             }),
           ];
 

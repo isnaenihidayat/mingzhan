@@ -7,6 +7,7 @@ import {
 } from "@mingzhan/core";
 import {
   defaultDiscoveryBaseUrl,
+  isDiscoveryModelProvider,
   NETRA_AGENT_MODEL_ID,
   resolveNetraModelId,
 } from "@mingzhan/core/discovery-providers";
@@ -25,25 +26,18 @@ const DEFAULT_CONTEXT_WINDOW = 128_000;
 
 const DEFAULT_MAX_OUTPUT = 8192;
 
-function resolveOpenRouterCatalogThinking(entry: CustomModelEntry): boolean {
-  if (entry.supportsThinking !== undefined) {
-    return entry.supportsThinking;
-  }
-
-  return openRouterSlugSupportsThinking(entry.id);
-}
-
 function openRouterCustomModelsToCatalog(
   entries: CustomModelEntry[]
 ): ProviderModelOption[] {
   return entries.map((entry) => {
     const model: ProviderModelOption = {
-      contextWindow: DEFAULT_CONTEXT_WINDOW,
+      contextWindow: entry.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
       id: entry.id,
-      maxOutputTokens: DEFAULT_MAX_OUTPUT,
+      maxOutputTokens: entry.maxOutputTokens ?? DEFAULT_MAX_OUTPUT,
       name: entry.name?.trim() || entry.id,
       provider: "openrouter",
-      supportsThinking: resolveOpenRouterCatalogThinking(entry),
+      supportsThinking:
+        entry.supportsThinking ?? openRouterSlugSupportsThinking(entry.id),
     };
 
     if (entry.default) {
@@ -66,25 +60,17 @@ function openRouterCustomModelsToCatalog(
   });
 }
 
-function resolveCerebrasCatalogThinking(entry: CustomModelEntry): boolean {
-  if (entry.supportsThinking !== undefined) {
-    return entry.supportsThinking;
-  }
-
-  return false;
-}
-
 function cerebrasCustomModelsToCatalog(
   entries: CustomModelEntry[]
 ): ProviderModelOption[] {
   return entries.map((entry) => {
     const model: ProviderModelOption = {
-      contextWindow: DEFAULT_CONTEXT_WINDOW,
+      contextWindow: entry.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
       id: entry.id,
-      maxOutputTokens: DEFAULT_MAX_OUTPUT,
+      maxOutputTokens: entry.maxOutputTokens ?? DEFAULT_MAX_OUTPUT,
       name: entry.name?.trim() || entry.id,
       provider: "cerebras",
-      supportsThinking: resolveCerebrasCatalogThinking(entry),
+      supportsThinking: entry.supportsThinking ?? false,
     };
 
     if (entry.supportsVision !== undefined) {
@@ -141,6 +127,7 @@ export function catalogCustomModelsToCatalog(
   provider: ProviderName
 ): ProviderModelOption[] {
   const staticById = new Map(staticModels.map((model) => [model.id, model]));
+  const hasSavedDefault = entries.some((entry) => entry.default === true);
 
   return entries.map((entry) => {
     const existing = staticById.get(entry.id);
@@ -157,8 +144,8 @@ export function catalogCustomModelsToCatalog(
       provider,
     };
 
-    if (entry.default) {
-      model.default = true;
+    if (hasSavedDefault) {
+      model.default = entry.default === true;
     }
 
     if (entry.contextWindow !== undefined) {
@@ -211,9 +198,9 @@ function customModelsToCatalog(
 ): ProviderModelOption[] {
   return entries.map((entry) => {
     const model: ProviderModelOption = {
-      contextWindow: DEFAULT_CONTEXT_WINDOW,
+      contextWindow: entry.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
       id: entry.id,
-      maxOutputTokens: DEFAULT_MAX_OUTPUT,
+      maxOutputTokens: entry.maxOutputTokens ?? DEFAULT_MAX_OUTPUT,
       name: entry.name?.trim() || entry.id,
       provider,
     };
@@ -317,7 +304,8 @@ export function getModelsForProviderInstance(
     );
   }
 
-  if (instance.type === "openai_compatible") {
+  // Netra returns above; other discovery providers list only the saved models.
+  if (isDiscoveryModelProvider(instance.type)) {
     const entries = instance.customModels ?? [];
 
     return annotate(

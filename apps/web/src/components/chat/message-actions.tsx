@@ -16,6 +16,8 @@ import {
   useState,
 } from "react";
 
+import { copyText } from "@/lib/copy-text";
+
 export const messageActionClass =
   "inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:opacity-40";
 
@@ -23,10 +25,44 @@ export const messageActionRowClass =
   "flex min-h-8 flex-wrap items-center gap-1 transition-opacity [@media(hover:hover)]:opacity-0 group-focus-within:opacity-100 group-hover:opacity-100";
 
 const timeFormatter = new Intl.DateTimeFormat("en-US", {
-  hour: "numeric",
+  hour: "2-digit",
   hour12: true,
   minute: "2-digit",
 });
+
+const weekdayFormatter = new Intl.DateTimeFormat("en-US", { weekday: "short" });
+
+const olderDateFormatter = new Intl.DateTimeFormat("en-US", {
+  day: "2-digit",
+  month: "short",
+});
+
+const clock24Formatter = new Intl.DateTimeFormat("en-GB", {
+  hour: "2-digit",
+  hourCycle: "h23",
+  minute: "2-digit",
+});
+
+function calendarDay(date: Date): number {
+  return (
+    Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / 86_400_000
+  );
+}
+
+export function formatMessageTime(date: Date, now = new Date()): string {
+  const age = calendarDay(now) - calendarDay(date);
+  const clock = timeFormatter.format(date);
+
+  if (age === 0) {
+    return clock;
+  }
+
+  if (age > 0 && age <= 7) {
+    return `${weekdayFormatter.format(date)} ${clock}`;
+  }
+
+  return `${olderDateFormatter.format(date)}, ${clock24Formatter.format(date)}`;
+}
 
 export function MessageTime({ createdAt }: { createdAt?: string }) {
   if (!createdAt) {
@@ -44,7 +80,7 @@ export function MessageTime({ createdAt }: { createdAt?: string }) {
       className="whitespace-nowrap px-1 text-muted-foreground text-xs tabular-nums"
       dateTime={createdAt}
     >
-      {timeFormatter.format(date)}
+      {formatMessageTime(date)}
     </time>
   );
 }
@@ -70,7 +106,7 @@ export function CopyMessageButton({
 
   async function copy() {
     try {
-      await navigator.clipboard.writeText(text);
+      await copyText(text);
       setFeedback("copied");
     } catch {
       setFeedback("failed");

@@ -16,6 +16,7 @@ import {
 } from "@mingzhan/core";
 import type { LlmRequestLogEntry } from "@mingzhan/core/contract";
 import { LOCAL_CLIENT_USER_ID } from "@mingzhan/core/local-auth";
+import { isThinkingEffort } from "@mingzhan/core/thinking-effort";
 import { LLM_USAGE_STATS_ID, WORKSPACE_SETTINGS_ID } from "../constants";
 import { ensureDatabaseDirectory, resolveDatabasePath } from "../database-url";
 import { migrateDatabase } from "../migrate";
@@ -59,6 +60,7 @@ import type {
   StoredProjectFileRecord,
   StoredProjectRecord,
   StoredRegressionCaseRecord,
+  StoredRegressionCaseRunRecord,
   StoredSessionMessageRecord,
   StoredSessionRecord,
   StoredSessionSummaryRecord,
@@ -624,6 +626,20 @@ interface ArtifactShareRow {
   source_path: string;
   storage_path: string;
   token_hash: string;
+}
+
+interface RegressionCaseRunRow {
+  case_id: string;
+  created_at: string;
+  created_by_user_id: string | null;
+  error: string | null;
+  id: string;
+  org_id: string;
+  output: string | null;
+  status: string;
+  verdict: string | null;
+  verdict_at: string | null;
+  verdict_by_user_id: string | null;
 }
 
 interface RegressionCaseRow {
@@ -1560,19 +1576,6 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
     SELECT * FROM session_messages
     WHERE session_id = ? AND EXISTS (SELECT 1 FROM sessions WHERE id = session_id AND app_user_id IS NULL)
     ORDER BY seq ASC
-  `);
-
-  /** One row instead of the whole transcript, which can carry base64 payloads. */
-  const getLastUserMessageForSessionStmt = db.prepare<
-    SessionMessageRow,
-    SQLQueryBindings[]
-  >(`
-    SELECT * FROM session_messages
-    WHERE session_id = ?
-      AND json_extract(payload, '$.role') = 'user'
-      AND EXISTS (SELECT 1 FROM sessions WHERE id = session_id AND app_user_id IS NULL)
-    ORDER BY seq DESC
-    LIMIT 1
   `);
 
   const appendMessageStmt = db.prepare(`
@@ -3894,6 +3897,32 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
     LIMIT ? OFFSET ?
   `);
 
+  const createRegressionCaseRunStmt = db.prepare(`
+    INSERT INTO regression_case_runs (
+      id, org_id, case_id, status, output, error, verdict, verdict_by_user_id,
+      verdict_at, created_by_user_id, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const getRegressionCaseRunStmt = db.prepare<
+    RegressionCaseRunRow,
+    SQLQueryBindings[]
+  >(`
+    SELECT * FROM regression_case_runs
+    WHERE org_id = ? AND case_id = ? AND id = ?
+    LIMIT 1
+  `);
+
+  const setRegressionCaseRunVerdictStmt = db.prepare<
+    RegressionCaseRunRow,
+    SQLQueryBindings[]
+  >(`
+    UPDATE regression_case_runs
+    SET verdict = ?, verdict_by_user_id = ?, verdict_at = ?
+    WHERE org_id = ? AND case_id = ? AND id = ?
+    RETURNING *
+  `);
+
   const getOrgMemberStmt = db.prepare<
     {
       org_id: string;
@@ -5058,6 +5087,22 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       );
     },
 
+    async createRegressionCaseRun(record) {
+      createRegressionCaseRunStmt.run(
+        record.id,
+        record.orgId,
+        record.caseId,
+        record.status,
+        record.output,
+        record.error,
+        record.verdict,
+        record.verdictByUserId,
+        record.verdictAt,
+        record.createdByUserId,
+        record.createdAt
+      );
+    },
+
     async createSharedAgentInstance(
       teamOrgId,
       publicationId,
@@ -5426,12 +5471,6 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
 
       return row ? toProfileRecord(row) : null;
     },
-    async getLastUserMessageForSession(sessionId) {
-      const row = getLastUserMessageForSessionStmt.get(sessionId);
-
-      return row ? toSessionMessageRecord(row) : null;
-    },
-
     async getLlmUsageStats(orgId) {
       const row = getLlmUsageStatsStmt.get(orgId, LLM_USAGE_STATS_ID);
 
@@ -5633,6 +5672,12 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
       const row = getRegressionCaseStmt.get(orgId, profileId, caseId);
 
       return row ? toRegressionCaseRecord(row) : null;
+    },
+
+    async getRegressionCaseRun(orgId, caseId, runId) {
+      const row = getRegressionCaseRunStmt.get(orgId, caseId, runId);
+
+      return row ? toRegressionCaseRunRecord(row) : null;
     },
 
     async getSession(id) {
@@ -6688,6 +6733,19 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
     async setPendingMfaSecret(id, pendingTotpSecretEnc, updatedAt) {
       setPendingMfaSecretStmt.run(pendingTotpSecretEnc, updatedAt, id);
     },
+    async setRegressionCaseRunVerdict(orgId, caseId, runId, mark) {
+      const row = setRegressionCaseRunVerdictStmt.get(
+        mark.verdict,
+        mark.userId,
+        mark.at,
+        orgId,
+        caseId,
+        runId
+      );
+
+      return row ? toRegressionCaseRunRecord(row) : null;
+    },
+
     async setSessionOrder(userId, sessionIds) {
       db.transaction(() => {
         for (const [index, sessionId] of sessionIds.entries()) {
@@ -7584,9 +7642,7 @@ function parseAgentQuestionnaire(
 }
 
 function parseThinkingEffort(value: string | null | undefined) {
-  return value === "low" || value === "medium" || value === "high"
-    ? value
-    : null;
+  return isThinkingEffort(value) ? value : null;
 }
 
 function toSessionRecord(row: SessionRow): StoredSessionRecord {
@@ -8326,6 +8382,26 @@ function toRegressionCaseRecord(
     sourceId: row.source_id,
     // SAFETY: The table CHECK constrains this column to the union values.
     sourceType: row.source_type as StoredRegressionCaseRecord["sourceType"],
+  };
+}
+
+function toRegressionCaseRunRecord(
+  row: RegressionCaseRunRow
+): StoredRegressionCaseRunRecord {
+  return {
+    caseId: row.case_id,
+    createdAt: row.created_at,
+    createdByUserId: row.created_by_user_id,
+    error: row.error,
+    id: row.id,
+    orgId: row.org_id,
+    output: row.output,
+    // SAFETY: The table CHECK constrains this column to the union values.
+    status: row.status as StoredRegressionCaseRunRecord["status"],
+    // SAFETY: The table CHECK constrains this column to the union values.
+    verdict: row.verdict as StoredRegressionCaseRunRecord["verdict"],
+    verdictAt: row.verdict_at,
+    verdictByUserId: row.verdict_by_user_id,
   };
 }
 

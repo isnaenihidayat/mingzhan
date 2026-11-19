@@ -39,6 +39,7 @@ import {
   type WebSearchSettingsResponse,
   type WhatsAppSettingsResponse,
 } from "@mingzhan/core";
+import { ChannelConfigBusyError } from "@mingzhan/core/channel-config-shared";
 import { USER_PROVIDER_NAMES } from "@mingzhan/core/provider-resolution";
 import {
   checkSlackTokensMatch,
@@ -49,6 +50,7 @@ import {
   saveSlackConfig,
   validateSlackTokens,
 } from "@mingzhan/core/slack-config";
+import { THINKING_EFFORTS } from "@mingzhan/core/thinking-effort";
 import type { Context, MiddlewareHandler } from "hono";
 import {
   completeChatgptOAuthDeviceSession,
@@ -477,7 +479,7 @@ export function registerModelRoutes(
   const updateThinkingRequestSchema = z
     .object({
       enabled: z.boolean(),
-      effort: z.enum(["low", "medium", "high"]).optional(),
+      effort: z.enum(THINKING_EFFORTS).optional(),
     })
     .passthrough()
     .openapi("UpdateThinkingRequest");
@@ -1907,8 +1909,16 @@ export function registerModelRoutes(
   });
 
   app.post("/v1/models/discover", async (c) => {
-    requireOrgAdminOrPlatformAdminFromContext(c);
+    const auth = requireOrgAdminOrPlatformAdminFromContext(c);
     const body = await readJson(c.req.raw, discoverModelsRequestSchema);
+
+    // Saving a provider is platform-admin-only, and a caller-chosen base URL is
+    // the same outbound authority. Org admins keep providerId discovery, which
+    // fetches a stored URL.
+    if (body.baseUrl?.trim() && !auth.isPlatformAdmin) {
+      throw new MíngZhànApiError("Forbidden", 403);
+    }
+
     const result = await agent.discoverModels(body);
 
     return json<ModelsResponse>(result);
@@ -2995,6 +3005,10 @@ export function registerModelRoutes(
         await agent.setWhatsAppSettings(await channelOwner(c), body)
       );
     } catch (error) {
+      if (error instanceof ChannelConfigBusyError) {
+        return errorResponse("WhatsApp settings are busy. Try again.", 503);
+      }
+
       if (error instanceof MíngZhànApiError) {
         return errorResponse(error.message, error.status);
       }
@@ -3011,6 +3025,10 @@ export function registerModelRoutes(
         await agent.regenerateWhatsAppPairingCode(await channelOwner(c))
       );
     } catch (error) {
+      if (error instanceof ChannelConfigBusyError) {
+        return errorResponse("WhatsApp settings are busy. Try again.", 503);
+      }
+
       const message = error instanceof Error ? error.message : String(error);
 
       return errorResponse(message, 400);
@@ -3030,6 +3048,10 @@ export function registerModelRoutes(
 
       return json<WhatsAppSettingsResponse>(settings);
     } catch (error) {
+      if (error instanceof ChannelConfigBusyError) {
+        return errorResponse("WhatsApp settings are busy. Try again.", 503);
+      }
+
       const message = error instanceof Error ? error.message : String(error);
 
       return errorResponse(message, 400);

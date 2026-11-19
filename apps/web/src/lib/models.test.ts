@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { ProviderName } from "@mingzhan/core";
+import { isDiscoveryModelProvider } from "@mingzhan/core/discovery-providers";
 import { USER_PROVIDER_NAMES } from "@mingzhan/core/provider-resolution";
 import {
   buildCreateProviderRequest,
   effectiveProfileModelSelection,
   encodeModelSelection,
   filterVisionCapableProviderGroups,
+  findSelectedModel,
   firstAvailableProviderOption,
   hasOpenCodeZenProvider,
   isLocalBaseUrl,
@@ -20,9 +22,8 @@ import {
 
 describe("buildCreateProviderRequest", () => {
   test("keeps custom models only for providers that accept a shortlist", () => {
+    // Discovery providers (Netra, Groq, …) always send their model list.
     const shortlistProviders: readonly ProviderName[] = [
-      "openai_compatible",
-      "netra",
       "openrouter",
       "xai_oauth",
       "chatgpt",
@@ -64,13 +65,16 @@ describe("buildCreateProviderRequest", () => {
         provider,
       });
 
-      if (provider === "openai_compatible" || provider === "netra") {
+      if (isDiscoveryModelProvider(provider)) {
         expect(empty.customModels).toEqual([]);
       } else {
         expect(empty).not.toHaveProperty("customModels");
       }
 
-      if (shortlistProviders.includes(provider)) {
+      if (
+        isDiscoveryModelProvider(provider) ||
+        shortlistProviders.includes(provider)
+      ) {
         expect(populated.customModels).toEqual([{ id: "private-model" }]);
       } else {
         expect(populated).not.toHaveProperty("customModels");
@@ -192,8 +196,10 @@ describe("resolveModelThinkingSupport", () => {
       if (explicitProviders.includes(provider)) {
         expect(
           resolveModelThinkingSupport(
-            encodeModelSelection("instance-one", "model-1"),
-            group("instance-one", provider)
+            findSelectedModel(
+              encodeModelSelection("instance-one", "model-1"),
+              group("instance-one", provider)
+            )
           )
         ).toBe(false);
       }
@@ -201,8 +207,10 @@ describe("resolveModelThinkingSupport", () => {
       for (const supportsThinking of [false, true]) {
         expect(
           resolveModelThinkingSupport(
-            encodeModelSelection("instance-one", "model-1"),
-            group("instance-one", provider, { supportsThinking })
+            findSelectedModel(
+              encodeModelSelection("instance-one", "model-1"),
+              group("instance-one", provider, { supportsThinking })
+            )
           )
         ).toBe(supportsThinking);
       }
@@ -212,15 +220,19 @@ describe("resolveModelThinkingSupport", () => {
   test("preserves existing non-compatible behavior", () => {
     expect(
       resolveModelThinkingSupport(
-        encodeModelSelection("openai-1", "model-1"),
-        group("openai-1", "openai")
+        findSelectedModel(
+          encodeModelSelection("openai-1", "model-1"),
+          group("openai-1", "openai")
+        )
       )
     ).toBe(true);
 
     expect(
       resolveModelThinkingSupport(
-        encodeModelSelection("openai-1", "model-1"),
-        group("openai-1", "openai", { supportsThinking: false })
+        findSelectedModel(
+          encodeModelSelection("openai-1", "model-1"),
+          group("openai-1", "openai", { supportsThinking: false })
+        )
       )
     ).toBe(false);
   });
